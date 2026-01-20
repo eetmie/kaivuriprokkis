@@ -1,0 +1,189 @@
+RT Jitter Analysis Results - Raspberry Pi 5 with PREEMPT_RT Kernel
+===================================================================
+
+===========================================================================
+IK MODULE PERFORMANCE (diff_ik_V2.py)
+===========================================================================
+
+Tested with Numba JIT-compiled functions after warmup.
+No I/O - pure computation.
+
+| Function           | Mean    | Max     | P99     |
+|--------------------|---------|---------|---------|
+| get_pose (FK)      | 191 us  | 487 us  | 358 us  |
+| compute_jacobian   | 223 us  | 487 us  | 317 us  |
+| IK compute (full)  | 510 us  | 1.6 ms  | 783 us  |
+
+Max theoretical rate: ~2000 Hz
+Status: Can easily run at 1kHz with 50% headroom
+
+IMPORTANT: Numba JIT warmup takes ~12 seconds on first run.
+Call warmup_numba_functions() at startup before entering control loop.
+
+Combined with ADC (20Hz) and PWM, the 100Hz control loop budget:
+- ADC: Runs in separate thread at 20Hz
+- IK compute: ~0.5ms
+- PWM update: ~0.2ms (estimate)
+- Headroom: ~9ms per 10ms cycle
+
+===========================================================================
+Date: 2026-01-19
+Hardware: Raspberry Pi 5
+Kernel: PREEMPT_RT
+I2C Bus: Software bit-banged (bus 3) at 200kHz
+ADC: MCP3424 via ADCPi board, 12-bit mode (240 SPS max)
+
+Test Configuration
+------------------
+- Target rate: 20 Hz (50ms period)
+- Reading 8 sensors via I2C
+- Work time per cycle: ~37-42ms
+- Available headroom: ~8-13ms
+
+===========================================================================
+KEY FINDING: Python Garbage Collector causes ~55ms spikes
+===========================================================================
+
+The ~55ms max jitter spikes observed in all tests WITH garbage collection
+enabled are caused by Python's GC, NOT the RT scheduler or I2C driver.
+
+Disabling GC reduced max jitter from 55ms to ~4ms (13x improvement).
+
+===========================================================================
+TEST RESULTS - WITH GARBAGE COLLECTION ENABLED
+===========================================================================
+
+| Priority        | Mean Jitter | Max Jitter | P99      | Missed  |
+|-----------------|-------------|------------|----------|---------|
+| None (baseline) | 921 us      | 55.2 ms    | 102.0 ms | 1.51%   |
+| nice -10        | 650 us      | 55.7 ms    | 56.4 ms  | 1.00%   |
+| SCHED_FIFO 10   | 450 us      | 55.0 ms    | 51.0 ms  | 0.50%   |
+| SCHED_FIFO 50   | 456 us      | 55.1 ms    | 50.8 ms  | 0.50%   |
+| SCHED_FIFO 80   | 452 us      | 54.9 ms    | 52.8 ms  | 0.50%   |
+
+Observation: RT priority helps reduce mean jitter and missed deadlines,
+but the ~55ms GC spike persists regardless of priority level.
+
+===========================================================================
+TEST RESULTS - WITH GARBAGE COLLECTION DISABLED
+===========================================================================
+
+| Priority        | Mean Jitter | Max Jitter | P99      | Missed  |
+|-----------------|-------------|------------|----------|---------|
+| None (baseline) | 251 us      | 10.1 ms    | 52.9 ms  | 0.25%   |
+| SCHED_FIFO 10   | 104 us      | 3.8 ms     | 50.6 ms  | 0%      |
+| SCHED_FIFO 20   | 98 us       | 3.8 ms     | 50.5 ms  | 0%      |
+| SCHED_FIFO 50   | 119 us      | 4.0 ms     | 50.9 ms  | 0%      |
+
+Observation:
+- FIFO 10-20 provides optimal results
+- Higher priorities (50+) show no improvement, slightly worse
+- Diminishing returns above FIFO 10
+
+===========================================================================
+RECOMMENDATIONS
+===========================================================================
+
+1. USE SCHED_FIFO PRIORITY 10
+   - Provides all RT scheduling benefits
+   - Not aggressive enough to starve system tasks
+   - Higher priorities provide no measurable benefit
+
+   Command: sudo chrt -f 10 python3 your_script.py
+
+2. CONTROL GARBAGE COLLECTION - HYBRID APPROACH (RECOMMENDED)
+
+   Disabling GC entirely is risky for long-running processes.
+   Instead, use this hybrid approach that schedules GC during idle time:
+
+   ```python
+   import gc
+   import time
+
+   gc.disable()  # Disable automatic GC
+
+   # Track last collection times
+   last_gen1 = time.perf_counter()
+   last_gen2 = time.perf_counter()
+
+   def do_gc_if_headroom(headroom_ms):
+       """Call this after work, before sleep, with available headroom."""
+       global last_gen1, last_gen2
+       now = time.perf_counter()
+
+       if headroom_ms > 5:  # Only if we have 5ms+ headroom
+           if now - last_gen2 > 30:      # Full GC every 30s
+               gc.collect(2)
+               last_gen2 = last_gen1 = now
+           elif now - last_gen1 > 5:     # Gen1 every 5s
+               gc.collect(1)
+               last_gen1 = now
+           else:                          # Gen0 when available
+               gc.collect(0)
+   ```
+
+   Why this works:
+   - Gen0 is fast (~0.1ms), runs frequently, handles short-lived objects
+   - Gen1 every 5s catches medium-lived objects
+   - Gen2 every 30s prevents long-term memory growth
+   - Only runs when headroom available - no deadline interference
+
+   Test results with hybrid approach (60 seconds @ 20Hz):
+   - Max jitter: 4.8ms
+   - P99: 50.7ms
+   - Missed deadlines: 0
+   - Memory stable (15.7MB)
+   - GC ran: gen0 ~1189x, gen1 10x, gen2 1x
+
+3. FOR 7 CHANNELS AT 20Hz:
+   - Work time: ~37ms average, ~42ms max
+   - Period: 50ms
+   - Headroom: ~8-13ms
+   - With FIFO 10 + GC control: expect max jitter ~4ms
+   - Should achieve 0% missed deadlines
+
+4. FOR 1 CHANNEL AT 100Hz:
+   - Work time: ~1ms average, ~4ms max (conversion wait)
+   - Period: 10ms
+   - Headroom: ~6-9ms
+   - Easily achievable with same configuration
+
+===========================================================================
+ADDITIONAL OBSERVATIONS
+===========================================================================
+
+- The 200kHz I2C bus speed helps reduce communication overhead but the
+  main bottleneck is MCP3424 conversion time (~4.17ms at 12-bit mode)
+
+- Software bit-banged I2C (bus 3) adds some variability vs hardware I2C,
+  but is acceptable for 20Hz operation
+
+- The ~4ms max jitter with GC disabled appears to be from occasional
+  I2C bus contention or kernel thread preemption - acceptable for
+  soft real-time control
+
+- Python's GC pause of ~55ms suggests significant object churn during
+  ADC reading - could investigate object pooling to reduce allocations
+
+===========================================================================
+RAW TEST OUTPUT SAMPLES
+===========================================================================
+
+30-second test with GC disabled, FIFO 10:
+-----------------------------------------
+Samples: 599
+Mean: 50006.4 us
+Stdev: 260.1 us
+Min: 48602.8 us
+Max: 53844.7 us
+Mean jitter: 120.6 us
+Max jitter: 3844.7 us
+P50: 49989.8 us
+P95: 50276.1 us
+P99: 50764.3 us
+Spikes >60ms: 0 (0.00%)
+
+This represents excellent soft real-time performance suitable for
+hydraulic control applications.
+
+===========================================================================

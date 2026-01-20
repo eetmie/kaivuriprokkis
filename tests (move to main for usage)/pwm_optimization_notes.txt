@@ -1,0 +1,168 @@
+PWM Optimization Notes - PCA9685 Direct I2C
+============================================
+Date: 2026-01-19
+Next step: Benchmark Adafruit library vs direct I2C
+
+===========================================================================
+ADAFRUIT LIBRARY OVERHEAD ANALYSIS
+===========================================================================
+
+Current library path:
+  /usr/local/lib/python3.13/dist-packages/adafruit_pca9685.py
+  /usr/local/lib/python3.13/dist-packages/adafruit_register/i2c_struct_array.py
+  /usr/local/lib/python3.13/dist-packages/adafruit_bus_device/i2c_device.py
+
+Per-channel write overhead:
+  1. bytearray(5) allocation - NEW ALLOCATION EACH TIME
+  2. struct.pack_into()
+  3. I2CDevice.__enter__: try_lock() + sleep(0) spin-wait
+  4. i2c.write(buf) - actual I2C transaction
+  5. I2CDevice.__exit__: unlock()
+
+At 100Hz with 8 channels = 800 allocations/sec, 800 I2C transactions/sec
+
+===========================================================================
+DIRECT I2C OPTIMIZATION IDEA
+===========================================================================
+
+PCA9685 supports auto-increment mode (already enabled by Adafruit).
+Can write all channels in ONE I2C transaction.
+
+Registers:
+  0x06 = LED0_ON_L  (start of PWM registers)
+  Each channel = 4 bytes: ON_L, ON_H, OFF_L, OFF_H
+  16 channels × 4 bytes = 64 bytes total
+
+Direct implementation concept:
+
+```python
+import board
+import busio
+
+class DirectPCA9685:
+    def __init__(self, i2c_bus, address=0x40):
+        self._i2c = i2c_bus
+        self._addr = address
+        # Pre-allocated buffer: 1 addr + 4 bytes × 16 channels
+        self._buf = bytearray(1 + 4 * 16)
+        self._buf[0] = 0x06  # LED0_ON_L register
+
+    def set_all_duty_cycles(self, duty_cycles):
+        """Update all channels in single I2C transaction.
+
+        Args:
+            duty_cycles: list of 16-bit duty cycle values (0-65535)
+        """
+        for i, duty in enumerate(duty_cycles):
+            if duty >= 0xFFF0:
+                # Fully on
+                on_val, off_val = 0x1000, 0
+            elif duty < 0x0010:
+                # Fully off
+                on_val, off_val = 0, 0x1000
+            else:
+                on_val = 0
+                off_val = duty >> 4  # 16-bit to 12-bit
+
+            offset = 1 + i * 4
+            self._buf[offset] = on_val & 0xFF
+            self._buf[offset + 1] = (on_val >> 8) & 0xFF
+            self._buf[offset + 2] = off_val & 0xFF
+            self._buf[offset + 3] = (off_val >> 8) & 0xFF
+
+        # Single I2C transaction for all channels!
+        while not self._i2c.try_lock():
+            pass
+        try:
+            self._i2c.writeto(self._addr, self._buf)
+        finally:
+            self._i2c.unlock()
+
+    def set_channel(self, channel, duty_cycle):
+        """Update single channel (for compatibility)."""
+        # Could implement partial buffer write if needed
+        pass
+```
+
+Expected benefits:
+  - 1 I2C transaction instead of 8-16
+  - Zero allocations in hot path (pre-allocated buffer)
+  - No per-channel lock overhead
+  - ~8-16x less I2C bus time
+
+===========================================================================
+IMPORTANT FILE PATHS
+===========================================================================
+
+Your modules:
+  /home/joel/masi/modules/PCA9685_controller.py   - Your PWM controller wrapper
+  /home/joel/masi/modules/ADC.py                  - ADC interface
+  /home/joel/masi/modules/ADCPi.py                - AB Electronics ADC library
+  /home/joel/masi/modules/diff_ik_V2.py           - IK controller (numba)
+  /home/joel/masi/modules/quaternion_math.py      - Quaternion math (numba)
+
+Test files:
+  /home/joel/masi/adc_channel_test.py             - ADC timing tests
+  /home/joel/masi/jitter_test.py                  - RT jitter evaluation
+  /home/joel/masi/rt_jitter_analysis_results.txt  - All timing results
+
+Config files:
+  /home/joel/masi/configuration_files/servo_config.yaml
+
+Adafruit library (for reference):
+  /usr/local/lib/python3.13/dist-packages/adafruit_pca9685.py
+  /usr/local/lib/python3.13/dist-packages/adafruit_register/i2c_struct_array.py
+  /usr/local/lib/python3.13/dist-packages/adafruit_bus_device/i2c_device.py
+
+===========================================================================
+CURRENT PERFORMANCE SUMMARY
+===========================================================================
+
+| Component        | Rate     | Time/cycle | Status              |
+|------------------|----------|------------|---------------------|
+| ADC 7ch          | 20 Hz    | ~37ms      | Works, I2C bound    |
+| ADC 1ch          | 100 Hz   | ~1ms       | Works well          |
+| IK compute       | ~2000 Hz | ~0.5ms     | Excellent (numba)   |
+| PWM (Adafruit)   | TBD      | TBD        | TEST TOMORROW       |
+
+Target: 100Hz combined control loop
+
+===========================================================================
+TOMORROW'S TEST PLAN
+===========================================================================
+
+1. Benchmark current Adafruit PCA9685 performance
+   - Time single channel update
+   - Time 8 channel update
+   - Check for GC spikes (buffer allocations)
+
+2. Implement direct I2C version
+   - Pre-allocated buffer
+   - Single transaction for all channels
+
+3. Compare:
+   - Latency (mean, max, P99)
+   - Throughput (max Hz)
+   - GC impact
+
+4. If direct is better, integrate into PCA9685_controller.py
+   - Keep high-level API (deadband, dither, ramp)
+   - Replace low-level I2C calls
+
+===========================================================================
+RT SETTINGS REMINDER
+===========================================================================
+
+Run production code with:
+  sudo chrt -f 10 python3 your_script.py
+
+GC strategy (hybrid approach):
+  - gc.disable() at startup
+  - Manual gen0 when headroom > 5ms
+  - gen1 every 5s, gen2 every 30s
+
+Numba warmup:
+  - Call warmup_numba_functions() at startup (~12s on RPi5)
+  - Do this BEFORE entering control loop
+
+===========================================================================

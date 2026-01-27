@@ -1,0 +1,36 @@
+# Hardware and driver configuration for excavator system
+# Used by: HardwareInterface, PWMController, IMU/ADC drivers
+
+rates:
+  # IMU expected sample rate in Hz (requested via handshake)
+  imu_hz: 120.0
+
+  # ADC/encoder read frequency in Hz
+  adc_hz: 120.0
+
+  # Optional PWM update cadence (if applicable in driver)
+  pwm_update_hz: 100.0
+
+perf:
+  # Default enablement for low-level perf tracking (hardware)
+  enabled_default: false
+
+imu:
+  # Optional IMU stream settings forwarded in handshake (device may clamp/ignore)
+  lpf_enabled: 1
+  lpf_alpha: 0.995
+  qmode: FULL
+  # TODO: rest of the filtering settings (currently requires recompile)
+
+pwm:
+  # PWM controller options forwarded to PCA9685 driver initialization
+  pump_variable: false
+  toggle_channels: false
+
+  # Safety settings (see docs/hardware_interface_args.md for details)
+  input_rate_threshold: 0    # Hz, 0 = disabled. Recommended: 5+ for remote control
+  stale_timeout_s: 0.0       # seconds, 0 = disabled. Recommended: 0.3-0.5
+
+  # Hardware watchdog (external relay failsafe)
+  # watchdog_channel: 15     # PWM channel for watchdog signal (uncomment to enable)
+  # watchdog_toggle_hz: 10.0 # Toggle frequency in Hz

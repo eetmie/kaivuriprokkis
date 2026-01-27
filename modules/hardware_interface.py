@@ -10,6 +10,7 @@ Usage:
 
 
 
+import os
 import time
 import numpy as np
 import logging
@@ -24,6 +25,23 @@ from .PCA9685_controller import PWMController
 from .usb_serial_reader import USBSerialReader
 from .ADC import SimpleADC
 from .quaternion_math import quat_from_axis_angle, wrap_to_pi
+from .perf_tracker import IntervalTracker
+from .rt_utils import apply_rt_to_thread, SCHED_FIFO
+
+
+class ReadyState:
+    """Hardware subsystem readiness states."""
+    PENDING = "pending"  # Still initializing, may become ready
+    READY = "ready"      # Working normally
+    FAULT = "fault"      # Failed permanently, unrecoverable
+
+
+class HardwareFaultError(Exception):
+    """Raised when a hardware subsystem has faulted."""
+    def __init__(self, subsystem: str, reason: str):
+        self.subsystem = subsystem
+        self.reason = reason
+        super().__init__(f"{subsystem} fault: {reason}")
 
 
 def _safe_hardware_operation(func):
@@ -137,18 +155,25 @@ class HardwareInterface:
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
                  input_rate_threshold: int = 0,
+                 stale_timeout_s: float = 0.0,
                  default_unset_to_zero: bool = True,
+                 watchdog_channel: Optional[int] = None,
+                 watchdog_toggle_hz: float = 0.0,
                  perf_enabled: bool = False,
                  imu_expected_hz: Optional[float] = None,
                  adc_sample_hz: Optional[float] = None,
                  adc_channels: Optional[List[Any]] = None,
-                 general_config_path: str = "configuration_files/general_config.yaml",
+                 hardware_config_path: str = "configuration_files/hardware_config.yaml",
                  log_level: str = "INFO",
                  enable_pwm: bool = True,
                  enable_imu: bool = True,
                  enable_adc: bool = True,
                  start_imu_reader: bool = True,
-                 start_adc_reader: bool = True):
+                 start_adc_reader: bool = True,
+                 imu_rt_priority: int = 0,
+                 adc_rt_priority: int = 0,
+                 imu_cpu_core: Optional[int] = None,
+                 adc_cpu_core: Optional[int] = None):
         """
         Initialize real hardware interface.
 
@@ -156,13 +181,26 @@ class HardwareInterface:
             config_file: Path to PWM controller configuration
             pump_variable: Whether to use variable/static pump speed
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
-            input_rate_threshold: Input rate threshold for PWM controller
+            input_rate_threshold: Input rate threshold for PWM controller safety monitoring.
+                                  If > 0, enables rate checking and resets PWM if rate drops below threshold.
+            stale_timeout_s: If > 0, reject commands older than this (requires command_ts in send_named_pwm_commands).
+                             Also triggers PWM reset if no commands received within this timeout.
+            watchdog_channel: PWM channel (0-15) to use for external hardware watchdog signal.
+                              If set, this channel toggles at watchdog_toggle_hz during normal operation.
+                              External watchdog relay detects missing pulses and cuts power - hardware-level failsafe.
+            watchdog_toggle_hz: Frequency (Hz) to toggle the watchdog channel. Typical: 5-20 Hz.
+                                Must be set along with watchdog_channel for watchdog to function.
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
             enable_pwm: If False, skip PWM controller initialization (sensor-only mode)
             enable_imu: If False, skip IMU initialization and threads
             enable_adc: If False, skip ADC/encoder initialization and threads
             start_imu_reader: Auto-start IMU background thread when IMU is enabled
             start_adc_reader: Auto-start ADC background thread when ADC is enabled
+            imu_rt_priority: RT priority for IMU thread (0 = normal, 1-89 = SCHED_FIFO).
+                             Use lower than control loop priority (e.g., 50 if control is 70).
+            adc_rt_priority: RT priority for ADC thread (0 = normal, 1-89 = SCHED_FIFO).
+            imu_cpu_core: CPU core to pin IMU thread to (None = no pinning, 0-3 on Pi 5).
+            adc_cpu_core: CPU core to pin ADC thread to (None = no pinning, 0-3 on Pi 5).
             adc_sample_hz: Target ADC sampling frequency for the background thread
             adc_channels: List of ADC channels to sample in the background thread.
                            Accepts sensor names from ADCConfig or (board, channel) tuples.
@@ -179,18 +217,26 @@ class HardwareInterface:
             self.logger.addHandler(handler)
 
         self.config_file = config_file
-        self._general_config_path = general_config_path
-        self._general_config = self._load_general_config(general_config_path)
+        self._hardware_config_path = hardware_config_path
+        self._hardware_config = self._load_config_yaml(hardware_config_path)
         self._enable_pwm = bool(enable_pwm)
         self._enable_imu = bool(enable_imu)
         self._enable_adc = bool(enable_adc)
         self._auto_start_imu = bool(start_imu_reader)
         self._auto_start_adc = bool(start_adc_reader)
+        self._imu_rt_priority = int(imu_rt_priority)
+        self._adc_rt_priority = int(adc_rt_priority)
+        self._imu_cpu_core = imu_cpu_core
+        self._adc_cpu_core = adc_cpu_core
         self._adc_sample_override = adc_sample_hz is not None
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name, is_slew}
         
         # Initialize PWM controller
+        # Use tri-state: PENDING -> READY or FAULT
+        self._pwm_state = ReadyState.PENDING
+        self._pwm_fault_reason: Optional[str] = None
+
         if PWMController is not None and self._enable_pwm:
             try:
                 self.pwm_controller = PWMController(
@@ -198,22 +244,28 @@ class HardwareInterface:
                     pump_variable=self._g('pwm.pump_variable', pump_variable),
                     toggle_channels=self._g('pwm.toggle_channels', toggle_channels),
                     input_rate_threshold=self._g('pwm.input_rate_threshold', input_rate_threshold),
-                    default_unset_to_zero=default_unset_to_zero
+                    stale_timeout_s=self._g('pwm.stale_timeout_s', stale_timeout_s),
+                    default_unset_to_zero=default_unset_to_zero,
+                    watchdog_channel=self._g('pwm.watchdog_channel', watchdog_channel),
+                    watchdog_toggle_hz=self._g('pwm.watchdog_toggle_hz', watchdog_toggle_hz),
+                    perf_enabled=perf_enabled,
                 )
-                self.pwm_ready = True
+                self._pwm_state = ReadyState.READY
                 self.logger.info("PWM controller initialized")
             except Exception as e:
                 self.logger.error(f"PWM controller initialization failed: {e}")
                 self.pwm_controller = None
-                self.pwm_ready = False
+                self._pwm_state = ReadyState.FAULT
+                self._pwm_fault_reason = str(e)
         elif not self._enable_pwm:
             self.logger.info("PWM controller disabled by configuration")
             self.pwm_controller = None
-            self.pwm_ready = True
+            self._pwm_state = ReadyState.READY  # Disabled counts as "ready"
         else:
             self.logger.warning("PWM controller not available")
             self.pwm_controller = None
-            self.pwm_ready = False
+            self._pwm_state = ReadyState.FAULT
+            self._pwm_fault_reason = "PWMController module not available"
         
         # Stop/coordination event for background threads (IMU/ADC)
         self._stop_event = threading.Event()
@@ -221,37 +273,19 @@ class HardwareInterface:
         # Perf tracking (opt-in and very low overhead when disabled)
         # Initialize BEFORE starting any reader threads to avoid races
         self._perf_enabled = bool(perf_enabled)
-        self._perf_lock = threading.Lock()
-        # IMU perf
-        self._imu_rate_count = 0
-        self._imu_rate_window_start = time.perf_counter()
-        self._imu_hz = 0.0
-        self._imu_n = 0  # wallclock interval samples
-        self._imu_mean = 0.0
-        self._imu_m2 = 0.0
-        self._imu_min = float('inf')
-        self._imu_max = 0.0
-        self._imu_last_wall = None
-        # Device timestamp derived intervals (if available)
-        self._imu_dev_n = 0
-        self._imu_dev_mean = 0.0
-        self._imu_dev_m2 = 0.0
-        self._imu_dev_min = float('inf')
-        self._imu_dev_max = 0.0
-        self._imu_last_dev_ts = None
-        # ADC perf
-        self._adc_rate_count = 0
-        self._adc_rate_window_start = time.perf_counter()
-        self._adc_hz = 0.0
-        self._adc_n = 0
-        self._adc_mean = 0.0
-        self._adc_m2 = 0.0
-        self._adc_min = float('inf')
-        self._adc_max = 0.0
-        self._adc_last_wall = None
+        # IMU interval tracker (wallclock-based)
+        self._imu_tracker = IntervalTracker(enabled=perf_enabled)
+        # IMU device timestamp tracker (separate, for hardware-reported intervals)
+        self._imu_dev_tracker = IntervalTracker(enabled=perf_enabled)
+        self._imu_last_dev_ts = None  # Track last device timestamp for delta
+        # ADC interval tracker
+        self._adc_tracker = IntervalTracker(enabled=perf_enabled)
 
         # Initialize IMU reader
-        self.imu_ready = False
+        # Use tri-state: PENDING -> READY or FAULT
+        # If disabled, mark as READY (not needed = OK)
+        self._imu_state = ReadyState.PENDING if self._enable_imu else ReadyState.READY
+        self._imu_fault_reason: Optional[str] = None
         self.latest_imu_data = None
         self.latest_imu_pitch = None  # radians, if available from stream
         self._imu_lock = threading.Lock()
@@ -272,7 +306,10 @@ class HardwareInterface:
             self._start_imu_reader()
 
         # Initialize ADC and encoder
-        self.adc_ready = False
+        # Use tri-state: PENDING -> READY or FAULT
+        # If disabled, mark as READY (not needed = OK)
+        self._adc_state = ReadyState.PENDING if self._enable_adc else ReadyState.READY
+        self._adc_fault_reason: Optional[str] = None
         self.latest_slew_angle = 0.0
         self.latest_slew_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Identity
         self._adc_lock = threading.Lock()
@@ -295,16 +332,16 @@ class HardwareInterface:
                 if self._auto_start_adc:
                     self._start_adc_reader()
                 else:
-                    self.adc_ready = True
+                    self._adc_state = ReadyState.READY
     
     def _check_imu_streaming(self, timeout: float = 2.0) -> bool:
         """Check if IMUs are already streaming valid data."""
         if self.usb_reader is None:
             return False
-            
+
         start_time = time.time()
         valid_count = 0
-        
+
         while (time.time() - start_time) < timeout:
             imu_data = self.usb_reader.read_imus()
             if imu_data is not None and len(imu_data) >= 3:
@@ -312,8 +349,20 @@ class HardwareInterface:
                 if valid_count >= 3:  # Got multiple valid readings
                     return True
             time.sleep(0.1)
-        
+
         return False
+
+    def _check_faults(self) -> None:
+        """Check for hardware faults and raise HardwareFaultError if any subsystem has faulted.
+
+        Call this before waiting on hardware to avoid infinite waits on unrecoverable failures.
+        """
+        if self._pwm_state == ReadyState.FAULT:
+            raise HardwareFaultError("PWM", self._pwm_fault_reason or "Unknown error")
+        if self._imu_state == ReadyState.FAULT:
+            raise HardwareFaultError("IMU", self._imu_fault_reason or "Unknown error")
+        if self._adc_state == ReadyState.FAULT:
+            raise HardwareFaultError("ADC", self._adc_fault_reason or "Unknown error")
     
     def _start_imu_reader(self) -> None:
         """Initialize IMU reader and start background thread."""
@@ -370,6 +419,26 @@ class HardwareInterface:
             
     def _imu_reader_thread(self) -> None:
         """Background thread for continuous IMU reading."""
+        # Apply CPU core pinning if configured (must be done from within the thread)
+        if self._imu_cpu_core is not None:
+            try:
+                os.sched_setaffinity(0, {self._imu_cpu_core})
+                self.logger.info(f"IMU thread: Pinned to Core {self._imu_cpu_core}")
+            except Exception as e:
+                self.logger.warning(f"IMU thread: Failed to pin to Core {self._imu_cpu_core}: {e}")
+
+        # Apply RT priority if configured (must be done from within the thread)
+        if self._imu_rt_priority > 0:
+            success = apply_rt_to_thread(
+                priority=self._imu_rt_priority,
+                policy=SCHED_FIFO,
+                quiet=False
+            )
+            if success:
+                self.logger.info(f"IMU thread: RT priority SCHED_FIFO-{self._imu_rt_priority} applied")
+            else:
+                self.logger.warning(f"IMU thread: Failed to apply RT priority {self._imu_rt_priority}")
+
         # Aim to match the device sample rate to avoid unnecessary polling
         next_run_time = time.perf_counter()
         read_period = 1.0 / max(1.0, self._imu_expected_hz)
@@ -401,48 +470,21 @@ class HardwareInterface:
                             self.latest_imu_data = quat_only[:3]  # Take first 3 IMUs
                             # Note: pitch can be computed from quaternion if needed
                             # pitch = arcsin(2*(w*y - z*x))
-                            if not self.imu_ready:
-                                self.imu_ready = True
+                            if self._imu_state != ReadyState.READY:
+                                self._imu_state = ReadyState.READY
                                 self.logger.info("IMU data streaming (CSV)")
 
-                        # Perf: count sample and interval stats (minimal, gated)
-                        if self._perf_enabled:
-                            now = time.perf_counter()
-                            # Wallclock intervals
-                            if self._imu_last_wall is not None:
-                                interval = max(0.0, now - self._imu_last_wall)
-                                with self._perf_lock:
-                                    self._imu_n += 1
-                                    # Welford update
-                                    delta = interval - self._imu_mean
-                                    self._imu_mean += delta / self._imu_n
-                                    self._imu_m2 += delta * (interval - self._imu_mean)
-                                    self._imu_min = interval if interval < self._imu_min else self._imu_min
-                                    self._imu_max = interval if interval > self._imu_max else self._imu_max
-                            self._imu_last_wall = now
+                        # Perf: record sample for interval/rate tracking (uses IntervalTracker)
+                        self._imu_tracker.record_sample()
 
-                            # Device timestamp derived intervals (if present)
-                            dev_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
-                            if isinstance(dev_ts, (int, float)):
-                                if self._imu_last_dev_ts is not None and dev_ts > self._imu_last_dev_ts:
-                                    dt_ms = (dev_ts - self._imu_last_dev_ts) / 1000.0
-                                    with self._perf_lock:
-                                        self._imu_dev_n += 1
-                                        ddelta = dt_ms - self._imu_dev_mean
-                                        self._imu_dev_mean += ddelta / self._imu_dev_n
-                                        self._imu_dev_m2 += ddelta * (dt_ms - self._imu_dev_mean)
-                                        self._imu_dev_min = dt_ms if dt_ms < self._imu_dev_min else self._imu_dev_min
-                                        self._imu_dev_max = dt_ms if dt_ms > self._imu_dev_max else self._imu_dev_max
-                                self._imu_last_dev_ts = dev_ts
-
-                            # Rate over a short window
-                            with self._perf_lock:
-                                self._imu_rate_count += 1
-                                elapsed = now - self._imu_rate_window_start
-                                if elapsed >= 0.5:
-                                    self._imu_hz = self._imu_rate_count / elapsed
-                                    self._imu_rate_count = 0
-                                    self._imu_rate_window_start = now
+                        # Device timestamp derived intervals (if present)
+                        dev_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
+                        if isinstance(dev_ts, (int, float)):
+                            if self._imu_last_dev_ts is not None and dev_ts > self._imu_last_dev_ts:
+                                # Convert us delta to seconds for tracker
+                                dt_s = (dev_ts - self._imu_last_dev_ts) / 1_000_000.0
+                                self._imu_dev_tracker.record_interval(dt_s)
+                            self._imu_last_dev_ts = dev_ts
 
                 # Accurate timing to match expected device SR
                 next_run_time += read_period
@@ -455,7 +497,7 @@ class HardwareInterface:
             except Exception as e:
                 self.logger.error(f"IMU reader thread error: {e}")
                 with self._imu_lock:
-                    self.imu_ready = False
+                    self._imu_state = ReadyState.PENDING
                 time.sleep(0.1)  # Back off on error
 
     def _ensure_adc_initialized(self) -> bool:
@@ -527,7 +569,7 @@ class HardwareInterface:
         )
         self.adc_thread.start()
         # Mark not ready until first successful read
-        self.adc_ready = False
+        self._adc_state = ReadyState.PENDING
 
     def start_adc_streaming(self) -> bool:
         """Public helper to start ADC thread when auto-start was disabled."""
@@ -551,6 +593,26 @@ class HardwareInterface:
 
     def _adc_reader_thread(self) -> None:
         """Background thread for continuous ADC reading."""
+        # Apply CPU core pinning if configured (must be done from within the thread)
+        if self._adc_cpu_core is not None:
+            try:
+                os.sched_setaffinity(0, {self._adc_cpu_core})
+                self.logger.info(f"ADC thread: Pinned to Core {self._adc_cpu_core}")
+            except Exception as e:
+                self.logger.warning(f"ADC thread: Failed to pin to Core {self._adc_cpu_core}: {e}")
+
+        # Apply RT priority if configured (must be done from within the thread)
+        if self._adc_rt_priority > 0:
+            success = apply_rt_to_thread(
+                priority=self._adc_rt_priority,
+                policy=SCHED_FIFO,
+                quiet=False
+            )
+            if success:
+                self.logger.info(f"ADC thread: RT priority SCHED_FIFO-{self._adc_rt_priority} applied")
+            else:
+                self.logger.warning(f"ADC thread: Failed to apply RT priority {self._adc_rt_priority}")
+
         next_run_time = time.perf_counter()
         read_period = 1.0 / max(1.0, self._adc_expected_hz)
 
@@ -567,31 +629,12 @@ class HardwareInterface:
                     with self._adc_lock:
                         self._latest_adc_readings[ch['name']] = voltage
                         self._latest_adc_timestamp = time.time()
-                        if not self.adc_ready:
-                            self.adc_ready = True
+                        if self._adc_state != ReadyState.READY:
+                            self._adc_state = ReadyState.READY
                             self.logger.info("ADC sampling ready")
 
-                # Perf: intervals and rate (gated)
-                if self._perf_enabled:
-                    now = time.perf_counter()
-                    if self._adc_last_wall is not None:
-                        interval = max(0.0, now - self._adc_last_wall)
-                        with self._perf_lock:
-                            self._adc_n += 1
-                            delta = interval - self._adc_mean
-                            self._adc_mean += delta / self._adc_n
-                            self._adc_m2 += delta * (interval - self._adc_mean)
-                            self._adc_min = interval if interval < self._adc_min else self._adc_min
-                            self._adc_max = interval if interval > self._adc_max else self._adc_max
-                    self._adc_last_wall = now
-
-                    with self._perf_lock:
-                        self._adc_rate_count += 1
-                        elapsed = now - self._adc_rate_window_start
-                        if elapsed >= 0.5:
-                            self._adc_hz = self._adc_rate_count / elapsed
-                            self._adc_rate_count = 0
-                            self._adc_rate_window_start = now
+                # Perf: record sample for interval/rate tracking (uses IntervalTracker)
+                self._adc_tracker.record_sample()
 
                 # Accurate timing
                 next_run_time += read_period
@@ -604,7 +647,7 @@ class HardwareInterface:
             except Exception as e:
                 self.logger.error(f"ADC reader thread error: {e}")
                 with self._adc_lock:
-                    self.adc_ready = False
+                    self._adc_state = ReadyState.PENDING
                     self._latest_adc_readings = {}
                     self._latest_adc_timestamp = None
                 time.sleep(0.1)  # Longer sleep on error
@@ -618,7 +661,7 @@ class HardwareInterface:
         """
         # Get latest data atomically - check ready flag inside lock
         with self._imu_lock:
-            if not self.imu_ready:
+            if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read IMU data")
 
             if self.latest_imu_data is not None:
@@ -635,7 +678,7 @@ class HardwareInterface:
         Requires debug telemetry to be enabled.
         """
         with self._imu_lock:
-            if not self.imu_ready:
+            if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read gyro data")
             if not self._debug_telemetry_enabled:
                 raise RuntimeError("Debug telemetry disabled - gyro data not captured")
@@ -650,7 +693,7 @@ class HardwareInterface:
         Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
         """
         with self._imu_lock:
-            if not self.imu_ready:
+            if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read pitch data")
             if self.latest_imu_pitch is None:
                 raise RuntimeError("IMU pitch data is None (may not be streamed by device)")
@@ -669,7 +712,7 @@ class HardwareInterface:
         """
         self._ensure_slew_channel_configured()
         with self._adc_lock:
-            if not self.adc_ready:
+            if self._adc_state != ReadyState.READY:
                 raise RuntimeError("ADC not ready - cannot read slew voltage")
             for ch in self._adc_channel_plan:
                 if ch['is_slew']:
@@ -690,7 +733,7 @@ class HardwareInterface:
         """
         self._ensure_slew_channel_configured()
         with self._adc_lock:
-            if not self.adc_ready:
+            if self._adc_state != ReadyState.READY:
                 raise RuntimeError("ADC not ready - cannot read slew angle")
             return self.latest_slew_angle
 
@@ -703,7 +746,7 @@ class HardwareInterface:
         """
         self._ensure_slew_channel_configured()
         with self._adc_lock:
-            if not self.adc_ready:
+            if self._adc_state != ReadyState.READY:
                 raise RuntimeError("ADC not ready - cannot read slew quaternion")
             return self.latest_slew_quat.copy()
 
@@ -712,7 +755,7 @@ class HardwareInterface:
         if not self._enable_adc:
             return {}
         with self._adc_lock:
-            if not self.adc_ready:
+            if self._adc_state != ReadyState.READY:
                 raise RuntimeError("ADC not ready - cannot get ADC readings")
             return dict(self._latest_adc_readings)
 
@@ -721,7 +764,7 @@ class HardwareInterface:
         if not self._enable_adc:
             return {'readings': {}, 'timestamp': None}
         with self._adc_lock:
-            if not self.adc_ready:
+            if self._adc_state != ReadyState.READY:
                 raise RuntimeError("ADC not ready - cannot get ADC readings")
             return {
                 'readings': dict(self._latest_adc_readings),
@@ -742,6 +785,14 @@ class HardwareInterface:
 
     def shutdown(self) -> None:
         """Gracefully stop background threads and close I/O resources."""
+        # SAFETY: Reset PWM to safe state before shutting down.
+        # PWMController has its own atexit handler that should do this internally,
+        # but better to call it twice than risk leaving actuators in unknown state.
+        try:
+            self.reset(reset_pump=True)
+        except Exception:
+            pass
+
         try:
             self._stop_event.set()
         except Exception:
@@ -768,9 +819,9 @@ class HardwareInterface:
 
         # Mark sensors not ready
         with self._imu_lock:
-            self.imu_ready = False
+            self._imu_state = ReadyState.PENDING
         with self._adc_lock:
-            self.adc_ready = False
+            self._adc_state = ReadyState.PENDING
 
     def __del__(self):
         try:
@@ -780,20 +831,25 @@ class HardwareInterface:
 
     def send_named_pwm_commands(self, commands: Dict[str, float], *,
                                 unset_to_zero: Optional[bool] = None,
-                                one_shot_pump_override: bool = True) -> bool:
+                                one_shot_pump_override: bool = True,
+                                command_ts: Optional[float] = None) -> bool:
         """Convenience method: send name-based PWM commands.
 
         Args:
             commands: Mapping from channel name to command value [-1, 1]. Unknown names ignored.
             unset_to_zero: If None, use controller default; otherwise override per call.
             one_shot_pump_override: If True, a provided 'pump' value only applies for this update.
+            command_ts: Optional monotonic timestamp of when command was generated (e.g., UDP receive time).
+                        If provided and PWM controller has stale_timeout_s configured, commands older
+                        than the timeout will be rejected for safety.
         """
-        if not self.pwm_ready or self.pwm_controller is None:
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
             return False
         try:
             self.pwm_controller.update_named(commands,
                                              unset_to_zero=unset_to_zero,
-                                             one_shot_pump_override=one_shot_pump_override)
+                                             one_shot_pump_override=one_shot_pump_override,
+                                             command_ts=command_ts)
             return True
         except Exception as e:
             self.logger.error(f"PWM named command error: {e}")
@@ -813,18 +869,24 @@ class HardwareInterface:
         self._debug_telemetry_enabled = bool(enabled)
 
     def is_hardware_ready(self) -> bool:
-        """Check if hardware is ready."""
-        pwm_ok = (not getattr(self, "_enable_pwm", True)) or self.pwm_ready
-        imu_ok = (not getattr(self, "_enable_imu", True)) or self.imu_ready
-        adc_ok = (not getattr(self, "_enable_adc", True)) or self.adc_ready
+        """Check if hardware is ready. Raises HardwareFaultError if any subsystem has faulted."""
+        # Check for faults first - raises if any subsystem failed permanently
+        self._check_faults()
+
+        pwm_ok = (not self._enable_pwm) or (self._pwm_state == ReadyState.READY)
+        imu_ok = (not self._enable_imu) or (self._imu_state == ReadyState.READY)
+        adc_ok = (not self._enable_adc) or (self._adc_state == ReadyState.READY)
         return pwm_ok and imu_ok and adc_ok
     
     def get_status(self) -> Dict[str, Any]:
         """Get hardware status for monitoring."""
         status = {
-            'pwm_ready': self.pwm_ready,
-            'imu_ready': self.imu_ready,
-            'adc_ready': self.adc_ready,
+            'pwm_state': self._pwm_state,
+            'imu_state': self._imu_state,
+            'adc_state': self._adc_state,
+            'pwm_fault': self._pwm_fault_reason,
+            'imu_fault': self._imu_fault_reason,
+            'adc_fault': self._adc_fault_reason,
             'latest_imu_timestamp': time.time() if self.latest_imu_data is not None else None,
             'slew_angle': self.latest_slew_angle
         }
@@ -846,11 +908,11 @@ class HardwareInterface:
             self.logger.error(f"Error reloading configuration: {e}")
             return False
 
-    def reload_general_config(self) -> bool:
-        """Reload general YAML configuration and apply rate settings to readers."""
+    def reload_hardware_config(self) -> bool:
+        """Reload hardware YAML configuration and apply rate settings to readers."""
         try:
-            cfg = self._load_general_config(self._general_config_path)
-            self._general_config = cfg
+            cfg = self._load_config_yaml(self._hardware_config_path)
+            self._hardware_config = cfg
             # Apply rates
             if self._enable_imu:
                 imu_hz_val = self._g('rates.imu_hz', self._imu_expected_hz)
@@ -868,11 +930,11 @@ class HardwareInterface:
                 pass
             return True
         except Exception as e:
-            self.logger.error(f"Error reloading general config: {e}")
+            self.logger.error(f"Error reloading hardware config: {e}")
             return False
 
-    def _load_general_config(self, path: str) -> Dict[str, Any]:
-        """Load general configuration YAML file if available; return dict."""
+    def _load_config_yaml(self, path: str) -> Dict[str, Any]:
+        """Load YAML configuration file if available; return dict."""
         try:
             p = Path(path)
             if not p.exists():
@@ -903,8 +965,8 @@ class HardwareInterface:
             self.adc.set_log_level(level)
 
     def _g(self, dotted: str, default=None):
-        """Get nested config value from general config using dotted path."""
-        cur = self._general_config
+        """Get nested config value from hardware config using dotted path."""
+        cur = self._hardware_config
         try:
             for part in dotted.split('.'):
                 if isinstance(cur, dict) and part in cur:
@@ -919,79 +981,69 @@ class HardwareInterface:
     # Perf helpers (opt-in)
     # ------------------------
     def set_perf_enabled(self, enabled: bool) -> None:
+        """Enable or disable performance tracking for all subsystems."""
         self._perf_enabled = bool(enabled)
+        self._imu_tracker.set_enabled(enabled)
+        self._imu_dev_tracker.set_enabled(enabled)
+        self._adc_tracker.set_enabled(enabled)
+        if self.pwm_controller is not None:
+            self.pwm_controller.set_perf_enabled(enabled)
 
     def reset_perf_stats(self) -> None:
-        with self._perf_lock:
-            # IMU
-            self._imu_rate_count = 0
-            self._imu_rate_window_start = time.perf_counter()
-            self._imu_hz = 0.0
-            self._imu_n = 0
-            self._imu_mean = 0.0
-            self._imu_m2 = 0.0
-            self._imu_min = float('inf')
-            self._imu_max = 0.0
-            self._imu_last_wall = None
-            self._imu_dev_n = 0
-            self._imu_dev_mean = 0.0
-            self._imu_dev_m2 = 0.0
-            self._imu_dev_min = float('inf')
-            self._imu_dev_max = 0.0
-            self._imu_last_dev_ts = None
-            # ADC
-            self._adc_rate_count = 0
-            self._adc_rate_window_start = time.perf_counter()
-            self._adc_hz = 0.0
-            self._adc_n = 0
-            self._adc_mean = 0.0
-            self._adc_m2 = 0.0
-            self._adc_min = float('inf')
-            self._adc_max = 0.0
-            self._adc_last_wall = None
+        """Reset all performance statistics for all subsystems."""
+        self._imu_tracker.reset()
+        self._imu_dev_tracker.reset()
+        self._imu_last_dev_ts = None
+        self._adc_tracker.reset()
+        if self.pwm_controller is not None:
+            self.pwm_controller.reset_perf_stats()
 
     def get_perf_stats(self) -> Dict[str, Any]:
+        """Get performance statistics for IMU, ADC, and PWM.
+
+        Returns:
+            Dictionary with 'imu', 'adc', and 'pwm' sub-dicts containing:
+            - hz: Measured sampling/update rate
+            - avg_interval_ms, std_interval_ms, min_interval_ms, max_interval_ms
+            - samples: Number of samples collected
+            For IMU, also includes dev_* fields for device timestamp intervals.
+            For PWM, includes proc_* fields for processing time stats.
+        """
         if not self._perf_enabled:
             return {}
-        with self._perf_lock:
-            def pack_wall(n, mean_s, m2, min_s, max_s):
-                if n > 1:
-                    var = m2 / (n - 1)
-                    std_ms = (var ** 0.5) * 1000.0
-                else:
-                    std_ms = 0.0
-                return {
-                    'avg_interval_ms': float(mean_s * 1000.0),
-                    'std_interval_ms': float(std_ms),
-                    'min_interval_ms': float(min_s * 1000.0 if min_s != float('inf') else 0.0),
-                    'max_interval_ms': float(max_s * 1000.0),
-                }
 
-            imu_wall = pack_wall(self._imu_n, self._imu_mean, self._imu_m2, self._imu_min, self._imu_max)
-            if self._imu_dev_n > 1:
-                dev_var = self._imu_dev_m2 / (self._imu_dev_n - 1)
-                dev_std = dev_var ** 0.5
-            else:
-                dev_std = 0.0
-            imu_dev = {
-                'dev_avg_interval_ms': float(self._imu_dev_mean),
-                'dev_std_interval_ms': float(dev_std),
-                'dev_min_interval_ms': float(self._imu_dev_min if self._imu_dev_min != float('inf') else 0.0),
-                'dev_max_interval_ms': float(self._imu_dev_max),
+        imu_stats = self._imu_tracker.get_stats()
+        imu_dev_stats = self._imu_dev_tracker.get_stats()
+        adc_stats = self._adc_tracker.get_stats()
+
+        result = {
+            'imu': {
+                'hz': imu_stats.get('hz', 0.0),
+                'avg_interval_ms': imu_stats.get('avg_interval_ms', 0.0),
+                'std_interval_ms': imu_stats.get('std_interval_ms', 0.0),
+                'min_interval_ms': imu_stats.get('min_interval_ms', 0.0),
+                'max_interval_ms': imu_stats.get('max_interval_ms', 0.0),
+                # Device timestamp derived intervals
+                'dev_avg_interval_ms': imu_dev_stats.get('avg_interval_ms', 0.0),
+                'dev_std_interval_ms': imu_dev_stats.get('std_interval_ms', 0.0),
+                'dev_min_interval_ms': imu_dev_stats.get('min_interval_ms', 0.0),
+                'dev_max_interval_ms': imu_dev_stats.get('max_interval_ms', 0.0),
+                'samples': imu_stats.get('samples', 0),
+            },
+            'adc': {
+                'hz': adc_stats.get('hz', 0.0),
+                'avg_interval_ms': adc_stats.get('avg_interval_ms', 0.0),
+                'std_interval_ms': adc_stats.get('std_interval_ms', 0.0),
+                'min_interval_ms': adc_stats.get('min_interval_ms', 0.0),
+                'max_interval_ms': adc_stats.get('max_interval_ms', 0.0),
+                'samples': adc_stats.get('samples', 0),
             }
+        }
 
-            adc_wall = pack_wall(self._adc_n, self._adc_mean, self._adc_m2, self._adc_min, self._adc_max)
+        # Include PWM stats if controller is available and has tracking enabled
+        if self.pwm_controller is not None:
+            pwm_stats = self.pwm_controller.get_perf_stats()
+            if pwm_stats:
+                result['pwm'] = pwm_stats
 
-            return {
-                'imu': {
-                    'hz': float(self._imu_hz),
-                    **imu_wall,
-                    **imu_dev,
-                    'samples': int(self._imu_n),
-                },
-                'adc': {
-                    'hz': float(self._adc_hz),
-                    **adc_wall,
-                    'samples': int(self._adc_n),
-                }
-            }
+        return result

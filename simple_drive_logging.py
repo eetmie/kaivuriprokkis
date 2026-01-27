@@ -1,9 +1,18 @@
 from modules.udp_socket import UDPSocket
-from modules.hardware_interface import HardwareInterface
+from modules.hardware_interface import HardwareInterface, HardwareFaultError
+from modules.perf_tracker import LoopPerfTracker
 import time
 import numpy as np
+import argparse
 from datetime import datetime
 from pathlib import Path
+
+# ============================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================
+parser = argparse.ArgumentParser(description="Simple drive logging with optional perf metrics")
+parser.add_argument("--perf", action="store_true", help="Show performance metrics in status output")
+args = parser.parse_args()
 
 # ============================================================
 # DATA COLLECTION SETTINGS
@@ -37,13 +46,15 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # INITIALIZE HARDWARE & NETWORK
 # ============================================================
 server = UDPSocket(local_id=2)
-server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=0, is_server=True)
+# server.setup("192.168.0.132", 8080, num_inputs=9, num_outputs=0, is_server=True)
+server.setup("192.168.0.105", 8080, num_inputs=9, num_outputs=0, is_server=True)
 
 hardware = HardwareInterface(
     config_file="configuration_files/servo_config.yaml",
     pump_variable=False,
     toggle_channels=True,
     input_rate_threshold=5,
+    stale_timeout_s=0.5,  # Reject commands older than 500ms, reset PWM if no commands for 500ms
     adc_channels=[
         "LiftBoom retract ps",
         "LiftBoom extend ps",
@@ -54,25 +65,39 @@ hardware = HardwareInterface(
         "Pump ps",
     ],
     adc_sample_hz=PRESSURE_SAMPLING_FREQUENCY,
+    # Subsystem enable flags (all default to True)
+    enable_pwm=True,
+    enable_imu=True,
+    enable_adc=True,
 )
 
 print("Waiting for hardware to be ready...")
-while not hardware.is_hardware_ready():
-    time.sleep(0.1)
-print("Hardware ready!")
-
 try:
-    # Enable low-overhead perf metrics so IMU/ADC Hz report correctly
-    hardware.set_perf_enabled(True)
-    hardware.reset_perf_stats()
-except Exception:
-    pass
+    while not hardware.is_hardware_ready():
+        time.sleep(0.1)
+    print("Hardware ready!")
+except HardwareFaultError as e:
+    print(f"\n*** HARDWARE FAULT: {e.subsystem} ***")
+    print(f"Reason: {e.reason}")
+    print("\nCheck your configuration and hardware connections.")
+    hardware.shutdown()
+    raise SystemExit(1)
+
+# Enable perf tracking if --perf flag is set
+main_loop_perf = LoopPerfTracker(enabled=args.perf)
+if args.perf:
+    try:
+        hardware.set_perf_enabled(True)
+        hardware.reset_perf_stats()
+        print("[PERF] Performance metrics enabled")
+    except Exception as e:
+        print(f"[PERF] Failed to enable: {e}")
 
 # ============================================================
 # DATA COLLECTION SETUP
 # ============================================================
 class DataLogger:
-    """Collects hydraulic actuator data for LSTM training.
+    """Collects hydraulic actuator data for analysis and model training.
 
     Data format (Egli-style approach):
     - 100Hz: valve commands, joint positions (IMU pitch), joint velocities, pressures
@@ -321,7 +346,7 @@ class DataLogger:
         return len(self.timestamps)
 
     def save(self):
-        """Save collected data to CSV for LSTM training.
+        """Save collected data to CSV.
 
         Saves in format:
         timestamp, valve_cmd_0, valve_cmd_1, valve_cmd_2,
@@ -451,7 +476,7 @@ class DataLogger:
         print(f"  Duration: {duration_min:.2f} minutes ({duration_sec:.1f} seconds)")
         print(f"  Samples: {num_samples}")
         print(f"  Actual sampling rate: {num_samples / duration_sec:.1f} Hz")
-        print(f"  Format: CSV (ready for LSTM training)")
+        print(f"  Format: CSV")
 
         # Valve command statistics
         print(f"\n  Valve Commands (3 joints: lift, tilt, scoop):")
@@ -541,9 +566,13 @@ if server.handshake(timeout=30.0):
 
     while True:
         loop_start = time.perf_counter()
+        main_loop_perf.tick_start()
 
         # Get latest controller data as floats in [-1, 1]
         float_data = server.get_latest_floats()
+
+        # Capture monotonic timestamp for stale command detection
+        command_ts = time.monotonic() if float_data else None
 
         if float_data:
 
@@ -595,7 +624,9 @@ if server.handshake(timeout=30.0):
             }
 
             # Send commands to hardware (zero unspecified channels per call)
-            hardware.send_named_pwm_commands(named, unset_to_zero=True) # unset_to_zero is True by default, but here for clarity
+            # Pass command_ts for stale detection - if command is older than stale_timeout_s, it will be rejected
+            # unset_to_zero is True by default, but here for clarity
+            hardware.send_named_pwm_commands(named, unset_to_zero=True, command_ts=command_ts)
 
             # Log data
             if logger.is_logging:
@@ -626,6 +657,37 @@ if server.handshake(timeout=30.0):
 
                 print(f"[STATUS] Logging={logging_state} | Time={elapsed_min:.1f} min | Samples={samples} | Next save in {remaining_str}")
 
+                # Show perf metrics if --perf flag is set
+                if args.perf:
+                    try:
+                        perf = hardware.get_perf_stats()
+                        loop_stats = main_loop_perf.get_stats()
+                        if perf:
+                            imu = perf.get('imu', {})
+                            adc = perf.get('adc', {})
+                            pwm = perf.get('pwm', {})
+
+                            imu_hz = imu.get('hz', 0)
+                            imu_jitter = imu.get('std_interval_ms', 0)
+                            adc_hz = adc.get('hz', 0)
+                            adc_jitter = adc.get('std_interval_ms', 0)
+                            pwm_hz = pwm.get('hz', 0)
+                            pwm_jitter = pwm.get('loop_std_ms', 0)
+
+                            # Main loop stats
+                            loop_hz = loop_stats.get('hz', 0)
+                            loop_proc = loop_stats.get('proc_avg_ms', 0)
+                            loop_headroom = loop_stats.get('headroom_avg_ms', 0)
+                            loop_violations = loop_stats.get('violation_pct', 0)
+
+                            print(f"[PERF]  IMU={imu_hz:.0f}Hz (j={imu_jitter:.2f}ms) | "
+                                  f"ADC={adc_hz:.0f}Hz (j={adc_jitter:.2f}ms) | "
+                                  f"PWM={pwm_hz:.0f}Hz (j={pwm_jitter:.2f}ms)")
+                            print(f"[LOOP]  {loop_hz:.0f}Hz | proc={loop_proc:.2f}ms | "
+                                  f"headroom={loop_headroom:.2f}ms | violations={loop_violations:.1f}%")
+                    except Exception:
+                        pass
+
             # IMU angle display (10Hz when enabled)
             if display_imu_angles and (current_time - last_imu_display_time >= IMU_DISPLAY_INTERVAL):
                 last_imu_display_time = current_time
@@ -645,6 +707,9 @@ if server.handshake(timeout=30.0):
                 loop_compute_time = time.perf_counter() - loop_start
                 logger.record_loop_time(loop_duration, loop_compute_time)
         last_loop_start = loop_start
+
+        # Track main loop compute time (before sleep)
+        main_loop_perf.tick_end(target_period_s=loop_period)
 
         # Adaptive sleep to maintain exact frequency (from excavator_controller.py)
         next_run_time += loop_period

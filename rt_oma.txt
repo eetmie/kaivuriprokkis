@@ -1,0 +1,71 @@
+======================================================================
+  RT FULL WORKLOAD TEST - SIMULATING run_hw.py
+======================================================================
+  Generated: 2026-01-24 23:20:36
+
+----------------------------------------------------------------------
+  SYSTEM INFORMATION
+----------------------------------------------------------------------
+  Kernel: Linux version 6.12.66-v8-16k+ (joel@raspberrypi) (gcc (
+  RT Kernel: Yes
+  Running as root: Yes
+
+----------------------------------------------------------------------
+  TEST CONFIGURATION
+----------------------------------------------------------------------
+  Control RT: RT-FIFO-70
+  IMU RT:     RT-FIFO-50
+  ADC RT:     RT-FIFO-50
+  Memory locked: No
+  Cores pinned:  No
+  Target frequency: 100 Hz
+  Duration: 300.0 seconds
+  Total samples: 30000
+
+  Workload includes:
+    - Controller.give_pose() (IMU read, FK, IK, PWM send)
+    - Controller.get_pose() + get_joint_angles()
+    - ADC sampling (8 channels at 20Hz)
+    - Data logging (CSV: trajectory + ADC)
+    - Periodic status output
+
+  Data saved to: /home/joel/masi_main/logs_rt_test/rt_test_1_trajectory.csv
+
+----------------------------------------------------------------------
+  MAIN LOOP PERFORMANCE
+----------------------------------------------------------------------
+  Frequency:    100.0 Hz (target: 100 Hz)
+  Jitter:       0.083 ms (std dev of loop interval)
+  Max spike:    17.413 ms
+  Processing:   0.135 ms avg
+  Headroom:     9.87 ms avg
+  Violations:   0.00%
+
+----------------------------------------------------------------------
+  SUBSYSTEM PERFORMANCE
+----------------------------------------------------------------------
+  IMU:   120.0 Hz, jitter = 0.591 ms
+  ADC:    20.1 Hz, jitter = 1.023 ms
+  PWM:   100.0 Hz, jitter = 1.675 ms
+
+----------------------------------------------------------------------
+  DATA LOGGING OVERHEAD
+----------------------------------------------------------------------
+  Avg log time: 0.0187 ms
+  Max log time: 0.8106 ms
+
+----------------------------------------------------------------------
+  ANALYSIS
+----------------------------------------------------------------------
+  Jitter: EXCELLENT (0.083ms < 0.3ms)
+  Headroom: 98.7% of period unused (9.87ms / 10.0ms)
+  Processing breakdown: 0.135ms total, 0.0187ms logging
+  Timing violations: NONE
+
+----------------------------------------------------------------------
+  CONCLUSION
+----------------------------------------------------------------------
+  System is STABLE and READY FOR PRODUCTION.
+  Recommended config: RT-FIFO-70
+
+======================================================================

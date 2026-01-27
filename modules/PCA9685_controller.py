@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 
-from adafruit_pca9685 import PCA9685
 import board
 import busio
+
+from .perf_tracker import LoopPerfTracker
 
 
 # ============================================================================
@@ -37,9 +38,18 @@ class DirectPWMWriter:
     """
 
     LED0_ON_L = 0x06  # First PWM register (channel 0)
+    MODE1 = 0x00
+    MODE2 = 0x01
+    PRE_SCALE = 0xFE
+
+    # MODE1 bits
+    SLEEP = 0x10
+    RESTART = 0x80
+    AI = 0x20  # Auto-increment
 
     def __init__(self, i2c_bus, address: int = 0x40,
-                 min_channel: int = 0, max_channel: int = 15):
+                 min_channel: int = 0, max_channel: int = 15,
+                 frequency: int = 200):
         """Initialize the direct PWM writer.
 
         Args:
@@ -47,6 +57,7 @@ class DirectPWMWriter:
             address: PCA9685 I2C address (default 0x40)
             min_channel: Lowest channel number to write (0-15)
             max_channel: Highest channel number to write (0-15)
+            frequency: PWM frequency in Hz (default 200)
         """
         self._i2c = i2c_bus
         self._addr = address
@@ -58,6 +69,45 @@ class DirectPWMWriter:
         self._buf = bytearray(1 + 4 * self._num_channels)
         self._buf[0] = self.LED0_ON_L + (min_channel * 4)  # Start register
         self._duty_cycles = [0] * 16  # Full array; only min_ch..max_ch are written
+
+        self._init_chip(frequency)
+
+    def _write_reg(self, reg: int, value: int):
+        """Write a single byte to a register."""
+        while not self._i2c.try_lock():
+            time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
+        try:
+            self._i2c.writeto(self._addr, bytes([reg, value]))
+        finally:
+            self._i2c.unlock()
+
+    def _init_chip(self, frequency: int):
+        """Initialize PCA9685 and set PWM frequency."""
+        # Reset - sleep mode, auto-increment enabled
+        self._write_reg(self.MODE1, self.SLEEP | self.AI)
+        self._write_reg(self.MODE2, 0x04)  # OUTDRV = totem pole
+
+        # Set frequency (prescale = 25MHz / (4096 * freq) - 1)
+        prescale = int(25_000_000 / (4096 * frequency) - 1)
+        prescale = max(3, min(255, prescale))  # Valid range: 3-255
+        self._write_reg(self.PRE_SCALE, prescale)
+
+        # Wake up
+        self._write_reg(self.MODE1, self.AI)  # Clear sleep
+        time.sleep(0.005)  # Wait for oscillator
+        self._write_reg(self.MODE1, self.AI | self.RESTART)
+
+        self.frequency = frequency
+
+    def sleep(self):
+        """Put chip to sleep - stops oscillator, outputs go low."""
+        self._write_reg(self.MODE1, self.SLEEP | self.AI)
+
+    def wake(self):
+        """Wake chip from sleep."""
+        self._write_reg(self.MODE1, self.AI)
+        time.sleep(0.005)
+        self._write_reg(self.MODE1, self.AI | self.RESTART)
 
     def set_channel(self, channel: int, duty_cycle: int):
         """Queue a duty cycle update (0-65535).
@@ -103,7 +153,7 @@ class DirectPWMWriter:
             buf[offset + 3] = (off_val >> 8) & 0xFF
 
         while not self._i2c.try_lock():
-            pass
+            time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
         try:
             self._i2c.writeto(self._addr, buf)
         finally:
@@ -140,9 +190,7 @@ class ChannelConfig:
     # Slew rate limiting (microseconds per second) to soften command steps
     ramp_enable: bool = False
     ramp_limit: float = 0.0  # us/s; ignored when ramp_enable is False
-    # Optional S-curve ramping (jerk-limited) using accel limit on rate changes
-    s_curve_enable: bool = False
-    accel_limit: float = 0.0  # us/s^2; used when s_curve_enable is True
+    ramp_skip_deadband: bool = False  # if True, deadband jump is instant (slew only applies to usable range)
 
     # Symmetric gamma shaping (1.0 = linear). Applied to magnitude for both directions.
     gamma: float = 1.0
@@ -151,7 +199,7 @@ class ChannelConfig:
         self.pulse_range = self.pulse_max - self.pulse_min
         if self.center is None:
             self.center = self.pulse_min + (self.pulse_range / 2)
-        self.deadzone_threshold = self.deadzone / 100.0 * 2
+        self.deadzone_threshold = self.deadzone / 100.0
         self._dither_omega = 2.0 * math.pi * float(self.dither_hz)
         self._dither_phase_offset = self.output_channel * 1.0471975512
 
@@ -182,7 +230,7 @@ class PWMConstants:
     PUMP_MULTIPLIER_MAX = 1.0
 
     # Safety parameters
-    DEFAULT_TIME_WINDOW = 5  # seconds
+    DEFAULT_TIME_WINDOW = 1.0  # seconds
     SAFE_STATE_THRESHOLD = 0.25
 
 
@@ -193,7 +241,7 @@ class PWMController:
                  toggle_channels: bool = True, input_rate_threshold: float = 0,
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
                  stale_timeout_s: float = 0.0, watchdog_channel: Optional[int] = None,
-                 watchdog_toggle_hz: float = 0.0):
+                 watchdog_toggle_hz: float = 0.0, perf_enabled: bool = False):
         """Initialize PWM controller.
 
         Args:
@@ -203,6 +251,10 @@ class PWMController:
             input_rate_threshold: Input rate threshold for safety monitoring
             default_unset_to_zero: Default unset channels to zero
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
+            stale_timeout_s: Timeout for stale commands (0 = disabled)
+            watchdog_channel: Optional watchdog output channel
+            watchdog_toggle_hz: Watchdog toggle frequency
+            perf_enabled: Enable performance tracking (loop time, jitter, headroom)
         """
         # Setup logger
         self.logger = logging.getLogger(f"{__name__}.PWMController")
@@ -240,17 +292,10 @@ class PWMController:
         self.running = False
         self.input_event = threading.Event()
         self.monitor_thread = None
-        self.input_count = 0
         self.last_input_time = time.time()
 
         # Load config
         self._load_config(config_file)
-
-        # Hardware init
-        i2c = busio.I2C(board.SCL, board.SDA)
-        self.pca = PCA9685(i2c)
-        self.pca.frequency = PWMConstants.PWM_FREQUENCY_DEFAULT
-        self._pwm_period_us = 1e6 / float(self.pca.frequency)
 
         # Compute channel range for optimized partial writes
         all_channels = [cfg.output_channel for cfg in self.channel_configs.values()]
@@ -258,7 +303,16 @@ class PWMController:
             all_channels.append(self.pump_config.output_channel)
         min_ch = min(all_channels) if all_channels else 0
         max_ch = max(all_channels) if all_channels else 15
-        self._direct_writer = DirectPWMWriter(i2c, min_channel=min_ch, max_channel=max_ch)
+
+        # Hardware init - direct I2C, no Adafruit dependency
+        i2c = busio.I2C(board.SCL, board.SDA)
+        self._direct_writer = DirectPWMWriter(
+            i2c,
+            min_channel=min_ch,
+            max_channel=max_ch,
+            frequency=PWMConstants.PWM_FREQUENCY_DEFAULT
+        )
+        self._pwm_period_us = 1e6 / float(self._direct_writer.frequency)
         self.logger.info(f"DirectPWMWriter using channels {min_ch}-{max_ch} "
                         f"({max_ch - min_ch + 1} channels, {1 + 4*(max_ch-min_ch+1)} bytes)")
 
@@ -279,6 +333,9 @@ class PWMController:
         # Behavior defaults
         self._default_unset_to_zero = default_unset_to_zero
         self._affects_pump_channels = [cfg for cfg in self.channel_configs.values() if cfg.affects_pump]
+
+        # Performance tracking (lightweight, opt-in)
+        self._perf_tracker = LoopPerfTracker(enabled=perf_enabled)
 
     def _load_config(self, config_file: str):
         config_path = Path(config_file)
@@ -332,7 +389,7 @@ class PWMController:
             'output_channel', 'pulse_min', 'pulse_max', 'direction', 'center',
             'deadzone', 'affects_pump', 'toggleable', 'deadband_us_pos', 'deadband_us_neg',
             'dither_enable', 'dither_amp_us', 'dither_hz', 'dither_taper',
-            'ramp_enable', 'ramp_limit', 's_curve_enable', 'accel_limit', 'gamma'
+            'ramp_enable', 'ramp_limit', 'ramp_skip_deadband', 'gamma'
         ]
 
         for name, cfg in raw_config['CHANNEL_CONFIGS'].items():
@@ -384,8 +441,7 @@ class PWMController:
                 dither_taper = _as_bool(scope, 'dither_taper', cfg['dither_taper'])
                 ramp_enable = _as_bool(scope, 'ramp_enable', cfg['ramp_enable'])
                 ramp_limit = _as_float(scope, 'ramp_limit', cfg['ramp_limit'])
-                s_curve_enable = _as_bool(scope, 's_curve_enable', cfg['s_curve_enable'])
-                accel_limit = _as_float(scope, 'accel_limit', cfg['accel_limit'])
+                ramp_skip_deadband = _as_bool(scope, 'ramp_skip_deadband', cfg['ramp_skip_deadband'])
                 gamma = _as_float(scope, 'gamma', cfg['gamma'])
                 if config_errors:
                     continue
@@ -409,9 +465,7 @@ class PWMController:
                     # Ramp/slew limiting - opt-in per channel
                     ramp_enable=ramp_enable,
                     ramp_limit=float(ramp_limit),
-                    # S-curve (jerk-limited) ramping - opt-in per channel
-                    s_curve_enable=s_curve_enable,
-                    accel_limit=float(accel_limit),
+                    ramp_skip_deadband=ramp_skip_deadband,
                     # Symmetric gamma shaping
                     gamma=float(gamma),
                 )
@@ -462,18 +516,18 @@ class PWMController:
             # dither amplitude reasonable vs span
             if float(config.dither_amp_us) < 0.0 or float(config.dither_amp_us) > (rng * 0.25):
                 errors.append(f"Channel '{name}': dither_amp_us is unrealistic (0 .. {rng*0.25:.1f}us)")
-            # dither frequency sensible
-            if float(config.dither_hz) <= 0.0 or float(config.dither_hz) > 200.0:
-                errors.append(f"Channel '{name}': dither_hz must be within (0, 200]")
+            # dither frequency sensible (allow 0 when disabled)
+            if float(config.dither_hz) < 0.0 or float(config.dither_hz) > 200.0:
+                errors.append(f"Channel '{name}': dither_hz must be within [0, 200]")
+            # when enabled, require non-zero values
+            if config.dither_enable:
+                if float(config.dither_amp_us) <= 0.0:
+                    errors.append(f"Channel '{name}': dither_amp_us must be > 0 when dither_enable is true")
+                if float(config.dither_hz) <= 0.0:
+                    errors.append(f"Channel '{name}': dither_hz must be > 0 when dither_enable is true")
             # ramp limits: enabled channels need a positive rate
             if config.ramp_enable and float(config.ramp_limit) <= 0.0:
                 errors.append(f"Channel '{name}': ramp_limit must be > 0 when ramp_enable is true")
-            # s-curve limits: require both rate and accel
-            if config.s_curve_enable:
-                if float(config.ramp_limit) <= 0.0:
-                    errors.append(f"Channel '{name}': ramp_limit must be > 0 when s_curve_enable is true")
-                if float(config.accel_limit) <= 0.0:
-                    errors.append(f"Channel '{name}': accel_limit must be > 0 when s_curve_enable is true")
             # gamma shaping bounds (keep reasonable)
             if float(config.gamma) <= 0.0 or float(config.gamma) > 5.0:
                 errors.append(f"Channel '{name}': gamma must be within (0, 5]")
@@ -543,6 +597,9 @@ class PWMController:
 
     def update_named(self, commands: Dict[str, float], *, unset_to_zero: Optional[bool] = None,
                      one_shot_pump_override: bool = True, command_ts: Optional[float] = None):
+        # Performance tracking (before lock to capture full update time)
+        self._perf_tracker.tick_start()
+
         with self._lock:
             now_mono = time.monotonic()
             if command_ts is not None and self._stale_timeout_s > 0.0:
@@ -578,8 +635,6 @@ class PWMController:
                 except Exception:
                     continue
                 value = max(-1.0, min(1.0, value))
-                if abs(value) < cfg.deadzone_threshold:
-                    value = 0.0
                 self.values[cfg.output_channel] = value
 
             for cfg in self._affects_pump_channels:
@@ -592,6 +647,9 @@ class PWMController:
 
             if one_shot_pump_override:
                 self._pump_override_throttle = None
+
+        # Performance tracking (after lock released, captures full update cycle)
+        self._perf_tracker.tick_end()
 
     def _update_channels(self):
         with self._lock:
@@ -623,22 +681,22 @@ class PWMController:
             now = time.time()
 
         # Enforce input deadzone locally so preview/compute_pulse() honors it too
-        if abs(value) < float(getattr(config, 'deadzone_threshold', 0.0)):
-            value = 0.0
+        value = self._apply_deadzone(value, float(getattr(config, 'deadzone_threshold', 0.0)))
         # Apply symmetric gamma shaping for both directions
         value = self._apply_gamma(value, float(config.gamma))
 
         base_pulse = self._compute_base_pulse(config, value)
-        if apply_ramp and (config.ramp_enable or config.s_curve_enable):
+        if apply_ramp and config.ramp_enable:
             base_pulse = self._apply_ramp(config, base_pulse, now)
 
+        dither_active = abs(base_pulse - float(config.center)) > 1e-6
         use_dither = (
             config.dither_enable
             and float(config.dither_amp_us) != 0.0
             and float(config.dither_hz) != 0.0
-            and abs(value) >= float(getattr(config, 'deadzone_threshold', 0.0))
+            and dither_active
         )
-        pulse = self._apply_dither(config, base_pulse, value, now) if use_dither else base_pulse
+        pulse = self._apply_dither(config, base_pulse, now) if use_dither else base_pulse
 
         # Clamp to limits (optionally expanded when dither is active to preserve full amplitude)
         if use_dither:
@@ -673,19 +731,17 @@ class PWMController:
             working_range = base - float(config.pulse_min)
             return base - abs(float(value)) * working_range
 
-    def _apply_dither(self, config: ChannelConfig, pulse: float, value: float, now: float) -> float:
+    def _apply_dither(self, config: ChannelConfig, pulse: float, now: float) -> float:
         # Dither to prevent valve stiction (only when actively commanding)
-        if config.dither_enable and value != 0.0 and abs(value) > float(getattr(config, 'deadzone_threshold', 0.0)):
-            # Per-channel phase offset using output_channel index to avoid perfect sync
-            phase = config._dither_omega * now + config._dither_phase_offset
-            if config.dither_taper:
-                headroom = min(pulse - float(config.pulse_min), float(config.pulse_max) - pulse)
-                allowed_amp = max(0.0, min(float(config.dither_amp_us), headroom))
-                dither = allowed_amp * math.sin(phase)
-            else:
-                dither = float(config.dither_amp_us) * math.sin(phase)
-            pulse += dither
-        return pulse
+        # Per-channel phase offset using output_channel index to avoid perfect sync
+        phase = config._dither_omega * now + config._dither_phase_offset
+        if config.dither_taper:
+            headroom = min(pulse - float(config.pulse_min), float(config.pulse_max) - pulse)
+            allowed_amp = max(0.0, min(float(config.dither_amp_us), headroom))
+            dither = allowed_amp * math.sin(phase)
+        else:
+            dither = float(config.dither_amp_us) * math.sin(phase)
+        return pulse + dither
 
     def _apply_ramp(self, config: ChannelConfig, target_pulse: float, now: float) -> float:
         """Limit slew rate so large steps are spread over time."""
@@ -701,74 +757,71 @@ class PWMController:
             return target_pulse
 
         last_pulse, last_time, last_vel = state
-        if config.s_curve_enable and float(config.ramp_limit) > 0.0 and float(config.accel_limit) > 0.0:
-            ramp_mode = "s_curve"
-        elif config.ramp_enable and float(config.ramp_limit) > 0.0:
-            ramp_mode = "linear"
-        else:
+        if not (config.ramp_enable and float(config.ramp_limit) > 0.0):
             self._channel_ramp_state[config.output_channel] = (target_pulse, now, 0.0)
             return target_pulse
+
+        # Deadband skip: slew limit only applies to usable range, not deadband jump
+        center = float(config.center)
+        if config.ramp_skip_deadband:
+            pos_edge = center + float(config.deadband_us_pos)
+            neg_edge = center - float(config.deadband_us_neg)
+
+            # Transitioning from center to active: start from deadband edge
+            if last_pulse == center and target_pulse != center:
+                if target_pulse > center:
+                    last_pulse = pos_edge
+                else:
+                    last_pulse = neg_edge
+                # If target is exactly at the edge, we're done
+                if target_pulse == last_pulse:
+                    self._channel_ramp_state[config.output_channel] = (target_pulse, now, 0.0)
+                    return target_pulse
+
+            # Crossing from one active side to the other: snap through center
+            elif last_pulse > center and target_pulse < center:
+                # Was positive, going negative - snap to negative edge
+                last_pulse = neg_edge
+                if target_pulse >= last_pulse:
+                    self._channel_ramp_state[config.output_channel] = (target_pulse, now, 0.0)
+                    return target_pulse
+            elif last_pulse < center and target_pulse > center:
+                # Was negative, going positive - snap to positive edge
+                last_pulse = pos_edge
+                if target_pulse <= last_pulse:
+                    self._channel_ramp_state[config.output_channel] = (target_pulse, now, 0.0)
+                    return target_pulse
 
         dt_raw = max(0.0, now - last_time)
         # Clamp dt so a stalled loop cannot create a giant one-shot jump.
         dt = min(dt_raw, PWMConstants.RAMP_DT_MAX)
         if dt <= 0.0:
-            self._channel_ramp_state[config.output_channel] = (last_pulse, now, last_vel)
+            self._channel_ramp_state[config.output_channel] = (last_pulse, now, 0.0)
             return last_pulse
 
-        if ramp_mode == "s_curve":
-            # Jerk-limited: limit acceleration of the slew rate
-            v_max = float(config.ramp_limit)
-            a_max = float(config.accel_limit)
-            target_vel = (target_pulse - last_pulse) / dt
-            if target_vel > v_max:
-                target_vel = v_max
-            elif target_vel < -v_max:
-                target_vel = -v_max
-            # Brake if we're too close to a limit to stop safely
-            if last_vel > 0.0:
-                dist_to_limit = float(config.pulse_max) - last_pulse
-            elif last_vel < 0.0:
-                dist_to_limit = last_pulse - float(config.pulse_min)
-            else:
-                dist_to_limit = float("inf")
-            if dist_to_limit <= (last_vel * last_vel) / (2.0 * a_max):
-                target_vel = 0.0
-
-            dv_max = a_max * dt
-            dv = target_vel - last_vel
-            if dv > dv_max:
-                new_vel = last_vel + dv_max
-            elif dv < -dv_max:
-                new_vel = last_vel - dv_max
-            else:
-                new_vel = target_vel
-            new_pulse = last_pulse + new_vel * dt
-            # Clamp to user-configured limits and zero velocity if we hit a stop
-            pulse_min = float(config.pulse_min)
-            pulse_max = float(config.pulse_max)
-            if new_pulse < pulse_min:
-                new_pulse = pulse_min
-                new_vel = 0.0
-            elif new_pulse > pulse_max:
-                new_pulse = pulse_max
-                new_vel = 0.0
-            self._channel_ramp_state[config.output_channel] = (new_pulse, now, new_vel)
+        # Linear ramp: limit step size per interval
+        allowed_step = float(config.ramp_limit) * dt  # microseconds permitted in this interval
+        delta = target_pulse - last_pulse
+        if abs(delta) <= allowed_step:
+            new_pulse = target_pulse
         else:
-            allowed_step = float(config.ramp_limit) * dt  # microseconds permitted in this interval
-            delta = target_pulse - last_pulse
-            if abs(delta) <= allowed_step:
-                new_pulse = target_pulse
-            else:
-                new_pulse = last_pulse + allowed_step * (1 if delta > 0 else -1)
-            # Clamp to user-configured limits
-            pulse_min = float(config.pulse_min)
-            pulse_max = float(config.pulse_max)
-            if new_pulse < pulse_min:
-                new_pulse = pulse_min
-            elif new_pulse > pulse_max:
-                new_pulse = pulse_max
-            self._channel_ramp_state[config.output_channel] = (new_pulse, now, 0.0)
+            new_pulse = last_pulse + allowed_step * (1 if delta > 0 else -1)
+
+        # If ramping toward center and we'd enter deadband region, snap to center
+        if config.ramp_skip_deadband and target_pulse == center:
+            pos_edge = center + float(config.deadband_us_pos)
+            neg_edge = center - float(config.deadband_us_neg)
+            if neg_edge < new_pulse < pos_edge:
+                new_pulse = center
+
+        # Clamp to user-configured limits
+        pulse_min = float(config.pulse_min)
+        pulse_max = float(config.pulse_max)
+        if new_pulse < pulse_min:
+            new_pulse = pulse_min
+        elif new_pulse > pulse_max:
+            new_pulse = pulse_max
+        self._channel_ramp_state[config.output_channel] = (new_pulse, now, 0.0)
         return new_pulse
 
     # Public helper for testers to preview the pulse for a value
@@ -778,6 +831,23 @@ class PWMController:
             return None
         value = max(-1.0, min(1.0, float(value)))
         return self._pulse_from_value(cfg, value, now)
+
+    @staticmethod
+    def _apply_deadzone(value: float, threshold: float) -> float:
+        """Apply deadzone with rescaling so output uses full range after threshold.
+
+        Values within [-threshold, +threshold] map to 0.
+        Values outside are rescaled so that threshold->0 and 1.0->1.0.
+        """
+        if threshold <= 0.0:
+            return value
+        abs_val = abs(value)
+        if abs_val < threshold:
+            return 0.0
+        if threshold >= 1.0:
+            return 0.0
+        sign = 1.0 if value >= 0 else -1.0
+        return sign * (abs_val - threshold) / (1.0 - threshold)
 
     @staticmethod
     def _apply_gamma(value: float, gamma: float) -> float:
@@ -826,7 +896,7 @@ class PWMController:
                 self._direct_writer.set_channel(self.pump_config.output_channel, duty_cycle)
             self._direct_writer.flush()
             self.is_safe_state = False
-            self.input_count = 0
+            self.input_counter = 0
             self._pump_override_throttle = None
 
     def get_average_input_rate(self) -> float:
@@ -839,6 +909,30 @@ class PWMController:
             self.input_counter = 0
             self.rate_window_start = current_time
         return rate
+
+    # =========================================================================
+    # Performance Tracking API
+    # =========================================================================
+
+    def set_perf_enabled(self, enabled: bool) -> None:
+        """Enable or disable performance tracking at runtime."""
+        self._perf_tracker.set_enabled(enabled)
+
+    def get_perf_stats(self) -> Dict[str, Any]:
+        """Get PWM update performance statistics.
+
+        Returns:
+            Dictionary with timing stats (all in milliseconds):
+            - hz: Measured update rate
+            - loop_avg_ms, loop_std_ms, loop_min_ms, loop_max_ms: Update interval stats
+            - proc_avg_ms, proc_std_ms, proc_min_ms, proc_max_ms: Processing time stats
+            - samples: Number of samples collected
+        """
+        return self._perf_tracker.get_stats()
+
+    def reset_perf_stats(self) -> None:
+        """Reset performance statistics."""
+        self._perf_tracker.reset()
 
     def set_pump(self, enabled: bool):
         self.pump_enabled = enabled
@@ -907,7 +1001,7 @@ class PWMController:
         try:
             with self._lock:
                 self._stop_monitoring()
-                self.reset(reset_pump=True)
+                self._direct_writer.sleep()  # Stops oscillator, outputs go low
         except:
             pass
 

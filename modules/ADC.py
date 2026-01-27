@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 # Import the original ADCPi library
 try:
-    from ADCPi import ADCPi
+    from .ADCPi import ADCPi
 except ImportError:
     raise ImportError("ADCPi library not found. Please install the original AB Electronics ADCPi library.")
 

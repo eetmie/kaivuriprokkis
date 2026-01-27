@@ -16,15 +16,18 @@ import time
 import threading
 import numpy as np
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
+from pathlib import Path
 import sys
 import os
+import yaml
 
 # Import project modules
 from . import diff_ik_V2 as diff_ik
 from .pid import PIDController
 from .quaternion_math import quat_from_axis_angle
+from .perf_tracker import ControlLoopPerfTracker
 
 # Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -41,11 +44,27 @@ from pathing_config import DEFAULT_CONFIG as _DEFAULT_CONFIG  # type: ignore
 class ControllerConfig:
     """Configuration for the excavator controller.
 
-    Note: All parameters are now loaded from configuration_files/general_config.yaml
+    Note: All parameters are now loaded from configuration_files/control_config.yaml
     This class is populated dynamically at runtime.
     """
     output_limits: Tuple[float, float]
     control_frequency: float  # Hz
+
+
+def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+    """Load control configuration YAML file."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            # Try relative to this module's parent directory
+            p = Path(__file__).parent.parent / path
+        if not p.exists():
+            return {}
+        with p.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 @dataclass
@@ -382,21 +401,21 @@ class ExcavatorController:
         except Exception:
             pass
 
-        # Load controller configuration from general_config.yaml if not provided
+        # Load controller configuration from control_config.yaml if not provided
         if config is None:
-            gc = getattr(self.hardware, '_general_config', None)
-            if not isinstance(gc, dict):
-                raise RuntimeError("Controller configuration requires general_config.yaml")
+            gc = _load_control_config()
+            if not isinstance(gc, dict) or not gc:
+                raise RuntimeError("Controller configuration requires control_config.yaml")
 
             # Load control frequency from rates section
             control_hz = gc.get('rates', {}).get('control_hz')
             if not isinstance(control_hz, (int, float)) or control_hz <= 0:
-                raise RuntimeError("Missing or invalid 'rates.control_hz' in general_config.yaml")
+                raise RuntimeError("Missing or invalid 'rates.control_hz' in control_config.yaml")
 
             # Load controller parameters
             ctrl_cfg = gc.get('controller', {})
             if not ctrl_cfg:
-                raise RuntimeError("Missing 'controller' section in general_config.yaml")
+                raise RuntimeError("Missing 'controller' section in control_config.yaml")
 
             try:
                 self.config = ControllerConfig(
@@ -407,9 +426,12 @@ class ExcavatorController:
                     control_frequency=float(control_hz)
                 )
             except KeyError as e:
-                raise RuntimeError(f"Missing required controller parameter in general_config.yaml: {e}")
+                raise RuntimeError(f"Missing required controller parameter in control_config.yaml: {e}")
         else:
             self.config = config
+
+        # Store control config reference for later use (PID, velocity limits, etc.)
+        self._control_config = _load_control_config() if config is None else {}
 
         # Robot configuration
         self.robot_config = diff_ik.create_excavator_config()
@@ -435,9 +457,8 @@ class ExcavatorController:
             raise RuntimeError(f"Missing required IK configuration in pathing_config.py: {e}")
 
         # IK config uses ignore_axes for orientation filtering
-        # Prepare optional IK V2 extras from general_config
-        gc = getattr(self.hardware, '_general_config', {}) or {}
-        ctrl_cfg = gc.get('controller', {}) if isinstance(gc, dict) else {}
+        # Prepare optional IK V2 extras from control_config
+        ctrl_cfg = self._control_config.get('controller', {}) if isinstance(self._control_config, dict) else {}
 
         # Velocity limiting settings
         enable_vel_limit = bool(ctrl_cfg.get('enable_velocity_limiting', True))
@@ -489,17 +510,16 @@ class ExcavatorController:
         except AttributeError as e:
             raise RuntimeError(f"Missing required relative control gains in pathing_config.py: {e}")
 
-        # Load PID gains from general_config.yaml
-        gc = getattr(self.hardware, '_general_config', None)
-        if not isinstance(gc, dict) or 'pid' not in gc:
-            raise RuntimeError("PID configuration missing from general_config.yaml")
+        # Load PID gains from control_config.yaml
+        if not isinstance(self._control_config, dict) or 'pid' not in self._control_config:
+            raise RuntimeError("PID configuration missing from control_config.yaml")
 
-        pid_cfg = gc['pid']
+        pid_cfg = self._control_config['pid']
         joint_configs = []
         for i, name in enumerate(["Slew", "Boom", "Arm", "Bucket"]):
             joint_key = f'joint{i}'
             if joint_key not in pid_cfg:
-                raise RuntimeError(f"Missing PID config for {joint_key} in general_config.yaml")
+                raise RuntimeError(f"Missing PID config for {joint_key} in control_config.yaml")
             j = pid_cfg[joint_key]
             joint_configs.append({
                 "name": name,
@@ -560,21 +580,18 @@ class ExcavatorController:
         self._prev_pose = None
         self._prev_orientation_deg = None
 
-        # Performance tracking
-        self._loop_times = []
-        self._compute_times = []  # Actual computation time (without sleep)
-        self._timing_violations = 0
-        self._loop_count = 0
-        self._perf_lock = threading.Lock()
-
-        # Detailed stage timing (sensors, IK/FK, PWM control)
-        self._sensor_times = []
-        self._ik_fk_times = []
-        self._pwm_times = []
+        # Performance tracking (standardized tracker with stage timing and percentiles)
+        self._perf_tracker = ControlLoopPerfTracker(
+            enabled=enable_perf_tracking,
+            target_hz=self.config.control_frequency,
+            buffer_size=1000
+        )
 
         self.logger.info("Controller initialized")
 
     def start(self) -> None:
+        # TODO: Call self.hardware._check_faults() here to fail fast with clear error
+        # if any hardware subsystem (PWM/IMU/ADC) is in FAULT state
         if self._control_thread is not None:
             self.logger.warning("Controller already running!")
             return
@@ -729,100 +746,82 @@ class ExcavatorController:
         return self.hardware.get_status()
 
     def get_performance_stats(self) -> dict:
-        """Get controller loop performance statistics."""
-        with self._perf_lock:
-            if not self._loop_times:
-                return {
-                    'avg_loop_time_ms': 0.0,
-                    'min_loop_time_ms': 0.0,
-                    'max_loop_time_ms': 0.0,
-                    'std_loop_time_ms': 0.0,
-                    'jitter_p95_ms': 0.0,
-                    'jitter_p99_ms': 0.0,
-                    'max_step_ms': 0.0,
-                    'avg_compute_time_ms': 0.0,
-                    'min_compute_time_ms': 0.0,
-                    'max_compute_time_ms': 0.0,
-                    'std_compute_time_ms': 0.0,
-                    'avg_headroom_ms': 0.0,
-                    'cpu_usage_pct': 0.0,
-                    'actual_hz': 0.0,
-                    'violation_pct': 0.0,
-                    'sample_count': 0,
-                    # Stage timings
-                    'avg_sensor_ms': 0.0,
-                    'min_sensor_ms': 0.0,
-                    'max_sensor_ms': 0.0,
-                    'avg_ik_fk_ms': 0.0,
-                    'min_ik_fk_ms': 0.0,
-                    'max_ik_fk_ms': 0.0,
-                    'avg_pwm_ms': 0.0,
-                    'min_pwm_ms': 0.0,
-                    'max_pwm_ms': 0.0,
-                    # Additional IK-related telemetry
-                    'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
-                    'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
-                    'effective_vel_cap_degps': [],
-                    }
+        """Get controller loop performance statistics.
 
-            loop_times_ms = np.array(self._loop_times) * 1000.0
-            compute_times_ms = np.array(self._compute_times) * 1000.0
-            sensor_times_ms = np.array(self._sensor_times) * 1000.0
-            ik_fk_times_ms = np.array(self._ik_fk_times) * 1000.0
-            pwm_times_ms = np.array(self._pwm_times) * 1000.0
+        Returns dict with:
+        - Loop timing: avg/std/min/max/p95/p99 in ms
+        - Compute timing: avg/std/min/max in ms
+        - Headroom and CPU usage
+        - Stage timings (sensor, ik_fk, pwm)
+        - IK telemetry (velocity limits, joint velocities)
+        - Hardware stats (IMU/ADC/PWM rates)
+        """
+        # Get stats from standardized tracker
+        tracker_stats = self._perf_tracker.get_stats()
 
-            # Jitter metrics (recent window)
-            jitter_p95_ms = float(np.percentile(loop_times_ms, 95)) if loop_times_ms.size > 0 else 0.0
-            jitter_p99_ms = float(np.percentile(loop_times_ms, 99)) if loop_times_ms.size > 0 else 0.0
-            max_step_ms = float(np.max(np.abs(np.diff(loop_times_ms)))) if loop_times_ms.size > 1 else 0.0
+        if not tracker_stats or tracker_stats.get('samples', 0) == 0:
+            # Return empty stats structure
+            stats = {
+                'avg_loop_time_ms': 0.0,
+                'min_loop_time_ms': 0.0,
+                'max_loop_time_ms': 0.0,
+                'std_loop_time_ms': 0.0,
+                'jitter_p95_ms': 0.0,
+                'jitter_p99_ms': 0.0,
+                'avg_compute_time_ms': 0.0,
+                'min_compute_time_ms': 0.0,
+                'max_compute_time_ms': 0.0,
+                'std_compute_time_ms': 0.0,
+                'avg_headroom_ms': 0.0,
+                'cpu_usage_pct': 0.0,
+                'actual_hz': 0.0,
+                'violation_pct': 0.0,
+                'sample_count': 0,
+                # Stage timings
+                'avg_sensor_ms': 0.0, 'min_sensor_ms': 0.0, 'max_sensor_ms': 0.0,
+                'avg_ik_fk_ms': 0.0, 'min_ik_fk_ms': 0.0, 'max_ik_fk_ms': 0.0,
+                'avg_pwm_ms': 0.0, 'min_pwm_ms': 0.0, 'max_pwm_ms': 0.0,
+                # IK telemetry
+                'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
+                'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
+                'effective_vel_cap_degps': [],
+            }
+        else:
+            # Map tracker stats to expected output format
+            stages = tracker_stats.get('stages', {})
+            sensor_stats = stages.get('sensor', {})
+            ik_fk_stats = stages.get('ik_fk', {})
+            pwm_stats = stages.get('pwm', {})
 
-            actual_hz = 1.0 / np.mean(self._loop_times)
-            violation_pct = (self._timing_violations / self._loop_count * 100) if self._loop_count > 0 else 0.0
-
-            # Calculate headroom (time available for sleep)
-            target_period_ms = 1000.0 / self.config.control_frequency
-            avg_headroom_ms = target_period_ms - np.mean(compute_times_ms)
-
-            # Calculate CPU usage percentage (compute time / total time)
-            cpu_usage_pct = (np.mean(compute_times_ms) / target_period_ms) * 100.0
-
-            # Overrun tracking on the recent window (buffers limited to last ~1000 samples)
-            overrun_count = int(np.sum(compute_times_ms > target_period_ms))
-            window_len = len(compute_times_ms)
-            window_secs = window_len / self.config.control_frequency if self.config.control_frequency > 0 else 0.0
-            overrun_pct = (overrun_count / window_len * 100.0) if window_len > 0 else 0.0
+            actual_hz = tracker_stats.get('hz', 0.0)
 
             stats = {
-                'avg_loop_time_ms': float(np.mean(loop_times_ms)),
-                'min_loop_time_ms': float(np.min(loop_times_ms)),
-                'max_loop_time_ms': float(np.max(loop_times_ms)),
-                'std_loop_time_ms': float(np.std(loop_times_ms)),
-                'jitter_p95_ms': jitter_p95_ms,
-                'jitter_p99_ms': jitter_p99_ms,
-                'max_step_ms': max_step_ms,
-                'avg_compute_time_ms': float(np.mean(compute_times_ms)),
-                'min_compute_time_ms': float(np.min(compute_times_ms)),
-                'max_compute_time_ms': float(np.max(compute_times_ms)),
-                'std_compute_time_ms': float(np.std(compute_times_ms)),
-                'avg_headroom_ms': float(avg_headroom_ms),
-                'cpu_usage_pct': float(cpu_usage_pct),
-                'actual_hz': float(actual_hz),
-                'violation_pct': float(violation_pct),
-                'sample_count': self._loop_count,
-                # Recent window overruns relative to target period
-                'overrun_count_recent': overrun_count,
-                'overrun_pct_recent': float(overrun_pct),
-                'overrun_window_sec': float(window_secs),
+                'avg_loop_time_ms': tracker_stats.get('loop_avg_ms', 0.0),
+                'min_loop_time_ms': tracker_stats.get('loop_min_ms', 0.0),
+                'max_loop_time_ms': tracker_stats.get('loop_max_ms', 0.0),
+                'std_loop_time_ms': tracker_stats.get('loop_std_ms', 0.0),
+                'jitter_p95_ms': tracker_stats.get('loop_p95_ms', 0.0),
+                'jitter_p99_ms': tracker_stats.get('loop_p99_ms', 0.0),
+                'avg_compute_time_ms': tracker_stats.get('compute_avg_ms', 0.0),
+                'min_compute_time_ms': tracker_stats.get('compute_min_ms', 0.0),
+                'max_compute_time_ms': tracker_stats.get('compute_max_ms', 0.0),
+                'std_compute_time_ms': tracker_stats.get('compute_std_ms', 0.0),
+                'avg_headroom_ms': tracker_stats.get('headroom_avg_ms', 0.0),
+                'cpu_usage_pct': tracker_stats.get('cpu_usage_pct', 0.0),
+                'actual_hz': actual_hz,
+                'violation_pct': tracker_stats.get('violation_pct', 0.0),
+                'violation_count': tracker_stats.get('violation_count', 0),
+                'sample_count': tracker_stats.get('samples', 0),
                 # Stage timings
-                'avg_sensor_ms': float(np.mean(sensor_times_ms)),
-                'min_sensor_ms': float(np.min(sensor_times_ms)),
-                'max_sensor_ms': float(np.max(sensor_times_ms)),
-                'avg_ik_fk_ms': float(np.mean(ik_fk_times_ms)),
-                'min_ik_fk_ms': float(np.min(ik_fk_times_ms)),
-                'max_ik_fk_ms': float(np.max(ik_fk_times_ms)),
-                'avg_pwm_ms': float(np.mean(pwm_times_ms)),
-                'min_pwm_ms': float(np.min(pwm_times_ms)),
-                'max_pwm_ms': float(np.max(pwm_times_ms)),
+                'avg_sensor_ms': sensor_stats.get('avg_ms', 0.0),
+                'min_sensor_ms': sensor_stats.get('min_ms', 0.0),
+                'max_sensor_ms': sensor_stats.get('max_ms', 0.0),
+                'avg_ik_fk_ms': ik_fk_stats.get('avg_ms', 0.0),
+                'min_ik_fk_ms': ik_fk_stats.get('min_ms', 0.0),
+                'max_ik_fk_ms': ik_fk_stats.get('max_ms', 0.0),
+                'avg_pwm_ms': pwm_stats.get('avg_ms', 0.0),
+                'min_pwm_ms': pwm_stats.get('min_ms', 0.0),
+                'max_pwm_ms': pwm_stats.get('max_ms', 0.0),
             }
 
             # Add IK limiter telemetry in deg/s for easier interpretation
@@ -835,13 +834,12 @@ class ExcavatorController:
                 stats['last_joint_vel_degps'] = []
             # Effective cap in deg/s, inferred from rad/iter caps and actual loop Hz
             if ik_vel_lim_enabled and hasattr(self.ik_controller, 'max_joint_velocities') and actual_hz > 0.0:
-                # rad/iter * Hz -> rad/s, then convert to deg/s
                 cap_degps = np.degrees(self.ik_controller.max_joint_velocities) * actual_hz
                 stats['effective_vel_cap_degps'] = list(cap_degps)
             else:
                 stats['effective_vel_cap_degps'] = []
 
-        # Optionally merge hardware perf stats (kept outside perf_lock to avoid long holds)
+        # Merge hardware perf stats
         try:
             if self._enable_perf_tracking and hasattr(self.hardware, 'get_perf_stats'):
                 hw = self.hardware.get_perf_stats() or {}
@@ -895,14 +893,7 @@ class ExcavatorController:
 
     def reset_performance_stats(self) -> None:
         """Reset performance statistics."""
-        with self._perf_lock:
-            self._loop_times = []
-            self._compute_times = []
-            self._sensor_times = []
-            self._ik_fk_times = []
-            self._pwm_times = []
-            self._timing_violations = 0
-            self._loop_count = 0
+        self._perf_tracker.reset()
         try:
             if self._enable_perf_tracking and hasattr(self.hardware, 'reset_perf_stats'):
                 self.hardware.reset_perf_stats()
@@ -955,17 +946,13 @@ class ExcavatorController:
             elif self._pause_ack_event.is_set():
                 self._pause_ack_event.clear()
 
-            # === Performance tracking (only if enabled) ===
-            if self._enable_perf_tracking:
-                compute_start_time = time.perf_counter()
-                t_sensor_start = compute_start_time
+            # Performance tracking: mark loop start
+            self._perf_tracker.loop_start()
 
             try:
+                self._perf_tracker.stage_start('sensor')
                 self._update_current_state()
-
-                if self._enable_perf_tracking:
-                    t_sensor_end = time.perf_counter()
-                    t_ik_fk_start = t_sensor_end
+                self._perf_tracker.stage_end('sensor')
 
                 # Refresh smoothed target using latest feedback + loop timing
                 self._refresh_smoothed_target(loop_dt)
@@ -980,45 +967,13 @@ class ExcavatorController:
                         self.hardware.reset(reset_pump=False)
                         self._outputs_zeroed = True
 
-                if self._enable_perf_tracking:
-                    t_ik_fk_end = time.perf_counter()
-
             except Exception as e:
                 self.logger.error(f"Control loop error: {e}")
                 self.hardware.reset(reset_pump=True)
                 break
 
-            # === Track performance metrics ===
-            if self._enable_perf_tracking:
-                compute_end_time = time.perf_counter()
-                actual_compute_time = compute_end_time - compute_start_time
-                actual_loop_period = loop_start_time - last_loop_start
-
-                # Collect stage timings
-                sensor_time = t_sensor_end - t_sensor_start
-                ik_time = getattr(self, '_last_ik_time', 0.0)
-                pwm_time = getattr(self, '_last_pwm_time', 0.0)
-
-                if actual_loop_period > 0.001:  # Ignore first loop
-                    with self._perf_lock:
-                        self._loop_times.append(actual_loop_period)
-                        self._compute_times.append(actual_compute_time)
-                        self._sensor_times.append(sensor_time)
-                        self._ik_fk_times.append(ik_time)
-                        self._pwm_times.append(pwm_time)
-                        self._loop_count += 1
-
-                        # Check for timing violations
-                        if actual_compute_time > loop_period:
-                            self._timing_violations += 1
-
-                        # Keep only last 1000 samples
-                        if len(self._loop_times) > 1000:
-                            self._loop_times.pop(0)
-                            self._compute_times.pop(0)
-                            self._sensor_times.pop(0)
-                            self._ik_fk_times.pop(0)
-                            self._pwm_times.pop(0)
+            # Performance tracking: mark loop end (before sleep)
+            self._perf_tracker.loop_end()
 
             last_loop_start = loop_start_time
 
@@ -1119,9 +1074,8 @@ class ExcavatorController:
 
     def _compute_control_commands(self, loop_dt: float) -> None:
         """Compute and send control commands based on current state and target."""
-        # Track IK/FK timing
-        if self._enable_perf_tracking:
-            t_ik_start = time.perf_counter()
+        # Track IK/FK timing via perf_tracker
+        self._perf_tracker.stage_start('ik_fk')
 
         try:
             # Get cached state from _update_current_state()
@@ -1132,7 +1086,6 @@ class ExcavatorController:
                 target_pos = self._target_position.copy()
                 target_quat = self._target_orientation.copy()
                 current_pos = self._current_position.copy()
-                projected_quats = self._current_projected_quats  # Use cached quaternions
                 raw_quats = self._current_raw_quats
                 current_ee_quat_full = self._current_ee_quat_full
                 target_lin_vel = self._target_linear_velocity.copy()
@@ -1143,13 +1096,10 @@ class ExcavatorController:
                 return
             current_joint_angles = diff_ik.compute_relative_joint_angles(raw_quats, self.robot_config)
 
-            # End-effector orientation quaternion to use in IK
-            # Use full orientation (including Z-rotation from slew)
-            # The Jacobian's structure naturally constrains which rotations each joint can achieve
-            # based on rotation_axes config (slew=Z, boom/arm/bucket=Y)
-            current_ee_quat = current_ee_quat_full
-
             # Outer Loop: Task-space IK control
+            # Note: Using current_ee_quat_full (including Z-rotation from slew) for IK.
+            # The Jacobian's structure naturally constrains which rotations each joint can achieve
+            # based on rotation_axes config (slew=Z, boom/arm/bucket=Y).
             if self.ik_config.use_relative_mode:
                 # Compute error w.r.t target
                 if self.ik_config.command_type == "position":
@@ -1288,21 +1238,16 @@ class ExcavatorController:
             if max_cmd > 0.01:  # Only print if non-trivial commands
                 self.logger.debug(f"Control commands: slew={pi_outputs[0]:+.3f} boom={pi_outputs[1]:+.3f} arm={pi_outputs[2]:+.3f} bucket={pi_outputs[3]:+.3f}")
 
-        # Track IK/FK completion time before PWM
-        if self._enable_perf_tracking:
-            t_ik_end = time.perf_counter()
-            t_pwm_start = t_ik_end
+        # End IK/FK stage timing, start PWM stage
+        self._perf_tracker.stage_end('ik_fk')
+        self._perf_tracker.stage_start('pwm')
 
         self.hardware.send_named_pwm_commands(named_commands)
         # Mark that we are actively commanding
         self._outputs_zeroed = False
 
-        # Track PWM completion time
-        if self._enable_perf_tracking:
-            t_pwm_end = time.perf_counter()
-            # Store stage timings in instance variables for collection in main loop
-            self._last_ik_time = t_ik_end - t_ik_start
-            self._last_pwm_time = t_pwm_end - t_pwm_start
+        # End PWM stage timing
+        self._perf_tracker.stage_end('pwm')
 
     def __del__(self):
         # Be defensive: __init__ can fail before thread fields exist

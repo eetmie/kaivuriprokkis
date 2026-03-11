@@ -3,45 +3,156 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 100.0
+  control_hz: 200.0
+
+imu:
+  # IMU sampling rate (Hz) - Pico AHRS loop frequency
+  sample_rate: 200
+  # Gyroscope full-scale range (125/250/500/1000/2000 dps)
+  gyro_dps: 250
+  # AHRS filter gain (higher = faster response, more noise)
+  ahrs_gain: 5.0
+  # Accelerometer rejection threshold (degrees) - reject accel when orientation deviates
+  accel_rejection: 20.0
+  # Recovery period (seconds) - time before re-enabling accel after rejection
+  recovery_s: 0.5
+  # Gyro offset tracking timeout (seconds)
+  offset_s: 0.5
+  # IMU order mapping: physical sensor index -> logical joint [boom, arm, bucket]
+  # Default [0, 1, 2] means physical IMU 0=boom, 1=arm, 2=bucket
+  imu_order: [0, 2, 1]
 
 pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 4.5 #5.0
-    ki: 0.250
-    kd: 0.75
+    kp: 2.0 #2
+    ki: 0.1 #0.25
+    kd: 0.0
 
   # Joint 1: Boom (lift arm)
   joint1:
-    kp: 15.0 #13
-    ki: 0.5
+    kp: 5.0
+    ki: 0.1
     kd: 0.0
 
   # Joint 2: Arm (tilt)
   joint2:
-    kp: 7.0 #5
-    ki: 0.50
-    kd: 0.15
+    kp: 6.0
+    ki: 0.1
+    kd: 0.0
 
   # Joint 3: Bucket (scoop)
   joint3:
-    kp: 5.0 #11
-    ki: 0.50
-    kd: 0.15
+    kp: 5.0
+    ki: 0.1
+    kd: 0.0
 
 controller:
-  # PID output limits (normalized -1.0 to 1.0)
+  # PID output limits (normalized to)
   output_limits_min: -1.0
   output_limits_max: 1.0
 
-  # Joint velocity limiting (applied at IK level for cleaner architecture)
+  # Joint velocity limiting (applied at IK level)
   # Set to False to disable velocity limiting entirely
-  enable_velocity_limiting: true
+  enable_velocity_limiting: True
 
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
-  # Examples at 100Hz:
-  #   0.1 rad/iter = 5.73°/iter = 573°/s
-  per_joint_max_velocity: [0.5, 1.0, 1.0, 1.0] #0.15
+  per_joint_max_velocity: [0.10, 0.12, 0.12, 0.12]
+
+  # Joint velocity estimation mode for controller telemetry/velocity-aware IK
+  # - fd_only: stock behavior (finite-difference from joint angles)
+  # - gyro_only: use IMU gyro rates for boom/arm/bucket (slew remains FD)
+  # - fused: blend gyro + FD for boom/arm/bucket (slew remains FD)
+  gyro_velocity_mode: "fused"
+
+  # Blend factor for fused mode: v = alpha*gyro + (1-alpha)*fd
+  # Only used when gyro_velocity_mode: "fused"
+  gyro_blend_alpha: 0.30
+
+  # Low-pass filter cutoff (Hz) on gyro-derived joint velocity
+  # Set to 0 to disable LPF
+  gyro_lpf_hz: 0.0 #12
+
+  # Gyro data freshness timeout (seconds)
+  # If gyro sample is stale longer than this, controller falls back to FD
+  gyro_timeout_s: 0.08
+
+  # Sanity clamp for gyro-derived joint speed magnitude (deg/s)
+  gyro_max_abs_degps: 180.0
+
+  # Slow online bias compensation for gyro-derived joint velocity
+  gyro_bias_comp:
+    enabled: False
+    # Consider near-stationary below this magnitude (deg/s)
+    stationarity_degps: 1.5
+    # Bias adaptation gain per control update (0..1)
+    adaptation_rate: 0.01
+
+  # Slew angle fusion: complementary filter blending encoder + averaged IMU gyro Z-axis.
+  # This is a yaw-rate proxy taken from the three boom/arm/bucket IMUs, not a direct yaw angle.
+  # Assumption: pitch joints are approximately planar and IMU local Z remains a usable proxy for slew yaw.
+  # If links pitch far from neutral, local IMU Z underestimates global yaw by roughly cos(pitch).
+  slew_fusion:
+    enabled: True                # false = pure encoder (current behavior)
+    alpha: 0.00                   # Weight on encoder (0..1). Higher = trust encoder more
+    aggregation: "mean"           # "mean" or "median" for combining 3 IMU Z-rates
+    gyro_bias_comp:
+      enabled: False
+      stationarity_degps: 1.0
+      adaptation_rate: 0.005
+    max_gyro_degps: 180.0         # Clamp on aggregated IMU Z-rate before fusion
+
+
+# Inverse Kinematics configuration
+# Used by: ExcavatorController, IKController
+ik:
+  # Command type: "position" (3D) or "pose" (6D with orientation)
+  command_type: "pose"
+
+  # Whether commands are relative to current pose (delta commands)
+  use_relative_mode: False
+  # IK solving method: "pinv", "svd", "trans", or "dls" (damped least squares)
+  method: "svd"
+
+  # Velocity mode: interpret commands as desired EE velocities
+  velocity_mode: True
+  velocity_error_gain: 200.0  # Note: depends on hw/sim_dt!
+  use_rotational_velocity: True
+
+  # Method/weighting parameters
+  # Note: k_val and lambda_val have decreased effect when velocity_mode is enabled,
+  # as velocity_error_gain and per_joint_max_velocity dominate the response.
+  params:
+    # For pinv, svd, trans
+    k_val: 1.45
+
+    # For svd
+    min_singular_value: 1.0e-5
+
+    # For dls
+    lambda_val: 0.01  # Base (min) value if adaptive damping is used
+
+  # Condition number threshold — discard IK commands when Jacobian condition
+  # number exceeds this value (0 = disabled, typical range: 50–500)
+  condition_number_threshold: 0
+
+  # Adaptive damping (DLS method only)
+  # Adjusts lambda based on Jacobian condition number for better singularity handling.
+  # Formula: lambda_adaptive = lambda_val * (1 + scaling * log(1 + condition_number))
+  # Clamped to: lambda_val <= lambda_adaptive <= lambda_val * max_multiplier
+
+  enable_adaptive_damping: False
+  adaptive_damping_scaling: 0.5        # How aggressively lambda increases near singularities
+  adaptive_damping_max_multiplier: 10.0  # Maximum lambda = lambda_val * max_multiplier
+
+  # Orientation axes to exclude from IK solving.
+  # Uncontrollable axes (e.g. roll) are auto-detected and always excluded. No hurt done if written here though.
+  # Slew rotation does Yaw, but we cannot separate rotation from Cartesian Y movement.
+  ignore_axes: [yaw]
+
+  # Relative joint limits (degrees) for [slew, boom, arm, bucket]
+  # Leave empty [] to use default [-π, π] for all joints
+  # Example: [[-30.0, 30.0], [-65.0, 25.0], [-15.0, 140.0], [-130.0, 75.0]]
+  joint_limits_relative: []

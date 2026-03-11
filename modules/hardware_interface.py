@@ -15,10 +15,8 @@ import time
 import numpy as np
 import logging
 from typing import List, Optional, Dict, Any
-import threading
 from pathlib import Path
-
-
+import threading
 import yaml
 
 from .PCA9685_controller import PWMController
@@ -27,6 +25,22 @@ from .ADC import SimpleADC
 from .quaternion_math import quat_from_axis_angle, wrap_to_pi
 from .perf_tracker import IntervalTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
+
+
+def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+    """Load control configuration YAML file."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            # Try relative to this module's parent directory
+            p = Path(__file__).parent.parent / path
+        if not p.exists():
+            return {}
+        with p.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 class ReadyState:
@@ -150,7 +164,7 @@ class HardwareInterface:
     """
     
     def __init__(self,
-                 config_file: str = "configuration_files/servo_config.yaml",
+                 config_file: str = "configuration_files/servo_config_200.yaml",
                  pump_variable: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
@@ -159,11 +173,16 @@ class HardwareInterface:
                  default_unset_to_zero: bool = True,
                  watchdog_channel: Optional[int] = None,
                  watchdog_toggle_hz: float = 0.0,
+                 cleanup_disable_osc: bool = True,
                  perf_enabled: bool = False,
                  imu_expected_hz: Optional[float] = None,
-                 adc_sample_hz: Optional[float] = None,
+                 imu_gyro_dps: Optional[int] = None,
+                 imu_ahrs_gain: Optional[float] = None,
+                 imu_accel_rejection: Optional[float] = None,
+                 imu_recovery_s: Optional[float] = None,
+                 imu_offset_s: Optional[float] = None,
+                 adc_sample_hz: float = 200.0,
                  adc_channels: Optional[List[Any]] = None,
-                 hardware_config_path: str = "configuration_files/hardware_config.yaml",
                  log_level: str = "INFO",
                  enable_pwm: bool = True,
                  enable_imu: bool = True,
@@ -173,7 +192,8 @@ class HardwareInterface:
                  imu_rt_priority: int = 0,
                  adc_rt_priority: int = 0,
                  imu_cpu_core: Optional[int] = None,
-                 adc_cpu_core: Optional[int] = None):
+                 adc_cpu_core: Optional[int] = None,
+                 pwm_frequency: Optional[int] = None):
         """
         Initialize real hardware interface.
 
@@ -204,6 +224,7 @@ class HardwareInterface:
             adc_sample_hz: Target ADC sampling frequency for the background thread
             adc_channels: List of ADC channels to sample in the background thread.
                            Accepts sensor names from ADCConfig or (board, channel) tuples.
+            pwm_frequency: PCA9685 PWM signal frequency in Hz (None = use default 50Hz).
         """
         # Setup logger first
         self.logger = logging.getLogger(f"{__name__}.HardwareInterface")
@@ -217,8 +238,6 @@ class HardwareInterface:
             self.logger.addHandler(handler)
 
         self.config_file = config_file
-        self._hardware_config_path = hardware_config_path
-        self._hardware_config = self._load_config_yaml(hardware_config_path)
         self._enable_pwm = bool(enable_pwm)
         self._enable_imu = bool(enable_imu)
         self._enable_adc = bool(enable_adc)
@@ -228,10 +247,23 @@ class HardwareInterface:
         self._adc_rt_priority = int(adc_rt_priority)
         self._imu_cpu_core = imu_cpu_core
         self._adc_cpu_core = adc_cpu_core
-        self._adc_sample_override = adc_sample_hz is not None
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name, is_slew}
-        
+
+        # IMU AHRS settings - load from config file, with constructor overrides
+        _cfg = _load_control_config()
+        _imu_cfg = _cfg.get('imu', {})
+        self._imu_gyro_dps = int(imu_gyro_dps if imu_gyro_dps is not None else _imu_cfg.get('gyro_dps', 500))
+        self._imu_ahrs_gain = float(imu_ahrs_gain if imu_ahrs_gain is not None else _imu_cfg.get('ahrs_gain', 0.5))
+        self._imu_accel_rejection = float(imu_accel_rejection if imu_accel_rejection is not None else _imu_cfg.get('accel_rejection', 10.0))
+        self._imu_recovery_s = float(imu_recovery_s if imu_recovery_s is not None else _imu_cfg.get('recovery_s', 1.0))
+        self._imu_offset_s = float(imu_offset_s if imu_offset_s is not None else _imu_cfg.get('offset_s', 1.0))
+        # IMU order mapping: physical sensor index -> logical joint [boom, arm, bucket]
+        _imu_order = _imu_cfg.get('imu_order', [0, 1, 2])
+        if not isinstance(_imu_order, list) or len(_imu_order) != 3 or set(_imu_order) != {0, 1, 2}:
+            raise ValueError(f"Invalid imu.imu_order in control_config.yaml: {_imu_order} (must be permutation of [0, 1, 2])")
+        self._imu_order = _imu_order
+
         # Initialize PWM controller
         # Use tri-state: PENDING -> READY or FAULT
         self._pwm_state = ReadyState.PENDING
@@ -241,14 +273,16 @@ class HardwareInterface:
             try:
                 self.pwm_controller = PWMController(
                     config_file=config_file,
-                    pump_variable=self._g('pwm.pump_variable', pump_variable),
-                    toggle_channels=self._g('pwm.toggle_channels', toggle_channels),
-                    input_rate_threshold=self._g('pwm.input_rate_threshold', input_rate_threshold),
-                    stale_timeout_s=self._g('pwm.stale_timeout_s', stale_timeout_s),
+                    pump_variable=pump_variable,
+                    toggle_channels=toggle_channels,
+                    input_rate_threshold=input_rate_threshold,
+                    stale_timeout_s=stale_timeout_s,
                     default_unset_to_zero=default_unset_to_zero,
-                    watchdog_channel=self._g('pwm.watchdog_channel', watchdog_channel),
-                    watchdog_toggle_hz=self._g('pwm.watchdog_toggle_hz', watchdog_toggle_hz),
+                    watchdog_channel=watchdog_channel,
+                    watchdog_toggle_hz=watchdog_toggle_hz,
+                    cleanup_disable_osc=cleanup_disable_osc,
                     perf_enabled=perf_enabled,
+                    pwm_frequency=pwm_frequency,
                 )
                 self._pwm_state = ReadyState.READY
                 self.logger.info("PWM controller initialized")
@@ -291,12 +325,11 @@ class HardwareInterface:
         self._imu_lock = threading.Lock()
         self._imu_expected_hz = None
         self.usb_reader = None
-        # IMU target SR from config unless explicitly provided
+        # IMU target sample rate (from config or constructor override)
         if self._enable_imu:
-            cfg_imu_hz = self._g('rates.imu_hz')
-            if cfg_imu_hz is None:
-                raise ValueError("rates.imu_hz must be specified in general config file")
-            self._imu_expected_hz = float(imu_expected_hz) if imu_expected_hz else float(cfg_imu_hz)
+            _cfg = _load_control_config()
+            _imu_cfg = _cfg.get('imu', {})
+            self._imu_expected_hz = float(imu_expected_hz if imu_expected_hz is not None else _imu_cfg.get('sample_rate', 200))
         # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
@@ -319,14 +352,9 @@ class HardwareInterface:
         self.adc_thread = None
         self.adc = None
         self.encoder_tracker = None
-        # ADC/encoder expected rate from config
+        # ADC/encoder expected rate (constructor arg, no config fallback)
         if self._enable_adc:
-            self._adc_expected_hz = float(adc_sample_hz) if adc_sample_hz else None
-            if self._adc_expected_hz is None:
-                cfg_adc_hz = self._g('rates.adc_hz')
-                if cfg_adc_hz is None:
-                    raise ValueError("rates.adc_hz must be specified in general config file or adc_sample_hz must be provided")
-                self._adc_expected_hz = float(cfg_adc_hz)
+            self._adc_expected_hz = float(adc_sample_hz)
             # Initialize ADC hardware even if the thread is not started so callers can read synchronously.
             if self._ensure_adc_initialized():
                 if self._auto_start_adc:
@@ -377,22 +405,17 @@ class HardwareInterface:
                 # Data format: CSV with [w,x,y,z,gx,gy,gz] per IMU
                 self.usb_reader = USBSerialReader(baud_rate=115200, timeout=1.0, simulation_mode=False)
 
-                # Send handshake to configure the device
-                # Request expected sample rate explicitly (firmware may clamp/ignore)
-                # Also pass optional LPF and QMODE from config if provided
-                hs_kwargs = {
-                    'sample_rate': int(self._imu_expected_hz)
-                }
-                lpf_enabled = self._g('imu.lpf_enabled', None)
-                lpf_alpha = self._g('imu.lpf_alpha', None)
-                qmode = self._g('imu.qmode', None)
-                if lpf_enabled is not None:
-                    hs_kwargs['lpf_enabled'] = int(bool(lpf_enabled))
-                if lpf_alpha is not None:
-                    hs_kwargs['lpf_alpha'] = float(lpf_alpha)
-                if qmode is not None:
-                    hs_kwargs['qmode'] = str(qmode)
-                self.usb_reader.send_handshake_config(**hs_kwargs)
+                # Send config and wait for acknowledgment
+                self.usb_reader.send_config(
+                    sample_rate=int(self._imu_expected_hz),
+                    gyro_dps=self._imu_gyro_dps,
+                    gain=self._imu_ahrs_gain,
+                    accel_rejection=self._imu_accel_rejection,
+                    recovery_s=self._imu_recovery_s,
+                    offset_s=self._imu_offset_s,
+                )
+                if not self.usb_reader.wait_for_cfg_ok(timeout_s=5.0):
+                    self.logger.warning("IMU config acknowledgment not received")
 
                 # Start background thread for IMU reading
                 self.imu_thread = threading.Thread(
@@ -453,7 +476,7 @@ class HardwareInterface:
                     if self._debug_telemetry_enabled:
                         gyro_only = [np.array(pkt[4:7], dtype=np.float32) for pkt in imu_packets]
                         with self._imu_lock:
-                            self.latest_imu_gyro = [g.copy() for g in gyro_only]
+                            self.latest_imu_gyro = [gyro_only[i] for i in self._imu_order]
                             self._imu_last_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
 
                     # Validate quaternion magnitudes (should be ~1.0 for unit quaternions)
@@ -467,7 +490,7 @@ class HardwareInterface:
                     if valid_data:
                         # Atomically update latest data
                         with self._imu_lock:
-                            self.latest_imu_data = quat_only[:3]  # Take first 3 IMUs
+                            self.latest_imu_data = [quat_only[i] for i in self._imu_order]
                             # Note: pitch can be computed from quaternion if needed
                             # pitch = arcsin(2*(w*y - z*x))
                             if self._imu_state != ReadyState.READY:
@@ -620,7 +643,11 @@ class HardwareInterface:
             try:
                 # Sample configured channels
                 for ch in self._adc_channel_plan:
-                    voltage = self.adc.read_channel(ch['board'], ch['channel'])
+                    if ch['is_slew']:
+                        # Slew encoder: 1x oversample for 200Hz support (4.16ms vs 8.32ms)
+                        voltage = self.adc.read_channel_fast(ch['board'], ch['channel'], oversample=1)
+                    else:
+                        voltage = self.adc.read_channel(ch['board'], ch['channel'])
                     if ch['is_slew']:
                         slew_data = self.encoder_tracker.update(voltage)
                         with self._adc_lock:
@@ -685,6 +712,24 @@ class HardwareInterface:
             if self.latest_imu_gyro is None:
                 raise RuntimeError("IMU gyro data is None")
             return [g.copy() for g in self.latest_imu_gyro]
+
+    def try_read_imu_gyro(self) -> Optional[Dict[str, Any]]:
+        """Best-effort gyro read for optional control features.
+
+        Unlike read_imu_gyro(), this method never raises and never triggers a safety reset.
+        Returns None when gyro telemetry is unavailable.
+        """
+        with self._imu_lock:
+            if self._imu_state != ReadyState.READY:
+                return None
+            if not self._debug_telemetry_enabled:
+                return None
+            if self.latest_imu_gyro is None:
+                return None
+            return {
+                'gyro': [g.copy() for g in self.latest_imu_gyro],
+                'device_timestamp_us': self._imu_last_device_ts,
+            }
 
     @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
@@ -908,45 +953,6 @@ class HardwareInterface:
             self.logger.error(f"Error reloading configuration: {e}")
             return False
 
-    def reload_hardware_config(self) -> bool:
-        """Reload hardware YAML configuration and apply rate settings to readers."""
-        try:
-            cfg = self._load_config_yaml(self._hardware_config_path)
-            self._hardware_config = cfg
-            # Apply rates
-            if self._enable_imu:
-                imu_hz_val = self._g('rates.imu_hz', self._imu_expected_hz)
-                if imu_hz_val is not None:
-                    self._imu_expected_hz = float(imu_hz_val)
-            if self._enable_adc and not self._adc_sample_override:
-                adc_hz_val = self._g('rates.adc_hz', self._adc_expected_hz)
-                if adc_hz_val is not None:
-                    self._adc_expected_hz = float(adc_hz_val)
-            # Update handshake for IMU if possible
-            try:
-                if self._enable_imu and self.usb_reader is not None and self._imu_expected_hz:
-                    self.usb_reader.send_handshake_config(sample_rate=int(self._imu_expected_hz))
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            self.logger.error(f"Error reloading hardware config: {e}")
-            return False
-
-    def _load_config_yaml(self, path: str) -> Dict[str, Any]:
-        """Load YAML configuration file if available; return dict."""
-        try:
-            p = Path(path)
-            if not p.exists():
-                return {}
-            with p.open('r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-                if not isinstance(data, dict):
-                    return {}
-                return data
-        except Exception:
-            return {}
-
     def set_log_level(self, level: str) -> None:
         """Change the logging level at runtime.
 
@@ -963,19 +969,6 @@ class HardwareInterface:
             self.pwm_controller.set_log_level(level)
         if hasattr(self, 'adc') and self.adc and hasattr(self.adc, 'set_log_level'):
             self.adc.set_log_level(level)
-
-    def _g(self, dotted: str, default=None):
-        """Get nested config value from hardware config using dotted path."""
-        cur = self._hardware_config
-        try:
-            for part in dotted.split('.'):
-                if isinstance(cur, dict) and part in cur:
-                    cur = cur[part]
-                else:
-                    return default
-            return cur
-        except Exception:
-            return default
 
     # ------------------------
     # Perf helpers (opt-in)

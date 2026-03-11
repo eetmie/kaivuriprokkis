@@ -19,7 +19,7 @@ IMPROVEMENTS IN V2:
 - Joint limit avoidance with repulsion forces
 - Proper error weighting applied to Jacobian rows (not to error vector)
 - Anti-windup for unreachable targets
-- Reduced Jacobian option for improved efficiency
+- Reduced Jacobian always active (auto-detects uncontrollable DOFs + ignore_axes)
 - Fastmath enabled for 20-30% speedup
 - New compute_relative_joint_angles() for proper limit checking
 """
@@ -108,17 +108,15 @@ class IKControllerConfig:
     velocity_error_gain: float = 1.0
     """Proportional gain applied to pose error when in velocity_mode."""
 
-    ik_params: Optional[Dict[str, float]] = None
-    """Method-specific parameters."""
+    ik_params: Optional[Dict[str, Any]] = None
+    """Method-specific parameters (k_val, lambda_val, min_singular_value).
+
+    Optional: ``joint_weights`` (list of per-joint weights). Higher weight = more
+    movement for that joint. Uses sqrt(w) internally for linear effective weighting."""
 
     ignore_axes: Optional[List[str]] = None
     """Axes to ignore in orientation error when solving IK.
     Any of ["roll", "pitch", "yaw"]. Example for excavator: ["roll", "yaw"]."""
-
-    # When True, also zero the corresponding rotation rows in the weighted Jacobian
-    # after applying position/rotation weights (hard removal of ignored rotational DOFs).
-    # This provides stronger decoupling and stability when an orientation axis is intentionally ignored.
-    use_ignore_axes_in_jacobian: bool = True
 
     enable_frame_transform: bool = True
     """Transform target orientation to robot's local frame when using ignore_axes.
@@ -149,11 +147,6 @@ class IKControllerConfig:
     enable_anti_windup: bool = False
     """Enable error saturation for unreachable targets."""
 
-    use_reduced_jacobian: bool = True
-    """Use reduced Jacobian by removing uncontrollable DOFs.
-    For excavators: removes roll axis (only position + pitch/yaw are controllable).
-    Automatically extracts controllable rows based on joint rotation axes."""
-
     def __post_init__(self):
         # Validate inputs
         if self.command_type not in ["position", "pose"]:
@@ -170,12 +163,11 @@ class IKControllerConfig:
                 "  - pinv: k_val\n"
                 "  - svd: k_val, min_singular_value\n"
                 "  - trans: k_val\n"
-                "  - dls: lambda_val\n"
-                "All methods also require: position_weight, rotation_weight"
+                "  - dls: lambda_val"
             )
 
         # Validate required parameters based on method
-        required_common = {"position_weight", "rotation_weight"}
+        required_common = set()
         method_specific = {
             "pinv": {"k_val"},
             "svd": {"k_val", "min_singular_value"},
@@ -458,14 +450,9 @@ class IKController:
         # Debug/telemetry values (for external logging when enabled)
         self.last_adaptive_lambda: float = 0.0
         self.last_condition_number: float = 0.0
-
-        # NEW: Compute controllable DOF mask for reduced Jacobian
-        if cfg.use_reduced_jacobian:
-            self.controllable_dofs = self._compute_controllable_dofs()
-            self.n_controllable = len(self.controllable_dofs)
-        else:
-            self.controllable_dofs = None
-            self.n_controllable = 6
+        # Always compute controllable DOFs (auto-detect + ignore_axes)
+        self.controllable_dofs = self._compute_controllable_dofs()
+        self.n_controllable = len(self.controllable_dofs)
 
     def _compute_controllable_dofs(self) -> List[int]:
         """Determine which DOFs (rows of Jacobian) are controllable based on joint axes.
@@ -505,7 +492,15 @@ class IKController:
             controllable.append(4)  # Pitch
         if has_z_rotation:
             controllable.append(5)  # Yaw
-        
+
+        # Also exclude user-specified ignore_axes
+        if self.cfg.ignore_axes:
+            axis_to_dof = {"roll": 3, "pitch": 4, "yaw": 5}
+            for axis in self.cfg.ignore_axes:
+                dof = axis_to_dof.get(axis)
+                if dof is not None and dof in controllable:
+                    controllable.remove(dof)
+
         return controllable
 
     def _get_reduced_jacobian(self, jacobian_full: np.ndarray) -> np.ndarray:
@@ -518,9 +513,6 @@ class IKController:
             Reduced m×n Jacobian where m = number of controllable DOFs
             For excavator: 5×4 (position + pitch + yaw)
         """
-        if self.controllable_dofs is None:
-            return jacobian_full
-        
         return jacobian_full[self.controllable_dofs, :]
 
     def _get_reduced_error(self, position_error: np.ndarray, 
@@ -534,11 +526,9 @@ class IKController:
         Returns:
             Reduced error vector with only controllable DOFs
         """
-        if self.controllable_dofs is None or axis_angle_error is None:
-            if axis_angle_error is None:
-                return position_error
-            return np.concatenate([position_error, axis_angle_error])
-        
+        if axis_angle_error is None:
+            return position_error
+
         # Build full 6D error
         full_error = np.concatenate([position_error, axis_angle_error])
         
@@ -559,15 +549,14 @@ class IKController:
         # Expand position-only inputs when orientation components are expected
         if desired_vec.size == 3 and required_size > 3:
             full_vec = np.concatenate([desired_vec, np.zeros(3, dtype=np.float32)])
-            if self.cfg.use_reduced_jacobian and self.controllable_dofs is not None and required_size != 6:
+            if required_size != 6:
                 desired_vec = full_vec[self.controllable_dofs][:required_size]
             else:
                 desired_vec = full_vec[:required_size]
 
         # Map full 6D inputs into the reduced task space (drops uncontrollable axes)
-        if self.cfg.use_reduced_jacobian and self.controllable_dofs is not None and required_size != 6:
-            if desired_vec.size == 6:
-                desired_vec = desired_vec[self.controllable_dofs][:required_size]
+        if required_size != 6 and desired_vec.size == 6:
+            desired_vec = desired_vec[self.controllable_dofs][:required_size]
 
         # Position-only mode: ignore any extra components
         if required_size == 3 and desired_vec.size > 3:
@@ -597,29 +586,6 @@ class IKController:
         self._command.fill(0.0)
         self.prev_error_norm = None
         self.windup_counter = 0
-
-    def apply_rotation_filter(self, rotation_error: np.ndarray) -> np.ndarray:
-        """Filter rotation error by zeroing out ignored axes.
-
-        Args:
-            rotation_error: 3D rotation error vector [roll, pitch, yaw] in axis-angle form
-
-        Returns:
-            Filtered rotation error with ignored axes zeroed out
-        """
-        if not self.cfg.ignore_axes:
-            return rotation_error
-
-        filtered = rotation_error.copy()
-        for axis in self.cfg.ignore_axes:
-            if axis == "roll":
-                filtered[0] = 0.0
-            elif axis == "pitch":
-                filtered[1] = 0.0
-            elif axis == "yaw":
-                filtered[2] = 0.0
-        return filtered
-
 
     def _transform_to_robot_local_frame(self, quat: np.ndarray, joint_quats: np.ndarray) -> np.ndarray:
         """
@@ -753,14 +719,8 @@ class IKController:
             jacobian_full[:3, :] = base_rot @ jacobian_full[:3, :]
             jacobian_full[3:, :] = base_rot @ jacobian_full[3:, :]
 
-        # NEW: Extract reduced Jacobian if enabled
-        if self.cfg.use_reduced_jacobian:
-            jacobian = self._get_reduced_jacobian(jacobian_full)
-        else:
-            jacobian = jacobian_full
-
-        # NEW: Compute adaptive damping based on condition number
-        adaptive_lambda = self._compute_adaptive_damping(jacobian)
+        # Extract reduced Jacobian (always — auto-detected + ignore_axes)
+        jacobian = self._get_reduced_jacobian(jacobian_full)
 
         # Initialize error containers for downstream logging/anti-windup
         position_error = np.zeros(3, dtype=np.float32)
@@ -769,13 +729,9 @@ class IKController:
         # Compute pose error and solve IK
         if self.cfg.command_type == "position":
             position_error = target_pos - current_pos
-
-            # NEW: Apply weighting to Jacobian rows instead of error vector
-            pos_weight = self.cfg.ik_params.get("position_weight")
-
-            # Extract position rows (always [0:3] even in reduced Jacobian)
-            jacobian_weighted = pos_weight * jacobian[0:3, :]
             reduced_error = position_error
+            # Use only position rows of the reduced Jacobian
+            jacobian = jacobian[0:3, :]
         else:
             # Transform both current and target orientations to robot's local frame if enabled
             # This makes pitch/roll errors relative to robot heading, not global frame
@@ -807,66 +763,17 @@ class IKController:
                 current_pos, ee_quat_local, target_pos, target_quat_local
             )
 
-            # Apply ignore_axes filtering to orientation error
-            axis_angle_error = self.apply_rotation_filter(axis_angle_error)
-
-            # NEW: Get reduced error vector if using reduced Jacobian
-            if self.cfg.use_reduced_jacobian:
-                pose_error = self._get_reduced_error(position_error, axis_angle_error)
-                
-                # Apply weighting to reduced Jacobian
-                # Position rows are always [0:3], rotation rows depend on controllable_dofs
-                pos_weight = self.cfg.ik_params.get("position_weight")
-                rot_weight = self.cfg.ik_params.get("rotation_weight")
-                
-                # Weight each row based on whether it's position or rotation
-                weighted_jacobian_rows = []
-                for i, dof_idx in enumerate(self.controllable_dofs):
-                    if dof_idx < 3:  # Position DOF
-                        row = pos_weight * jacobian[i, :]
-                    else:  # Rotation DOF
-                        row = rot_weight * jacobian[i, :]
-                        # Optionally hard-remove ignored rotation DOFs by zeroing their rows
-                        if self.cfg.use_ignore_axes_in_jacobian and self.cfg.ignore_axes:
-                            if (dof_idx == 3 and "roll" in self.cfg.ignore_axes) or \
-                               (dof_idx == 4 and "pitch" in self.cfg.ignore_axes) or \
-                               (dof_idx == 5 and "yaw" in self.cfg.ignore_axes):
-                                row = np.zeros_like(row)
-                    weighted_jacobian_rows.append(row)
-                
-                jacobian_weighted = np.vstack(weighted_jacobian_rows).astype(np.float32)
-                reduced_error = pose_error
-            else:
-                # Full Jacobian case
-                pos_weight = self.cfg.ik_params.get("position_weight")
-                rot_weight = self.cfg.ik_params.get("rotation_weight")
-
-                jacobian_weighted = np.vstack([
-                    pos_weight * jacobian[0:3, :],
-                    rot_weight * jacobian[3:6, :]
-                ]).astype(np.float32)
-
-                # Optionally hard-remove ignored rotation DOFs by zeroing their rows
-                if self.cfg.use_ignore_axes_in_jacobian and self.cfg.ignore_axes:
-                    if "roll" in self.cfg.ignore_axes:
-                        jacobian_weighted[3, :] = 0.0
-                    if "pitch" in self.cfg.ignore_axes:
-                        jacobian_weighted[4, :] = 0.0
-                    if "yaw" in self.cfg.ignore_axes:
-                        jacobian_weighted[5, :] = 0.0
-
-                reduced_error = np.concatenate([position_error, axis_angle_error])
+            # Get reduced error vector (only controllable DOFs — ignored axes already excluded)
+            reduced_error = self._get_reduced_error(position_error, axis_angle_error)
 
         # Choose task vector based on mode (position vs velocity)
         if self.velocity_mode:
             desired_vec = self._prepare_desired_velocity(desired_ee_velocity, reduced_error.size)
             task_vec = desired_vec + (self.velocity_error_gain * reduced_error)
-            joint_rate_cmd = self._compute_delta_joint_angles(task_vec, jacobian_weighted, adaptive_lambda)
+            joint_rate_cmd = self._compute_delta_joint_angles(task_vec, jacobian)
             delta_joint_angles = joint_rate_cmd * dt_val
         else:
-            delta_joint_angles = self._compute_delta_joint_angles(
-                reduced_error, jacobian_weighted, adaptive_lambda
-            )
+            delta_joint_angles = self._compute_delta_joint_angles(reduced_error, jacobian)
 
         # DEBUG: Log raw IK output before any limiting
         self._ik_raw_debug_counter += 1
@@ -894,12 +801,11 @@ class IKController:
 
         return joint_angles + delta_joint_angles
 
-    def _compute_adaptive_damping(self, jacobian: np.ndarray) -> float:
+    def _compute_adaptive_damping(self) -> float:
         """Compute adaptive damping factor based on Jacobian conditioning.
-        
-        Args:
-            jacobian: Current Jacobian matrix
-            
+
+        Uses ``self.last_condition_number`` which must be set before calling.
+
         Returns:
             Adaptive damping value (lambda)
         """
@@ -908,10 +814,7 @@ class IKController:
             self.last_adaptive_lambda = float(lam)
             return lam
 
-        # Compute singular values for condition number (no fallback)
-        _, S, _ = np.linalg.svd(jacobian.astype(np.float64))
-        cond = S[0] / (S[-1] + 1e-12)
-        self.last_condition_number = float(cond)
+        cond = self.last_condition_number
 
         # Base damping and adaptive scaling
         base_lambda = self.cfg.ik_params.get("lambda_val", 0.01)
@@ -1016,60 +919,58 @@ class IKController:
         return delta_joint_angles
 
     def _compute_delta_joint_angles(
-        self, delta_pose: np.ndarray, jacobian: np.ndarray, adaptive_lambda: float
+        self, delta_pose: np.ndarray, jacobian: np.ndarray,
     ) -> np.ndarray:
-        """Compute joint angle changes using specified IK method."""
+        """Compute joint angle changes using specified IK method.
+
+        If ``joint_weights`` is set in ``ik_params``, applies weighted
+        pseudoinverse via ``W @ pinv(J @ W)`` where ``W = diag(sqrt(w_i))``.
+        This gives **linear** effective weighting: a user weight of 0.8
+        produces ~0.8x movement, not 0.64x (which would be W²).
+        """
 
         delta_pose = np.asarray(delta_pose, dtype=np.float32)
         jacobian = np.asarray(jacobian, dtype=np.float32)
-        
-        # Get joint weights (higher = more preferred/more movement)
-        joint_weights = self.cfg.ik_params.get("joint_weights", None)
-        if joint_weights is None:
-            joint_weights = [1.0] * jacobian.shape[1]
 
-        # Build weight matrix W (diagonal of multipliers)
-        w_mat = self._build_weight_matrix(joint_weights)
+        # Build sqrt weight matrix for joint weighting (linear effective weighting)
+        joint_weights = self.cfg.ik_params.get("joint_weights", None) if self.cfg.ik_params else None
+        if joint_weights is not None:
+            w = np.asarray(joint_weights, dtype=np.float32)
+            w = np.clip(w, 1e-6, None)
+            w_sqrt = np.diag(np.sqrt(w))
+            jacobian = np.dot(jacobian, w_sqrt)
+        else:
+            w_sqrt = None
 
-        # Apply weighting depending on method
+        # Compute condition number
+        self.last_condition_number = float(compute_condition_number(jacobian))
+
+        # Compute adaptive damping (uses self.last_condition_number)
+        adaptive_lambda = self._compute_adaptive_damping()
+
         method = self.cfg.ik_method
         if method == "pinv":
-            # Use Jacobian with column scaling, map back via W
-            jac_w = np.dot(jacobian, w_mat)
-            dq_prime = ik_method_pinv(jac_w, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
-            return np.dot(w_mat, dq_prime)
+            dq = ik_method_pinv(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
         elif method == "svd":
-            return ik_method_svd(
+            dq = ik_method_svd(
                 jacobian, delta_pose,
                 np.float32(self.cfg.ik_params["k_val"]),
                 np.float32(self.cfg.ik_params["min_singular_value"]),
-                w_mat
             )
         elif method == "trans":
-            # For transpose, scaling columns and using J_w^T gives W * J^T * e directly
-            jac_w = np.dot(jacobian, w_mat)
-            return ik_method_transpose(jac_w, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
+            dq = ik_method_transpose(jacobian, delta_pose, np.float32(self.cfg.ik_params["k_val"]))
         elif method == "dls":
-            # Use adaptive lambda for better conditioning
-            return ik_method_damped_least_squares(
-                jacobian, delta_pose, np.float32(adaptive_lambda), w_mat
+            dq = ik_method_damped_least_squares(
+                jacobian, delta_pose, np.float32(adaptive_lambda),
             )
         else:
             raise ValueError(f"Unknown IK method: {self.cfg.ik_method}")
 
-    def _build_weight_matrix(self, joint_weights) -> np.ndarray:
-        """Build weight matrix for joint weighting (multipliers).
+        # Post-multiply by W_sqrt to complete the weighted pseudoinverse
+        if w_sqrt is not None:
+            dq = np.dot(w_sqrt, dq)
 
-        Args:
-            joint_weights: List of per-joint multipliers (higher = more preferred)
-
-        Returns:
-            Diagonal weight matrix W of shape [num_joints, num_joints]
-        """
-        w = np.asarray(joint_weights, dtype=np.float32)
-        # Prevent degenerate zeros; allow near-zero to effectively disable a joint
-        w = np.clip(w, 1e-6, None)
-        return np.diag(w)
+        return dq
 
 
 # Numba-optimized kinematics functions
@@ -1188,61 +1089,60 @@ def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, o
 
 
 # Numba-optimized IK methods - ALL FLOAT32
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
+
+@numba.njit(fastmath=True)
+def compute_condition_number(jacobian):
+    """Condition number: ratio of largest to smallest singular value."""
+    _, S, _ = np.linalg.svd(jacobian.astype(np.float64), full_matrices=False)
+    return S[0] / (S[-1] + 1e-12)
+
+
+@numba.njit(fastmath=True)
 def ik_method_pinv(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32) -> np.ndarray:
     """Pseudo-inverse IK method."""
     jacobian_pinv = np.linalg.pinv(np.asarray(jacobian, dtype=np.float32))
     return k_val * np.dot(jacobian_pinv, np.asarray(delta_pose, dtype=np.float32))
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
-def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32, min_singular_value: np.float32, w_inv: np.ndarray) -> np.ndarray:
-    """SVD-based IK method with singular value thresholding and joint weighting."""
+@numba.njit(fastmath=True)
+def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32, min_singular_value: np.float32) -> np.ndarray:
+    """SVD-based IK method with singular value thresholding."""
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
     delta_f32 = np.asarray(delta_pose, dtype=np.float32)
-    w_inv_f32 = np.asarray(w_inv, dtype=np.float32)
 
-    # Apply joint weighting: J_weighted = J * W^{-1}
-    jac_weighted = np.dot(jac_f32, w_inv_f32)
-    
-    U, S, Vh = np.linalg.svd(jac_weighted, full_matrices=False)
+    U, S, Vh = np.linalg.svd(jac_f32, full_matrices=False)
 
     # Compute U^T * delta_pose
     ut_delta = np.dot(U.T, delta_f32)
 
     # Apply pseudoinverse of singular values with thresholding
-    result = np.zeros(jac_weighted.shape[1], dtype=np.float32)
+    result = np.zeros(jac_f32.shape[1], dtype=np.float32)
     for i in range(len(S)):
         if S[i] > min_singular_value:
             result += Vh[i] * (ut_delta[i] / S[i])
 
-    # Apply weight matrix: delta_q = W^{-1} * J_pinv * delta_pose
-    return k_val * np.dot(w_inv_f32, result)
+    return k_val * result
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
+@numba.njit(fastmath=True)
 def ik_method_transpose(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32) -> np.ndarray:
     """Jacobian transpose IK method."""
     return k_val * np.dot(np.asarray(jacobian, dtype=np.float32).T, np.asarray(delta_pose, dtype=np.float32))
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
-def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray, lambda_val: np.float32, w_inv: np.ndarray) -> np.ndarray:
-    """Damped least squares IK method with joint weighting."""
+@numba.njit(fastmath=True)
+def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray, lambda_val: np.float32) -> np.ndarray:
+    """Damped least squares IK method."""
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
     delta_f32 = np.asarray(delta_pose, dtype=np.float32)
-    w_inv_f32 = np.asarray(w_inv, dtype=np.float32)
 
-    # Apply joint weighting: J_weighted = J * W^{-1}
-    jac_weighted = np.dot(jac_f32, w_inv_f32)
-
-    # (J_W * J_W^T + λ²I)^-1
-    jjt = np.dot(jac_weighted, jac_weighted.T)
+    # (J * J^T + λ²I)^-1
+    jjt = np.dot(jac_f32, jac_f32.T)
     lambda_matrix = (lambda_val ** 2) * np.eye(jjt.shape[0], dtype=np.float32)
     jjt_lambda_inv = np.linalg.inv(jjt + lambda_matrix)
 
-    # delta_q = W^{-1} * J_W^T * (J_W*J_W^T + λ²I)^-1 * Δp
-    return np.dot(w_inv_f32, np.dot(jac_weighted.T, np.dot(jjt_lambda_inv, delta_f32)))
+    # delta_q = J^T * (J*J^T + λ²I)^-1 * Δp
+    return np.dot(jac_f32.T, np.dot(jjt_lambda_inv, delta_f32))
 
 
 def apply_imu_offsets(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
@@ -1497,8 +1397,7 @@ def warmup_numba_functions():
     try:
         dummy_jacobian = np.random.rand(6, 3).astype(np.float32)
         dummy_delta_pose = np.random.rand(6).astype(np.float32)
-        dummy_w_inv = np.eye(3, dtype=np.float32)
-        
+
         for _ in range(3):  # Multiple calls to ensure compilation
             # Forward kinematics functions
             _ = forward_kinematics_core(dummy_quats, dummy_link_lengths, dummy_link_directions, dummy_origin_offset)
@@ -1507,9 +1406,10 @@ def warmup_numba_functions():
             
             # IK method functions
             _ = ik_method_pinv(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
-            _ = ik_method_svd(dummy_jacobian, dummy_delta_pose, np.float32(1.0), np.float32(1e-5), dummy_w_inv)
+            _ = ik_method_svd(dummy_jacobian, dummy_delta_pose, np.float32(1.0), np.float32(1e-5))
             _ = ik_method_transpose(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
-            _ = ik_method_damped_least_squares(dummy_jacobian, dummy_delta_pose, np.float32(0.1), dummy_w_inv)
+            _ = ik_method_damped_least_squares(dummy_jacobian, dummy_delta_pose, np.float32(0.1))
+            _ = compute_condition_number(dummy_jacobian)
     except Exception as e:
         # Note: Using print here as this is a module-level function called at import
         # before any logger instances are created
@@ -1555,7 +1455,7 @@ def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.25
     """
 
     # Physical offset from slew axis to boom mounting point (rotates with slew!)
-    slew_offset_vec = np.array([0.0165, 0.0, 0.0645], dtype=np.float32)  # x+16.5mm, z+64.5mm
+    slew_offset_vec = np.array([0.0165, 0.0, 0.0645], dtype=np.float32)# x+16.5mm, z+64.5mm.
     slew_length = float(np.linalg.norm(slew_offset_vec))
     slew_direction = slew_offset_vec / slew_length  # Normalized direction
 
@@ -1565,7 +1465,7 @@ def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.25
     imu_offsets = [
         create_imu_offset_quat(0.0),     # Slew joint - no IMU offset needed for encoder
         create_imu_offset_quat(+13.85),  # Boom IMU/joint
-        create_imu_offset_quat(+0.61),   # -0.61 Arm IMU/joint
+        create_imu_offset_quat(+1.0),   # +0.61 Arm IMU/joint
         create_imu_offset_quat(0.0)      # Bucket IMU/joint - no offset
     ]
 
@@ -1585,5 +1485,5 @@ def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.25
         ],
         imu_offsets=imu_offsets,
         ee_offset=np.array([0.0, 0.0, -0.142], dtype=np.float32),  # Tool tip below bucket center
-        origin_offset=np.array([0.0, 0.0, 0.0], dtype=np.float32)   # Slew axis is world origin
+        origin_offset=np.array([0.0, 0.0, 0.075], dtype=np.float32)   # Slew axis + track height
     )

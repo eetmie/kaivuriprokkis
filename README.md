@@ -1,2 +1,0 @@
-# kaivuriprokkis
-oma backup

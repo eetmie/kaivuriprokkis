@@ -24,11 +24,9 @@ typedef struct Sensor {
     uint64_t timestamp;
     // Mounting transform (unused but kept for future)
     FusionQuaternion mountingQuaternion;
-    // Pitch tracking (degrees)
-    float lastPitchDeg;
-    float unwrapOffsetDeg;
-    float zeroOffsetDeg;
+    // Tilt tracking derived from gravity (degrees)
     float pitchDeg;
+    float rollDeg;
     // Previous quaternion for hemisphere continuity
     FusionQuaternion previousQuaternion;
 } Sensor;

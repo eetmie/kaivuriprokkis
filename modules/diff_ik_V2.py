@@ -9,7 +9,8 @@ IMPORTANT: Origin and end-effector offset handling:
 
 Notes:
 - All quaternions are float32 and use [w, x, y, z] convention
-- We assume FULL IMU quaternions on input; no axis projection is applied.
+- We assume corrected joint-frame quaternions on input; no mounting-offset correction is applied here.
+- We assume FULL quaternions on input; no axis projection is applied.
   Orientation components are filtered in IK via the ignore_axes system.
 - Base rotation propagation handles slew (Z-axis) from encoder.
 
@@ -31,8 +32,10 @@ IMPROVEMENTS IN V2:
 import numpy as np
 import numba
 import logging
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal, Dict, Optional, List, Tuple, Any
+import yaml
 
 from .quaternion_math import (
     quat_normalize, quat_multiply, quat_conjugate, quat_rotate_vector,
@@ -212,9 +215,6 @@ class RobotConfig:
     rotation_axes: Optional[List[np.ndarray]] = None
     """Rotation axis for each joint (default: z for first, y for others)."""
 
-    imu_offsets: Optional[List[np.ndarray]] = None
-    """IMU mounting offset quaternions [w, x, y, z] for each joint."""
-
     ee_offset: Optional[np.ndarray] = None
     """End-effector position offset from last joint in local frame [x, y, z]."""
 
@@ -238,18 +238,11 @@ class RobotConfig:
             self.rotation_axes.extend([np.array([0.0, 1.0, 0.0], dtype=np.float32)
                                        for _ in range(1, self.num_joints)])  # Others: Y
 
-        if self.imu_offsets is None:
-            # Identity quaternions (no offset)
-            self.imu_offsets = [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                                for _ in range(self.num_joints)]
-
         # Validate dimensions
         if len(self.link_directions) != self.num_links:
             raise ValueError(f"Expected {self.num_links} link directions")
         if len(self.rotation_axes) != self.num_joints:
             raise ValueError(f"Expected {self.num_joints} rotation axes")
-        if len(self.imu_offsets) != self.num_joints:
-            raise ValueError(f"Expected {self.num_joints} IMU offsets")
 
         # Set default ee_offset if not provided
         if self.ee_offset is None:
@@ -263,7 +256,6 @@ class RobotConfig:
         self.link_lengths = np.asarray(self.link_lengths, dtype=np.float32)  # Convert list to numpy array!
         self.link_directions = [np.asarray(arr, dtype=np.float32) for arr in self.link_directions]
         self.rotation_axes = [np.asarray(arr, dtype=np.float32) for arr in self.rotation_axes]
-        self.imu_offsets = [np.asarray(arr, dtype=np.float32) for arr in self.imu_offsets]
         self.ee_offset = np.asarray(self.ee_offset, dtype=np.float32)
         self.origin_offset = np.asarray(self.origin_offset, dtype=np.float32)
 
@@ -282,6 +274,86 @@ class CheckDOF:
     This correctly identifies when orientation DOFs are coupled with position
     (e.g., without rotating tool head the excavator slew affects both position and yaw simultaneously).
     """
+
+
+def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+    """Load control configuration YAML file."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            p = Path(__file__).parent.parent / path
+        if not p.exists():
+            return {}
+        with p.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _require_xyz_vector(value: Any, field_name: str) -> np.ndarray:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{field_name} must be a list of 3 numbers")
+    return np.asarray(value, dtype=np.float32)
+
+
+def load_excavator_robot_config(path: str = "configuration_files/control_config.yaml") -> RobotConfig:
+    """Build the excavator kinematic model from control_config.yaml."""
+    cfg = _load_control_config(path)
+    robot_cfg = cfg.get('robot', {}) if isinstance(cfg, dict) else {}
+    if not isinstance(robot_cfg, dict) or not robot_cfg:
+        raise RuntimeError("Missing 'robot' section in control_config.yaml")
+
+    frame_cfg = robot_cfg.get('frame', {})
+    links_cfg = robot_cfg.get('links', {})
+    tools_cfg = robot_cfg.get('tools', {})
+    if not isinstance(frame_cfg, dict) or not isinstance(links_cfg, dict) or not isinstance(tools_cfg, dict):
+        raise RuntimeError("robot.frame, robot.links, and robot.tools are required in control_config.yaml")
+
+    try:
+        origin_height_m = float(frame_cfg['origin_height_m'])
+        boom_mount_offset = _require_xyz_vector(links_cfg['boom_mount_offset_m'], "robot.links.boom_mount_offset_m")
+        boom_length_m = float(links_cfg['boom_length_m'])
+        arm_length_m = float(links_cfg['arm_length_m'])
+        coupler_length_m = float(links_cfg['coupler_length_m'])
+        active_tool = tools_cfg['active']
+        presets = tools_cfg['presets']
+    except KeyError as e:
+        raise RuntimeError(f"Missing required robot configuration in control_config.yaml: {e}") from e
+
+    if not isinstance(active_tool, str) or not active_tool:
+        raise RuntimeError("robot.tools.active must be a non-empty string")
+    if not isinstance(presets, dict):
+        raise RuntimeError("robot.tools.presets must be a dict")
+    if active_tool not in presets or not isinstance(presets[active_tool], dict):
+        raise RuntimeError(f"robot.tools.active '{active_tool}' not found in robot.tools.presets")
+    tool_tip_offset = _require_xyz_vector(
+        presets[active_tool].get('tip_offset_m'),
+        f"robot.tools.presets.{active_tool}.tip_offset_m",
+    )
+
+    slew_length = float(np.linalg.norm(boom_mount_offset))
+    if slew_length <= 1e-9:
+        raise RuntimeError("robot.links.boom_mount_offset_m must not be zero")
+    slew_direction = boom_mount_offset / slew_length
+
+    return RobotConfig(
+        link_lengths=[slew_length, boom_length_m, arm_length_m, coupler_length_m],
+        link_directions=[
+            slew_direction,
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        ],
+        rotation_axes=[
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        ],
+        ee_offset=tool_tip_offset,
+        origin_offset=np.array([0.0, 0.0, origin_height_m], dtype=np.float32),
+    )
 
     def __init__(
         self,
@@ -671,7 +743,7 @@ class IKController:
             ee_pos: Current end-effector position [x, y, z]
             ee_quat: Current end-effector quaternion [w, x, y, z]
             joint_angles: Current RELATIVE joint angles in radians (for limit checking)
-            joint_quats: Current joint quaternions from IMUs (absolute, with mounting offsets applied)
+            joint_quats: Current joint quaternions in joint frames (absolute, already corrected)
             desired_ee_velocity: Optional desired EE twist (position 3D or pose 6D) for velocity mode
             dt: Optional timestep (seconds). Defaults to self.default_dt.
             current_joint_velocities: Optional measured joint velocities (rad/s) for future adaptive use
@@ -976,7 +1048,7 @@ class IKController:
 # Numba-optimized kinematics functions
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath for 20-30% speedup
+@numba.njit(fastmath=True, nogil=True)  # CHANGED: Enabled fastmath for 20-30% speedup
 def forward_kinematics_core(quats, link_lengths, link_directions, origin_offset):
     """
     Core forward kinematics - joint positions only (no end-effector offset).
@@ -1016,7 +1088,7 @@ def forward_kinematics_core(quats, link_lengths, link_directions, origin_offset)
     return joint_positions
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
+@numba.njit(fastmath=True, nogil=True)  # CHANGED: Enabled fastmath
 def forward_kinematics_with_ee_offset_core(quats, link_lengths, link_directions, origin_offset, ee_offset):
     """
     Forward kinematics with full end-effector offset calculation.
@@ -1049,7 +1121,7 @@ def forward_kinematics_with_ee_offset_core(quats, link_lengths, link_directions,
     return joint_positions, ee_position
 
 
-@numba.njit(fastmath=True)  # CHANGED: Enabled fastmath
+@numba.njit(fastmath=True, nogil=True)  # CHANGED: Enabled fastmath
 def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, origin_offset, ee_offset):
     # Inputs should already be properly formatted arrays
 
@@ -1090,21 +1162,21 @@ def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, o
 
 # Numba-optimized IK methods - ALL FLOAT32
 
-@numba.njit(fastmath=True)
+@numba.njit(fastmath=True, nogil=True)
 def compute_condition_number(jacobian):
     """Condition number: ratio of largest to smallest singular value."""
     _, S, _ = np.linalg.svd(jacobian.astype(np.float64), full_matrices=False)
     return S[0] / (S[-1] + 1e-12)
 
 
-@numba.njit(fastmath=True)
+@numba.njit(fastmath=True, nogil=True)
 def ik_method_pinv(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32) -> np.ndarray:
     """Pseudo-inverse IK method."""
     jacobian_pinv = np.linalg.pinv(np.asarray(jacobian, dtype=np.float32))
     return k_val * np.dot(jacobian_pinv, np.asarray(delta_pose, dtype=np.float32))
 
 
-@numba.njit(fastmath=True)
+@numba.njit(fastmath=True, nogil=True)
 def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32, min_singular_value: np.float32) -> np.ndarray:
     """SVD-based IK method with singular value thresholding."""
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
@@ -1124,13 +1196,13 @@ def ik_method_svd(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float3
     return k_val * result
 
 
-@numba.njit(fastmath=True)
+@numba.njit(fastmath=True, nogil=True)
 def ik_method_transpose(jacobian: np.ndarray, delta_pose: np.ndarray, k_val: np.float32) -> np.ndarray:
     """Jacobian transpose IK method."""
     return k_val * np.dot(np.asarray(jacobian, dtype=np.float32).T, np.asarray(delta_pose, dtype=np.float32))
 
 
-@numba.njit(fastmath=True)
+@numba.njit(fastmath=True, nogil=True)
 def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray, lambda_val: np.float32) -> np.ndarray:
     """Damped least squares IK method."""
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
@@ -1144,37 +1216,6 @@ def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray,
     # delta_q = J^T * (J*J^T + λ²I)^-1 * Δp
     return np.dot(jac_f32.T, np.dot(jjt_lambda_inv, delta_f32))
 
-
-def apply_imu_offsets(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """
-    Apply IMU mounting offset corrections using full quaternion system.
-
-    The imu_offsets represent the physical mounting angle of each IMU relative to the joint frame.
-    If the IMU reading is q_imu = q_joint * q_offset, removing the mounting offset requires
-    right-multiplying by the inverse: q_corrected = q_imu * q_offset_inverse
-
-    This undoes the physical mounting rotation to get the true joint orientation.
-
-    Returns corrected quaternions preserving all rotation information.
-    """
-    imu_quats = np.asarray(imu_quats, dtype=np.float32)
-    corrected_quats = np.zeros_like(imu_quats, dtype=np.float32)
-
-    for i in range(len(imu_quats)):
-        # Normalize raw IMU quaternion
-        normalized_imu_quat = quat_normalize(imu_quats[i])
-
-        # Apply mounting offset correction by removing the mounting rotation
-        # q_corrected = q_imu * q_offset_inverse (undoes mounting offset)
-        offset_quat_inv = quat_conjugate(robot_config.imu_offsets[i])
-        corrected_quat = quat_normalize(
-            quat_multiply(normalized_imu_quat, offset_quat_inv)
-        )
-
-        # Store the full corrected quaternion
-        corrected_quats[i] = corrected_quat
-
-    return corrected_quats
 
 # Wrapper functions for Numba usage
 
@@ -1234,29 +1275,29 @@ def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) 
     - Joint 3 (bucket): Relative pitch from arm orientation
     
     Args:
-        quats: Absolute joint quaternions from IMUs (after offset correction)
+        quats: Absolute joint quaternions already corrected into joint frames
         robot_config: Robot configuration with rotation axes
         
     Returns:
         np.ndarray: Relative joint angles in radians [n_joints]
     """
     quats = np.asarray(quats, dtype=np.float32)
-    corrected_quats = apply_imu_offsets(quats, robot_config)
-    
-    n_joints = len(corrected_quats)
+    quats = np.asarray(quats, dtype=np.float32)
+
+    n_joints = len(quats)
     relative_angles = np.zeros(n_joints, dtype=np.float32)
     
     # Joint 0 (slew): Extract absolute rotation about Z-axis
     relative_angles[0] = extract_axis_rotation(
-        corrected_quats[0], 
+        quats[0],
         robot_config.rotation_axes[0]
     )
     
     # Joints 1+ : Extract relative rotation from parent link
     for i in range(1, n_joints):
         # Get parent orientation (world frame)
-        parent_quat = corrected_quats[i-1]
-        current_quat = corrected_quats[i]
+        parent_quat = quats[i-1]
+        current_quat = quats[i]
         
         # Compute relative orientation: q_rel = q_parent^-1 * q_current
         parent_quat_inv = quat_conjugate(parent_quat)
@@ -1279,12 +1320,10 @@ def compute_jacobian(quats: np.ndarray, robot_config: RobotConfig):
     """Jacobian computation wrapper using RobotConfig.
 
     Pipeline (FULL input):
-      1) Apply IMU mounting offsets
-      2) Propagate base (slew) rotation to downstream joints
+      1) Propagate base (slew) rotation to downstream joints
     """
     quats = np.asarray(quats, dtype=np.float32)
-    corrected_quats = apply_imu_offsets(quats, robot_config)
-    propagated_quats = propagate_base_rotation(corrected_quats, robot_config)
+    propagated_quats = propagate_base_rotation(quats, robot_config)
     return compute_jacobian_core(
         propagated_quats,
         robot_config.link_lengths,  # Already np.array from RobotConfig
@@ -1302,8 +1341,7 @@ def get_joint_positions(quats: np.ndarray, robot_config: RobotConfig) -> np.ndar
         np.ndarray: Joint positions [n x 3] including origin_offset, without end-effector offset
     """
     quats = np.asarray(quats, dtype=np.float32)
-    corrected_quats = apply_imu_offsets(quats, robot_config)
-    propagated_quats = propagate_base_rotation(corrected_quats, robot_config)
+    propagated_quats = propagate_base_rotation(quats, robot_config)
     return forward_kinematics_core(
         propagated_quats,
         robot_config.link_lengths,  # Already np.array from RobotConfig
@@ -1330,8 +1368,7 @@ def get_all_poses(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndar
         - ee_orientation [4]: End-effector orientation [w, x, y, z]
     """
     quats = np.asarray(quats, dtype=np.float32)
-    corrected_quats = apply_imu_offsets(quats, robot_config)
-    propagated_quats = propagate_base_rotation(corrected_quats, robot_config)
+    propagated_quats = propagate_base_rotation(quats, robot_config)
 
     # Get joint positions and ee_position with offsets
     joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
@@ -1416,74 +1453,6 @@ def warmup_numba_functions():
         print(f"Numba warmup failed: {e}")
 
 
-def create_imu_offset_quat(angle_degrees: float) -> np.ndarray:
-    """Helper function to create IMU offset quaternion for Y-axis rotation.
-
-    Args:
-        angle_degrees: Rotation angle in degrees around Y-axis
-
-    Returns:
-        np.ndarray: Quaternion [w, x, y, z] for the offset
-    """
-    angle = np.float32(np.radians(angle_degrees))
-    axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    return quat_from_axis_angle(axis, angle)
-
-
-# Example robot configuration
-def create_excavator_config(boom_length: float = 0.468, arm_length: float = 0.250,
-                            bucket_length: float = 0.031) -> RobotConfig:
-    """Create excavator robot configuration with 4 joints: slew (Z-axis) + boom/arm/bucket (Y-axis).
-
-    Physical geometry:
-    - Slew link: Physical offset from slew rotation axis to boom mounting point (x+16.5mm, z+64.5mm)
-                 This offset rotates with the slew joint, making boom mount orbit around Z-axis
-    - Boom/Arm/Bucket: Serial links extending in local X direction
-    - End-effector: Tool tip 142mm below bucket mounting center
-
-    The slew joint models the mounting offset as a rotating link. When the slew rotates,
-    the boom mounting point orbits around the slew axis, which is the correct physical behavior.
-    The IK solver uses rotation axes (not link directions) so this causes no issues.
-
-    Args:
-        boom_length: Length of boom link in meters
-        arm_length: Length of arm link in meters
-        bucket_length: Length of bucket link in meters
-
-    Returns:
-        RobotConfig: Configured excavator robot with proper IMU offsets, ee_offset, and origin_offset
-    """
-
-    # Physical offset from slew axis to boom mounting point (rotates with slew!)
-    slew_offset_vec = np.array([0.0165, 0.0, 0.0645], dtype=np.float32)# x+16.5mm, z+64.5mm.
-    slew_length = float(np.linalg.norm(slew_offset_vec))
-    slew_direction = slew_offset_vec / slew_length  # Normalized direction
-
-    # IMU mounting offsets (in degrees around Y-axis)
-    # These correct for physical IMU mounting angles relative to joint axes
-    # Pico sends RAW quaternions - Python handles all mounting corrections
-    imu_offsets = [
-        create_imu_offset_quat(0.0),     # Slew joint - no IMU offset needed for encoder
-        create_imu_offset_quat(+13.85),  # Boom IMU/joint
-        create_imu_offset_quat(+1.0),   # +0.61 Arm IMU/joint
-        create_imu_offset_quat(0.0)      # Bucket IMU/joint - no offset
-    ]
-
-    return RobotConfig(
-        link_lengths=[slew_length, float(boom_length), float(arm_length), float(bucket_length)],
-        link_directions=[
-            slew_direction,  # Slew: from axis to boom mount (radial + vertical offset)
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),  # Boom: horizontal (X-axis)
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),  # Arm: horizontal (X-axis)
-            np.array([1.0, 0.0, 0.0], dtype=np.float32)   # Bucket: horizontal (X-axis)
-        ],
-        rotation_axes=[
-            np.array([0.0, 0.0, 1.0], dtype=np.float32),  # Slew: Z-axis rotation
-            np.array([0.0, 1.0, 0.0], dtype=np.float32),  # Boom: Y-axis rotation
-            np.array([0.0, 1.0, 0.0], dtype=np.float32),  # Arm: Y-axis rotation
-            np.array([0.0, 1.0, 0.0], dtype=np.float32)   # Bucket: Y-axis rotation
-        ],
-        imu_offsets=imu_offsets,
-        ee_offset=np.array([0.0, 0.0, -0.142], dtype=np.float32),  # Tool tip below bucket center
-        origin_offset=np.array([0.0, 0.0, 0.075], dtype=np.float32)   # Slew axis + track height
-    )
+def create_excavator_config() -> RobotConfig:
+    """Compatibility wrapper for the config-backed excavator model."""
+    return load_excavator_robot_config()

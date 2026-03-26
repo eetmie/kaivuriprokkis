@@ -1,9 +1,27 @@
 #include "ism330dlc.h"
 #include "i2c_helpers.h"
+#include "output.h"
 #include "FusionMath.h"
 #include "cdc_console.h"
 #include "pico/time.h"
 #include <math.h>
+
+typedef struct ActiveImu {
+    i2c_inst_t *i2c_port;
+    uint8_t bus_index;
+    uint8_t device_addr;
+} ActiveImu;
+
+static ActiveImu active_imus[MAX_SENSORS];
+static uint8_t active_sensor_count = 0;
+
+static bool ism330dhcx_probe(i2c_inst_t *i2c_port, uint8_t device_addr) {
+    uint8_t who_am_i = 0;
+    if (!ism330dhcx_read_reg(i2c_port, device_addr, WHO_AM_I, &who_am_i, 1)) {
+        return false;
+    }
+    return who_am_i == ISM330DHCX_ID;
+}
 
 // Function to write to ISM330DHCX register
 bool ism330dhcx_write_reg(i2c_inst_t *i2c_port, uint8_t device_addr, uint8_t reg, uint8_t value) {
@@ -120,29 +138,62 @@ bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr) {
     return true;
 }
 
-// Initialize all 3 IMUs: 2 on I2C0 (0x6A, 0x6B), 1 on I2C1 (0x6A)
 int initialize_sensors(void) {
-    cdc_write_line("Initializing 3 IMUs...");
-    int ok = 1;
+    static const struct {
+        i2c_inst_t *i2c_port;
+        uint8_t bus_index;
+        uint8_t device_addr;
+    } candidates[MAX_SENSORS] = {
+        {I2C_PORT_0, 0, ISM330DHCX_ADDR_DO_LOW},
+        {I2C_PORT_0, 0, ISM330DHCX_ADDR_DO_HIGH},
+        {I2C_PORT_1, 1, ISM330DHCX_ADDR_DO_LOW},
+        {I2C_PORT_1, 1, ISM330DHCX_ADDR_DO_HIGH},
+    };
 
-    // IMU 0: I2C0 @ 0x6B
-    if (!ism330dhcx_init(I2C_PORT_0, ISM330DHCX_ADDR_DO_HIGH)) {
-        cdc_write_line("Failed: I2C0 @ 0x6B");
-        ok = 0;
-    }
-    // IMU 1: I2C0 @ 0x6A
-    if (!ism330dhcx_init(I2C_PORT_0, ISM330DHCX_ADDR_DO_LOW)) {
-        cdc_write_line("Failed: I2C0 @ 0x6A");
-        ok = 0;
-    }
-    // IMU 2: I2C1 @ 0x6A
-    if (!ism330dhcx_init(I2C_PORT_1, ISM330DHCX_ADDR_DO_LOW)) {
-        cdc_write_line("Failed: I2C1 @ 0x6A");
-        ok = 0;
+    active_sensor_count = 0;
+    cdc_write_line("Probing IMUs on I2C0/I2C1 @ 0x6A/0x6B...");
+
+    for (uint8_t i = 0; i < MAX_SENSORS; i++) {
+        const uint8_t addr = candidates[i].device_addr;
+        const uint8_t bus = candidates[i].bus_index;
+
+        if (!ism330dhcx_probe(candidates[i].i2c_port, addr)) {
+            cdc_writef("No IMU at I2C%d @ 0x%02x\n", bus, addr);
+            continue;
+        }
+
+        if (!ism330dhcx_init(candidates[i].i2c_port, addr)) {
+            cdc_writef("Probe OK but init failed: I2C%d @ 0x%02x\n", bus, addr);
+            continue;
+        }
+
+        active_imus[active_sensor_count].i2c_port = candidates[i].i2c_port;
+        active_imus[active_sensor_count].bus_index = bus;
+        active_imus[active_sensor_count].device_addr = addr;
+        active_sensor_count++;
+        cdc_writef("Active IMU %d: I2C%d @ 0x%02x\n", active_sensor_count - 1, bus, addr);
     }
 
-    cdc_writef("IMU init %s\n", ok ? "OK" : "FAILED");
-    return ok;
+    cdc_writef("Detected %d IMU(s)\n", active_sensor_count);
+    return active_sensor_count > 0 ? 1 : 0;
+}
+
+uint8_t get_active_sensor_count(void) {
+    return active_sensor_count;
+}
+
+uint8_t get_active_sensor_bus(uint8_t sensor_index) {
+    if (sensor_index >= active_sensor_count) {
+        return 0xFF;
+    }
+    return active_imus[sensor_index].bus_index;
+}
+
+uint8_t get_active_sensor_addr(uint8_t sensor_index) {
+    if (sensor_index >= active_sensor_count) {
+        return 0xFF;
+    }
+    return active_imus[sensor_index].device_addr;
 }
 
 // Wait for new data to be ready from the sensor
@@ -180,42 +231,18 @@ bool ism330dhcx_read_accelerometer(i2c_inst_t* i2c_port, uint8_t device_addr, Fu
     return true;
 }
 
-// Read all 3 IMUs in fixed order
 void read_all_sensors(Sensor* sensors) {
-    // IMU 0: I2C0 @ 0x6B
-    if (!ism330dhcx_read_accelerometer(I2C_PORT_0, ISM330DHCX_ADDR_DO_HIGH, &sensors[0].accelerometer) ||
-        !ism330dhcx_read_gyro(I2C_PORT_0, ISM330DHCX_ADDR_DO_HIGH, &sensors[0].gyroscope)) {
-        sensors[0].accelerometer.axis.x = NAN;
-        sensors[0].accelerometer.axis.y = NAN;
-        sensors[0].accelerometer.axis.z = NAN;
-        sensors[0].gyroscope.axis.x = NAN;
-        sensors[0].gyroscope.axis.y = NAN;
-        sensors[0].gyroscope.axis.z = NAN;
+    for (uint8_t i = 0; i < active_sensor_count; i++) {
+        if (!ism330dhcx_read_accelerometer(active_imus[i].i2c_port, active_imus[i].device_addr, &sensors[i].accelerometer) ||
+            !ism330dhcx_read_gyro(active_imus[i].i2c_port, active_imus[i].device_addr, &sensors[i].gyroscope)) {
+            sensors[i].accelerometer.axis.x = NAN;
+            sensors[i].accelerometer.axis.y = NAN;
+            sensors[i].accelerometer.axis.z = NAN;
+            sensors[i].gyroscope.axis.x = NAN;
+            sensors[i].gyroscope.axis.y = NAN;
+            sensors[i].gyroscope.axis.z = NAN;
+        }
+        sensors[i].timestamp = time_us_64();
     }
-    sensors[0].timestamp = time_us_64();
-
-    // IMU 1: I2C0 @ 0x6A
-    if (!ism330dhcx_read_accelerometer(I2C_PORT_0, ISM330DHCX_ADDR_DO_LOW, &sensors[1].accelerometer) ||
-        !ism330dhcx_read_gyro(I2C_PORT_0, ISM330DHCX_ADDR_DO_LOW, &sensors[1].gyroscope)) {
-        sensors[1].accelerometer.axis.x = NAN;
-        sensors[1].accelerometer.axis.y = NAN;
-        sensors[1].accelerometer.axis.z = NAN;
-        sensors[1].gyroscope.axis.x = NAN;
-        sensors[1].gyroscope.axis.y = NAN;
-        sensors[1].gyroscope.axis.z = NAN;
-    }
-    sensors[1].timestamp = time_us_64();
-
-    // IMU 2: I2C1 @ 0x6A
-    if (!ism330dhcx_read_accelerometer(I2C_PORT_1, ISM330DHCX_ADDR_DO_LOW, &sensors[2].accelerometer) ||
-        !ism330dhcx_read_gyro(I2C_PORT_1, ISM330DHCX_ADDR_DO_LOW, &sensors[2].gyroscope)) {
-        sensors[2].accelerometer.axis.x = NAN;
-        sensors[2].accelerometer.axis.y = NAN;
-        sensors[2].accelerometer.axis.z = NAN;
-        sensors[2].gyroscope.axis.x = NAN;
-        sensors[2].gyroscope.axis.y = NAN;
-        sensors[2].gyroscope.axis.z = NAN;
-    }
-    sensors[2].timestamp = time_us_64();
 }
  

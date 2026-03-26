@@ -3,12 +3,12 @@
 #include "output.h"
 #include "tusb.h"
 #include <pico/stdlib.h>
-
-volatile int zero_requested = 0;
+#include <stdbool.h>
+#include <string.h>
 
 // Default settings
 imu_reader_settings_t imu_reader_settings = {
-    .sampleRate = 200,
+    .sampleRate = 100,
     .gyroRangeDps = 500.0f,
     .ahrsGain = 0.5f,
     .ahrsAccelRejection = 10.0f,
@@ -16,6 +16,42 @@ imu_reader_settings_t imu_reader_settings = {
     .offsetTimeoutS = 1.0f
 };
 settings_enum settings_option;
+static volatile bool g_settings_ready = false;
+
+static bool read_cdc_line(char *line, size_t line_len) {
+    static char rx_buf[SETTINGS_BUF_LEN];
+    static size_t rx_len = 0;
+
+    while (tud_cdc_available()) {
+        char ch = 0;
+        if (tud_cdc_read(&ch, 1) != 1) {
+            break;
+        }
+
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            if (rx_len == 0) {
+                continue;
+            }
+            size_t out_len = (rx_len < (line_len - 1)) ? rx_len : (line_len - 1);
+            memcpy(line, rx_buf, out_len);
+            line[out_len] = '\0';
+            rx_len = 0;
+            return true;
+        }
+
+        if (rx_len < sizeof(rx_buf) - 1) {
+            rx_buf[rx_len++] = ch;
+        } else {
+            rx_len = 0;
+        }
+    }
+
+    return false;
+}
 
 static void extract_part(const char* key, const char* buf, settings_enum setting) {
     char *pos = strstr(buf, key);
@@ -67,7 +103,7 @@ static void parse_settings(const char* buf) {
     extract_part("OFFSET_S=", buf, S_OFFSET_TIMEOUT_S);
 
     // Validate
-    if (imu_reader_settings.sampleRate < 10) imu_reader_settings.sampleRate = 200;
+    if (imu_reader_settings.sampleRate < 10) imu_reader_settings.sampleRate = 100;
     if (imu_reader_settings.sampleRate > 1000) imu_reader_settings.sampleRate = 1000;
     if (imu_reader_settings.gyroRangeDps < 125.0f) imu_reader_settings.gyroRangeDps = 500.0f;
     if (imu_reader_settings.ahrsGain <= 0.0f) imu_reader_settings.ahrsGain = 0.5f;
@@ -82,68 +118,46 @@ static void parse_settings(const char* buf) {
 }
 
 void wait_for_settings() {
-    char buf[SETTINGS_BUF_LEN];
-    cdc_write_line("Waiting for config (SR=xxx|...)...");
+    // Pure binary protocol — no text output
+    cdc_console_enable(false);
+    g_settings_ready = false;
 
+    char buf[SETTINGS_BUF_LEN];
     absolute_time_t last_beat = get_absolute_time();
 
+    // Wait forever for config — no timeout, no defaults
     while (1) {
         tud_task();
-        if (absolute_time_diff_us(last_beat, get_absolute_time()) >= 1000 * 1000) {
+
+        // Periodic CFG_WAIT heartbeat (binary, 200ms)
+        if (absolute_time_diff_us(last_beat, get_absolute_time()) >= 200 * 1000) {
             send_control_msg(MSG_TYPE_CFG_WAIT);
             last_beat = get_absolute_time();
         }
 
-        if (tud_cdc_available()) {
-            uint32_t count = tud_cdc_read(buf, sizeof(buf) - 1);
-            if (count > 0) {
-                buf[count] = '\0';
-
-                // Handle ZERO command
-                if (strstr(buf, "CMD=ZERO") != NULL) {
-                    zero_requested = 1;
-                    cdc_write_line("ZERO queued.");
-                }
-
-                // Basic connectivity test
-                if (strstr(buf, "TEST") != NULL) {
-                    cdc_write_line("TEST_OK");
-                }
-
-                // Parse settings if SR= is present
-                if (strstr(buf, "SR=")) {
-                    parse_settings(buf);
-                    // Disable text console before streaming binary data
-                    cdc_console_enable(false);
-                    // Send CFG_OK for a short window, then exit to streaming.
-                    absolute_time_t cfg_ok_start = get_absolute_time();
-                    absolute_time_t last_cfg_ok = cfg_ok_start;
-                    while (absolute_time_diff_us(cfg_ok_start, get_absolute_time()) < 500 * 1000) {
-                        tud_task();
-                        if (absolute_time_diff_us(last_cfg_ok, get_absolute_time()) >= 100 * 1000) {
-                            send_control_msg(MSG_TYPE_CFG_OK);
-                            last_cfg_ok = get_absolute_time();
-                        }
-                        sleep_ms(10);
+        if (read_cdc_line(buf, sizeof(buf))) {
+            // Parse settings if SR= is present
+            if (strstr(buf, "SR=")) {
+                parse_settings(buf);
+                g_settings_ready = true;
+                // Send CFG_OK for a short window, then exit to streaming
+                absolute_time_t cfg_ok_start = get_absolute_time();
+                absolute_time_t last_cfg_ok = cfg_ok_start;
+                while (absolute_time_diff_us(cfg_ok_start, get_absolute_time()) < 500 * 1000) {
+                    tud_task();
+                    if (absolute_time_diff_us(last_cfg_ok, get_absolute_time()) >= 100 * 1000) {
+                        send_control_msg(MSG_TYPE_CFG_OK);
+                        last_cfg_ok = get_absolute_time();
                     }
-                    return;
+                    sleep_ms(10);
                 }
+                return;
             }
         }
-        sleep_ms(100);
+        sleep_ms(50);
     }
 }
 
-void check_for_zero_command() {
-    if (!tud_cdc_available()) return;
-
-    char buf[SETTINGS_BUF_LEN];
-    uint32_t count = tud_cdc_read(buf, sizeof(buf) - 1);
-    if (count == 0) return;
-
-    buf[count] = '\0';
-    if (strstr(buf, "CMD=ZERO") != NULL) {
-        zero_requested = 1;
-        send_control_msg(MSG_TYPE_ZERO_ACK);
-    }
+bool settings_are_ready(void) {
+    return g_settings_ready;
 }

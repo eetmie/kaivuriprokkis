@@ -14,10 +14,8 @@ void initialize_sensors_values(Sensor* sensors, int count) {
         sensors[i].accelerometer.axis.z = 0.0f;
 
         sensors[i].mountingQuaternion = FUSION_IDENTITY_QUATERNION;
-        sensors[i].lastPitchDeg = 0.0f;
-        sensors[i].unwrapOffsetDeg = 0.0f;
-        sensors[i].zeroOffsetDeg = 0.0f;
         sensors[i].pitchDeg = 0.0f;
+        sensors[i].rollDeg = 0.0f;
 
         // Initialize timestamps to avoid huge deltaTime on first iteration
         sensors[i].timestamp = time_us_64();

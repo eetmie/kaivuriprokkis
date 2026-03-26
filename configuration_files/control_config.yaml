@@ -3,11 +3,11 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 200.0
+  control_hz: 100.0
 
 imu:
   # IMU sampling rate (Hz) - Pico AHRS loop frequency
-  sample_rate: 200
+  sample_rate: 100
   # Gyroscope full-scale range (125/250/500/1000/2000 dps)
   gyro_dps: 250
   # AHRS filter gain (higher = faster response, more noise)
@@ -18,9 +18,39 @@ imu:
   recovery_s: 0.5
   # Gyro offset tracking timeout (seconds)
   offset_s: 0.5
-  # IMU order mapping: physical sensor index -> logical joint [boom, arm, bucket]
-  # Default [0, 1, 2] means physical IMU 0=boom, 1=arm, 2=bucket
-  imu_order: [0, 2, 1]
+  # Named IMU mapping: logical role -> physical sensor index
+  # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
+  # The mapping length defines the expected IMU count from firmware
+  imu_mapping:
+    base: 0
+    boom: 1
+    arm: 3
+    bucket: 2
+  # Mounting correction quaternions by logical IMU role [w, x, y, z]
+  # Hardware layer removes these offsets before publishing quats/gyro.
+  mounting_offsets_quat:
+    base: [1.0, 0.0, 0.0, 0.0]
+    boom: [0.9927048, 0.0, 0.12057, 0.0]
+    arm: [0.9999619, 0.0, 0.0087265, 0.0]
+    bucket: [1.0, 0.0, 0.0, 0.0]
+
+robot:
+  frame:
+    # Ground to slew/cabin rotation origin
+    origin_height_m: 0.075
+  links:
+    # Vector from slew origin to first boom pivot in slew-local coordinates
+    boom_mount_offset_m: [0.0165, 0.0, 0.0645]
+    boom_length_m: 0.468
+    arm_length_m: 0.250
+    # Link from arm joint to tool coupler center
+    coupler_length_m: 0.031
+  tools:
+    active: default_bucket_tip
+    presets:
+      default_bucket_tip:
+        # Local-frame offset from coupler center to tool tip / working point
+        tip_offset_m: [0.0, 0.0, -0.142]
 
 pid:
   # PID controller gains for each joint
@@ -65,7 +95,7 @@ controller:
   # - fd_only: stock behavior (finite-difference from joint angles)
   # - gyro_only: use IMU gyro rates for boom/arm/bucket (slew remains FD)
   # - fused: blend gyro + FD for boom/arm/bucket (slew remains FD)
-  gyro_velocity_mode: "fused"
+  gyro_velocity_mode: "fd_only"
 
   # Blend factor for fused mode: v = alpha*gyro + (1-alpha)*fd
   # Only used when gyro_velocity_mode: "fused"
@@ -117,9 +147,9 @@ ik:
   method: "svd"
 
   # Velocity mode: interpret commands as desired EE velocities
-  velocity_mode: True
+  velocity_mode: False
   velocity_error_gain: 200.0  # Note: depends on hw/sim_dt!
-  use_rotational_velocity: True
+  use_rotational_velocity: False
 
   # Method/weighting parameters
   # Note: k_val and lambda_val have decreased effect when velocity_mode is enabled,

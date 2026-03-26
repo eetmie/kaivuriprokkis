@@ -970,6 +970,7 @@ class PWMController:
         self.pump_variable = variable
 
     def update_pump_load(self, adjustment: float):
+        # TODO: make cleaner, makes no sense handle this confusingly!
         self.manual_pump_load = max(-1.0, min(0.3, self.manual_pump_load + adjustment / 10))
 
     def reset_pump_load(self):

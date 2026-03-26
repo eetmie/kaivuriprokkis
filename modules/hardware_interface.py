@@ -20,9 +20,16 @@ import threading
 import yaml
 
 from .PCA9685_controller import PWMController
-from .usb_serial_reader import USBSerialReader
+from .imu_stream_reader import USBSerialReader
 from .ADC import SimpleADC
-from .quaternion_math import quat_from_axis_angle, wrap_to_pi
+from .quaternion_math import (
+    quat_from_axis_angle,
+    quat_normalize,
+    quat_multiply,
+    quat_conjugate,
+    quat_rotate_vector,
+    wrap_to_pi,
+)
 from .perf_tracker import IntervalTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
 
@@ -41,6 +48,13 @@ def _load_control_config(path: str = "configuration_files/control_config.yaml") 
             return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _parse_offset_quaternion(value: Any, field_name: str) -> np.ndarray:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"{field_name} must be a list of 4 numbers")
+    quat = quat_normalize(np.asarray(value, dtype=np.float32))
+    return quat
 
 
 class ReadyState:
@@ -258,11 +272,38 @@ class HardwareInterface:
         self._imu_accel_rejection = float(imu_accel_rejection if imu_accel_rejection is not None else _imu_cfg.get('accel_rejection', 10.0))
         self._imu_recovery_s = float(imu_recovery_s if imu_recovery_s is not None else _imu_cfg.get('recovery_s', 1.0))
         self._imu_offset_s = float(imu_offset_s if imu_offset_s is not None else _imu_cfg.get('offset_s', 1.0))
-        # IMU order mapping: physical sensor index -> logical joint [boom, arm, bucket]
-        _imu_order = _imu_cfg.get('imu_order', [0, 1, 2])
-        if not isinstance(_imu_order, list) or len(_imu_order) != 3 or set(_imu_order) != {0, 1, 2}:
-            raise ValueError(f"Invalid imu.imu_order in control_config.yaml: {_imu_order} (must be permutation of [0, 1, 2])")
-        self._imu_order = _imu_order
+        # Named IMU mapping: logical role -> physical sensor index
+        _imu_mapping = _imu_cfg.get('imu_mapping')
+        if _imu_mapping is None or not isinstance(_imu_mapping, dict):
+            raise ValueError("imu.imu_mapping is required in control_config.yaml (dict of role -> sensor index)")
+        _mounting_offsets_cfg = _imu_cfg.get('mounting_offsets_quat', {})
+        if _mounting_offsets_cfg is None:
+            _mounting_offsets_cfg = {}
+        if not isinstance(_mounting_offsets_cfg, dict):
+            raise ValueError("imu.mounting_offsets_quat must be a dict of role -> quaternion")
+        # Joint roles that feed into the IK pipeline (order matters: boom, arm, bucket)
+        _JOINT_ROLES = ('boom', 'arm', 'bucket')
+        for role in _JOINT_ROLES:
+            if role not in _imu_mapping:
+                raise ValueError(f"imu.imu_mapping missing required joint role '{role}'")
+        self._imu_joint_indices = [_imu_mapping[r] for r in _JOINT_ROLES]
+        self._base_imu_index = _imu_mapping.get('base')
+        self._expected_imu_count = len(_imu_mapping)
+        # Validate: all indices distinct and within [0, expected_count)
+        all_indices = list(_imu_mapping.values())
+        if len(set(all_indices)) != len(all_indices):
+            raise ValueError(f"imu.imu_mapping has duplicate indices: {_imu_mapping}")
+        for role, idx in _imu_mapping.items():
+            if not isinstance(idx, int) or idx < 0 or idx >= self._expected_imu_count:
+                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} out of range [0, {self._expected_imu_count})")
+        self._imu_offset_inv_by_index = [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                                         for _ in range(self._expected_imu_count)]
+        for role, idx in _imu_mapping.items():
+            quat = _parse_offset_quaternion(
+                _mounting_offsets_cfg.get(role, [1.0, 0.0, 0.0, 0.0]),
+                f"imu.mounting_offsets_quat.{role}",
+            )
+            self._imu_offset_inv_by_index[idx] = quat_conjugate(quat)
 
         # Initialize PWM controller
         # Use tri-state: PENDING -> READY or FAULT
@@ -322,6 +363,8 @@ class HardwareInterface:
         self._imu_fault_reason: Optional[str] = None
         self.latest_imu_data = None
         self.latest_imu_pitch = None  # radians, if available from stream
+        self.latest_base_imu_quat = None   # Base IMU quaternion (supplementary, not in IK)
+        self.latest_base_imu_gyro = None   # Base IMU gyro [gx, gy, gz] deg/s
         self._imu_lock = threading.Lock()
         self._imu_expected_hz = None
         self.usb_reader = None
@@ -329,7 +372,7 @@ class HardwareInterface:
         if self._enable_imu:
             _cfg = _load_control_config()
             _imu_cfg = _cfg.get('imu', {})
-            self._imu_expected_hz = float(imu_expected_hz if imu_expected_hz is not None else _imu_cfg.get('sample_rate', 200))
+        self._imu_expected_hz = float(imu_expected_hz if imu_expected_hz is not None else _imu_cfg.get('sample_rate', 100))
         # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
@@ -370,9 +413,21 @@ class HardwareInterface:
         start_time = time.time()
         valid_count = 0
 
+        count_checked = False
         while (time.time() - start_time) < timeout:
             imu_data = self.usb_reader.read_imus()
-            if imu_data is not None and len(imu_data) >= 3:
+            if imu_data is not None and len(imu_data) >= self._expected_imu_count:
+                # On first valid frame, enforce sensor count
+                if not count_checked:
+                    num_sensors = getattr(self.usb_reader, 'num_sensors', len(imu_data))
+                    if num_sensors != self._expected_imu_count:
+                        self._imu_state = ReadyState.FAULT
+                        self._imu_fault_reason = (
+                            f"Expected {self._expected_imu_count} IMUs, "
+                            f"firmware reports {num_sensors}"
+                        )
+                        return False
+                    count_checked = True
                 valid_count += 1
                 if valid_count >= 3:  # Got multiple valid readings
                     return True
@@ -391,6 +446,16 @@ class HardwareInterface:
             raise HardwareFaultError("IMU", self._imu_fault_reason or "Unknown error")
         if self._adc_state == ReadyState.FAULT:
             raise HardwareFaultError("ADC", self._adc_fault_reason or "Unknown error")
+
+    def _correct_imu_quaternion(self, quat: np.ndarray, sensor_index: int) -> np.ndarray:
+        """Map a raw IMU quaternion into the configured joint/base frame."""
+        normalized = quat_normalize(np.asarray(quat, dtype=np.float32))
+        offset_inv = self._imu_offset_inv_by_index[sensor_index]
+        return quat_normalize(quat_multiply(normalized, offset_inv))
+
+    def _correct_imu_gyro(self, gyro: np.ndarray, sensor_index: int) -> np.ndarray:
+        """Map a raw IMU gyro vector into the configured joint/base frame."""
+        return quat_rotate_vector(self._imu_offset_inv_by_index[sensor_index], np.asarray(gyro, dtype=np.float32))
     
     def _start_imu_reader(self) -> None:
         """Initialize IMU reader and start background thread."""
@@ -414,8 +479,10 @@ class HardwareInterface:
                     recovery_s=self._imu_recovery_s,
                     offset_s=self._imu_offset_s,
                 )
-                if not self.usb_reader.wait_for_cfg_ok(timeout_s=5.0):
+                if not self.usb_reader.wait_for_cfg_ok(timeout_s=1.0):
                     self.logger.warning("IMU config acknowledgment not received")
+
+                self.usb_reader.start_background_reader()
 
                 # Start background thread for IMU reading
                 self.imu_thread = threading.Thread(
@@ -462,27 +529,32 @@ class HardwareInterface:
             else:
                 self.logger.warning(f"IMU thread: Failed to apply RT priority {self._imu_rt_priority}")
 
-        # Aim to match the device sample rate to avoid unnecessary polling
-        next_run_time = time.perf_counter()
-        read_period = 1.0 / max(1.0, self._imu_expected_hz)
         while not self._stop_event.is_set():
             try:
                 # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] arrays
-                imu_packets = self.usb_reader.read_imus()
-                if imu_packets is not None and len(imu_packets) >= 3:
+                imu_packets = self.usb_reader.get_latest_imus(only_new=True)
+                if imu_packets is not None and len(imu_packets) >= self._expected_imu_count:
                     # Extract only the quaternion portion [w,x,y,z] from each IMU packet
                     # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
-                    quat_only = [np.array(pkt[:4], dtype=np.float32) for pkt in imu_packets]
-                    if self._debug_telemetry_enabled:
-                        gyro_only = [np.array(pkt[4:7], dtype=np.float32) for pkt in imu_packets]
-                        with self._imu_lock:
-                            self.latest_imu_gyro = [gyro_only[i] for i in self._imu_order]
-                            self._imu_last_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
+                    quat_only = [
+                        self._correct_imu_quaternion(np.array(pkt[:4], dtype=np.float32), i)
+                        for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
+                    ]
+                    gyro_only = [
+                        self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
+                        for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
+                    ]
+                    with self._imu_lock:
+                        self.latest_imu_gyro = [gyro_only[i] for i in self._imu_joint_indices]
+                        self._imu_last_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
+                        # Extract base IMU gyro if configured
+                        if self._base_imu_index is not None:
+                            self.latest_base_imu_gyro = gyro_only[self._base_imu_index].copy()
 
-                    # Validate quaternion magnitudes (should be ~1.0 for unit quaternions)
+                    # Validate quaternion magnitudes for joint IMUs (should be ~1.0)
                     valid_data = True
-                    for q in quat_only[:3]:
-                        mag = np.linalg.norm(q)
+                    for i in self._imu_joint_indices:
+                        mag = np.linalg.norm(quat_only[i])
                         if mag < 0.95 or mag > 1.05:
                             valid_data = False
                             break
@@ -490,7 +562,10 @@ class HardwareInterface:
                     if valid_data:
                         # Atomically update latest data
                         with self._imu_lock:
-                            self.latest_imu_data = [quat_only[i] for i in self._imu_order]
+                            self.latest_imu_data = [quat_only[i] for i in self._imu_joint_indices]
+                            # Extract base IMU quaternion if configured
+                            if self._base_imu_index is not None:
+                                self.latest_base_imu_quat = quat_only[self._base_imu_index].copy()
                             # Note: pitch can be computed from quaternion if needed
                             # pitch = arcsin(2*(w*y - z*x))
                             if self._imu_state != ReadyState.READY:
@@ -509,13 +584,8 @@ class HardwareInterface:
                                 self._imu_dev_tracker.record_interval(dt_s)
                             self._imu_last_dev_ts = dev_ts
 
-                # Accurate timing to match expected device SR
-                next_run_time += read_period
-                sleep_time = next_run_time - time.perf_counter()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_run_time = time.perf_counter()
+                if imu_packets is None:
+                    time.sleep(0.0005)
 
             except Exception as e:
                 self.logger.error(f"IMU reader thread error: {e}")
@@ -682,7 +752,9 @@ class HardwareInterface:
 
     @_safe_hardware_operation
     def read_imu_data(self) -> Optional[List[np.ndarray]]:
-        """Read latest IMU data with yaw calibration applied.
+        """Read latest corrected IMU quaternions.
+
+        Mounting offsets are already removed in the hardware layer.
 
         Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
         """
@@ -693,22 +765,18 @@ class HardwareInterface:
 
             if self.latest_imu_data is not None:
                 # Return copy to avoid race conditions
-                raw_data = [q.copy() for q in self.latest_imu_data]
-                return raw_data
+                corrected_data = [q.copy() for q in self.latest_imu_data]
+                return corrected_data
             else:
                 raise RuntimeError("IMU data is None despite ready flag being set")
 
     @_safe_hardware_operation
     def read_imu_gyro(self) -> Optional[List[np.ndarray]]:
-        """Read latest IMU gyro data [gx, gy, gz] per IMU (deg/s).
-
-        Requires debug telemetry to be enabled.
+        """Read latest corrected IMU gyro data [gx, gy, gz] per IMU (deg/s).
         """
         with self._imu_lock:
             if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read gyro data")
-            if not self._debug_telemetry_enabled:
-                raise RuntimeError("Debug telemetry disabled - gyro data not captured")
             if self.latest_imu_gyro is None:
                 raise RuntimeError("IMU gyro data is None")
             return [g.copy() for g in self.latest_imu_gyro]
@@ -722,14 +790,28 @@ class HardwareInterface:
         with self._imu_lock:
             if self._imu_state != ReadyState.READY:
                 return None
-            if not self._debug_telemetry_enabled:
-                return None
             if self.latest_imu_gyro is None:
                 return None
             return {
                 'gyro': [g.copy() for g in self.latest_imu_gyro],
                 'device_timestamp_us': self._imu_last_device_ts,
             }
+
+    def read_base_imu(self) -> Optional[Dict[str, Any]]:
+        """Read latest corrected base IMU data (supplementary, not used in IK).
+
+        Returns {'quat': ndarray[4], 'gyro': ndarray[3]} or None if base IMU
+        is not configured or no data has arrived yet.
+        """
+        if self._base_imu_index is None:
+            return None
+        with self._imu_lock:
+            if self.latest_base_imu_quat is None:
+                return None
+            result = {'quat': self.latest_base_imu_quat.copy()}
+            if self.latest_base_imu_gyro is not None:
+                result['gyro'] = self.latest_base_imu_gyro.copy()
+            return result
 
     @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
@@ -910,7 +992,7 @@ class HardwareInterface:
             return []
     
     def set_debug_telemetry_enabled(self, enabled: bool) -> None:
-        """Enable or disable debug telemetry capture (e.g., IMU gyro)."""
+        """Compatibility flag for optional extra telemetry paths."""
         self._debug_telemetry_enabled = bool(enabled)
 
     def is_hardware_ready(self) -> bool:

@@ -8,14 +8,17 @@
 bool reserved_addr(uint8_t addr);
 int setup_I2C_pins();
 void i2c_scan(i2c_inst_t *i2c_port);
-// I2C(0) configuration
+// Fixed Seeed XIAO RP2040 IMU wiring:
+// - I2C0 uses P28/P29
+// - I2C1 uses P6/P7
+// Do not change these without updating the hardware wiring as well.
 #define I2C_PORT_0 i2c0
-#define I2C_SDA_0 0
-#define I2C_SCL_0 1
+#define I2C_SDA_0 28
+#define I2C_SCL_0 29
 
-// I2C(1) configuration
+// Fixed Seeed XIAO RP2040 IMU wiring for second bus: P6/P7
 #define I2C_PORT_1 i2c1
-#define I2C_SDA_1 2
-#define I2C_SCL_1 3
+#define I2C_SDA_1 6
+#define I2C_SCL_1 7
 
 #endif

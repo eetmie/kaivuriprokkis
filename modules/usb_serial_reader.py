@@ -1,13 +1,15 @@
 import serial
 import time
 import logging
+import os
 import serial.tools.list_ports
 import struct
 import math
+import threading
 
 
 class USBSerialReader:
-    """Read IMU quaternion data from Pico over USB serial (binary protocol)."""
+    """Read IMU quaternion data from Pico over USB serial."""
 
     MAX_SENSORS = 4
     FLOATS_PER_SENSOR = 7  # w, x, y, z, gx, gy, gz
@@ -16,15 +18,20 @@ class USBSerialReader:
     FRAME_VERSION_DATA = 1
     FRAME_VERSION_CTRL = 2
     FRAME_VERSION_DESC = 3
+    FRAME_VERSION_STATUS = 4  # legacy firmware only
 
     # Control frame message types (version=2)
     MSG_TYPE_CFG_OK = 0x01
     MSG_TYPE_CFG_WAIT = 0x02
-    MSG_TYPE_ZERO_ACK = 0x03
     MSG_TYPE_ERROR = 0x04
+    MSG_TYPE_ERR_I2C = 0x05
+    MSG_TYPE_ERR_IMU = 0x06
 
-    # Tuned AHRS defaults (extensively tested)
-    DEFAULT_SAMPLE_RATE = 200
+    STATUS_FLAG_USB_CONNECTED = 0x01
+    STATUS_FLAG_HOST_ALIVE = 0x02
+
+    # Tuned AHRS defaults (tested)
+    DEFAULT_SAMPLE_RATE = 100
     DEFAULT_GYRO_DPS = 250
     DEFAULT_GAIN = 5.0
     DEFAULT_ACCEL_REJ = 20.0
@@ -32,8 +39,9 @@ class USBSerialReader:
     DEFAULT_OFFSET_S = 0.5
 
     def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False,
-                 log_level: str = "INFO", port: str = None, debug: bool = False,
-                 verify_checksum: bool = True, heartbeat_timeout: float = 3.0):
+                 log_level: str = "INFO", port: str | None = None, debug: bool = False,
+                 verify_checksum: bool = True, heartbeat_timeout: float = 3.0,
+                 status_telemetry: bool | None = None):
         self.logger = logging.getLogger(f"{__name__}.USBSerialReader")
         self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
@@ -45,6 +53,7 @@ class USBSerialReader:
 
         self.baud_rate = baud_rate
         self.timeout = timeout
+        self.write_timeout = 1.0
         self.ser = None
         self.port = port
         self._requested_port = port  # remember original for reconnect
@@ -52,10 +61,13 @@ class USBSerialReader:
         self.debug = debug
         self.verify_checksum = verify_checksum
         self.heartbeat_timeout = heartbeat_timeout
+        self._blocking_reads = os.name != "nt"
+        self._read_timeout = min(max(timeout, 0.001), 0.02) if self._blocking_reads else 0
         self.sim_time = 0.0
         self.num_sensors = 0  # discovered at runtime from first frame
         self.last_timestamp_us = None
         self._imu_descriptors = []  # list of {"bus": int, "addr": int}
+        self._descriptor_signature = None
         self._target_sps = 0       # target sample rate reported by firmware
         self._last_data_time = time.time()
         self._connect_time = time.time()
@@ -65,11 +77,33 @@ class USBSerialReader:
         self._checksum_failures = 0
         self._header_failures = 0
         self._reconnect_count = 0
+        self._timestamp_sps = 0.0
+        self._host_sps = 0.0
+        self._status_enabled = False
+        self._stream_status = {
+            "target_hz": 0,
+            "sensor_count": 0,
+            "flags": 0,
+            "tx_drop_count": 0,
+            "tx_short_write_count": 0,
+            "usb_disconnect_count": 0,
+            "loop_overrun_count": 0,
+            "max_loop_lag_us": 0,
+            "last_loop_us": 0,
+            "host_age_ms": 0,
+        }
+        self._lock = threading.Lock()
+        self._reader_thread = None
+        self._reader_stop = threading.Event()
+        self._latest_frame = None
+        self._latest_frame_seq = 0
+        self._last_returned_seq = 0
 
         # SPS (samples per second) tracking
-        self._frame_count = 0
-        self._sps_time = time.time()
-        self._sps = 0.0
+        self._reset_sps_tracking()
+
+        if status_telemetry:
+            self.logger.debug("Status telemetry is not used by stream-only firmware")
 
         if not simulation_mode:
             self.connect()
@@ -110,20 +144,24 @@ class USBSerialReader:
             connected = True
         else:
             connected = self.ser is not None and self.ser.is_open
-        return {
+        with self._lock:
+            return {
             "connected": connected,
             "port": self.port,
             "num_sensors": self.num_sensors,
             "imu_descriptors": list(self._imu_descriptors),
             "target_sps": self._target_sps,
-            "sps": self._sps,
+            "sps": self._host_sps,
+            "host_sps": self._host_sps,
+            "timestamp_sps": self._timestamp_sps,
             "last_timestamp_us": self.last_timestamp_us,
+            "stream_status": dict(self._stream_status),
             "checksum_failures": self._checksum_failures,
             "header_failures": self._header_failures,
             "reconnect_count": self._reconnect_count,
             "uptime_s": time.time() - self._connect_time,
             "simulation_mode": self.simulation_mode,
-        }
+            }
 
     @property
     def connected(self):
@@ -134,8 +172,18 @@ class USBSerialReader:
 
     @property
     def sps(self):
-        """Current frames-per-second rate."""
-        return self._sps
+        """Current host-observed frames-per-second rate."""
+        return self._host_sps
+
+    @property
+    def host_sps(self):
+        """Current host-observed frames-per-second rate."""
+        return self._host_sps
+
+    @property
+    def timestamp_sps(self):
+        """Current frames-per-second rate derived from firmware timestamps."""
+        return self._timestamp_sps
 
     @property
     def target_sps(self):
@@ -153,6 +201,10 @@ class USBSerialReader:
         """
         return list(self._imu_descriptors)
 
+    def set_log_level(self, level: str):
+        """Update logger level at runtime."""
+        self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -167,15 +219,37 @@ class USBSerialReader:
         keywords = ("XIAO", "RP2040", "Pico", "USB Serial", "CDC", "ACM")
         vidpid_markers = ("VID:PID=2E8A:", "VID:PID=2886:")
 
-        for port in ports:
+        def score_port(port_info):
+            device = (port_info.device or "").upper()
+            desc = (port_info.description or "").upper()
+            hwid = (port_info.hwid or "").upper()
+            score = 0
+            if "TTYACM" in device:
+                score += 100
+            if "COM" in device:
+                score += 60
+            if "TTYAMA" in device or "TTYS" in device:
+                score -= 100
+            if any(k in desc for k in keywords):
+                score += 40
+            if any(m in hwid for m in vidpid_markers):
+                score += 80
+            if "USB" in desc or "CDC" in desc:
+                score += 20
+            return score
+
+        ranked = sorted(ports, key=score_port, reverse=True)
+
+        for port in ranked:
             desc = port.description or ""
             hwid = port.hwid or ""
             if any(k in desc for k in keywords) or any(m in hwid for m in vidpid_markers):
                 self.logger.info(f"Found device on port: {port.device}")
                 return port.device
 
-        self.logger.warning(f"No descriptor match; defaulting to {ports[0].device}")
-        return ports[0].device
+        fallback = ranked[0].device
+        self.logger.warning(f"No descriptor match; defaulting to {fallback}")
+        return fallback
 
     def connect(self):
         """Connect to the serial port."""
@@ -184,17 +258,42 @@ class USBSerialReader:
         if not self.port:
             raise serial.SerialException("No serial port found")
 
-        self.ser = serial.Serial(self.port, self.baud_rate, timeout=self.timeout)
+        # Use non-blocking reads and a bounded write timeout so a wedged CDC
+        # endpoint cannot hang the whole process on Windows.
+        self.ser = serial.Serial(
+            self.port,
+            self.baud_rate,
+            timeout=self._read_timeout,
+            write_timeout=self.write_timeout,
+            inter_byte_timeout=0,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+        if hasattr(self.ser, "set_buffer_size"):
+            try:
+                if os.name == "nt":
+                    self.ser.set_buffer_size(rx_size=512)
+            except Exception:
+                pass
         self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
         self._bin_buf.clear()
+        self._text_buf.clear()
+        self._descriptor_signature = None
+        self._imu_descriptors = []
+        self.num_sensors = 0
+        self._target_sps = 0
+        self._latest_frame = None
+        self._latest_frame_seq = 0
+        self._last_returned_seq = 0
         self._last_data_time = time.time()
         self._connect_time = time.time()
+        self._reset_sps_tracking()
         self.logger.info(f"Connected to {self.port} at {self.baud_rate} baud")
         time.sleep(0.1)
 
     def reconnect(self):
-        """Close and re-establish connection, then re-send config."""
+        """Close and re-open connection, then resend config after a reset."""
         self._reconnect_count += 1
         self.logger.info(f"Reconnecting (attempt #{self._reconnect_count})...")
 
@@ -212,20 +311,24 @@ class USBSerialReader:
 
         try:
             self.connect()
+            if self._last_config:
+                ser = self.ser
+                try:
+                    if ser is not None:
+                        ser.write(self._last_config.encode("utf-8"))
+                except serial.SerialTimeoutException:
+                    self.logger.warning("Timed out resending config after reconnect")
+                self.wait_for_cfg_ok(timeout_s=1.0, resend_s=0.3)
+            self.logger.info("Reconnected — config resent, waiting for stream")
+            return True
         except serial.SerialException as e:
             self.logger.warning(f"Reconnect failed: {e}")
             return False
 
-        # Re-send config and wait for handshake
-        if self._last_config:
-            self.ser.write(self._last_config.encode("utf-8"))
-            if self.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.5):
-                self.logger.info("Reconnected and handshake OK")
-                return True
-            else:
-                self.logger.warning("Reconnected but no CFG_OK — Pico may be streaming already")
-                return True  # still usable, just no handshake
-        return True
+    def send_command(self, command: str):
+        """Legacy no-op: stream-only firmware does not accept runtime commands."""
+        self.logger.warning("Ignoring runtime command for stream-only firmware: %s", command)
+        return False
 
     # ------------------------------------------------------------------
     # Configuration
@@ -261,28 +364,44 @@ class USBSerialReader:
             f"OFFSET_S={os_}|\n"
         )
         self._last_config = config
-        self.ser.write(config.encode("utf-8"))
+        try:
+            self.ser.write(config.encode("utf-8"))
+        except serial.SerialTimeoutException:
+            self.logger.warning("Timed out sending config over CDC; proceeding to reads")
+            return False
         self.logger.info(f"Sent config: {config.strip()}")
         return True
 
-    def wait_for_cfg_ok(self, timeout_s=5.0, resend_s=0.5):
-        """Wait for binary CFG_OK from Pico, resending config periodically."""
+    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None):
+        """Wait for binary CFG_OK from Pico, or infer success from streaming.
+
+        If CFG_OK is not received within ``timeout_s``, return False and let the
+        caller proceed directly to streaming reads using the bytes already buffered.
+        """
         if not self.ser or not self.ser.is_open:
             self.logger.warning("Not connected - cannot wait for CFG_OK")
             return False
 
         start = time.time()
-        last_send = 0.0
+        last_send = start
 
         while True:
             now = time.time()
             if timeout_s is not None and (now - start) >= timeout_s:
+                self.logger.warning(
+                    "CFG_OK not received within %.1fs; proceeding to streaming reads",
+                    timeout_s,
+                )
                 return False
 
             if resend_s is not None and (now - last_send) >= resend_s:
                 # Resend last config if available
                 if self._last_config:
-                    self.ser.write(self._last_config.encode("utf-8"))
+                    try:
+                        self.ser.write(self._last_config.encode("utf-8"))
+                    except serial.SerialTimeoutException:
+                        self.logger.warning("Timed out resending config; proceeding to reads")
+                        return False
                 last_send = now
 
             if self.ser.in_waiting > 0:
@@ -291,8 +410,9 @@ class USBSerialReader:
                     self.logger.info("RX(wait): %r", chunk)
                 self._bin_buf.extend(chunk)
 
-                # Scan buffer for CFG_OK and descriptor frames
+                # Scan buffer for CFG_OK, descriptor frames, or first data frame.
                 found_cfg_ok = False
+                found_stream = False
                 idx = 0
                 while idx <= len(self._bin_buf) - 6:
                     if self._bin_buf[idx] == 0xAA and self._bin_buf[idx + 1] == 0x55:
@@ -301,10 +421,20 @@ class USBSerialReader:
                             msg_type = self._bin_buf[idx + 3]
                             expected_cs = struct.unpack_from("<H", self._bin_buf, idx + 4)[0]
                             calc_cs = (version + msg_type) & 0xFFFF
-                            if calc_cs == expected_cs and msg_type == self.MSG_TYPE_CFG_OK:
-                                found_cfg_ok = True
-                                self._bin_buf = bytearray(self._bin_buf[idx + 6:])
-                                break
+                            if calc_cs == expected_cs:
+                                if msg_type == self.MSG_TYPE_CFG_OK:
+                                    found_cfg_ok = True
+                                    self._bin_buf = bytearray(self._bin_buf[idx + 6:])
+                                    break
+                                if msg_type == self.MSG_TYPE_CFG_WAIT:
+                                    idx += 6
+                                    continue
+                                if msg_type == self.MSG_TYPE_ERR_I2C:
+                                    self.logger.error("Pico reported I2C initialization failure")
+                                    return False
+                                if msg_type == self.MSG_TYPE_ERR_IMU:
+                                    self.logger.error("Pico reported IMU initialization failure")
+                                    return False
                             idx += 6
                         elif version == self.FRAME_VERSION_DESC:
                             # Parse descriptor if complete
@@ -315,22 +445,27 @@ class USBSerialReader:
                                 exp_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
                                 cal_cs = sum(self._bin_buf[idx + 2:cs_off]) & 0xFFFF
                                 if cal_cs == exp_cs:
-                                    self._target_sps = struct.unpack_from("<H", self._bin_buf, idx + 4)[0]
-                                    self._imu_descriptors = []
-                                    for di in range(dc):
-                                        bus = self._bin_buf[idx + 6 + di * 2]
-                                        addr = self._bin_buf[idx + 6 + di * 2 + 1]
-                                        self._imu_descriptors.append({
-                                            "bus": bus, "addr": addr,
-                                            "label": f"I2C{bus}:0x{addr:02X}",
-                                        })
-                                    self.num_sensors = dc
-                                    self.logger.info(
-                                        "IMU descriptor: %d sensor(s) @ %d Hz — %s",
-                                        dc, self._target_sps,
-                                        ", ".join(d["label"] for d in self._imu_descriptors),
-                                    )
-                                idx += df_len
+                                    target_sps, descriptors = self._parse_descriptor_payload(idx, dc)
+                                    self._apply_descriptor(dc, target_sps, descriptors)
+                                    found_stream = True
+                                del self._bin_buf[idx:idx + df_len]
+                                continue
+                            else:
+                                idx += 1
+                        elif version == self.FRAME_VERSION_DATA:
+                            sensor_count = self._bin_buf[idx + 3]
+                            if 1 <= sensor_count <= self.MAX_SENSORS:
+                                payload_len = 4 + sensor_count * self.FLOATS_PER_SENSOR * 4
+                                frame_len = 2 + 1 + 1 + payload_len + 2
+                                if idx + frame_len <= len(self._bin_buf):
+                                    checksum_offset = idx + 2 + 1 + 1 + payload_len
+                                    expected = struct.unpack_from("<H", self._bin_buf, checksum_offset)[0]
+                                    calc = sum(self._bin_buf[idx + 2:checksum_offset]) & 0xFFFF
+                                    if calc == expected:
+                                        found_stream = True
+                                        break
+                                else:
+                                    idx += 1
                             else:
                                 idx += 1
                         else:
@@ -341,6 +476,10 @@ class USBSerialReader:
                 if found_cfg_ok:
                     self._last_data_time = time.time()
                     return True
+                if found_stream:
+                    self._last_data_time = time.time()
+                    self.logger.info("Streaming started before CFG_OK was observed")
+                    return True
 
                 # Keep buffer bounded
                 if len(self._bin_buf) > 4096:
@@ -348,15 +487,69 @@ class USBSerialReader:
 
             time.sleep(0.01)
 
-    def send_zero(self):
-        """Request re-zero (sets current pitch as zero reference)."""
-        if not self.ser or not self.ser.is_open:
-            self.logger.warning("Not connected - cannot send ZERO")
-            return False
+    def set_status_enabled(self, enabled: bool):
+        """Legacy no-op retained for compatibility."""
+        self._status_enabled = bool(enabled)
+        self.logger.warning("Firmware status telemetry is unavailable in stream-only mode")
+        return False
 
-        self.ser.write(b"CMD=ZERO\n")
-        self.logger.info("Sent ZERO command")
+    def _send_heartbeat_if_due(self):
+        return
+
+    def _parse_status_payload(self):
+        if len(self._bin_buf) < 37:
+            return None
+        frame_len = 37
+        checksum_offset = frame_len - 2
+        expected = struct.unpack_from("<H", self._bin_buf, checksum_offset)[0]
+        calc = sum(self._bin_buf[2:checksum_offset]) & 0xFFFF
+        if calc != expected:
+            self._checksum_failures += 1
+            del self._bin_buf[0:1]
+            return None
+
+        target_hz, sensor_count, flags = struct.unpack_from("<HBB", self._bin_buf, 3)
+        fields = struct.unpack_from("<IIIIIII", self._bin_buf, 7)
+        with self._lock:
+            self._stream_status = {
+                "target_hz": target_hz,
+                "sensor_count": sensor_count,
+                "flags": flags,
+                "tx_drop_count": fields[0],
+                "tx_short_write_count": fields[1],
+                "usb_disconnect_count": fields[2],
+                "loop_overrun_count": fields[3],
+                "max_loop_lag_us": fields[4],
+                "last_loop_us": fields[5],
+                "host_age_ms": fields[6],
+            }
+        del self._bin_buf[:frame_len]
         return True
+
+    def _fill_binary_buffer(self, min_bytes=1):
+        """Pull bytes from serial, preferring low-latency reads on POSIX."""
+        if not self.ser or not self.ser.is_open:
+            return 0
+
+        read_count = 0
+        try:
+            if self._blocking_reads and len(self._bin_buf) < min_bytes:
+                needed = max(1, min_bytes - len(self._bin_buf))
+                chunk = self.ser.read(needed)
+                if chunk:
+                    self._bin_buf.extend(chunk)
+                    read_count += len(chunk)
+
+            waiting = self.ser.in_waiting
+            if waiting > 0:
+                chunk = self.ser.read(waiting)
+                if chunk:
+                    self._bin_buf.extend(chunk)
+                    read_count += len(chunk)
+        except (serial.SerialException, OSError):
+            return 0
+
+        return read_count
 
     # ------------------------------------------------------------------
     # Data reading
@@ -387,33 +580,118 @@ class USBSerialReader:
         """Check if data stream is alive. Returns True if OK, False if timed out."""
         if self.heartbeat_timeout <= 0:
             return True
+
         elapsed = time.time() - self._last_data_time
-        if elapsed > self.heartbeat_timeout:
-            self.logger.warning(f"No data for {elapsed:.1f}s — connection may be lost")
-            return False
-        return True
+        if elapsed <= self.heartbeat_timeout:
+            return True
+
+        if self._blocking_reads and self.ser and self.ser.is_open:
+            try:
+                rescue = self.ser.read(1)
+            except (serial.SerialException, OSError):
+                rescue = b""
+            if rescue:
+                self._bin_buf.extend(rescue)
+                self._last_data_time = time.time()
+                return True
+
+        self.logger.warning(f"No data for {elapsed:.1f}s — connection may be lost")
+        return False
 
     def _update_sps(self):
-        """Update samples-per-second counter."""
-        self._frame_count += 1
-        now = time.time()
-        elapsed = now - self._sps_time
-        if elapsed >= 1.0:
-            self._sps = self._frame_count / elapsed
-            self._frame_count = 0
-            self._sps_time = now
+        """Update host-observed and timestamp-derived SPS counters."""
+        now = time.perf_counter()
+        if self._prime_sps:
+            self._host_frame_count = 0
+            self._host_sps = 0.0
+            self._host_sps_time = now
+            self._ts_frame_count = 0
+            self._timestamp_sps = 0.0
+            self._ts_window_start_us = self.last_timestamp_us
+            self._ts_prev_us = self.last_timestamp_us
+            self._prime_sps = False
+            return
 
-    def _read_binary_frame(self):
+        self._host_frame_count += 1
+        elapsed = now - self._host_sps_time
+        if elapsed >= 1.0:
+            self._host_sps = self._host_frame_count / elapsed
+            self._host_frame_count = 0
+            self._host_sps_time = now
+
+        ts_us = self.last_timestamp_us
+        if ts_us is None:
+            return
+
+        if self._ts_prev_us is None or self._ts_window_start_us is None or ts_us < self._ts_prev_us:
+            self._ts_frame_count = 0
+            self._timestamp_sps = 0.0
+            self._ts_window_start_us = ts_us
+            self._ts_prev_us = ts_us
+            return
+
+        self._ts_frame_count += 1
+        elapsed_ts_us = ts_us - self._ts_window_start_us
+        if elapsed_ts_us >= 1_000_000:
+            self._timestamp_sps = self._ts_frame_count * 1_000_000.0 / elapsed_ts_us
+            self._ts_frame_count = 0
+            self._ts_window_start_us = ts_us
+
+        self._ts_prev_us = ts_us
+
+    def _reset_sps_tracking(self):
+        """Restart SPS measurement after connect or resync."""
+        self._host_frame_count = 0
+        self._host_sps = 0.0
+        self._host_sps_time = time.perf_counter()
+        self._ts_frame_count = 0
+        self._timestamp_sps = 0.0
+        self._ts_window_start_us = None
+        self._ts_prev_us = None
+        self._prime_sps = True
+
+    def _parse_descriptor_payload(self, start, desc_count):
+        """Decode descriptor payload from the current binary buffer."""
+        target_sps = struct.unpack_from("<H", self._bin_buf, start + 4)[0]
+        descriptors = []
+        for i in range(desc_count):
+            bus = self._bin_buf[start + 6 + i * 2]
+            addr = self._bin_buf[start + 6 + i * 2 + 1]
+            descriptors.append({
+                "bus": bus,
+                "addr": addr,
+                "label": f"I2C{bus}:0x{addr:02X}",
+            })
+        return target_sps, descriptors
+
+    def _apply_descriptor(self, desc_count, target_sps, descriptors):
+        """Store descriptor data and log only when it changes."""
+        signature = (target_sps, tuple((d["bus"], d["addr"]) for d in descriptors))
+        changed = signature != self._descriptor_signature
+
+        with self._lock:
+            self._target_sps = target_sps
+            self._imu_descriptors = descriptors
+            self.num_sensors = desc_count
+
+        if changed:
+            self._descriptor_signature = signature
+            labels = ", ".join(d["label"] for d in descriptors)
+            self.logger.info(
+                "IMU descriptor: %d sensor(s) @ %d Hz - %s",
+                desc_count,
+                target_sps,
+                labels,
+            )
+
+    def _read_binary_frame(self, refill=True):
         """Parse binary IMU frame from serial buffer."""
         if not self.ser or not self.ser.is_open:
             return None
 
         # Read available data into buffer
-        try:
-            if self.ser.in_waiting > 0:
-                self._bin_buf.extend(self.ser.read(self.ser.in_waiting))
-        except (serial.SerialException, OSError):
-            return None
+        if refill:
+            self._fill_binary_buffer(min_bytes=8)
 
         # Frame: 0xAA 0x55 | ver(1) | count(1) | ts_us(4) | payload | checksum(2)
         while True:
@@ -431,24 +709,49 @@ class USBSerialReader:
                 return None
             if sync > 0:
                 del self._bin_buf[:sync]
-                if len(self._bin_buf) < 4:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=8)
+                if len(self._bin_buf) < 8:
                     return None
 
             # Parse header
+            if len(self._bin_buf) < 8:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=8)
             if len(self._bin_buf) < 8:
                 return None
 
             version = self._bin_buf[2]
 
-            # Handle control frames (version=2) - skip them silently
+            # Handle control frames (version=2)
             if version == self.FRAME_VERSION_CTRL:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=6)
                 if len(self._bin_buf) < 6:
                     return None
+                msg_type = self._bin_buf[3]
+                expected_cs = struct.unpack_from("<H", self._bin_buf, 4)[0]
+                calc_cs = (version + msg_type) & 0xFFFF
+                if calc_cs == expected_cs:
+                    if msg_type == self.MSG_TYPE_ERR_I2C:
+                        self.logger.error("Pico reported I2C initialization failure")
+                    elif msg_type == self.MSG_TYPE_ERR_IMU:
+                        self.logger.error("Pico reported IMU initialization failure")
                 del self._bin_buf[:6]
+                continue
+
+            if version == self.FRAME_VERSION_STATUS:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=37)
+                parsed = self._parse_status_payload()
+                if parsed is None:
+                    return None
                 continue
 
             # Handle IMU descriptor frame (version=3)
             if version == self.FRAME_VERSION_DESC:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=8)
                 if len(self._bin_buf) < 8:
                     return None
                 desc_count = self._bin_buf[3]
@@ -457,6 +760,8 @@ class USBSerialReader:
                     continue
                 # Frame: sync(2) + ver(1) + count(1) + sps(2) + N*2 + checksum(2)
                 desc_frame_len = 4 + 2 + desc_count * 2 + 2
+                if refill:
+                    self._fill_binary_buffer(min_bytes=desc_frame_len)
                 if len(self._bin_buf) < desc_frame_len:
                     return None
                 # Verify checksum
@@ -464,22 +769,8 @@ class USBSerialReader:
                 expected_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
                 calc_cs = sum(self._bin_buf[2:cs_off]) & 0xFFFF
                 if calc_cs == expected_cs:
-                    self._target_sps = struct.unpack_from("<H", self._bin_buf, 4)[0]
-                    self._imu_descriptors = []
-                    for i in range(desc_count):
-                        bus = self._bin_buf[6 + i * 2]
-                        addr = self._bin_buf[6 + i * 2 + 1]
-                        self._imu_descriptors.append({
-                            "bus": bus,
-                            "addr": addr,
-                            "label": f"I2C{bus}:0x{addr:02X}",
-                        })
-                    self.num_sensors = desc_count
-                    self.logger.info(
-                        "IMU descriptor: %d sensor(s) @ %d Hz — %s",
-                        desc_count, self._target_sps,
-                        ", ".join(d["label"] for d in self._imu_descriptors),
-                    )
+                    target_sps, descriptors = self._parse_descriptor_payload(0, desc_count)
+                    self._apply_descriptor(desc_count, target_sps, descriptors)
                 del self._bin_buf[:desc_frame_len]
                 continue
 
@@ -495,6 +786,8 @@ class USBSerialReader:
             payload_len = 4 + sensor_count * self.FLOATS_PER_SENSOR * 4
             frame_len = 2 + 1 + 1 + payload_len + 2
 
+            if refill:
+                self._fill_binary_buffer(min_bytes=frame_len)
             if len(self._bin_buf) < frame_len:
                 return None
 
@@ -520,7 +813,7 @@ class USBSerialReader:
 
             # Parse timestamp
             ts = struct.unpack_from("<I", self._bin_buf, 4)[0]
-            self.last_timestamp_us = int(ts)
+            ts = int(ts)
 
             # Parse sensor data
             imu_data = []
@@ -531,12 +824,62 @@ class USBSerialReader:
                 offset += 28
 
             del self._bin_buf[:frame_len]
+            self.last_timestamp_us = ts
             self._last_data_time = time.time()
             self._update_sps()
-            if self.num_sensors != sensor_count:
-                self.num_sensors = sensor_count
+            sensor_count_changed = False
+            with self._lock:
+                if self.num_sensors != sensor_count:
+                    self.num_sensors = sensor_count
+                    sensor_count_changed = True
+            if sensor_count_changed:
                 self.logger.info(f"Receiving data from {sensor_count} IMU(s)")
             return imu_data
+
+    def _reader_loop(self):
+        while not self._reader_stop.is_set():
+            try:
+                frame = self.read_imus(auto_reconnect=True)
+                if frame is not None:
+                    with self._lock:
+                        self._latest_frame = frame
+                        self._latest_frame_seq += 1
+                elif self._blocking_reads:
+                    time.sleep(0.0005)
+            except Exception as exc:
+                self.logger.warning("Background IMU reader stopped: %s", exc)
+                time.sleep(0.05)
+
+    def start_background_reader(self):
+        """Start a latest-only background drain thread."""
+        if self.simulation_mode:
+            return True
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            return True
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        return True
+
+    def stop_background_reader(self):
+        """Stop the background reader thread if running."""
+        self._reader_stop.set()
+        thread = self._reader_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._reader_thread = None
+
+    def get_latest_imus(self, only_new=True):
+        """Return the newest frame captured by the background reader."""
+        if self.simulation_mode:
+            return self.generate_simulation_data()
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+            if only_new and self._latest_frame_seq == self._last_returned_seq:
+                return None
+            self._last_returned_seq = self._latest_frame_seq
+            return [list(pkt) for pkt in self._latest_frame]
 
     def read_imus(self, auto_reconnect=True):
         """
@@ -559,10 +902,11 @@ class USBSerialReader:
             # Put bytes back into binary buffer for parsing
             self._bin_buf.extend(peek)
 
-        # Drain buffer and return only the LATEST frame to avoid latency
-        latest_data = None
+        # Refill once, then drain only the backlog already buffered. Otherwise a
+        # continuous stream can keep this call busy forever on POSIX.
+        latest_data = self._read_binary_frame(refill=True)
         while True:
-            data = self._read_binary_frame()
+            data = self._read_binary_frame(refill=False)
             if data is None:
                 break
             latest_data = data
@@ -574,13 +918,16 @@ class USBSerialReader:
         return latest_data
 
     def quaternion_to_pitch(self, w, x, y, z):
-        """Extract pitch angle (Y-axis rotation) from quaternion in degrees."""
-        # Y-twist: 2*atan2(y, w)
-        pitch = 2.0 * math.atan2(y, w) * 180.0 / math.pi
-        if pitch <= -180.0:
-            pitch += 360.0
-        elif pitch > 180.0:
-            pitch -= 360.0
+        """Extract pitch angle from quaternion using gravity vector projection (degrees).
+
+        Computes pitch as the angle of the gravity vector projected through the
+        quaternion rotation, matching the firmware's gravity-based extraction.
+        """
+        # Rotate world gravity [0,0,-1] by conjugate of quaternion to get
+        # gravity in sensor frame, then compute pitch = atan2(-gx, gz)
+        gx = 2.0 * (x * z - w * y)
+        gz = 1.0 - 2.0 * (x * x + y * y)
+        pitch = math.atan2(-gx, gz) * 180.0 / math.pi
         return pitch
 
     def iter_stream(self, sleep_s=0.001):
@@ -617,12 +964,17 @@ if __name__ == "__main__":
                         help="Gyro range (125/250/500/1000/2000)")
     parser.add_argument("--sim", action="store_true", help="Simulation mode")
     parser.add_argument("--debug", action="store_true", help="Print raw serial data")
+    parser.add_argument("--status", action="store_true",
+                        help="Legacy option; ignored by stream-only firmware")
     parser.add_argument("--no-checksum", action="store_true",
                         help="Skip checksum verification (debug only)")
     parser.add_argument("--no-wait", action="store_true",
                         help="Skip waiting for CFG_OK (useful if Pico is already streaming)")
     parser.add_argument("--heartbeat", type=float, default=3.0,
                         help="Reconnect if no data for this many seconds (0=disable)")
+    parser.add_argument("--poll-sleep-ms", type=float,
+                        default=0.0 if os.name != "nt" else 1.0,
+                        help="Host loop sleep between polls in ms (default: 0 on Linux, 1 on Windows)")
     args = parser.parse_args()
 
     reader = USBSerialReader(
@@ -640,7 +992,7 @@ if __name__ == "__main__":
             gyro_dps=args.gyro_dps,
         )
         if not args.no_wait:
-            if not reader.wait_for_cfg_ok(timeout_s=5.0, resend_s=0.5):
+            if not reader.wait_for_cfg_ok(timeout_s=1.0, resend_s=0.3):
                 reader.logger.warning("CFG_OK not received; continuing anyway")
 
     # Wait briefly for descriptor frame to arrive with first data
@@ -650,6 +1002,7 @@ if __name__ == "__main__":
     n = 0
 
     try:
+        poll_sleep_s = max(0.0, args.poll_sleep_ms / 1000.0)
         while True:
             data = reader.read_imus()
             if data is not None:
@@ -675,14 +1028,21 @@ if __name__ == "__main__":
                         pitch = reader.quaternion_to_pitch(w, x, y, z)
                         label = descs[i]["label"] if i < len(descs) else f"IMU{i}"
                         pitches.append(f"{label}:{pitch:+6.1f}")
-                    sps_str = f"{st['sps']:.0f}"
+                    host_sps_str = f"{st['host_sps']:.0f}"
+                    ts_sps_str = f"{st['timestamp_sps']:.0f}"
                     if st['target_sps']:
-                        sps_str += f"/{st['target_sps']}"
+                        host_sps_str += f"/{st['target_sps']}"
+                        ts_sps_str += f"/{st['target_sps']}"
                     ts = reader.last_timestamp_us
-                    print(f"SPS={sps_str:>7s} Hz  ts={ts:10d}  {' | '.join(pitches)}")
+                    print(
+                        f"Host={host_sps_str:>7s} Hz  FW={ts_sps_str:>7s} Hz  "
+                        f"cs={st['checksum_failures']:3d} hdr={st['header_failures']:3d} rc={st['reconnect_count']:2d} "
+                        f"ts={ts:10d}  {' | '.join(pitches)}"
+                    )
                     n = 0
                     t0 = time.time()
-            time.sleep(0.001)
+            if poll_sleep_s > 0:
+                time.sleep(poll_sleep_s)
     except KeyboardInterrupt:
         pass
     finally:

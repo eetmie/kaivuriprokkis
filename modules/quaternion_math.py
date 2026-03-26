@@ -10,7 +10,7 @@ import numba
 
 
 # General utility functions for numerical operations
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def normalize_vector(x, eps=1e-9):
     """Normalize a vector to unit length."""
     x = np.asarray(x, dtype=np.float32)
@@ -21,7 +21,7 @@ def normalize_vector(x, eps=1e-9):
     return x / norm
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def saturate(x, lower, upper):
     """Clamp values between lower and upper bounds."""
     x = np.asarray(x, dtype=np.float32)
@@ -30,7 +30,7 @@ def saturate(x, lower, upper):
     return np.maximum(np.minimum(x, upper), lower)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def wrap_to_pi(angles):
     """Wrap angles to [-π, π] range."""
     angles = np.asarray(angles, dtype=np.float32)
@@ -46,7 +46,7 @@ def wrap_to_pi(angles):
 
 
 # Quaternion operations
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_normalize(q, eps=1e-9):
     """
     Normalize a quaternion to unit magnitude.
@@ -65,7 +65,7 @@ def quat_normalize(q, eps=1e-9):
     return q / norm
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_multiply(q1, q2):
     """
     Multiply two quaternions.
@@ -98,7 +98,7 @@ def quat_multiply(q1, q2):
     return np.array([w, x, y, z], dtype=np.float32)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_inverse(q):
     """
     Compute quaternion inverse.
@@ -114,7 +114,7 @@ def quat_inverse(q):
 
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_conjugate(q):
     """
     Computes the conjugate of a quaternion.
@@ -134,7 +134,7 @@ def quat_conjugate(q):
     return result
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_rotate_vector(q, v):
     """
     Rotate a 3D vector using a quaternion.
@@ -172,7 +172,7 @@ def quat_rotate_vector(q, v):
     return v + np.float32(2.0) * qw * cross1 + np.float32(2.0) * cross2
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_from_axis_angle(axis, angle):
     """Convert axis-angle to quaternion."""
     axis = np.asarray(axis, dtype=np.float32)
@@ -192,7 +192,7 @@ def quat_from_axis_angle(axis, angle):
     ], dtype=np.float32)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def axis_angle_from_quat(q, eps=1e-6):
     """Convert quaternion to axis-angle representation."""
     q = np.asarray(q, dtype=np.float32)
@@ -218,7 +218,7 @@ def axis_angle_from_quat(q, eps=1e-6):
     return (axis * angle).astype(np.float32)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def axis_angle_from_quat_signed(q, eps=1e-6):
     """
     Convert quaternion to axis-angle representation with signed angle.
@@ -244,7 +244,7 @@ def axis_angle_from_quat_signed(q, eps=1e-6):
     axis = quat_im / mag
     return (axis * angle).astype(np.float32)
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_from_euler_xyz(roll, pitch, yaw):
     """
     Convert Euler angles (XYZ convention) to quaternion.
@@ -279,7 +279,7 @@ def quat_from_euler_xyz(roll, pitch, yaw):
     return np.array([qw, qx, qy, qz], dtype=np.float32)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def euler_xyz_from_quat(quat):
     """
     Convert quaternion to Euler angles (XYZ convention).
@@ -288,7 +288,7 @@ def euler_xyz_from_quat(quat):
         quat: Quaternion [w, x, y, z]
 
     Returns:
-        Tuple of (roll, pitch, yaw) in radians as float32. [0, 2π]!
+        Tuple of (roll, pitch, yaw) in radians as float32. [-π, π].
     """
     # Ensure float32
     quat = np.asarray(quat, dtype=np.float32)
@@ -314,7 +314,7 @@ def euler_xyz_from_quat(quat):
 
     return roll, pitch, yaw
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_unique(q):
     """Ensure quaternion has positive real part."""
     q = np.asarray(q, dtype=np.float32)
@@ -323,7 +323,88 @@ def quat_unique(q):
     return q
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
+def quat_enforce_hemisphere(q, q_prev):
+    """Keep quaternion in the same hemisphere as a previous quaternion.
+
+    Quaternions q and -q represent the same rotation, but flipping between
+    them causes interpolation and visualization artefacts. This negates q
+    when it points away from q_prev (negative dot product).
+
+    Args:
+        q: Current quaternion [w, x, y, z]
+        q_prev: Previous quaternion [w, x, y, z]
+
+    Returns:
+        q or -q, whichever is closer to q_prev.
+    """
+    q = np.asarray(q, dtype=np.float32)
+    q_prev = np.asarray(q_prev, dtype=np.float32)
+    dot = q[0]*q_prev[0] + q[1]*q_prev[1] + q[2]*q_prev[2] + q[3]*q_prev[3]
+    if dot < np.float32(0.0):
+        return -q
+    return q
+
+
+@numba.njit(fastmath=False, nogil=True)
+def quat_slerp(q1, q2, t):
+    """Spherical linear interpolation between two quaternions.
+
+    Args:
+        q1: Start quaternion [w, x, y, z]  (returned when t=0)
+        q2: End quaternion [w, x, y, z]    (returned when t=1)
+        t:  Interpolation parameter in [0, 1]
+
+    Returns:
+        Interpolated unit quaternion [w, x, y, z]
+    """
+    q1 = np.asarray(q1, dtype=np.float32)
+    q2 = np.asarray(q2, dtype=np.float32)
+    t = np.float32(t)
+
+    dot = q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3]
+
+    # Stay in same hemisphere
+    if dot < np.float32(0.0):
+        q2 = -q2
+        dot = -dot
+
+    # If very close, use linear interp to avoid division by zero
+    if dot > np.float32(0.9995):
+        result = q1 + t * (q2 - q1)
+        return quat_normalize(result)
+
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    w1 = np.sin((np.float32(1.0) - t) * theta) / sin_theta
+    w2 = np.sin(t * theta) / sin_theta
+    return quat_normalize(w1 * q1 + w2 * q2)
+
+
+@numba.njit(fastmath=False, nogil=True)
+def quat_remove_yaw(q):
+    """Remove yaw (Z-axis rotation) component from a quaternion.
+
+    Computes the yaw angle, builds its inverse, and pre-multiplies
+    to cancel it out, leaving only roll and pitch.
+
+    Args:
+        q: Quaternion [w, x, y, z]
+
+    Returns:
+        Quaternion with yaw zeroed out.
+    """
+    q = np.asarray(q, dtype=np.float32)
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    yaw = np.arctan2(np.float32(2.0) * (w * z + x * y),
+                     np.float32(1.0) - np.float32(2.0) * (y * y + z * z))
+    half = -yaw / np.float32(2.0)
+    yaw_inv = np.array([np.cos(half), np.float32(0.0), np.float32(0.0),
+                         np.sin(half)], dtype=np.float32)
+    return quat_multiply(yaw_inv, q)
+
+
+@numba.njit(fastmath=False, nogil=True)
 def quat_box_minus(q1, q2):
     """Quaternion box-minus operator (quaternion difference)."""
     q1 = np.asarray(q1, dtype=np.float32)
@@ -336,14 +417,14 @@ def quat_box_minus(q1, q2):
     return axis_angle_from_quat(quat_diff)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_error_magnitude(q1, q2):
     """Compute angular error between two quaternions."""
     diff_axis_angle = quat_box_minus(q1, q2)
     return np.linalg.norm(diff_axis_angle)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def compute_quat_error(q1, q2):
     """
     Compute the orientation error between two quaternions.
@@ -368,7 +449,7 @@ def compute_quat_error(q1, q2):
     return axis_angle_from_quat(quat_error)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def quat_exponential(v, scalar=0.0):
     """
     Compute quaternion exponential exp(q).
@@ -403,7 +484,7 @@ def quat_exponential(v, scalar=0.0):
     ], dtype=np.float32)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def integrate_quat_exp(q, angular_velocity, dt):
     """
     Integrate quaternion with exponential method.
@@ -451,7 +532,7 @@ def y_deg_from_quat(q: np.ndarray) -> float:
     return float(np.rad2deg(angle))
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def compute_pose_error(pos1, quat1, pos2, quat2):
     """
     Compute the position and orientation error between current and target poses.
@@ -481,7 +562,7 @@ def compute_pose_error(pos1, quat1, pos2, quat2):
     return pos_error, rot_error
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def apply_delta_pose(source_pos, source_quat, delta_pose, eps=1e-6):
     """
     Apply delta pose (6DOF: position + axis-angle) to source pose.
@@ -518,7 +599,7 @@ def apply_delta_pose(source_pos, source_quat, delta_pose, eps=1e-6):
     return target_pos, quat_normalize(target_quat)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def check_jacobian_singularity(jacobian, threshold=1e-3):
     """
     Check if Jacobian is near singular configuration.
@@ -538,13 +619,13 @@ def check_jacobian_singularity(jacobian, threshold=1e-3):
     return is_singular, condition_number, min_sv
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def apply_joint_limits(joint_angles, joint_limits_lower, joint_limits_upper):
     """Apply joint limits with clamping."""
     return saturate(joint_angles, joint_limits_lower, joint_limits_upper)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def apply_joint_velocity_limits(delta_joints, velocity_limits, dt=0.01):
     """Apply joint velocity limits."""
     delta_joints = np.asarray(delta_joints, dtype=np.float32)
@@ -555,7 +636,7 @@ def apply_joint_velocity_limits(delta_joints, velocity_limits, dt=0.01):
     return saturate(delta_joints, -max_delta, max_delta)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def check_workspace_limits(target_pos, max_reach, min_reach=0.0):
     """Check if target position is within workspace."""
     target_pos = np.asarray(target_pos, dtype=np.float32)
@@ -566,7 +647,7 @@ def check_workspace_limits(target_pos, max_reach, min_reach=0.0):
     return (distance >= min_reach) and (distance <= max_reach)
 
 
-@numba.njit(fastmath=False)
+@numba.njit(fastmath=False, nogil=True)
 def compute_manipulability(jacobian):
     """Compute manipulability measure (sqrt of determinant of J*J^T)."""
     jacobian = np.asarray(jacobian, dtype=np.float32)

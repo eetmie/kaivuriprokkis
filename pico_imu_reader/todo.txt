@@ -1,30 +1,79 @@
-TODO: Add DTR disconnect detection
-======================================
+Firmware changes now in place in this repo:
 
-When Python closes the serial port, DTR drops. Monitor this to reset
-the Pico back to config-waiting state without power cycling.
+  Wiring note (confirmed on hardware, keep this fixed):
 
-Changes needed:
+  - Board: Seeed XIAO RP2040
+  - I2C0 bus uses P28/P29
+  - I2C1 bus uses P6/P7
+  - P26/P27 does NOT have the second IMU bus on this hardware setup
+  - Do not change these pin assignments unless the physical wiring is changed too
 
-1. update_loop() in main.c - Add DTR check, return bool on disconnect:
-   ```c
-   // Inside while(true), after tud_task():
-   if (!(tud_cdc_get_line_state() & 0x01)) {  // DTR dropped
-       return false;
-   }
-   ```
+  - IMU discovery is runtime-based, not fixed-slot.
+  - Probes all four valid locations:
+      - I2C0 @ 0x6A
+      - I2C0 @ 0x6B
+      - I2C1 @ 0x6A
+      - I2C1 @ 0x6B
+  - Detection uses WHO_AM_I == ISM330DHCX_ID.
+  - Active IMU list is cached after init and reused until restart/re-init.
+  - Data frame sensor count is variable and matches detected IMUs.
+  - Descriptor frames are sent at stream startup and retried a few times.
+  - Descriptor payload includes:
+      - sensor count
+      - sample rate
+      - per-sensor bus
+      - per-sensor addr
+  - Tilt extraction was changed to gravity-based pitch/roll, not 2*atan2(y,w).
+  - Firmware-side zero/identity command handling was removed as unused.
 
-2. main() in main.c - Wrap in outer loop:
-   ```c
-   while (1) {
-       wait_for_settings();
-       // ... existing setup ...
-       if (!update_loop(...)) {
-           // Disconnected - re-enable console and restart
-           cdc_console_enable(true);
-           continue;
-       }
-   }
-   ```
+  Completed follow-up:
 
-~10 lines total. No Python changes needed.
+  - [DONE] Updated host-side Python pitch extraction in usb_serial_reader.py to gravity-based method.
+  - [DONE] Updated simple_drive_logging.py pitch extraction to gravity-based method.
+  - Host tilt extraction now matches firmware's gravity-based approach.
+
+  Potential next improvements:
+
+  - Send descriptor frames periodically, not only at startup retries, if reconnect behavior needs to be
+    bulletproof.
+  - Add a host command to request descriptor resend on demand.
+  - Add explicit per-IMU health/status flags in the binary protocol if needed later.
+
+Notes from Mar 26, 2026 troubleshooting:
+
+  - Confirmed hardware bus wiring on Seeed XIAO RP2040:
+      - I2C0 -> P28/P29
+      - I2C1 -> P6/P7
+      - P26/P27 is not used for the second IMU bus on this setup.
+  - Added and used an I2C scan demo to verify all four IMUs are physically present.
+  - Added and used an I2C stress demo; raw 200 kHz read ceiling measured roughly:
+      - ~268 Hz with 4 IMUs
+      - ~358 Hz with 3 IMUs
+  - Conclusion from stress test:
+      - 200 Hz with 4 IMUs is feasible with modest processing overhead.
+      - 300 Hz with 4 IMUs is not realistic at 200 kHz I2C in the current design.
+  - Updated firmware loop timing to use absolute-deadline scheduling.
+  - Added host-vs-firmware SPS reporting to usb_serial_reader.py.
+  - Added reconnect/re-init support via host heartbeat and re-entry to config mode.
+  - Added optional status telemetry counters (drop/short/overrun/lag).
+  - Observed behavior:
+      - Windows host sustains 200 Hz cleanly.
+      - Raspberry Pi 5 can still drop the USB CDC connection even at 100 Hz.
+      - During Pi-side drops, checksum/header failures remain at zero, suggesting link stalls rather than frame corruption.
+  - Tried simplified stream-only firmware/host paths and an RT reader demo; none proved more reliable on the Pi,
+    so those experiments were removed to keep the repo clean.
+  - Current practical baseline kept in repo:
+      - full main firmware stack
+      - default sample rate reduced to 100 Hz
+      - reconnect logic retained
+      - I2C scan demo retained
+
+  Candidate next firmware simplification to try later:
+
+  - After initial config/bring-up, switch to a lean stream-only runtime path:
+      - read IMUs
+      - run Fusion/AHRS
+      - send binary frame only
+  - Remove heartbeat-driven re-init and periodic status traffic from the hot loop.
+  - If re-init is still needed, prefer an explicit host-triggered re-enter-config action,
+    not automatic timeout-based fallback during streaming.

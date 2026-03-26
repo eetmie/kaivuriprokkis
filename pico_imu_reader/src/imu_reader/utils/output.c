@@ -1,32 +1,54 @@
 #include "output.h"
 #include "tusb.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #define FRAME_SYNC_0 0xAA
 #define FRAME_SYNC_1 0x55
-#define FRAME_VERSION_DATA 1
-#define FRAME_VERSION_CTRL 2
-#define NUM_SENSORS 3
-#define FLOATS_PER_SENSOR 7
+#define FRAME_TYPE_DATA 1
+#define FRAME_TYPE_CTRL 2
+#define FRAME_TYPE_DESC 3
 
-// Binary frame format:
-// [0xAA 0x55] [version:1] [count:1] [timestamp_us:4] [sensor0..N: 7 floats each] [checksum:2]
-// Each sensor: w, x, y, z (quaternion), gx, gy, gz (gyro dps)
-
-void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR]) {
+static bool cdc_send_frame_best_effort(const uint8_t *frame, size_t len, bool drop_if_full) {
+    (void)drop_if_full;
     if (!tud_cdc_connected()) {
-        return;
+        return false;
     }
 
-    // Frame buffer: header(4) + timestamp(4) + payload(3*7*4=84) + checksum(2) = 94 bytes
-    uint8_t frame[4 + 4 + (NUM_SENSORS * FLOATS_PER_SENSOR * 4) + 2];
+    if (tud_cdc_write_available() < len) {
+        tud_cdc_write_flush();
+        return false;
+    }
+
+    const uint32_t written = tud_cdc_write(frame, len);
+    if (written != len) {
+        tud_cdc_write_flush();
+        return false;
+    }
+
+    tud_cdc_write_flush();
+    return true;
+}
+
+// Binary data frame:
+// [0xAA 0x55] [frame_type:1] [count:1] [timestamp_us:4] [sensor0..N: 7 floats each] [checksum:2]
+// Each sensor: w, x, y, z (quaternion), gx, gy, gz (gyro dps)
+
+void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR], uint8_t sensor_count) {
+    if (sensor_count > MAX_SENSORS) {
+        sensor_count = MAX_SENSORS;
+    }
+
+    // Buffer sized for the maximum supported sensor count.
+    uint8_t frame[4 + 4 + (MAX_SENSORS * FLOATS_PER_SENSOR * 4) + 2];
     size_t idx = 0;
 
     // Sync + header
     frame[idx++] = FRAME_SYNC_0;
     frame[idx++] = FRAME_SYNC_1;
-    frame[idx++] = FRAME_VERSION_DATA;
-    frame[idx++] = NUM_SENSORS;
+    frame[idx++] = FRAME_TYPE_DATA;
+    frame[idx++] = sensor_count;
 
     // Timestamp (truncated to 32-bit, wraps every ~71 minutes)
     uint32_t ts32 = (uint32_t)ts_us;
@@ -34,7 +56,7 @@ void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR]) 
     idx += sizeof(ts32);
 
     // Sensor data
-    for (int i = 0; i < NUM_SENSORS; i++) {
+    for (uint8_t i = 0; i < sensor_count; i++) {
         for (int j = 0; j < FLOATS_PER_SENSOR; j++) {
             float v = sensors_data[i][j];
             memcpy(&frame[idx], &v, sizeof(float));
@@ -50,43 +72,53 @@ void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR]) 
     frame[idx++] = (uint8_t)(checksum & 0xFF);
     frame[idx++] = (uint8_t)((checksum >> 8) & 0xFF);
 
-    // Wait for buffer space to avoid dropping bytes (with timeout)
-    uint32_t avail = tud_cdc_write_available();
-    if (avail < idx) {
-        // Flush any pending data and wait briefly for space
-        tud_cdc_write_flush();
-        for (int retry = 0; retry < 10 && tud_cdc_write_available() < idx; retry++) {
-            tud_task();  // Process USB events
-        }
-    }
-
-    // Write entire frame atomically if possible
-    uint32_t written = tud_cdc_write(frame, idx);
-    if (written < idx) {
-        // Buffer still full - write remaining bytes
-        tud_cdc_write_flush();
-        tud_cdc_write(frame + written, idx - written);
-    }
-    tud_cdc_write_flush();
+    (void)cdc_send_frame_best_effort(frame, idx, true);
 }
 
-// Send a control message (CFG_OK, ZERO_ACK, etc.)
-// Frame: [0xAA 0x55] [version=2] [msg_type] [checksum:2]
+// Send a control message (CFG_OK, CFG_WAIT, etc.)
+// Frame: [0xAA 0x55] [frame_type=2] [msg_type] [checksum:2]
 void send_control_msg(uint8_t msg_type) {
-    if (!tud_cdc_connected()) {
-        return;
-    }
-
     uint8_t frame[6];
     frame[0] = FRAME_SYNC_0;
     frame[1] = FRAME_SYNC_1;
-    frame[2] = FRAME_VERSION_CTRL;
+    frame[2] = FRAME_TYPE_CTRL;
     frame[3] = msg_type;
 
     uint16_t checksum = frame[2] + frame[3];
     frame[4] = (uint8_t)(checksum & 0xFF);
     frame[5] = (uint8_t)((checksum >> 8) & 0xFF);
 
-    tud_cdc_write(frame, sizeof(frame));
-    tud_cdc_write_flush();
+    (void)cdc_send_frame_best_effort(frame, sizeof(frame), false);
+}
+
+// Send a one-shot descriptor frame so the host can map stream index -> bus/address.
+// Frame: [0xAA 0x55] [frame_type=3] [count:1] [sample_rate_hz:2] [bus,addr]*N [checksum:2]
+void send_descriptor_frame(uint16_t sample_rate_hz, uint8_t sensor_count, const uint8_t *bus_ids, const uint8_t *device_addrs) {
+    if (sensor_count > MAX_SENSORS) {
+        sensor_count = MAX_SENSORS;
+    }
+
+    uint8_t frame[4 + 2 + (MAX_SENSORS * 2) + 2];
+    size_t idx = 0;
+
+    frame[idx++] = FRAME_SYNC_0;
+    frame[idx++] = FRAME_SYNC_1;
+    frame[idx++] = FRAME_TYPE_DESC;
+    frame[idx++] = sensor_count;
+    memcpy(&frame[idx], &sample_rate_hz, sizeof(sample_rate_hz));
+    idx += sizeof(sample_rate_hz);
+
+    for (uint8_t i = 0; i < sensor_count; i++) {
+        frame[idx++] = bus_ids[i];
+        frame[idx++] = device_addrs[i];
+    }
+
+    uint16_t checksum = 0;
+    for (size_t i = 2; i < idx; i++) {
+        checksum = (uint16_t)(checksum + frame[i]);
+    }
+    frame[idx++] = (uint8_t)(checksum & 0xFF);
+    frame[idx++] = (uint8_t)((checksum >> 8) & 0xFF);
+
+    (void)cdc_send_frame_best_effort(frame, idx, false);
 }

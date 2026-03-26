@@ -29,7 +29,7 @@ class RobotService:
     def __init__(self, controller, hardware):
         self.controller = controller
         self.hardware = hardware
-        self.robot_config = diff_ik.create_excavator_config()
+        self.robot_config = diff_ik.load_excavator_robot_config()
         self.state = RobotServiceState()
         self._telemetry_sequence = 0
 
@@ -101,6 +101,48 @@ class RobotService:
                     np.array([self.state.target_pose.x, self.state.target_pose.y, self.state.target_pose.z], dtype=np.float32),
                     float(self.state.target_pose.rot_y_deg),
                 )
+
+    # ---- Lifecycle wrappers ----
+
+    def start(self):
+        """Start the controller's background control loop."""
+        self.controller.start()
+
+    def stop(self):
+        """Stop the controller and reset hardware."""
+        self.controller.stop()
+        self.hardware.reset(reset_pump=True)
+
+    def reset_perf_stats(self):
+        """Reset performance statistics on controller and hardware."""
+        try:
+            self.controller.reset_performance_stats()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.hardware, "reset_perf_stats"):
+                self.hardware.reset_perf_stats()
+        except Exception:
+            pass
+
+    def get_debug_state(self) -> dict:
+        """Return debug info for diagnostics without exposing controller internals."""
+        state = {
+            'raw_quaternions': self.controller.get_raw_quaternions(),
+            'condition_number': self.controller.get_condition_number(),
+            'perf_stats': self.controller.get_performance_stats() or {},
+            'robot_config': self.robot_config,
+        }
+        # Include base IMU if available
+        base_imu = self.hardware.read_base_imu()
+        if base_imu is not None:
+            state['base_imu_quat'] = base_imu.get('quat')
+            state['base_imu_gyro'] = base_imu.get('gyro')
+        return state
+
+    def get_pose(self):
+        """Return (position_array, rot_y_deg) from the controller."""
+        return self.controller.get_pose()
 
     def get_state(self) -> RobotTelemetry:
         measured_pos, measured_rot = self.controller.get_pose()

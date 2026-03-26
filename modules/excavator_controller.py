@@ -26,7 +26,7 @@ import yaml
 # Import project modules
 from . import diff_ik_V2 as diff_ik
 from .pid import PIDController
-from .quaternion_math import quat_from_axis_angle, quat_rotate_vector, quat_conjugate
+from .quaternion_math import quat_from_axis_angle
 from .perf_tracker import ControlLoopPerfTracker
 
 # Load settings
@@ -535,7 +535,7 @@ class ExcavatorController:
         self._control_config = _load_control_config() if config is None else {}
 
         # Robot configuration
-        self.robot_config = diff_ik.create_excavator_config()
+        self.robot_config = diff_ik.load_excavator_robot_config()
         diff_ik.warmup_numba_functions()
 
         # IK controller setup (pull settings from control_config.yaml - fail hard if missing)
@@ -1205,13 +1205,9 @@ class ExcavatorController:
             gyro_vec_dps = np.asarray(gyro_packets[i], dtype=np.float32)
             gyro_vec_rad = np.radians(gyro_vec_dps)
 
-            # Correct gyro vector for IMU mounting orientation.
-            offset_inv = quat_conjugate(self.robot_config.imu_offsets[i + 1])
-            gyro_corrected = quat_rotate_vector(offset_inv, gyro_vec_rad)
-
             axis = self.robot_config.rotation_axes[i + 1]
             axis_norm = axis / (np.linalg.norm(axis) + 1e-12)
-            joint_rates[i] = float(np.dot(gyro_corrected, axis_norm))
+            joint_rates[i] = float(np.dot(gyro_vec_rad, axis_norm))
 
         if self._gyro_bias_enabled:
             if np.max(np.abs(joint_rates)) <= self._gyro_bias_stationarity_radps:
@@ -1321,17 +1317,14 @@ class ExcavatorController:
             self._slew_fusion_filter.update_encoder_only(encoder_angle)
             return slew_quat
 
-        # Extract Z-axis gyro rate from each IMU, corrected for mounting orientation
+        # Extract Z-axis gyro rate from each IMU. HardwareInterface already applies mounting correction.
         z_rates = np.zeros(3, dtype=np.float32)
         for i in range(3):
             gyro_vec_dps = np.asarray(gyro_packets[i], dtype=np.float32)
             gyro_vec_rad = np.radians(gyro_vec_dps)
 
-            offset_inv = quat_conjugate(self.robot_config.imu_offsets[i + 1])
-            gyro_corrected = quat_rotate_vector(offset_inv, gyro_vec_rad)
-
             # Project onto Z-axis (slew axis)
-            z_rates[i] = gyro_corrected[2]
+            z_rates[i] = gyro_vec_rad[2]
 
         # Aggregate 3 IMU Z-rates
         if self._slew_fusion_filter.aggregation == "median":
@@ -1346,10 +1339,10 @@ class ExcavatorController:
 
     def _get_raw_quaternions(self) -> Optional[np.ndarray]:
         """
-        Read raw sensor data and combine into quaternion array.
+        Read corrected sensor data and combine into quaternion array.
 
         Returns:
-            Raw quaternions [slew, boom, arm, bucket] or None if hardware not ready
+            Corrected quaternions [slew, boom, arm, bucket] or None if hardware not ready
         """
         try:
             # Read IMU data (3 IMUs: boom, arm, bucket)
@@ -1444,17 +1437,16 @@ class ExcavatorController:
     def _update_current_state(self) -> None:
         """Update current robot state from sensors."""
         try:
-            # Get raw quaternions from sensors
-            raw_quats = self._get_raw_quaternions()
-            if raw_quats is None:
+            # Get corrected quaternions from sensors
+            sensed_quats = self._get_raw_quaternions()
+            if sensed_quats is None:
                 return
 
-            # Compute forward kinematics - get_pose() handles full pipeline
-            ee_pos, ee_quat = diff_ik.get_pose(raw_quats, self.robot_config)
+            # Compute forward kinematics - quaternions are already corrected in HardwareInterface.
+            ee_pos, ee_quat = diff_ik.get_pose(sensed_quats, self.robot_config)
 
             # Also compute processed quaternions for joint angle extraction in control commands
-            corrected_quats = diff_ik.apply_imu_offsets(raw_quats, self.robot_config)
-            projected_quats = diff_ik.project_to_rotation_axes(corrected_quats, self.robot_config.rotation_axes)
+            projected_quats = diff_ik.project_to_rotation_axes(sensed_quats, self.robot_config.rotation_axes)
             propagated_quats = diff_ik.propagate_base_rotation(projected_quats, self.robot_config)
 
             # Extract Y-axis rotation for end-effector orientation
@@ -1467,7 +1459,7 @@ class ExcavatorController:
                 self._current_position = ee_pos
                 self._current_orientation_y_deg = ee_y_angle_deg
                 self._current_projected_quats = propagated_quats  # Cache processed quats for control
-                self._current_raw_quats = raw_quats
+                self._current_raw_quats = sensed_quats
                 self._current_ee_quat_full = ee_quat
 
             # Update simple EE velocity estimates for smoother seeding
@@ -1603,7 +1595,7 @@ class ExcavatorController:
                 ee_pos=current_pos,
                 ee_quat=current_ee_quat_full,  # Full orientation incl. slew yaw
                 joint_angles=current_joint_angles,
-                joint_quats=raw_quats,  # Pass raw IMU quats; V2 handles offsets/propagation
+                joint_quats=raw_quats,  # Hardware already corrected IMU mounting; V2 handles propagation
                 desired_ee_velocity=desired_vel,
                 dt=loop_dt,
                 current_joint_velocities=self._last_joint_vel_radps,

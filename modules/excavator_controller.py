@@ -28,6 +28,7 @@ from . import diff_ik_V2 as diff_ik
 from .pid import PIDController
 from .quaternion_math import quat_from_axis_angle
 from .perf_tracker import ControlLoopPerfTracker
+from .rt_utils import apply_rt_to_thread, SCHED_FIFO
 
 # Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -468,7 +469,9 @@ class MotionProcessor:
 
 class ExcavatorController:
     def __init__(self, hardware_interface, config: Optional[ControllerConfig] = None,
-                 enable_perf_tracking: bool = False, log_level: str = "INFO"):
+                 enable_perf_tracking: bool = False, log_level: str = "INFO",
+                 rt_priority: int = 0, rt_lock_memory: bool = False,
+                 rt_cpu_core: Optional[int] = None):
         """Initialize the excavator controller.
 
         Args:
@@ -476,9 +479,15 @@ class ExcavatorController:
             config: Optional controller configuration
             enable_perf_tracking: Enable performance statistics tracking
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR" (default: "INFO")
+            rt_priority: RT priority for the controller loop thread (0 = normal).
+            rt_lock_memory: Whether to call mlockall() from the controller thread.
+            rt_cpu_core: Optional CPU core to pin the controller loop thread to.
         """
         self.hardware = hardware_interface
         self._enable_perf_tracking = enable_perf_tracking
+        self._rt_priority = int(rt_priority)
+        self._rt_lock_memory = bool(rt_lock_memory)
+        self._rt_cpu_core = rt_cpu_core
 
         # Setup logger for this controller instance
         self.logger = logging.getLogger(f"{__name__}.ExcavatorController")
@@ -531,8 +540,10 @@ class ExcavatorController:
         else:
             self.config = config
 
-        # Store control config reference for later use (PID, velocity limits, etc.)
-        self._control_config = _load_control_config() if config is None else {}
+        # Store full control config reference for later use (PID, IK, velocity limits, etc.)
+        self._control_config = _load_control_config()
+        if not isinstance(self._control_config, dict) or not self._control_config:
+            raise RuntimeError("Controller configuration requires control_config.yaml")
 
         # Robot configuration
         self.robot_config = diff_ik.load_excavator_robot_config()
@@ -938,7 +949,7 @@ class ExcavatorController:
         Returns dict with:
         - Loop timing: avg/std/min/max/p95/p99 in ms
         - Compute timing: avg/std/min/max in ms
-        - Headroom and CPU usage
+        - Headroom, loop utilization, and whole-process CPU usage
         - Stage timings (sensor, ik_fk, pwm)
         - IK telemetry (velocity limits, joint velocities)
         - Hardware stats (IMU/ADC/PWM rates)
@@ -959,10 +970,30 @@ class ExcavatorController:
                 'min_compute_time_ms': 0.0,
                 'max_compute_time_ms': 0.0,
                 'std_compute_time_ms': 0.0,
+                'max_step_ms': 0.0,
                 'avg_headroom_ms': 0.0,
                 'cpu_usage_pct': 0.0,
+                'loop_util_pct': 0.0,
+                'process_cpu_pct': 0.0,
                 'actual_hz': 0.0,
                 'violation_pct': 0.0,
+                'violation_count': 0,
+                'compute_overrun_pct': 0.0,
+                'compute_overrun_count': 0,
+                'compute_overrun_count_recent': 0,
+                'compute_overrun_pct_recent': 0.0,
+                'deadline_miss_count': 0,
+                'deadline_miss_pct': 0.0,
+                'deadline_miss_count_recent': 0,
+                'deadline_miss_pct_recent': 0.0,
+                'deadline_miss_1pct_count': 0,
+                'deadline_miss_1pct_pct': 0.0,
+                'deadline_miss_1pct_count_recent': 0,
+                'deadline_miss_1pct_pct_recent': 0.0,
+                'deadline_window_sec': 0.0,
+                'overrun_count_recent': 0,
+                'overrun_pct_recent': 0.0,
+                'overrun_window_sec': 0.0,
                 'sample_count': 0,
                 # Stage timings
                 'avg_sensor_ms': 0.0, 'min_sensor_ms': 0.0, 'max_sensor_ms': 0.0,
@@ -996,15 +1027,34 @@ class ExcavatorController:
                 'std_loop_time_ms': tracker_stats.get('loop_std_ms', 0.0),
                 'jitter_p95_ms': tracker_stats.get('loop_p95_ms', 0.0),
                 'jitter_p99_ms': tracker_stats.get('loop_p99_ms', 0.0),
+                'max_step_ms': tracker_stats.get('max_step_ms', 0.0),
                 'avg_compute_time_ms': tracker_stats.get('compute_avg_ms', 0.0),
                 'min_compute_time_ms': tracker_stats.get('compute_min_ms', 0.0),
                 'max_compute_time_ms': tracker_stats.get('compute_max_ms', 0.0),
                 'std_compute_time_ms': tracker_stats.get('compute_std_ms', 0.0),
                 'avg_headroom_ms': tracker_stats.get('headroom_avg_ms', 0.0),
                 'cpu_usage_pct': tracker_stats.get('cpu_usage_pct', 0.0),
+                'loop_util_pct': tracker_stats.get('loop_util_pct', tracker_stats.get('cpu_usage_pct', 0.0)),
+                'process_cpu_pct': tracker_stats.get('process_cpu_pct', 0.0),
                 'actual_hz': actual_hz,
                 'violation_pct': tracker_stats.get('violation_pct', 0.0),
                 'violation_count': tracker_stats.get('violation_count', 0),
+                'compute_overrun_pct': tracker_stats.get('compute_overrun_pct', tracker_stats.get('violation_pct', 0.0)),
+                'compute_overrun_count': tracker_stats.get('compute_overrun_count', tracker_stats.get('violation_count', 0)),
+                'compute_overrun_count_recent': tracker_stats.get('compute_overrun_count_recent', 0),
+                'compute_overrun_pct_recent': tracker_stats.get('compute_overrun_pct_recent', 0.0),
+                'deadline_miss_count': tracker_stats.get('deadline_miss_count', 0),
+                'deadline_miss_pct': tracker_stats.get('deadline_miss_pct', 0.0),
+                'deadline_miss_count_recent': tracker_stats.get('deadline_miss_count_recent', tracker_stats.get('overrun_count_recent', 0)),
+                'deadline_miss_pct_recent': tracker_stats.get('deadline_miss_pct_recent', tracker_stats.get('overrun_pct_recent', 0.0)),
+                'deadline_miss_1pct_count': tracker_stats.get('deadline_miss_1pct_count', 0),
+                'deadline_miss_1pct_pct': tracker_stats.get('deadline_miss_1pct_pct', 0.0),
+                'deadline_miss_1pct_count_recent': tracker_stats.get('deadline_miss_1pct_count_recent', 0),
+                'deadline_miss_1pct_pct_recent': tracker_stats.get('deadline_miss_1pct_pct_recent', 0.0),
+                'deadline_window_sec': tracker_stats.get('deadline_window_sec', tracker_stats.get('overrun_window_sec', 0.0)),
+                'overrun_count_recent': tracker_stats.get('overrun_count_recent', 0),
+                'overrun_pct_recent': tracker_stats.get('overrun_pct_recent', 0.0),
+                'overrun_window_sec': tracker_stats.get('overrun_window_sec', 0.0),
                 'sample_count': tracker_stats.get('samples', 0),
                 # Stage timings
                 'avg_sensor_ms': sensor_stats.get('avg_ms', 0.0),
@@ -1368,6 +1418,27 @@ class ExcavatorController:
             return None
 
     def _control_loop(self) -> None:
+        if self._rt_priority > 0 or self._rt_lock_memory or self._rt_cpu_core is not None:
+            cpu_affinity = None if self._rt_cpu_core is None else {int(self._rt_cpu_core)}
+            success = apply_rt_to_thread(
+                priority=self._rt_priority,
+                policy=SCHED_FIFO,
+                lock_memory=self._rt_lock_memory,
+                cpu_affinity=cpu_affinity,
+                quiet=False,
+            )
+            if success:
+                details = []
+                if self._rt_priority > 0:
+                    details.append(f"SCHED_FIFO-{self._rt_priority}")
+                if self._rt_lock_memory:
+                    details.append("mlockall")
+                if self._rt_cpu_core is not None:
+                    details.append(f"core {self._rt_cpu_core}")
+                self.logger.info("Control thread: applied %s", ", ".join(details) if details else "RT settings")
+            else:
+                self.logger.warning("Control thread: Failed to apply requested RT settings")
+
         loop_period = 1.0 / self.config.control_frequency
         next_run_time = time.perf_counter()
         last_loop_start = next_run_time

@@ -203,8 +203,11 @@ class HardwareInterface:
                  enable_adc: bool = True,
                  start_imu_reader: bool = True,
                  start_adc_reader: bool = True,
+                 rt_lock_memory: bool = False,
+                 usb_rt_priority: int = 0,
                  imu_rt_priority: int = 0,
                  adc_rt_priority: int = 0,
+                 usb_cpu_core: Optional[int] = None,
                  imu_cpu_core: Optional[int] = None,
                  adc_cpu_core: Optional[int] = None,
                  pwm_frequency: Optional[int] = None):
@@ -230,9 +233,11 @@ class HardwareInterface:
             enable_adc: If False, skip ADC/encoder initialization and threads
             start_imu_reader: Auto-start IMU background thread when IMU is enabled
             start_adc_reader: Auto-start ADC background thread when ADC is enabled
+            rt_lock_memory: Whether to call mlockall() for RT worker threads.
+            usb_rt_priority: RT priority for USB serial background reader thread (0 = normal).
             imu_rt_priority: RT priority for IMU thread (0 = normal, 1-89 = SCHED_FIFO).
-                             Use lower than control loop priority (e.g., 50 if control is 70).
             adc_rt_priority: RT priority for ADC thread (0 = normal, 1-89 = SCHED_FIFO).
+            usb_cpu_core: CPU core to pin USB serial background reader thread to.
             imu_cpu_core: CPU core to pin IMU thread to (None = no pinning, 0-3 on Pi 5).
             adc_cpu_core: CPU core to pin ADC thread to (None = no pinning, 0-3 on Pi 5).
             adc_sample_hz: Target ADC sampling frequency for the background thread
@@ -257,8 +262,11 @@ class HardwareInterface:
         self._enable_adc = bool(enable_adc)
         self._auto_start_imu = bool(start_imu_reader)
         self._auto_start_adc = bool(start_adc_reader)
+        self._rt_lock_memory = bool(rt_lock_memory)
+        self._usb_rt_priority = int(usb_rt_priority)
         self._imu_rt_priority = int(imu_rt_priority)
         self._adc_rt_priority = int(adc_rt_priority)
+        self._usb_cpu_core = usb_cpu_core
         self._imu_cpu_core = imu_cpu_core
         self._adc_cpu_core = adc_cpu_core
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
@@ -468,7 +476,14 @@ class HardwareInterface:
             try:
                 # Initialize USBSerialReader with basic parameters
                 # Data format: CSV with [w,x,y,z,gx,gy,gz] per IMU
-                self.usb_reader = USBSerialReader(baud_rate=115200, timeout=1.0, simulation_mode=False)
+                self.usb_reader = USBSerialReader(
+                    baud_rate=115200,
+                    timeout=1.0,
+                    simulation_mode=False,
+                    rt_priority=self._usb_rt_priority,
+                    rt_lock_memory=self._rt_lock_memory,
+                    rt_cpu_core=self._usb_cpu_core,
+                )
 
                 # Send config and wait for acknowledgment
                 self.usb_reader.send_config(
@@ -509,25 +524,26 @@ class HardwareInterface:
             
     def _imu_reader_thread(self) -> None:
         """Background thread for continuous IMU reading."""
-        # Apply CPU core pinning if configured (must be done from within the thread)
-        if self._imu_cpu_core is not None:
-            try:
-                os.sched_setaffinity(0, {self._imu_cpu_core})
-                self.logger.info(f"IMU thread: Pinned to Core {self._imu_cpu_core}")
-            except Exception as e:
-                self.logger.warning(f"IMU thread: Failed to pin to Core {self._imu_cpu_core}: {e}")
-
-        # Apply RT priority if configured (must be done from within the thread)
-        if self._imu_rt_priority > 0:
+        if self._imu_rt_priority > 0 or self._rt_lock_memory or self._imu_cpu_core is not None:
+            cpu_affinity = None if self._imu_cpu_core is None else {int(self._imu_cpu_core)}
             success = apply_rt_to_thread(
                 priority=self._imu_rt_priority,
                 policy=SCHED_FIFO,
+                lock_memory=self._rt_lock_memory,
+                cpu_affinity=cpu_affinity,
                 quiet=False
             )
             if success:
-                self.logger.info(f"IMU thread: RT priority SCHED_FIFO-{self._imu_rt_priority} applied")
+                details = []
+                if self._imu_rt_priority > 0:
+                    details.append(f"SCHED_FIFO-{self._imu_rt_priority}")
+                if self._rt_lock_memory:
+                    details.append("mlockall")
+                if self._imu_cpu_core is not None:
+                    details.append(f"core {self._imu_cpu_core}")
+                self.logger.info("IMU thread: applied %s", ", ".join(details) if details else "RT settings")
             else:
-                self.logger.warning(f"IMU thread: Failed to apply RT priority {self._imu_rt_priority}")
+                self.logger.warning("IMU thread: Failed to apply requested RT settings")
 
         while not self._stop_event.is_set():
             try:
@@ -686,25 +702,26 @@ class HardwareInterface:
 
     def _adc_reader_thread(self) -> None:
         """Background thread for continuous ADC reading."""
-        # Apply CPU core pinning if configured (must be done from within the thread)
-        if self._adc_cpu_core is not None:
-            try:
-                os.sched_setaffinity(0, {self._adc_cpu_core})
-                self.logger.info(f"ADC thread: Pinned to Core {self._adc_cpu_core}")
-            except Exception as e:
-                self.logger.warning(f"ADC thread: Failed to pin to Core {self._adc_cpu_core}: {e}")
-
-        # Apply RT priority if configured (must be done from within the thread)
-        if self._adc_rt_priority > 0:
+        if self._adc_rt_priority > 0 or self._rt_lock_memory or self._adc_cpu_core is not None:
+            cpu_affinity = None if self._adc_cpu_core is None else {int(self._adc_cpu_core)}
             success = apply_rt_to_thread(
                 priority=self._adc_rt_priority,
                 policy=SCHED_FIFO,
+                lock_memory=self._rt_lock_memory,
+                cpu_affinity=cpu_affinity,
                 quiet=False
             )
             if success:
-                self.logger.info(f"ADC thread: RT priority SCHED_FIFO-{self._adc_rt_priority} applied")
+                details = []
+                if self._adc_rt_priority > 0:
+                    details.append(f"SCHED_FIFO-{self._adc_rt_priority}")
+                if self._rt_lock_memory:
+                    details.append("mlockall")
+                if self._adc_cpu_core is not None:
+                    details.append(f"core {self._adc_cpu_core}")
+                self.logger.info("ADC thread: applied %s", ", ".join(details) if details else "RT settings")
             else:
-                self.logger.warning(f"ADC thread: Failed to apply RT priority {self._adc_rt_priority}")
+                self.logger.warning("ADC thread: Failed to apply requested RT settings")
 
         next_run_time = time.perf_counter()
         read_period = 1.0 / max(1.0, self._adc_expected_hz)

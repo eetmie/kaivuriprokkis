@@ -113,10 +113,15 @@ class ServerDiagnostics:
         loop_p95 = perf_stats.get('jitter_p95_ms', 0.0)
         loop_p99 = perf_stats.get('jitter_p99_ms', 0.0)
         loop_step = perf_stats.get('max_step_ms', 0.0)
+        actual_hz = perf_stats.get('actual_hz', perf_stats.get('hz', 0.0))
+        process_cpu = perf_stats.get('process_cpu_pct', 0.0)
+        loop_util = perf_stats.get('loop_util_pct', perf_stats.get('cpu_usage_pct', 0.0))
         line = (f"Loop: {perf_stats.get('avg_loop_time_ms', 0):.2f}ms "
                 f"(min={perf_stats.get('min_loop_time_ms', 0):.2f} max={loop_max:.2f}) | "
-                f"Jitter: std={loop_std:.2f} p95={loop_p95:.2f} p99={loop_p99:.2f} max\u0394={loop_step:.2f}ms | "
-                f"CPU: {perf_stats.get('cpu_usage_pct', 0):.1f}% | "
+                f"Timing: std={loop_std:.2f} p95={loop_p95:.2f} p99={loop_p99:.2f} max\u0394={loop_step:.2f}ms | "
+                f"Hz: {actual_hz:.1f} | "
+                f"ProcCPU: {process_cpu:.1f}% | "
+                f"LoopUtil: {loop_util:.1f}% | "
                 f"Headroom: {perf_stats.get('avg_headroom_ms', 0):.2f}ms")
 
         # Stage breakdown
@@ -153,10 +158,13 @@ class ServerDiagnostics:
         if cond > 0:
             line += f" | Cond: {cond:.1f}"
 
-        over_cnt = perf_stats.get('overrun_count_recent', 0)
-        over_pct = perf_stats.get('overrun_pct_recent', 0.0)
-        over_win = perf_stats.get('overrun_window_sec', 0.0)
-        line += f" | Overruns: {int(over_cnt)} ({over_pct:.1f}% over {over_win:.1f}s)"
+        late_cnt = perf_stats.get('deadline_miss_count_recent', perf_stats.get('overrun_count_recent', 0))
+        late_pct = perf_stats.get('deadline_miss_pct_recent', perf_stats.get('overrun_pct_recent', 0.0))
+        late_win = perf_stats.get('deadline_window_sec', perf_stats.get('overrun_window_sec', 0.0))
+        comp_cnt = perf_stats.get('compute_overrun_count_recent', perf_stats.get('violation_count', 0))
+        comp_pct = perf_stats.get('compute_overrun_pct_recent', perf_stats.get('violation_pct', 0.0))
+        line += f" | Late: {int(late_cnt)} ({late_pct:.1f}% over {late_win:.1f}s)"
+        line += f" | ComputeOV: {int(comp_cnt)} ({comp_pct:.1f}%)"
 
         if not perf_only:
             line += f" | Pkt: {packet_rate:.1f}Hz"

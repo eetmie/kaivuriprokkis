@@ -3,11 +3,11 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 100.0
+  control_hz: 200.0
 
 imu:
   # IMU sampling rate (Hz) - Pico AHRS loop frequency
-  sample_rate: 100
+  sample_rate: 200
   # Gyroscope full-scale range (125/250/500/1000/2000 dps)
   gyro_dps: 250
   # AHRS filter gain (higher = faster response, more noise)
@@ -56,8 +56,8 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 2.0 #2
-    ki: 0.1 #0.25
+    kp: 1.8 #2
+    ki: 0.0 #0.25
     kd: 0.0
 
   # Joint 1: Boom (lift arm)
@@ -85,7 +85,7 @@ controller:
 
   # Joint velocity limiting (applied at IK level)
   # Set to False to disable velocity limiting entirely
-  enable_velocity_limiting: True
+  enable_velocity_limiting: False
 
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
@@ -126,29 +126,29 @@ controller:
   # If links pitch far from neutral, local IMU Z underestimates global yaw by roughly cos(pitch).
   slew_fusion:
     enabled: True                # false = pure encoder (current behavior)
-    alpha: 0.00                   # Weight on encoder (0..1). Higher = trust encoder more
+    alpha: 0.0                   # Weight on encoder (0..1). Higher = trust encoder more
     aggregation: "mean"           # "mean" or "median" for combining 3 IMU Z-rates
     gyro_bias_comp:
       enabled: False
-      stationarity_degps: 1.0
+      stationarity_degps: 0.7
       adaptation_rate: 0.005
     max_gyro_degps: 180.0         # Clamp on aggregated IMU Z-rate before fusion
 
 
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController
-ik:
+ik
   # Command type: "position" (3D) or "pose" (6D with orientation)
   command_type: "pose"
 
   # Whether commands are relative to current pose (delta commands)
   use_relative_mode: False
   # IK solving method: "pinv", "svd", "trans", or "dls" (damped least squares)
-  method: "svd"
+  method: "dls"
 
   # Velocity mode: interpret commands as desired EE velocities
   velocity_mode: False
-  velocity_error_gain: 200.0  # Note: depends on hw/sim_dt!
+  velocity_error_gain: 250.0  # Note: depends on hw/sim_dt!
   use_rotational_velocity: False
 
   # Method/weighting parameters

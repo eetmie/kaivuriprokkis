@@ -1,0 +1,19 @@
+Base orientation:
+- Use base IMU for pitch/roll (currently only used for diagnostics, not in IK)
+- Yaw from slew encoder (real excavators use GPS for yaw + world position)
+- Integrate base pitch/roll into the IK pipeline so the controller accounts for machine tilt and roll
+
+- for yaw fuse all 4 imus???
+
+- center rotation affects pump speed when IK mode!
+
+- gyro bias comp, should we use the same one on yaw / joint vel!!!
+
+- generate gyro yaw tester: set the robot on stable surface, no pwm control. Measure the fused-together imu yaw for 20minutes.
+
+
+Radial slew usage:
+- copy from Isaac demo
+
+sudo python excv_gui.py --fifo-priority 75 --lock-memory --control-core 2 --io-core 3
+

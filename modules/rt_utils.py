@@ -180,7 +180,7 @@ def get_thread_info(target_id: Optional[int] = None) -> Dict[str, Any]:
 
 
 def apply_rt_to_thread(
-    priority: int = PRIORITY_DEFAULT,
+    priority: Optional[int] = PRIORITY_DEFAULT,
     policy: int = SCHED_FIFO,
     lock_memory: bool = False,
     cpu_affinity: Optional[Set[int]] = None,
@@ -192,7 +192,8 @@ def apply_rt_to_thread(
     Safe to call even if RT is unavailable - will silently succeed with no-op.
 
     Args:
-        priority: RT priority (1-89, higher = more priority)
+        priority: RT priority (1-89, higher = more priority). If None or <= 0,
+                  scheduler policy is left unchanged.
         policy: SCHED_FIFO (default) or SCHED_RR
         lock_memory: Lock all memory to prevent page faults
         cpu_affinity: Set of CPUs to pin to (None = don't change)
@@ -206,19 +207,18 @@ def apply_rt_to_thread(
     success = True
     sched_target = _resolve_target_id(target_id)
 
-    # Clamp priority to safe range
-    priority = max(PRIORITY_MIN, min(PRIORITY_MAX, priority))
-
     # Set scheduler priority
-    try:
-        if _sched_param is None or _sched_setscheduler is None:
-            raise AttributeError("sched_setscheduler unavailable")
-        param = _sched_param(priority)
-        _sched_setscheduler(sched_target, policy, param)
-    except (AttributeError, PermissionError, OSError) as e:
-        if not quiet:
-            print(f"[RT] Could not set scheduler priority: {e}")
-        success = False
+    if priority is not None and priority > 0:
+        try:
+            priority = max(PRIORITY_MIN, min(PRIORITY_MAX, int(priority)))
+            if _sched_param is None or _sched_setscheduler is None:
+                raise AttributeError("sched_setscheduler unavailable")
+            param = _sched_param(priority)
+            _sched_setscheduler(sched_target, policy, param)
+        except (AttributeError, PermissionError, OSError) as e:
+            if not quiet:
+                print(f"[RT] Could not set scheduler priority: {e}")
+            success = False
 
     # Lock memory
     if lock_memory:

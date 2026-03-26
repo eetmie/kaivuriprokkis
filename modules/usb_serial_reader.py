@@ -7,6 +7,11 @@ import struct
 import math
 import threading
 
+try:
+    from .rt_utils import apply_rt_to_thread, SCHED_FIFO
+except ImportError:
+    from rt_utils import apply_rt_to_thread, SCHED_FIFO
+
 
 class USBSerialReader:
     """Read IMU quaternion data from Pico over USB serial."""
@@ -41,7 +46,8 @@ class USBSerialReader:
     def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False,
                  log_level: str = "INFO", port: str | None = None, debug: bool = False,
                  verify_checksum: bool = True, heartbeat_timeout: float = 3.0,
-                 status_telemetry: bool | None = None):
+                 status_telemetry: bool | None = None, rt_priority: int = 0,
+                 rt_lock_memory: bool = False, rt_cpu_core: int | None = None):
         self.logger = logging.getLogger(f"{__name__}.USBSerialReader")
         self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
@@ -80,6 +86,9 @@ class USBSerialReader:
         self._timestamp_sps = 0.0
         self._host_sps = 0.0
         self._status_enabled = False
+        self._rt_priority = int(rt_priority)
+        self._rt_lock_memory = bool(rt_lock_memory)
+        self._rt_cpu_core = rt_cpu_core
         self._stream_status = {
             "target_hz": 0,
             "sensor_count": 0,
@@ -837,6 +846,27 @@ class USBSerialReader:
             return imu_data
 
     def _reader_loop(self):
+        if self._rt_priority > 0 or self._rt_lock_memory or self._rt_cpu_core is not None:
+            cpu_affinity = None if self._rt_cpu_core is None else {int(self._rt_cpu_core)}
+            success = apply_rt_to_thread(
+                priority=self._rt_priority,
+                policy=SCHED_FIFO,
+                lock_memory=self._rt_lock_memory,
+                cpu_affinity=cpu_affinity,
+                quiet=False,
+            )
+            if success:
+                details = []
+                if self._rt_priority > 0:
+                    details.append(f"SCHED_FIFO-{self._rt_priority}")
+                if self._rt_lock_memory:
+                    details.append("mlockall")
+                if self._rt_cpu_core is not None:
+                    details.append(f"core {self._rt_cpu_core}")
+                self.logger.info("USB reader thread: applied %s", ", ".join(details) if details else "RT settings")
+            else:
+                self.logger.warning("USB reader thread: Failed to apply requested RT settings")
+
         while not self._reader_stop.is_set():
             try:
                 frame = self.read_imus(auto_reconnect=True)
@@ -999,8 +1029,6 @@ if __name__ == "__main__":
     print(f"Connecting... (Ctrl+C to stop)")
     desc_shown = False
     t0 = time.time()
-    n = 0
-
     try:
         poll_sleep_s = max(0.0, args.poll_sleep_ms / 1000.0)
         while True:
@@ -1016,8 +1044,6 @@ if __name__ == "__main__":
                     for i, d in enumerate(descs):
                         print(f"  [{i}] {d['label']}  (bus={d['bus']}, addr=0x{d['addr']:02X})")
                     print(f"----------------------\n")
-
-                n += 1
                 if time.time() - t0 >= 1.0:
                     st = reader.status()
                     # Build per-IMU pitch readout with labels
@@ -1033,13 +1059,10 @@ if __name__ == "__main__":
                     if st['target_sps']:
                         host_sps_str += f"/{st['target_sps']}"
                         ts_sps_str += f"/{st['target_sps']}"
-                    ts = reader.last_timestamp_us
                     print(
                         f"Host={host_sps_str:>7s} Hz  FW={ts_sps_str:>7s} Hz  "
-                        f"cs={st['checksum_failures']:3d} hdr={st['header_failures']:3d} rc={st['reconnect_count']:2d} "
-                        f"ts={ts:10d}  {' | '.join(pitches)}"
+                        f"{' | '.join(pitches)}"
                     )
-                    n = 0
                     t0 = time.time()
             if poll_sleep_s > 0:
                 time.sleep(poll_sleep_s)

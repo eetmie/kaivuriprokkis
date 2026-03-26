@@ -94,7 +94,7 @@ CHANNEL_CONFIGS:
         pulse_min: 1520
         pulse_max: 1640             #CW
         deadzone: 0.0
-        deadband_us_pos: 47.5       #48
+        deadband_us_pos: 47.0       #48
         deadband_us_neg: 44.0       #45
         dither_enable: False
         dither_amp_us: 10.0

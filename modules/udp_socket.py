@@ -274,7 +274,7 @@ class UDPSocket:
                 return None
 
             # Check if data is too old
-            age = time.time() - self.latest_timestamp
+            age = time.monotonic() - self.latest_timestamp
             if age > self.max_age_seconds:
                 self.packets_expired += 1
                 #if self.packets_expired % 10 == 1:  # Log every 10th expiration
@@ -286,7 +286,7 @@ class UDPSocket:
     def get_connection_stats(self) -> dict:
         """Get connection statistics for monitoring."""
         with self.data_lock:
-            current_time = time.time()
+            current_time = time.monotonic()
             age = current_time - self.latest_timestamp if self.latest_timestamp > 0 else float('inf')
             time_since_last = current_time - self.last_packet_time if self.last_packet_time > 0 else float('inf')
 
@@ -344,7 +344,7 @@ class UDPSocket:
 
                     # Use arrival time as packet timestamp - much simpler and more reliable
                     # than trying to handle 32-bit wraparound across network
-                    arrival_time = time.time()
+                    arrival_time = time.monotonic()
 
                     with self.data_lock:
                         self.latest_data = values

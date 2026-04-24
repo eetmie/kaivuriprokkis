@@ -15,8 +15,8 @@ CHANNEL_CONFIGS:
         output_channel: 9
         pulse_min: 1000
         pulse_max: 1700
-        idle: 0.50 # 0.45
-        multiplier: 0.4
+        base_command: 0.50    # normalized command applied when pump is enabled
+        activity_gain: 0.40   # extra normalized command from average valve activity when pump_variable=True
 
 
     lift_boom:

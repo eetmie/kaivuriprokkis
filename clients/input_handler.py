@@ -4,17 +4,24 @@ Input handling for excavator GUI — keyboard + gamepad merge logic.
 Extracted from client_gui.py to make input testable and decoupled from UI.
 """
 
-from typing import Dict, Optional, Set, Tuple
+from typing import Optional, Set, Tuple
+
+from modules.excavator_target_state import IKControlSpace
 
 
 class InputHandler:
     """Processes keyboard and gamepad input into movement deltas."""
 
     # Gamepad axis mappings: (axis_name, sign)
-    GAMEPAD_IK = {
+    GAMEPAD_IK_CARTESIAN = {
         'dx': ('LeftJoystickX', +1),
         'dz': ('LeftJoystickY', +1),
         'dy': ('RightJoystickX', -1),
+    }
+    GAMEPAD_IK_RADIAL = {
+        'dr': ('LeftJoystickY', +1),
+        'd_slew': ('LeftJoystickX', +1),
+        'dz': ('RightJoystickY', -1),
     }
     GAMEPAD_DIRECT = {
         'slew':   ('LeftJoystickX', -1),
@@ -32,12 +39,26 @@ class InputHandler:
         controller_state: Optional[dict],
         step_pos: float,
         step_rot: float,
+        control_space: IKControlSpace = IKControlSpace.CARTESIAN,
     ) -> Tuple[float, float, float, float]:
-        """Compute IK-mode deltas (dx, dy, dz, drot) from keyboard + gamepad.
+        """Compute IK-mode deltas from keyboard + gamepad.
 
         Returns:
-            (dx, dy, dz, drot) — position deltas in meters, rotation in degrees.
+            Cartesian: (dx, dy, dz, drot)
+            Radial: (dr, d_slew_deg, dz, drot)
         """
+        if control_space == IKControlSpace.RADIAL:
+            return self.tick_ik_radial(keys_down, controller_state, step_pos, step_rot)
+        return self.tick_ik_cartesian(keys_down, controller_state, step_pos, step_rot)
+
+    def tick_ik_cartesian(
+        self,
+        keys_down: Set[str],
+        controller_state: Optional[dict],
+        step_pos: float,
+        step_rot: float,
+    ) -> Tuple[float, float, float, float]:
+        """Compute Cartesian IK deltas (dx, dy, dz, drot)."""
         mult = self.FAST_MULTIPLIER if 'shift' in keys_down else 1.0
         dp = step_pos * mult
         dr = step_rot * mult
@@ -66,9 +87,9 @@ class InputHandler:
         if controller_state is not None and controller_state.get('LeftBumper'):
             fast_dp = step_pos * self.GAMEPAD_POS_MULTIPLIER
             fast_dr = step_rot * self.FAST_MULTIPLIER
-            ax, sx = self.GAMEPAD_IK['dx']
-            az, sz = self.GAMEPAD_IK['dz']
-            ay, sy = self.GAMEPAD_IK['dy']
+            ax, sx = self.GAMEPAD_IK_CARTESIAN['dx']
+            az, sz = self.GAMEPAD_IK_CARTESIAN['dz']
+            ay, sy = self.GAMEPAD_IK_CARTESIAN['dy']
             ctrl_dx = sx * controller_state[ax] * fast_dp
             ctrl_dz = sz * controller_state[az] * fast_dp
             ctrl_dy = sy * controller_state[ay] * fast_dp
@@ -81,6 +102,56 @@ class InputHandler:
         drot = kbd_drot if abs(kbd_drot) >= abs(ctrl_drot) else ctrl_drot
 
         return dx, dy, dz, drot
+
+    def tick_ik_radial(
+        self,
+        keys_down: Set[str],
+        controller_state: Optional[dict],
+        step_pos: float,
+        step_rot: float,
+    ) -> Tuple[float, float, float, float]:
+        """Compute radial IK deltas (dr, d_slew_deg, dz, drot)."""
+        mult = self.FAST_MULTIPLIER if 'shift' in keys_down else 1.0
+        dp = step_pos * mult
+        dr = step_rot * mult
+
+        # Keyboard: W/S=radius, A/D=slew, Q/E=vertical, R/F=tool pitch
+        kbd_radius = kbd_slew = kbd_dz = kbd_drot = 0.0
+        if 'w' in keys_down:
+            kbd_radius += dp
+        if 's' in keys_down:
+            kbd_radius -= dp
+        if 'a' in keys_down:
+            kbd_slew -= dr
+        if 'd' in keys_down:
+            kbd_slew += dr
+        if 'q' in keys_down:
+            kbd_dz -= dp
+        if 'e' in keys_down:
+            kbd_dz += dp
+        if 'r' in keys_down:
+            kbd_drot += dr
+        if 'f' in keys_down:
+            kbd_drot -= dr
+
+        ctrl_radius = ctrl_slew = ctrl_dz = ctrl_drot = 0.0
+        if controller_state is not None and controller_state.get('LeftBumper'):
+            fast_dp = step_pos * self.GAMEPAD_POS_MULTIPLIER
+            fast_dr = step_rot * self.FAST_MULTIPLIER
+            ar, sr = self.GAMEPAD_IK_RADIAL['dr']
+            ayaw, syaw = self.GAMEPAD_IK_RADIAL['d_slew']
+            az, sz = self.GAMEPAD_IK_RADIAL['dz']
+            ctrl_radius = sr * controller_state[ar] * fast_dp
+            ctrl_slew = syaw * controller_state[ayaw] * fast_dr
+            ctrl_dz = sz * controller_state[az] * fast_dp
+            ctrl_drot = (controller_state['RightTrigger'] - controller_state['LeftTrigger']) * fast_dr
+
+        radius = kbd_radius if abs(kbd_radius) >= abs(ctrl_radius) else ctrl_radius
+        slew = kbd_slew if abs(kbd_slew) >= abs(ctrl_slew) else ctrl_slew
+        dz = kbd_dz if abs(kbd_dz) >= abs(ctrl_dz) else ctrl_dz
+        drot = kbd_drot if abs(kbd_drot) >= abs(ctrl_drot) else ctrl_drot
+
+        return radius, slew, dz, drot
 
     def tick_direct(
         self,

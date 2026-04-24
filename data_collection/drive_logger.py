@@ -605,7 +605,7 @@ def main():
                 if buttons[2] > button_threshold and button_prev[2] <= button_threshold:
                     print("\n[Button 2] Toggling pump...")
                     if hardware.pwm_controller:
-                        hardware.pwm_controller.set_pump(not hardware.pwm_controller.pump_enabled)
+                        hardware.pwm_controller.set_pump_enabled(not hardware.pwm_controller.pump_enabled)
 
                 # Button 3: Cycle sine amplitude
                 if buttons[3] > button_threshold and button_prev[3] <= button_threshold:

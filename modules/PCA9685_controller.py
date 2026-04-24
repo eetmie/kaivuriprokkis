@@ -24,8 +24,28 @@ import busio
 from .perf_tracker import LoopPerfTracker
 
 
+class PWMControllerError(Exception):
+    """Base exception for PWM controller failures."""
+
+
+class PWMConfigError(PWMControllerError):
+    """Base exception for PWM configuration failures."""
+
+
+class PWMConfigLoadError(PWMConfigError):
+    """Raised when a PWM config file cannot be loaded or parsed."""
+
+
+class PWMConfigValidationError(PWMConfigError):
+    """Raised when a PWM config file is syntactically valid but invalid semantically."""
+
+
+class PWMHardwareIOError(PWMControllerError):
+    """Raised when a low-level PWM hardware operation fails."""
+
+
 # ============================================================================
-# Direct I2C PWM Writer (optimized for real-time performance)
+# Direct I2C PWM Writer
 # ============================================================================
 
 class DirectPWMWriter:
@@ -34,7 +54,6 @@ class DirectPWMWriter:
     Writes only configured channels in a single I2C transaction, eliminating
     per-channel allocation and lock overhead from the Adafruit library.
 
-    At 1MHz I2C: 21 bytes (5 channels) takes ~250µs vs ~540µs with Adafruit.
     """
 
     LED0_ON_L = 0x06  # First PWM register (channel 0)
@@ -59,6 +78,10 @@ class DirectPWMWriter:
             max_channel: Highest channel number to write (0-15)
             frequency: PWM frequency in Hz (default 200)
         """
+        if not (0 <= min_channel <= max_channel < 16):
+            raise ValueError(
+                f"Invalid PWM channel range [{min_channel}, {max_channel}] - expected 0 <= min <= max < 16"
+            )
         self._i2c = i2c_bus
         self._addr = address
         self._min_ch = min_channel
@@ -77,7 +100,12 @@ class DirectPWMWriter:
         while not self._i2c.try_lock():
             time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
         try:
-            self._i2c.writeto(self._addr, bytes([reg, value]))
+            try:
+                self._i2c.writeto(self._addr, bytes([reg, value]))
+            except Exception as exc:
+                raise PWMHardwareIOError(
+                    f"Failed to write PCA9685 register 0x{reg:02X} at address 0x{self._addr:02X}: {exc}"
+                ) from exc
         finally:
             self._i2c.unlock()
 
@@ -113,13 +141,17 @@ class DirectPWMWriter:
         """Queue a duty cycle update (0-65535).
 
         Note: Only channels within [min_channel, max_channel] are written by flush().
-        # TODO: Add bounds check `if 0 <= channel < 16` to prevent IndexError on invalid channel.
-        #       Skipped for now since PWMController validates channels at config load time.
         """
+        if not 0 <= channel < 16:
+            raise ValueError(f"PWM channel {channel} out of range [0, 15]")
         self._duty_cycles[channel] = duty_cycle
 
     def set_channel_range(self, min_channel: int, max_channel: int):
         """Update the channel range. For benchmarking only - allocates memory."""
+        if not (0 <= min_channel <= max_channel < 16):
+            raise ValueError(
+                f"Invalid PWM channel range [{min_channel}, {max_channel}] - expected 0 <= min <= max < 16"
+            )
         self._min_ch = min_channel
         self._max_ch = max_channel
         self._num_channels = max_channel - min_channel + 1
@@ -155,7 +187,12 @@ class DirectPWMWriter:
         while not self._i2c.try_lock():
             time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
         try:
-            self._i2c.writeto(self._addr, buf)
+            try:
+                self._i2c.writeto(self._addr, buf)
+            except Exception as exc:
+                raise PWMHardwareIOError(
+                    f"Failed to flush PCA9685 channel buffer at address 0x{self._addr:02X}: {exc}"
+                ) from exc
         finally:
             self._i2c.unlock()
 
@@ -181,7 +218,7 @@ class ChannelConfig:
     deadband_us_pos: float = 0.0
     deadband_us_neg: float = 0.0
 
-    # Dither settings to prevent valve stiction - DISABLED by default
+    # Dither settings to prevent valve stiction
     dither_enable: bool = False
     dither_amp_us: float = 8.0  # vibration amplitude in microseconds
     dither_hz: float = 40.0  # vibration frequency
@@ -210,9 +247,8 @@ class PumpConfig:
     output_channel: int
     pulse_min: int
     pulse_max: int
-    idle: float
-    multiplier: float
-    # Manual pump via input channel removed in testing controller.
+    base_command: float
+    activity_gain: float
 
 
 class PWMConstants:
@@ -227,11 +263,8 @@ class PWMConstants:
     PULSE_MAX = 4095
     PWM_FREQ_MIN = 30
     PWM_FREQ_MAX = 1000
-    PWM_FREQ_WARN_LOW = 50
-    PWM_FREQ_WARN_HIGH = 200
-    PUMP_IDLE_MIN = -1.0
-    PUMP_IDLE_MAX = 0.6
-    PUMP_MULTIPLIER_MAX = 1.0
+    NORMALIZED_COMMAND_MIN = -1.0
+    NORMALIZED_COMMAND_MAX = 1.0
 
     # Safety parameters
     DEFAULT_TIME_WINDOW = 1.0  # seconds
@@ -244,8 +277,7 @@ class PWMController:
     def __init__(self, config_file: str, pump_variable: bool = False,
                  toggle_channels: bool = True, input_rate_threshold: float = 0,
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
-                 stale_timeout_s: float = 0.0, watchdog_channel: Optional[int] = None,
-                 watchdog_toggle_hz: float = 0.0, perf_enabled: bool = False,
+                 stale_timeout_s: float = 0.0, perf_enabled: bool = False,
                  cleanup_disable_osc: bool = True, pwm_frequency: Optional[int] = None):
         """Initialize PWM controller.
 
@@ -257,8 +289,6 @@ class PWMController:
             default_unset_to_zero: Default unset channels to zero
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
             stale_timeout_s: Timeout for stale commands (0 = disabled)
-            watchdog_channel: Optional watchdog output channel
-            watchdog_toggle_hz: Watchdog toggle frequency
             perf_enabled: Enable performance tracking (loop time, jitter, headroom)
             cleanup_disable_osc: If True, stop PCA9685 oscillator on cleanup (outputs go LOW).
                                  If False, keep oscillator running (outputs stay at center).
@@ -279,16 +309,12 @@ class PWMController:
         self.pump_variable = pump_variable
         self.toggle_channels = toggle_channels
         self.pump_enabled = True
-        self.manual_pump_load = 0.0
-        self.pump_variable_sum = 0.0
-        self.pump_variable_count = 0
+        self._pump_command_bias = 0.0
+        self.pump_activity_sum = 0.0
+        self.pump_activity_count = 0
         self._pump_override_throttle: Optional[float] = None
         self._stale_timeout_s = max(0.0, float(stale_timeout_s))
         self._last_command_ts = time.monotonic()
-        self._watchdog_channel = watchdog_channel
-        self._watchdog_toggle_hz = max(0.0, float(watchdog_toggle_hz))
-        self._watchdog_last_toggle = time.monotonic()
-        self._watchdog_state = False
 
         # Rate monitoring (optional)
         self.input_rate_threshold = input_rate_threshold
@@ -305,25 +331,11 @@ class PWMController:
         # Load config
         self._load_config(config_file)
 
-        # Compute channel range for optimized partial writes
-        all_channels = [cfg.output_channel for cfg in self.channel_configs.values()]
-        if self.pump_config:
-            all_channels.append(self.pump_config.output_channel)
-        min_ch = min(all_channels) if all_channels else 0
-        max_ch = max(all_channels) if all_channels else 15
-
         # Hardware init - direct I2C, no Adafruit dependency
-        i2c = busio.I2C(board.SCL, board.SDA)
-        freq = pwm_frequency if pwm_frequency is not None else self._config_pwm_frequency
-        self._direct_writer = DirectPWMWriter(
-            i2c,
-            min_channel=min_ch,
-            max_channel=max_ch,
-            frequency=freq
-        )
-        self._pwm_period_us = 1e6 / float(self._direct_writer.frequency)
-        self.logger.info(f"DirectPWMWriter using channels {min_ch}-{max_ch} "
-                        f"({max_ch - min_ch + 1} channels, {1 + 4*(max_ch-min_ch+1)} bytes)")
+        self._i2c = busio.I2C(board.SCL, board.SDA)
+        self._direct_writer = None
+        self._pwm_period_us = 0.0
+        self._rebuild_writer(pwm_frequency=pwm_frequency)
 
         # Current normalized values per channel
         self.values = [0.0] * PWMConstants.MAX_CHANNELS
@@ -338,10 +350,9 @@ class PWMController:
 
         if not self.skip_rate_checking:
             self._start_monitoring()
-        
+
         # Behavior defaults
         self._default_unset_to_zero = default_unset_to_zero
-        self._affects_pump_channels = [cfg for cfg in self.channel_configs.values() if cfg.affects_pump]
 
         # Performance tracking (lightweight, opt-in)
         self._perf_tracker = LoopPerfTracker(enabled=perf_enabled)
@@ -350,14 +361,55 @@ class PWMController:
         self._cleanup_disable_osc = cleanup_disable_osc
 
     def _load_config(self, config_file: str):
-        config_path = Path(config_file)
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file '{config_file}' not found")
-        with open(config_path, 'r') as f:
-            raw_config = yaml.safe_load(f)
-        self.channel_configs, self.pump_config = self._parse_config(raw_config)
-        self._config_pwm_frequency = raw_config.get('pwm_frequency', None)
-        self._validate_config()
+        config_path, channel_configs, pump_config, pwm_frequency = self._read_config_data(config_file)
+        self._config_path = config_path
+        self.channel_configs = channel_configs
+        self.pump_config = pump_config
+        self._config_pwm_frequency = pwm_frequency
+
+    def _resolve_config_path(self, config_file: str) -> Path:
+        path = Path(config_file)
+        candidates = [path]
+        if not path.is_absolute():
+            candidates.append(Path(__file__).resolve().parent.parent / path)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+
+        searched = ", ".join(str(candidate) for candidate in candidates)
+        raise PWMConfigLoadError(f"PWM config file '{config_file}' not found. Searched: {searched}")
+
+    def _read_config_data(self, config_file: str) -> tuple[Path, Dict[str, ChannelConfig], Optional[PumpConfig], Any]:
+        config_path = self._resolve_config_path(config_file)
+
+        try:
+            with config_path.open('r', encoding='utf-8') as f:
+                raw_config = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise PWMConfigLoadError(f"Failed to parse YAML in '{config_path}': {exc}") from exc
+        except OSError as exc:
+            raise PWMConfigLoadError(f"Failed to read PWM config '{config_path}': {exc}") from exc
+
+        if raw_config is None:
+            raise PWMConfigLoadError(f"PWM config '{config_path}' is empty")
+        if not isinstance(raw_config, dict):
+            raise PWMConfigLoadError(
+                f"PWM config '{config_path}' must contain a top-level mapping, got {type(raw_config).__name__}"
+            )
+        if 'CHANNEL_CONFIGS' not in raw_config:
+            raise PWMConfigValidationError(
+                f"PWM config '{config_path}' is missing required top-level key 'CHANNEL_CONFIGS'"
+            )
+        if not isinstance(raw_config['CHANNEL_CONFIGS'], dict):
+            raise PWMConfigValidationError(
+                f"PWM config '{config_path}': 'CHANNEL_CONFIGS' must be a mapping"
+            )
+
+        channel_configs, pump_config = self._parse_config(raw_config)
+        pwm_frequency = raw_config.get('pwm_frequency', None)
+        self._validate_config_data(channel_configs, pump_config, pwm_frequency)
+        return config_path, channel_configs, pump_config, pwm_frequency
 
     def _parse_config(self, raw_config: Dict) -> tuple[Dict[str, ChannelConfig], Optional[PumpConfig]]:
         channel_configs: Dict[str, ChannelConfig] = {}
@@ -396,7 +448,7 @@ class PWMController:
             return None
 
         required_pump_keys = [
-            'output_channel', 'pulse_min', 'pulse_max', 'idle', 'multiplier'
+            'output_channel', 'pulse_min', 'pulse_max', 'base_command', 'activity_gain'
         ]
         required_channel_keys = [
             'output_channel', 'pulse_min', 'pulse_max', 'direction', 'center',
@@ -406,6 +458,13 @@ class PWMController:
         ]
 
         for name, cfg in raw_config['CHANNEL_CONFIGS'].items():
+            if not isinstance(cfg, dict):
+                config_errors.append(
+                    f"Entry '{name}' in CHANNEL_CONFIGS must be a mapping (got {type(cfg).__name__})"
+                )
+                continue
+
+            item_errors_before = len(config_errors)
             if name == 'pump':
                 missing = [k for k in required_pump_keys if k not in cfg]
                 if missing:
@@ -417,16 +476,16 @@ class PWMController:
                 output_channel = _as_int(scope, 'output_channel', cfg['output_channel'])
                 pulse_min = _as_int(scope, 'pulse_min', cfg['pulse_min'])
                 pulse_max = _as_int(scope, 'pulse_max', cfg['pulse_max'])
-                idle = _as_float(scope, 'idle', cfg['idle'])
-                multiplier = _as_float(scope, 'multiplier', cfg['multiplier'])
-                if config_errors:
+                base_command = _as_float(scope, 'base_command', cfg['base_command'])
+                activity_gain = _as_float(scope, 'activity_gain', cfg['activity_gain'])
+                if len(config_errors) != item_errors_before:
                     continue
                 pump_config = PumpConfig(
                     output_channel=output_channel,
                     pulse_min=pulse_min,
                     pulse_max=pulse_max,
-                    idle=idle,
-                    multiplier=multiplier,
+                    base_command=base_command,
+                    activity_gain=activity_gain,
                 )
             else:
                 missing = [k for k in required_channel_keys if k not in cfg]
@@ -456,7 +515,7 @@ class PWMController:
                 ramp_limit = _as_float(scope, 'ramp_limit', cfg['ramp_limit'])
                 ramp_skip_deadband = _as_bool(scope, 'ramp_skip_deadband', cfg['ramp_skip_deadband'])
                 gamma = _as_float(scope, 'gamma', cfg['gamma'])
-                if config_errors:
+                if len(config_errors) != item_errors_before:
                     continue
                 channel_configs[name] = ChannelConfig(
                     output_channel=output_channel,
@@ -484,7 +543,7 @@ class PWMController:
                 )
 
         if config_errors:
-            raise ValueError("Invalid PWM config:\n- " + "\n- ".join(config_errors))
+            raise PWMConfigValidationError("Invalid PWM config:\n- " + "\n- ".join(config_errors))
 
         return channel_configs, pump_config
 
@@ -494,26 +553,32 @@ class PWMController:
         return None if value in none_values else value
 
     def _validate_config(self):
+        self._validate_config_data(self.channel_configs, self.pump_config, self._config_pwm_frequency)
+
+    def _validate_config_data(
+        self,
+        channel_configs: Dict[str, ChannelConfig],
+        pump_config: Optional[PumpConfig],
+        pwm_frequency: Any,
+    ):
         errors = []
         used_outputs = {}
 
         # PWM frequency validation
-        if self._config_pwm_frequency is None:
+        if pwm_frequency is None:
             errors.append("pwm_frequency: missing from servo config (required)")
-        elif not isinstance(self._config_pwm_frequency, (int, float)):
-            errors.append(f"pwm_frequency: must be a number (got {type(self._config_pwm_frequency).__name__})")
+        elif isinstance(pwm_frequency, bool) or not isinstance(pwm_frequency, (int, float)):
+            errors.append(f"pwm_frequency: must be a number (got {type(pwm_frequency).__name__})")
         else:
-            freq = int(self._config_pwm_frequency)
+            freq = int(pwm_frequency)
             if not PWMConstants.PWM_FREQ_MIN <= freq <= PWMConstants.PWM_FREQ_MAX:
                 errors.append(f"pwm_frequency: {freq} Hz out of range "
                               f"({PWMConstants.PWM_FREQ_MIN}-{PWMConstants.PWM_FREQ_MAX} Hz)")
-            elif freq < PWMConstants.PWM_FREQ_WARN_LOW or freq > PWMConstants.PWM_FREQ_WARN_HIGH:
-                self.logger.warning(f"pwm_frequency={freq} Hz is outside typical range "
-                                    f"({PWMConstants.PWM_FREQ_WARN_LOW}-{PWMConstants.PWM_FREQ_WARN_HIGH} Hz) "
-                                    f"- pulse tuning may not behave as expected")
-                time.sleep(2)
 
-        for name, config in self.channel_configs.items():
+        if not channel_configs and pump_config is None:
+            errors.append("CHANNEL_CONFIGS: must define at least one channel or a pump")
+
+        for name, config in channel_configs.items():
             if config.direction not in [-1, 1]:
                 errors.append(f"Channel '{name}': direction must be -1 or 1")
 
@@ -561,16 +626,64 @@ class PWMController:
             if float(config.gamma) <= 0.0 or float(config.gamma) > 5.0:
                 errors.append(f"Channel '{name}': gamma must be within (0, 5]")
 
-        if self.pump_config:
-            if self.pump_config.output_channel in used_outputs:
-                errors.append(f"Pump: output {self.pump_config.output_channel} already used")
-            if not PWMConstants.PUMP_IDLE_MIN <= self.pump_config.idle <= PWMConstants.PUMP_IDLE_MAX:
-                errors.append("Pump: idle out of range")
-            if not 0 < self.pump_config.multiplier <= PWMConstants.PUMP_MULTIPLIER_MAX:
-                errors.append("Pump: multiplier out of range")
+        if pump_config:
+            if pump_config.output_channel in used_outputs:
+                errors.append(f"Pump: output {pump_config.output_channel} already used")
+            elif not 0 <= pump_config.output_channel < PWMConstants.MAX_CHANNELS:
+                errors.append(f"Pump: output must be 0-{PWMConstants.MAX_CHANNELS - 1}")
+
+            if not PWMConstants.PULSE_MIN <= pump_config.pulse_min <= PWMConstants.PULSE_MAX:
+                errors.append("Pump: pulse_min out of range")
+            if not PWMConstants.PULSE_MIN <= pump_config.pulse_max <= PWMConstants.PULSE_MAX:
+                errors.append("Pump: pulse_max out of range")
+            if pump_config.pulse_min >= pump_config.pulse_max:
+                errors.append("Pump: pulse_min must be less than pulse_max")
+
+            if not PWMConstants.NORMALIZED_COMMAND_MIN <= pump_config.base_command <= PWMConstants.NORMALIZED_COMMAND_MAX:
+                errors.append("Pump: base_command must be within [-1.0, 1.0]")
+            if not 0.0 <= pump_config.activity_gain <= 1.0:
+                errors.append("Pump: activity_gain must be within [0.0, 1.0]")
 
         if errors:
-            raise ValueError("Configuration validation failed:\n" + "\n".join(errors))
+            raise PWMConfigValidationError("Configuration validation failed:\n" + "\n".join(errors))
+
+    def _build_writer_state(
+        self,
+        channel_configs: Optional[Dict[str, ChannelConfig]] = None,
+        pump_config: Optional[PumpConfig] = None,
+        pwm_frequency: Optional[int] = None,
+    ) -> tuple[DirectPWMWriter, float, List[ChannelConfig], int, int]:
+        channel_configs = self.channel_configs if channel_configs is None else channel_configs
+        pump_config = self.pump_config if pump_config is None else pump_config
+
+        all_channels = [cfg.output_channel for cfg in channel_configs.values()]
+        if pump_config:
+            all_channels.append(pump_config.output_channel)
+        min_ch = min(all_channels) if all_channels else 0
+        max_ch = max(all_channels) if all_channels else 15
+
+        freq = int(pwm_frequency if pwm_frequency is not None else self._config_pwm_frequency)
+        writer = DirectPWMWriter(
+            self._i2c,
+            min_channel=min_ch,
+            max_channel=max_ch,
+            frequency=freq,
+        )
+        pwm_period_us = 1e6 / float(writer.frequency)
+        affects_pump_channels = [cfg for cfg in channel_configs.values() if cfg.affects_pump]
+        return writer, pwm_period_us, affects_pump_channels, min_ch, max_ch
+
+    def _rebuild_writer(self, pwm_frequency: Optional[int] = None) -> None:
+        writer, pwm_period_us, affects_pump_channels, min_ch, max_ch = self._build_writer_state(
+            pwm_frequency=pwm_frequency,
+        )
+        self._direct_writer = writer
+        self._pwm_period_us = pwm_period_us
+        self._affects_pump_channels = affects_pump_channels
+        self.logger.info(
+            f"DirectPWMWriter using channels {min_ch}-{max_ch} "
+            f"({max_ch - min_ch + 1} channels, {1 + 4 * (max_ch - min_ch + 1)} bytes)"
+        )
 
     def _start_monitoring(self):
         if self.skip_rate_checking or (self.monitor_thread and self.monitor_thread.is_alive()):
@@ -609,7 +722,7 @@ class PWMController:
                 self.input_counter = 0
                 self.rate_window_start = current_time
 
-            # Stale watchdog: if no updates for too long, reset outputs
+            # Stale command timeout: if no updates for too long, reset outputs
             if self._stale_timeout_s > 0.0:
                 if (time.monotonic() - self._last_command_ts) > self._stale_timeout_s:
                     with self._lock:
@@ -653,8 +766,8 @@ class PWMController:
                 for cfg in self.channel_configs.values():
                     self.values[cfg.output_channel] = 0.0
 
-            self.pump_variable_sum = 0.0
-            self.pump_variable_count = 0
+            self.pump_activity_sum = 0.0
+            self.pump_activity_count = 0
             for name, val in commands.items():
                 cfg = self.channel_configs.get(name)
                 if cfg is None:
@@ -667,8 +780,8 @@ class PWMController:
                 self.values[cfg.output_channel] = value
 
             for cfg in self._affects_pump_channels:
-                self.pump_variable_sum += abs(self.values[cfg.output_channel])
-                self.pump_variable_count += 1
+                self.pump_activity_sum += abs(self.values[cfg.output_channel])
+                self.pump_activity_count += 1
 
             self._update_channels()
             self._update_pump()
@@ -694,8 +807,6 @@ class PWMController:
                 duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
                 duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
                 self._direct_writer.set_channel(config.output_channel, duty_cycle)
-
-            self._update_watchdog_queued()
             # Note: flush is called by update_named after _update_pump queues pump
 
     def _pulse_from_value(self, config: ChannelConfig, value: float, now: Optional[float] = None,
@@ -897,11 +1008,14 @@ class PWMController:
                 throttle = -1.0
             else:
                 if self.pump_variable:
-                    denom = max(1, self.pump_variable_count)
-                    throttle = self.pump_config.idle + (self.pump_config.multiplier * self.pump_variable_sum / denom)
+                    denom = max(1, self.pump_activity_count)
+                    throttle = self.pump_config.base_command + (
+                        self.pump_config.activity_gain * self.pump_activity_sum / denom
+                    )
                 else:
-                    throttle = self.pump_config.idle + (self.pump_config.multiplier / 10)
-                throttle += self.manual_pump_load
+                    # Preserve the legacy fixed-speed behavior as a small bias above base_command.
+                    throttle = self.pump_config.base_command + (self.pump_config.activity_gain / 10.0)
+                throttle += self._pump_command_bias
 
             throttle = max(-1.0, min(1.0, throttle))
             pulse_range = self.pump_config.pulse_max - self.pump_config.pulse_min
@@ -914,6 +1028,10 @@ class PWMController:
 
     def reset(self, reset_pump: bool = True):
         with self._lock:
+            self.values = [0.0] * PWMConstants.MAX_CHANNELS
+            self.pump_activity_sum = 0.0
+            self.pump_activity_count = 0
+            self._pump_command_bias = 0.0
             for name, config in self.channel_configs.items():
                 duty_cycle = int((config.center / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
                 duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
@@ -963,18 +1081,20 @@ class PWMController:
         """Reset performance statistics."""
         self._perf_tracker.reset()
 
-    def set_pump(self, enabled: bool):
-        self.pump_enabled = enabled
+    def set_pump_enabled(self, enabled: bool, flush: bool = True):
+        with self._lock:
+            self.pump_enabled = bool(enabled)
+            if flush:
+                self._update_pump(flush=True)
 
     def toggle_pump_variable(self, variable: bool):
         self.pump_variable = variable
 
-    def update_pump_load(self, adjustment: float):
-        # TODO: make cleaner, makes no sense handle this confusingly!
-        self.manual_pump_load = max(-1.0, min(0.3, self.manual_pump_load + adjustment / 10))
+    def update_pump_bias(self, adjustment: float):
+        self._pump_command_bias = max(-1.0, min(0.3, self._pump_command_bias + adjustment / 10.0))
 
-    def reset_pump_load(self):
-        self.manual_pump_load = 0.0
+    def reset_pump_bias(self):
+        self._pump_command_bias = 0.0
         self._update_pump(flush=True)
 
     def disable_channels(self, disabled: bool):
@@ -999,18 +1119,39 @@ class PWMController:
         return commands
 
     def reload_config(self, config_file: str) -> bool:
-        self.reset(reset_pump=True)
+        config_path = None
         try:
+            config_path, channel_configs, pump_config, pwm_frequency = self._read_config_data(config_file)
             was_monitoring = self.running
             if was_monitoring:
                 self._stop_monitoring()
-            self._load_config(config_file)
-            self.reset(reset_pump=True)
+
+            with self._lock:
+                writer_state = self._build_writer_state(
+                    channel_configs=channel_configs,
+                    pump_config=pump_config,
+                    pwm_frequency=int(pwm_frequency),
+                )
+                self._config_path = config_path
+                self.channel_configs = channel_configs
+                self.pump_config = pump_config
+                self._config_pwm_frequency = pwm_frequency
+                self._direct_writer, self._pwm_period_us, self._affects_pump_channels, min_ch, max_ch = writer_state
+                self.logger.info(
+                    f"DirectPWMWriter using channels {min_ch}-{max_ch} "
+                    f"({max_ch - min_ch + 1} channels, {1 + 4 * (max_ch - min_ch + 1)} bytes)"
+                )
+                self.reset(reset_pump=True)
+
             if was_monitoring:
                 self._start_monitoring()
             return True
-        except Exception as e:
-            self.logger.error(f"Error loading configuration: {e}")
+        except PWMConfigError as exc:
+            location = config_path if config_path is not None else config_file
+            self.logger.error(f"Configuration reload failed for '{location}': {exc}")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Unexpected error reloading configuration '{config_file}': {exc}")
             return False
 
     def set_log_level(self, level: str) -> None:
@@ -1030,8 +1171,8 @@ class PWMController:
     def _simple_cleanup(self):
         """Cleanup on exit: reset channels to center, optionally stop oscillator."""
         try:
+            self._stop_monitoring()
             with self._lock:
-                self._stop_monitoring()
                 # Reset all channels to center (safe neutral position)
                 self.reset(reset_pump=True)
                 # Small delay for hardware to settle at center position
@@ -1039,8 +1180,8 @@ class PWMController:
                 # Optionally stop oscillator (outputs go LOW) or keep running (outputs stay at center)
                 if self._cleanup_disable_osc:
                     self._direct_writer.sleep()
-        except:
-            pass
+        except Exception as exc:
+            self.logger.warning(f"PWM cleanup failed: {exc}")
 
     def set_cleanup_disable_osc(self, enabled: bool) -> None:
         """Configure whether oscillator stops on cleanup.
@@ -1050,16 +1191,3 @@ class PWMController:
                      If False, keep oscillator running (outputs stay at center).
         """
         self._cleanup_disable_osc = enabled
-
-    def _update_watchdog_queued(self) -> None:
-        """Queue watchdog toggle (called before flush)."""
-        if self._watchdog_channel is None or self._watchdog_toggle_hz <= 0.0:
-            return
-        now_mono = time.monotonic()
-        period = 1.0 / self._watchdog_toggle_hz
-        if (now_mono - self._watchdog_last_toggle) < period:
-            return
-        self._watchdog_last_toggle = now_mono
-        self._watchdog_state = not self._watchdog_state
-        duty_cycle = PWMConstants.DUTY_CYCLE_MAX if self._watchdog_state else 0
-        self._direct_writer.set_channel(int(self._watchdog_channel), duty_cycle)

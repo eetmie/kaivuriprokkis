@@ -5,7 +5,7 @@ Excavator 3D Position GUI — Keyboard control with UDP streaming.
 Orchestrates InputHandler, ArmVisualizer, and ExcavatorUDPClient.
 
 Controls:
-    IK:     A/D=X, W/S=Z, Q/E=Y, R/F=Rot | Shift=5x
+    IK:     Toggle Cartesian / radial target-space control locally in the GUI
     Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket | Shift=full
 """
 
@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Optional
 
 _ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(_ROOT_DIR) not in sys.path:
@@ -26,6 +25,7 @@ from modules.control_protocol import (
     PoseTarget,
     RobotTelemetry,
 )
+from modules.excavator_target_state import ExcavatorTargetState, IKControlSpace
 from clients.input_handler import InputHandler
 from clients.arm_visualizer import ArmVisualizer
 from clients.udp_client import ExcavatorUDPClient
@@ -55,20 +55,27 @@ class ExcavatorGUI3D:
         self.root = root
         self.root.title("Excavator 3D Position Control GUI - UDP Streaming")
 
-        # Target pose
-        self.current_x = self.DEFAULT_X
-        self.current_y = self.DEFAULT_Y
-        self.current_z = self.DEFAULT_Z
-        self.current_rot_y = 0.0
+        # IK target state stays local to the GUI and always composes back into
+        # Cartesian commands before the network boundary.
+        self.target_state = ExcavatorTargetState.from_cartesian_pose(
+            self.DEFAULT_X,
+            self.DEFAULT_Y,
+            self.DEFAULT_Z,
+            0.0,
+        )
+        self.ik_control_space = IKControlSpace.CARTESIAN
 
         # Measured pose from telemetry
         self.measured_x = self.DEFAULT_X
         self.measured_y = self.DEFAULT_Y
         self.measured_z = self.DEFAULT_Z
         self.measured_rot_y = 0.0
+        self._has_telemetry = False
+        self._sync_target_from_telemetry = False
 
         # Key state
         self.keys_down = set()
+        self._prev_controller_toggle = False
 
         # Step sizes
         self.step_pos = self.KEY_STEP_POS
@@ -103,13 +110,55 @@ class ExcavatorGUI3D:
         self._create_widgets()
         self._bind_events()
         self.visualizer.update(
-            (self.current_x, self.current_y, self.current_z, self.current_rot_y),
+            self._target_pose(),
             self.joint_positions,
         )
+        self._update_ik_space_ui()
 
         # Start tick loop (~30 FPS)
         self._schedule_tick()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _target_pose(self) -> tuple[float, float, float, float]:
+        return self.target_state.compose_cartesian_pose()
+
+    def _sync_target_from_measured(self) -> bool:
+        if not self._has_telemetry:
+            return False
+        self.target_state.sync_from_cartesian_pose(
+            (self.measured_x, self.measured_y, self.measured_z),
+            self.measured_rot_y,
+        )
+        self.target_state.clamp_cartesian(self.WORKSPACE_LIMITS)
+        return True
+
+    def _toggle_ik_space(self):
+        if self.ik_control_space == IKControlSpace.CARTESIAN:
+            self.ik_control_space = IKControlSpace.RADIAL
+        else:
+            self.ik_control_space = IKControlSpace.CARTESIAN
+        self._update_ik_space_ui()
+        self.visualizer.set_state(target_pose=self._target_pose(), joint_positions=self.joint_positions)
+        self.visualizer.request_redraw(self.root)
+
+    def _update_ik_space_ui(self):
+        if self.ik_control_space == IKControlSpace.CARTESIAN:
+            button_text = "IK Space: Cartesian"
+            hint = (
+                "IK Cartesian: A/D=X, W/S=Z, Q/E=Y, R/F=Rot | "
+                "Tab / A / Button = radial | Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket"
+            )
+        else:
+            button_text = "IK Space: Radial"
+            hint = (
+                "IK Radial: A/D=Slew, W/S=Radius, Q/E=Z, R/F=Rot | "
+                "Tab / A / Button = Cartesian | Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket"
+            )
+
+        if hasattr(self, "ik_space_btn"):
+            self.ik_space_btn.config(text=button_text)
+        if hasattr(self, "hint_label"):
+            self.hint_label.config(text=hint)
 
     # ---- UI Layout ----
     def _create_widgets(self):
@@ -191,11 +240,13 @@ class ExcavatorGUI3D:
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._trigger_pause, state=tk.DISABLED)
         self.resume_btn = ttk.Button(btns, text="Resume", command=self._trigger_resume, state=tk.DISABLED)
         self.direct_btn = ttk.Button(btns, text="Direct Mode", command=self._toggle_direct_mode, state=tk.DISABLED)
+        self.ik_space_btn = ttk.Button(btns, text="IK Space: Cartesian", command=self._toggle_ik_space)
         self.copy_btn = ttk.Button(btns, text="Copy Position", command=self._copy_command)
         self.reset_btn = ttk.Button(btns, text="Reset (0.6, 0.0, 0\u00b0)", command=self._reset_position)
 
         for i, btn in enumerate([self.connect_btn, self.stream_btn, self.reload_btn,
                                   self.pause_btn, self.resume_btn, self.direct_btn,
+                                  self.ik_space_btn,
                                   self.copy_btn, self.reset_btn]):
             btn.grid(row=0, column=i, padx=(0, 4))
 
@@ -220,11 +271,12 @@ class ExcavatorGUI3D:
         self.recv_label.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
 
         # Hint
-        ttk.Label(
+        self.hint_label = ttk.Label(
             main,
-            text="IK: A/D=X, W/S=Z, Q/E=Y, R/F=Rot | Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket | Shift=fast",
+            text="",
             font=('Courier', 9),
-        ).grid(row=6, column=0, columnspan=3, pady=(6, 0), sticky=tk.W)
+        )
+        self.hint_label.grid(row=6, column=0, columnspan=3, pady=(6, 0), sticky=tk.W)
 
         # Resizing
         self.root.rowconfigure(0, weight=1)
@@ -240,6 +292,11 @@ class ExcavatorGUI3D:
     # ---- Keyboard ----
     def _on_key_press(self, event):
         key = (event.keysym or '').lower()
+        if key == 'tab':
+            if key not in self.keys_down:
+                self.keys_down.add(key)
+                self._toggle_ik_space()
+            return "break"
         if key in ('shift_l', 'shift_r'):
             self.keys_down.add('shift')
         else:
@@ -247,6 +304,9 @@ class ExcavatorGUI3D:
 
     def _on_key_release(self, event):
         key = (event.keysym or '').lower()
+        if key == 'tab':
+            self.keys_down.discard(key)
+            return "break"
         if key in ('shift_l', 'shift_r'):
             self.keys_down.discard('shift')
         else:
@@ -265,25 +325,35 @@ class ExcavatorGUI3D:
             except Exception:
                 pass
 
+        toggle_pressed = bool(controller_state and controller_state.get('A'))
+        if toggle_pressed and not self._prev_controller_toggle:
+            self._toggle_ik_space()
+        self._prev_controller_toggle = toggle_pressed
+
         if self.direct_mode:
             slew, boom, arm, bucket = self.input_handler.tick_direct(self.keys_down, controller_state)
             self.direct_commands = [slew, boom, arm, bucket]
             self.visualizer.set_state(
-                target_pose=(self.current_x, self.current_y, self.current_z, self.current_rot_y),
+                target_pose=self._target_pose(),
                 joint_positions=self.joint_positions,
             )
             self.visualizer.request_redraw(self.root)
         else:
-            dx, dy, dz, drot = self.input_handler.tick_ik(
-                self.keys_down, controller_state, self.step_pos, self.step_rot)
-            if dx or dy or dz or drot:
-                self.current_x += dx
-                self.current_y += dy
-                self.current_z += dz
-                self.current_rot_y += drot
+            d0, d1, dz, drot = self.input_handler.tick_ik(
+                self.keys_down,
+                controller_state,
+                self.step_pos,
+                self.step_rot,
+                control_space=self.ik_control_space,
+            )
+            if d0 or d1 or dz or drot:
+                if self.ik_control_space == IKControlSpace.CARTESIAN:
+                    self.target_state.apply_cartesian_delta(d0, d1, dz, drot)
+                else:
+                    self.target_state.apply_radial_delta(d0, d1, dz, drot)
                 self._clamp_pose()
                 self.visualizer.set_state(
-                    target_pose=(self.current_x, self.current_y, self.current_z, self.current_rot_y),
+                    target_pose=self._target_pose(),
                     joint_positions=self.joint_positions,
                 )
                 self.visualizer.request_redraw(self.root)
@@ -291,17 +361,14 @@ class ExcavatorGUI3D:
         self._update_labels()
 
     def _clamp_pose(self):
-        wl = self.WORKSPACE_LIMITS
-        self.current_x = max(wl['x_min'], min(self.current_x, wl['x_max']))
-        self.current_y = max(wl['y_min'], min(self.current_y, wl['y_max']))
-        self.current_z = max(wl['z_min'], min(self.current_z, wl['z_max']))
-        self.current_rot_y = max(-45.0, min(45.0, self.current_rot_y))
+        self.target_state.clamp_cartesian(self.WORKSPACE_LIMITS)
 
     def _update_labels(self):
-        self.x_label.config(text=f"X T:{self.current_x:+6.3f} M:{self.measured_x:+6.3f}")
-        self.y_label.config(text=f"Y T:{self.current_y:+6.3f} M:{self.measured_y:+6.3f}")
-        self.z_label.config(text=f"Z T:{self.current_z:+6.3f} M:{self.measured_z:+6.3f}")
-        self.rot_label.config(text=f"Rot T:{self.current_rot_y:+5.1f} M:{self.measured_rot_y:+5.1f}")
+        target_x, target_y, target_z, target_rot_y = self._target_pose()
+        self.x_label.config(text=f"X T:{target_x:+6.3f} M:{self.measured_x:+6.3f}")
+        self.y_label.config(text=f"Y T:{target_y:+6.3f} M:{self.measured_y:+6.3f}")
+        self.z_label.config(text=f"Z T:{target_z:+6.3f} M:{self.measured_z:+6.3f}")
+        self.rot_label.config(text=f"Rot T:{target_rot_y:+5.1f} M:{self.measured_rot_y:+5.1f}")
 
     # ---- Settings ----
     def _apply_pos_step(self):
@@ -326,18 +393,17 @@ class ExcavatorGUI3D:
             self.rot_step_var.set(f"{self.step_rot:.1f}")
 
     def _copy_command(self):
-        cmd = f"{self.current_x:.3f}, {self.current_y:.3f}, {self.current_z:.3f}, {self.current_rot_y:.1f}"
+        target_x, target_y, target_z, target_rot_y = self._target_pose()
+        cmd = f"{target_x:.3f}, {target_y:.3f}, {target_z:.3f}, {target_rot_y:.1f}"
         self.root.clipboard_clear()
         self.root.clipboard_append(cmd)
         self.root.update()
         messagebox.showinfo("Copied", f"Copied pose: {cmd}")
 
     def _reset_position(self):
-        self.current_x = self.DEFAULT_X
-        self.current_y = self.DEFAULT_Y
-        self.current_z = self.DEFAULT_Z
-        self.current_rot_y = 0.0
+        self.target_state.set_cartesian_pose(self.DEFAULT_X, self.DEFAULT_Y, self.DEFAULT_Z, 0.0)
         self._clamp_pose()
+        self.visualizer.set_state(target_pose=self._target_pose(), joint_positions=self.joint_positions)
         self.visualizer.request_redraw(self.root)
 
     # ---- Direct mode ----
@@ -349,13 +415,12 @@ class ExcavatorGUI3D:
             self.status_label.config(text="Status: DIRECT MODE")
         else:
             self.direct_commands = [0.0, 0.0, 0.0, 0.0]
-            self.current_x = self.measured_x
-            self.current_y = self.measured_y
-            self.current_z = self.measured_z
-            self.current_rot_y = self.measured_rot_y
+            self._sync_target_from_measured()
             self.direct_btn.config(text="Direct Mode")
             if self.udp_client.is_streaming:
                 self.status_label.config(text="Status: Streaming")
+            self.visualizer.set_state(target_pose=self._target_pose(), joint_positions=self.joint_positions)
+            self.visualizer.request_redraw(self.root)
 
     # ---- UDP / Streaming ----
     def _toggle_connect(self):
@@ -385,6 +450,7 @@ class ExcavatorGUI3D:
     def _disconnect(self):
         self._stop_streaming()
         self.udp_client.disconnect()
+        self._has_telemetry = False
         self.connect_btn.config(text="Connect")
         self.stream_btn.config(state=tk.DISABLED)
         self.reload_btn.config(state=tk.DISABLED)
@@ -404,6 +470,7 @@ class ExcavatorGUI3D:
             messagebox.showwarning("Not connected", "Connect to the UDP server first.")
             return
 
+        self._sync_target_from_telemetry = not self._sync_target_from_measured()
         self.udp_client.start_streaming(
             get_command=self._build_command,
             on_telemetry=self._on_telemetry,
@@ -421,6 +488,8 @@ class ExcavatorGUI3D:
         if not self.udp_client.is_streaming:
             return
         self.udp_client.stop_streaming()
+        self._sync_target_from_telemetry = False
+        self._has_telemetry = False
         self.stream_btn.config(text="Start Streaming")
         self.reload_btn.config(state=tk.DISABLED)
         self.pause_btn.config(state=tk.DISABLED)
@@ -437,12 +506,17 @@ class ExcavatorGUI3D:
             self.status_label.config(text="Status: Disconnected")
 
     def _build_command(self) -> ControlCommand:
-        """Called by UDP send thread each tick."""
+        """Called by UDP send thread each tick.
+
+        Radial IK stays local to the GUI; this boundary always emits Cartesian
+        poses so the real controller and protocol stay unchanged.
+        """
         self.command_sequence += 1
+        target_x, target_y, target_z, target_rot_y = self._target_pose()
         cmd = ControlCommand(
             sequence=self.command_sequence,
             mode=ControlMode.DIRECT if self.direct_mode else ControlMode.IK,
-            pose=PoseTarget(self.current_x, self.current_y, self.current_z, self.current_rot_y),
+            pose=PoseTarget(target_x, target_y, target_z, target_rot_y),
             direct=DirectCommand(*self.direct_commands),
             reload_config=bool(self.reload_flag),
             pause=bool(self.pause_flag),
@@ -461,13 +535,17 @@ class ExcavatorGUI3D:
         self.measured_y = telemetry.measured_pose.y
         self.measured_z = telemetry.measured_pose.z
         self.measured_rot_y = telemetry.measured_pose.rot_y_deg
+        self._has_telemetry = True
         mode_name = "DIRECT" if telemetry.mode == ControlMode.DIRECT else "IK"
         fusion = "fused" if telemetry.slew_fusion_active else ("enc" if telemetry.slew_fusion_enabled else "off")
         self.root.after(0, self._apply_telemetry_to_view, self.joint_positions, mode_name, fusion)
 
     def _apply_telemetry_to_view(self, joint_positions, mode_name: str, fusion: str):
+        if self._sync_target_from_telemetry and not self.direct_mode:
+            if self._sync_target_from_measured():
+                self._sync_target_from_telemetry = False
         self.visualizer.set_state(
-            target_pose=(self.current_x, self.current_y, self.current_z, self.current_rot_y),
+            target_pose=self._target_pose(),
             joint_positions=joint_positions,
         )
         self.visualizer.request_redraw(self.root)
@@ -484,6 +562,7 @@ class ExcavatorGUI3D:
         self.pause_flag = 1
 
     def _trigger_resume(self):
+        self._sync_target_from_measured()
         self.resume_flag = 1
 
     # ---- Shutdown ----

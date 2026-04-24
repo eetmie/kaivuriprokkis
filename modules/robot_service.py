@@ -44,6 +44,13 @@ class RobotService:
         except Exception:
             pass
 
+    def _set_pump_enabled(self, enabled: bool) -> None:
+        try:
+            if hasattr(self.hardware, "set_pump_enabled"):
+                self.hardware.set_pump_enabled(enabled)
+        except Exception:
+            pass
+
     def submit_command(self, command: ControlCommand) -> None:
         self.state.last_command_sequence = int(command.sequence)
 
@@ -52,10 +59,12 @@ class RobotService:
 
         if command.pause and not self.state.paused:
             self.controller.pause()
+            self._set_pump_enabled(False)
             self.state.paused = True
 
         if command.resume and self.state.paused:
             self.controller.resume()
+            self._set_pump_enabled(True)
             self.state.paused = False
 
         if command.mode == ControlMode.DIRECT and self.state.mode != ControlMode.DIRECT:

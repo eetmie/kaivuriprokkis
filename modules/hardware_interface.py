@@ -185,8 +185,6 @@ class HardwareInterface:
                  input_rate_threshold: int = 0,
                  stale_timeout_s: float = 0.0,
                  default_unset_to_zero: bool = True,
-                 watchdog_channel: Optional[int] = None,
-                 watchdog_toggle_hz: float = 0.0,
                  cleanup_disable_osc: bool = True,
                  perf_enabled: bool = False,
                  imu_expected_hz: Optional[float] = None,
@@ -222,11 +220,6 @@ class HardwareInterface:
                                   If > 0, enables rate checking and resets PWM if rate drops below threshold.
             stale_timeout_s: If > 0, reject commands older than this (requires command_ts in send_named_pwm_commands).
                              Also triggers PWM reset if no commands received within this timeout.
-            watchdog_channel: PWM channel (0-15) to use for external hardware watchdog signal.
-                              If set, this channel toggles at watchdog_toggle_hz during normal operation.
-                              External watchdog relay detects missing pulses and cuts power - hardware-level failsafe.
-            watchdog_toggle_hz: Frequency (Hz) to toggle the watchdog channel. Typical: 5-20 Hz.
-                                Must be set along with watchdog_channel for watchdog to function.
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
             enable_pwm: If False, skip PWM controller initialization (sensor-only mode)
             enable_imu: If False, skip IMU initialization and threads
@@ -327,8 +320,6 @@ class HardwareInterface:
                     input_rate_threshold=input_rate_threshold,
                     stale_timeout_s=stale_timeout_s,
                     default_unset_to_zero=default_unset_to_zero,
-                    watchdog_channel=watchdog_channel,
-                    watchdog_toggle_hz=watchdog_toggle_hz,
                     cleanup_disable_osc=cleanup_disable_osc,
                     perf_enabled=perf_enabled,
                     pwm_frequency=pwm_frequency,
@@ -997,6 +988,17 @@ class HardwareInterface:
             return True
         except Exception as e:
             self.logger.error(f"PWM named command error: {e}")
+            return False
+
+    def set_pump_enabled(self, enabled: bool, *, flush: bool = True) -> bool:
+        """Enable or disable the hydraulic pump immediately."""
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return False
+        try:
+            self.pwm_controller.set_pump_enabled(enabled, flush=flush)
+            return True
+        except Exception as e:
+            self.logger.error(f"Pump toggle error: {e}")
             return False
 
     def get_pwm_channel_names(self, include_pump: bool = True) -> List[str]:

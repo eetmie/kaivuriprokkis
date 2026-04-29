@@ -191,15 +191,15 @@ class ServerDiagnostics:
         """Print Jacobian debug block."""
         if not debug_state:
             return
-        raw_quats = debug_state.get('raw_quaternions')
+        fk_quats = debug_state.get('fk_quaternions')
         robot_config = debug_state.get('robot_config')
-        if raw_quats is None or len(raw_quats) < 4 or robot_config is None:
+        if fk_quats is None or len(fk_quats) < 4 or robot_config is None:
             return
 
         try:
             from .differential_ik import compute_jacobian, extract_axis_rotation, project_to_rotation_axes
 
-            J = compute_jacobian(raw_quats, robot_config)
+            J = compute_jacobian(fk_quats, robot_config)
             J_pos = J[0:3, :]
             J_ang = J[3:6, :]
             s = np.linalg.svd(J_pos, compute_uv=False)
@@ -208,7 +208,7 @@ class ServerDiagnostics:
             cond = float(np.max(s_nonzero) / np.min(s_nonzero)) if len(s_nonzero) > 0 else float('inf')
 
             axes = np.array(robot_config.rotation_axes, dtype=np.float32)
-            projected = project_to_rotation_axes(raw_quats, axes)
+            projected = project_to_rotation_axes(fk_quats, axes)
             joint_angles = np.array([
                 extract_axis_rotation(q, axis) for q, axis in zip(projected, robot_config.rotation_axes)
             ], dtype=np.float32)

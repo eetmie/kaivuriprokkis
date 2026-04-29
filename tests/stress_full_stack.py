@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run the excavator stack at a fixed rate with explicit zero PWM commands.
+"""Run the excavator stack at a fixed rate while forcing zero PWM commands.
 
 This is a hardware stress/integration test, not a unit test.
-It starts the real hardware interface and controller, enters direct mode,
-and pushes explicit zero-valued named PWM commands every cycle.
+It starts the real hardware interface and controller, submits IK commands through
+the service/protocol boundary, and forces every named PWM valve command to zero
+before it reaches hardware.
 
 The pump channel is left under the normal controller logic so valve zeros still
 exercise the real PWM update path with the configured pump behavior.
@@ -29,6 +30,7 @@ from modules.control_protocol import (  # noqa: E402
     ControlCommand,
     ControlMode,
     DirectCommand,
+    PoseTarget,
     decode_command_message,
     encode_command_message,
     encode_telemetry_message,
@@ -82,6 +84,8 @@ def main() -> int:
                         help="CPU core for sender + control loop (default: 2)")
     parser.add_argument("--io-core", type=int, default=3,
                         help="CPU core for USB reader + IMU + ADC threads (default: 3)")
+    parser.add_argument("--ik-dither-m", type=float, default=0.004,
+                        help="Small IK target oscillation to exercise reachability checks; valves remain zero")
     parser.add_argument("--log-level", type=str, default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -122,6 +126,14 @@ def main() -> int:
                 raise TimeoutError("Hardware did not become ready before timeout")
             time.sleep(0.1)
 
+        original_send_named_pwm_commands = hardware.send_named_pwm_commands
+
+        def send_zero_named_pwm_commands(commands):
+            zero_commands = {name: 0.0 for name in dict(commands)}
+            return original_send_named_pwm_commands(zero_commands)
+
+        hardware.send_named_pwm_commands = send_zero_named_pwm_commands
+
         controller = ExcavatorController(
             hardware,
             config=ControllerConfig(output_limits=output_limits, control_frequency=target_hz),
@@ -145,15 +157,12 @@ def main() -> int:
             quiet=True,
         )
 
-        zero_named_commands = {
-            "rotate": 0.0,
-            "lift_boom": 0.0,
-            "tilt_boom": 0.0,
-            "scoop": 0.0,
-        }
-        pwm = getattr(hardware, "pwm_controller", None)
-        if pwm is not None and hasattr(pwm, "build_zero_commands"):
-            zero_named_commands = pwm.build_zero_commands(include_toggleable=True, include_pump=False)
+        base_pos, base_rot = service.get_pose()
+        base_x = float(base_pos[0])
+        base_y = float(base_pos[1])
+        base_z = float(base_pos[2])
+        base_rot = float(base_rot)
+        dither_m = max(0.0, float(args.ik_dither_m))
 
         period_s = 1.0 / max(1.0, target_hz)
         miss_threshold_s = period_s * 1.01
@@ -166,7 +175,8 @@ def main() -> int:
         print(
             f"[stress] full stack start: control={target_hz:.1f}Hz imu={target_imu_hz:.1f}Hz "
             f"adc={target_hz:.1f}Hz duration={args.duration_s:.1f}s fifo={args.fifo_priority} "
-            f"control_core={args.control_core} io_core={args.io_core} lock_memory={args.lock_memory}"
+            f"control_core={args.control_core} io_core={args.io_core} lock_memory={args.lock_memory} "
+            f"ik_dither={dither_m:.4f}m valves=forced_zero"
         )
 
         while (time.perf_counter() - started) < args.duration_s:
@@ -180,15 +190,16 @@ def main() -> int:
                     sender_miss_count += 1
             last_sender_start = loop_start
 
-            zero_cmd = ControlCommand(
+            phase = 1.0 if sequence % 2 == 0 else -1.0
+            ik_cmd = ControlCommand(
                 sequence=sequence,
                 timestamp_ms=int(time.time() * 1000) & 0xFFFFFFFF,
-                mode=ControlMode.DIRECT,
+                mode=ControlMode.IK,
+                pose=PoseTarget(base_x + phase * dither_m, base_y, base_z, base_rot),
                 direct=DirectCommand(0.0, 0.0, 0.0, 0.0),
             )
-            decoded = decode_command_message(encode_command_message(zero_cmd))
+            decoded = decode_command_message(encode_command_message(ik_cmd))
             service.submit_command(decoded)
-            controller.give_direct_commands(zero_named_commands)
 
             telemetry = service.get_state()
             encode_telemetry_message(telemetry)

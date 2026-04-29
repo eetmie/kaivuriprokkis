@@ -76,7 +76,7 @@ class _FakeController:
     def get_joint_angles(self):
         return np.zeros(4, dtype=np.float32)
 
-    def get_raw_quaternions(self):
+    def get_fk_quaternions(self):
         return None
 
     def get_condition_number(self):

@@ -11,7 +11,7 @@ Intended call site (when wired):
         joint_angles=current_joint_angles,    # rad, [slew, boom, arm, bucket]
         joint_velocities=last_joint_vel_radps,  # rad/s, optional
         target_joint_angles=target_joint_angles,  # rad, for velocity FF
-        joint_quats=current_raw_quats,        # for world-pitch of each link
+        joint_quats=current_fk_quats,         # for world-pitch of each link
     )
     combined = [p + f for p, f in zip(pid_outputs, ff)]
     combined = np.clip(combined, -1.0, 1.0)

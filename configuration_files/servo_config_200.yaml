@@ -13,41 +13,35 @@ CHANNEL_CONFIGS:
     pump:
         output_channel: 9
         pulse_min: 1000
-        pulse_max: 1700
-        static_pulse_us: 1530  # fixed pulse width (us) used when auto mode is off
-        base_pulse_us: 1525    # idle pulse (us) in auto mode with no valve activity
-        activity_gain_us: 140  # extra us added at full average valve activity in auto mode
+        pulse_max: 1650
+        static_pulse_us: 1510  # fixed pulse width (us) used when auto mode is off
+        base_pulse_us: 1480    # idle pulse (us) in auto mode with no valve activity
+        activity_gain_us: 80  # extra us added at full average valve activity in auto mode
 
 
     lift_boom:
         output_channel: 3  # output pin on the servo board
         affects_pump: True # whether moving this servo affects the pump speed (if set to variable)
         toggleable: False  # whether this servo can be toggled on/off via call
-        center: 1592.5       # 1595 1570 center pulse width in microseconds. Calculated automatically between min/max if set to None
+        center: 1590       # center pulse width in microseconds. Calculated automatically between min/max if set to None
         direction: 1       # pretty self-explanatory, -1 or 1
-        pulse_min: 1358    # extend. This sets max velocity. Increase until arm doesn't go faster --> valve fully open
-        pulse_max: 1800    # 1770 retract. Max velocity in other direction
+        pulse_min: 1330    # extend. This sets max velocity. Increase until arm doesn't go faster --> valve fully open
+        pulse_max: 1820    # retract. Max velocity in other direction
         deadzone: 0.0      # % per direction
 
-        deadband_us_pos: 166.0 #167 pos/neg offsets from center (us)
-        deadband_us_neg: 166.0 #165 if these match, your center value is prob correct :)
+        deadband_us_pos: 150.0 #pos/neg offsets from center (us)
+        deadband_us_neg: 150.0 #if these match, your center value is prob correct :)
 
         dither_enable: True # dither on/off. Adds vibration to reduce valve stiction.
-        dither_amp_us: 25.0 # 20dither amplitude in microseconds (us)
-        dither_hz: 11.0     # 15dither frequency in Hz
-        dither_taper: False # taper dither near limits instead of expanding clamp
+        dither_amp_us: 20.0 # dither amplitude in microseconds (us)
+        dither_hz: 33.0     # dither frequency in Hz
+        dither_taper: True # fade dither in after deadband edge
+        dither_taper_us: 40.0
 
         ramp_enable: True    # linear slew limit on pulse changes
-        ramp_limit: 800.0    # 750 max rate in us/s; lower = smoother, less overshoot
+        ramp_limit: 1250.0    # lower = smoother, less overshoot
         ramp_skip_deadband: False  # if True, deadband jump is instant (slew only for usable range)
-        # Tuning sequence:
-        #   1. Set ramp_brake_threshold: 0.0, raise ramp_limit until fast but no jump on release
-        #   2. Enable brake: start ramp_brake_threshold around 0.15, shrink until jumps return, back off a little
-        #   3. Adjust ramp_brake_min_rate if arrival is sluggish (raise) or still slams (lower)
-        ramp_brake_threshold: 0.0  # [0.0–1.0] fraction of working range where braking begins; 0 = disabled
-        ramp_brake_min_rate: 80.0  # minimum µs/s at end of brake zone — keep high enough to avoid stalling near target
-
-        gamma: 1.0          # curve shaping; <1 = more sensitive near center
+        gamma: 1.2          # curve shaping; <1 = more sensitive near center
 
 
 
@@ -55,64 +49,61 @@ CHANNEL_CONFIGS:
         output_channel: 4
         affects_pump: True
         toggleable: False
-        center: 1500.25 # 1487
+        center: 1500
         direction: 1
-        pulse_min: 1300     # ret
-        pulse_max: 1720     # ext
+        pulse_min: 1260     # ret
+        pulse_max: 1740     # ext
         deadzone: 0.0
-        deadband_us_pos: 155.0 #161 158
-        deadband_us_neg: 155.0 #159 155
+        deadband_us_pos: 140.0
+        deadband_us_neg: 140.0
         dither_enable: True
-        dither_amp_us: 25.0
-        dither_hz: 11.0
-        dither_taper: False
+        dither_amp_us: 20.0 #25
+        dither_hz: 33.0 # 33
+        dither_taper: True
+        dither_taper_us: 40.0
         ramp_enable: True
-        ramp_limit: 900.0 # 900
+        ramp_limit: 1250.0
         ramp_skip_deadband: False
-        ramp_brake_threshold: 0.0
-        ramp_brake_min_rate: 80.0
         gamma: 1.2
 
     scoop:
         output_channel: 2
         affects_pump: True
         toggleable: False
-        center: 1410 #1450 1430
-        direction: -1       # ext/ret flipped!
-        pulse_min: 1220     # ext 1170  1220
-        pulse_max: 1640     # ret 1620  1700 1660
+        center: 1410
+        direction: -1
+        pulse_min: 1190     # ext 1190
+        pulse_max: 1630     # ret 1630
         deadzone: 0.0
-        deadband_us_pos: 150.0 # 161ret
-        deadband_us_neg: 159.0 # 159ext
+        deadband_us_pos: 140.0 # ret
+        deadband_us_neg: 140.0 # ext
         dither_enable: true
-        dither_amp_us: 25.0
-        dither_hz: 11.0
-        dither_taper: False
+        dither_amp_us: 20.0
+        dither_hz: 33.0
+        dither_taper: True
+        dither_taper_us: 40.0
         ramp_enable: True
-        ramp_limit: 800.0
+        ramp_limit: 1250.0
         ramp_skip_deadband: False
-        ramp_brake_threshold: 0.0
-        ramp_brake_min_rate: 80.0
-        gamma: 1.2
+        gamma: 1.0
 
     rotate:
         output_channel: 5
         affects_pump: False
         toggleable: False
-        center: 1581                #1585
+        center: 1581
         direction: -1
-        pulse_min: 1520
-        pulse_max: 1640             #CW
+        pulse_min: 1480 #1520
+        pulse_max: 1680 #1640            #CW
         deadzone: 0.0
-        deadband_us_pos: 47.0       #48
-        deadband_us_neg: 44.0       #45
+        deadband_us_pos: 45.0 #47.0
+        deadband_us_neg: 42.0 #44.0
         dither_enable: False
-        dither_amp_us: 10.0
-        dither_hz: 50.0
+        dither_amp_us: 2.0
+        dither_hz: 20.0
         dither_taper: False
+        dither_taper_us: 10.0
         ramp_enable: True
         ramp_limit: 250.0
-        ramp_skip_deadband: False
-        ramp_brake_threshold: 0.0
-        ramp_brake_min_rate: 80.0
+        ramp_skip_deadband: True
         gamma: 1.5

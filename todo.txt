@@ -12,5 +12,17 @@ Geometric reachability check (replaces removed heuristic anti-windup):
 Radial slew usage:
 - copy from Isaac demo
 
+
+good results with(maybe set these values as RT defaults):
 sudo python excv_gui.py --fifo-priority 75 --lock-memory --control-core 2 --io-core 3
 
+
+IMU/FK state cleanup:
+- Make debug/readout values explicitly axis-aware: base/slew should report yaw, boom/arm/bucket should report pitch according to configured IK axes, instead of every IMU display assuming pitch.
+- Make the stack more robust by standardizing when APIs pass full quaternions versus extracted scalar pitch/yaw angles; current mixed usage creates bug-prone spots.
+
+Async reachability validation:
+- Move expensive reachability rollout out of the command/control path into a background worker.
+- Allow delayed results (~500 ms is acceptable) because the hydraulic machine is slow.
+- Keep streaming last known-good IK target while the worker validates new targets.
+- Use worker result to mark/reject/clamp clearly out-of-bounds GUI targets without blocking UDP/control timing.

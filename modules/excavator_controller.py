@@ -32,7 +32,7 @@ from .differential_ik import (
     joint_angles_to_absolute_quaternions, get_pose_from_joint_angles,
 )
 from .excavator_ik_utils import (
-    absolute_link_angles_from_quats, canonical_joint_angles_from_imus,
+    canonical_joint_angles_from_imus, gravity_pitch_from_quat,
     compute_relative_joint_angles, warmup_numba_functions,
 )
 from .quaternion_math import (
@@ -519,7 +519,7 @@ class ExcavatorController:
             np.clip(float(bias_cfg.get('adaptation_rate', 0.01)), 0.0, 1.0)
         )
 
-        # Slew/yaw now comes from the four-IMU canonical state extractor, not
+        # Slew/yaw now comes from the configured IMU canonical state extractor, not
         # from the encoder or an encoder/gyro complementary filter.
         self._slew_fusion_enabled = False
 
@@ -655,8 +655,8 @@ class ExcavatorController:
         self._target_orientation = None
         self._current_position = np.zeros(3, dtype=np.float32)
         self._current_orientation_y_deg = 0.0
-        self._current_raw_quats = None  # Canonical absolute link quats [slew, boom, arm, bucket]
-        self._current_sensor_quats = None  # Corrected physical IMU quats [base, boom, arm, bucket]
+        self._current_fk_quats = None  # Canonical absolute link quats [slew, boom, arm, bucket]
+        self._current_sensor_quats = None  # Corrected physical IMU quats in configured role order
         self._current_joint_angles = None
         self._current_ee_quat_full = None
         self._current_projected_quats = None  # Backward-compatible alias for canonical quats
@@ -826,10 +826,10 @@ class ExcavatorController:
 
         with self._lock:
             cached_angles = getattr(self, '_current_joint_angles', None)
-            cached_quats = getattr(self, '_current_raw_quats', None)
+            cached_quats = getattr(self, '_current_fk_quats', None)
             current_angles = None if cached_angles is None else cached_angles.copy()
-            raw_quats = None if cached_quats is None else cached_quats.copy()
-        if current_angles is None and raw_quats is None:
+            fk_quats = None if cached_quats is None else cached_quats.copy()
+        if current_angles is None and fk_quats is None:
             # No state yet — can't simulate; allow command through.
             return ReachabilityResult(
                 reachable=True,
@@ -840,7 +840,7 @@ class ExcavatorController:
             )
 
         if current_angles is None:
-            current_angles = compute_relative_joint_angles(raw_quats, self.robot_config)
+            current_angles = compute_relative_joint_angles(fk_quats, self.robot_config)
         result = reachability_module.check_reachability(
             self.ik_controller,
             self.robot_config,
@@ -913,35 +913,31 @@ class ExcavatorController:
         return np.degrees(joint_angles)
 
     def get_absolute_link_angles(self) -> np.ndarray:
-        """Per-link absolute angles in degrees: slew yaw + cab-frame cumulative pitch.
+        """Per-sensor absolute pitch in degrees after mounting correction.
 
-        For boom/arm/bucket the slew yaw is removed first so the result is what
-        an inclinometer mounted on each link would read in cab-frame
-        orientation — useful for operator displays and ground-relative diagnostics.
-
-        Mounting offsets are already removed upstream by
-        ``HardwareInterface._correct_imu_quaternion`` (per
-        ``imu.mounting_offsets_quat`` in ``control_config.yaml``) before the
-        canonical absolute link quats reach this controller, so no further
-        correction is applied here.
+        This is the direct inclinometer-style readout for each configured IMU
+        role: base/boom/arm/bucket pitch against gravity. It is not projected
+        through the excavator FK model and is not relative to parent links.
         """
         with self._lock:
-            if self._current_raw_quats is None:
+            if self._current_sensor_quats is None:
                 return np.zeros(4, dtype=np.float32)
-            quats = self._current_raw_quats.copy()
+            quats = self._current_sensor_quats.copy()
 
-        return np.degrees(absolute_link_angles_from_quats(quats, self.robot_config))
+        return np.degrees(np.array([
+            gravity_pitch_from_quat(q) for q in quats
+        ], dtype=np.float32))
 
-    def get_raw_quaternions(self) -> Optional[np.ndarray]:
+    def get_fk_quaternions(self) -> Optional[np.ndarray]:
         """Get latest canonical absolute link quaternions [slew, boom, arm, bucket].
 
-        These are rebuilt from the four-IMU canonical joint state and are safe to
+        These are rebuilt from the canonical joint state and are safe to
         feed into FK/debug visualization. They are not the raw physical IMU quats.
         """
         with self._lock:
-            if self._current_raw_quats is None:
+            if self._current_fk_quats is None:
                 return None
-            return np.array(self._current_raw_quats, dtype=np.float32, copy=True)
+            return np.array(self._current_fk_quats, dtype=np.float32, copy=True)
 
     def get_condition_number(self) -> float:
         """Get the Jacobian condition number from the last IK solve."""
@@ -1340,24 +1336,26 @@ class ExcavatorController:
         except Exception:
             pass
 
-    def _get_raw_quaternions(self) -> Optional[np.ndarray]:
+    def _get_sensor_quaternions(self) -> Optional[np.ndarray]:
         """
-        Read corrected four-IMU sensor data.
+        Read corrected configured IMU sensor data.
 
         Returns:
-            Corrected physical IMU quaternions [base, boom, arm, bucket] or None if hardware not ready
+            Corrected physical IMU quaternions in configured role order, or None if hardware not ready
         """
         try:
             if hasattr(self.hardware, 'read_all_imu_quaternions'):
                 quaternions = self.hardware.read_all_imu_quaternions()
-                if quaternions is not None and len(quaternions) == 4:
+                if quaternions is not None and len(quaternions) > 0:
                     return np.array(quaternions, dtype=np.float32)
 
             # Compatibility fallback for older hardware objects used in tests.
             joint_quats = self.hardware.read_imu_data()
             base_imu = self.hardware.read_base_imu()
-            if joint_quats is None or len(joint_quats) != 3 or base_imu is None:
+            if joint_quats is None:
                 return None
+            if base_imu is None:
+                return np.array(joint_quats, dtype=np.float32)
             return np.array([base_imu['quat']] + joint_quats, dtype=np.float32)
 
         except Exception as e:
@@ -1455,8 +1453,8 @@ class ExcavatorController:
     def _update_current_state(self) -> None:
         """Update current robot state from sensors."""
         try:
-            # Get corrected physical IMU quaternions [base, boom, arm, bucket]
-            sensor_quats = self._get_raw_quaternions()
+            # Get corrected physical IMU quaternions in configured role order.
+            sensor_quats = self._get_sensor_quaternions()
             if sensor_quats is None:
                 return
 
@@ -1480,7 +1478,7 @@ class ExcavatorController:
                 self._current_position = ee_pos
                 self._current_orientation_y_deg = ee_y_angle_deg
                 self._current_projected_quats = joint_quats
-                self._current_raw_quats = joint_quats
+                self._current_fk_quats = joint_quats
                 self._current_sensor_quats = sensor_quats
                 self._current_joint_angles = joint_angles
                 self._current_ee_quat_full = ee_quat
@@ -1512,7 +1510,7 @@ class ExcavatorController:
             current_rot = float(self._current_orientation_y_deg)
             lin_vel = self._current_linear_velocity
             rot_vel = self._current_rot_velocity_degps
-            raw_quats = self._current_raw_quats
+            fk_quats = self._current_fk_quats
 
         if raw_pos is None or raw_rot is None:
             with self._lock:
@@ -1541,8 +1539,8 @@ class ExcavatorController:
         # TODO: add orientation_mode here (pitch_follows_slew / full_pose) for rototilt support.
         y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         pitch_quat = quat_from_axis_angle(y_axis, np.radians(smoothed_rot))
-        if raw_quats is not None:
-            slew_quat = raw_quats[0]
+        if fk_quats is not None:
+            slew_quat = fk_quats[0]
             smoothed_quat = quat_normalize(quat_multiply(slew_quat, pitch_quat))
         else:
             smoothed_quat = pitch_quat
@@ -1568,7 +1566,7 @@ class ExcavatorController:
                 target_quat = self._target_orientation.copy()
                 current_pos = self._current_position.copy()
                 joint_angles = None if self._current_joint_angles is None else self._current_joint_angles.copy()
-                joint_quats = self._current_raw_quats
+                joint_quats = self._current_fk_quats
                 current_ee_quat_full = self._current_ee_quat_full
                 target_lin_vel = self._target_linear_velocity.copy()
                 target_rot_vel_dps = float(self._target_rot_velocity_dps)

@@ -31,6 +31,8 @@ class USBSerialReader:
     MSG_TYPE_ERROR = 0x04
     MSG_TYPE_ERR_I2C = 0x05
     MSG_TYPE_ERR_IMU = 0x06
+    MSG_TYPE_CAL_WAIT = 0x07
+    MSG_TYPE_ERR_CAL = 0x08
 
     STATUS_FLAG_USB_CONNECTED = 0x01
     STATUS_FLAG_HOST_ALIVE = 0x02
@@ -42,6 +44,8 @@ class USBSerialReader:
     DEFAULT_ACCEL_REJ = 20.0
     DEFAULT_RECOVERY_S = 0.5
     DEFAULT_OFFSET_S = 0.5
+    STARTUP_CALIBRATION_SETTLE_S = 5.0
+    STARTUP_CALIBRATION_DURATION_S = 15.0
 
     def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False,
                  log_level: str = "INFO", port: str | None = None, debug: bool = False,
@@ -101,6 +105,10 @@ class USBSerialReader:
             "last_loop_us": 0,
             "host_age_ms": 0,
         }
+        self._startup_phase = "disconnected"
+        self._calibration_wait_start_time = None
+        self._last_calibration_log_time = 0.0
+        self._last_error_msg_type = None
         self._lock = threading.Lock()
         self._reader_thread = None
         self._reader_stop = threading.Event()
@@ -165,6 +173,11 @@ class USBSerialReader:
             "timestamp_sps": self._timestamp_sps,
             "last_timestamp_us": self.last_timestamp_us,
             "stream_status": dict(self._stream_status),
+            "startup_phase": self._startup_phase,
+            "calibration_wait_s": (
+                time.time() - self._calibration_wait_start_time
+                if self._calibration_wait_start_time is not None else 0.0
+            ),
             "checksum_failures": self._checksum_failures,
             "header_failures": self._header_failures,
             "reconnect_count": self._reconnect_count,
@@ -295,6 +308,10 @@ class USBSerialReader:
         self._latest_frame = None
         self._latest_frame_seq = 0
         self._last_returned_seq = 0
+        self._startup_phase = "connected"
+        self._calibration_wait_start_time = None
+        self._last_calibration_log_time = 0.0
+        self._last_error_msg_type = None
         self._last_data_time = time.time()
         self._connect_time = time.time()
         self._reset_sps_tracking()
@@ -379,13 +396,73 @@ class USBSerialReader:
             self.logger.warning("Timed out sending config over CDC; proceeding to reads")
             return False
         self.logger.info(f"Sent config: {config.strip()}")
+        self._startup_phase = "config_sent"
         return True
 
-    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None):
+    def _handle_control_msg(self, msg_type):
+        """Handle Pico control frames. Returns True when startup may continue."""
+        now = time.time()
+        if msg_type == self.MSG_TYPE_CFG_OK:
+            self._startup_phase = "ready"
+            self._calibration_wait_start_time = None
+            return True
+        if msg_type == self.MSG_TYPE_CFG_WAIT:
+            self._startup_phase = "waiting_for_config"
+            return False
+        if msg_type == self.MSG_TYPE_CAL_WAIT:
+            if self._calibration_wait_start_time is None:
+                self._calibration_wait_start_time = now
+                self.logger.info(
+                    "Pico startup calibration in progress; keep IMUs stationary "
+                    "(~%.0fs total after config)",
+                    self.STARTUP_CALIBRATION_SETTLE_S + self.STARTUP_CALIBRATION_DURATION_S,
+                )
+            elif (now - self._last_calibration_log_time) >= 5.0:
+                elapsed = now - self._calibration_wait_start_time
+                total = self.STARTUP_CALIBRATION_SETTLE_S + self.STARTUP_CALIBRATION_DURATION_S
+                remaining = max(0.0, total - elapsed)
+                self.logger.info(
+                    "Pico startup calibration still running (%.0fs elapsed, ~%.0fs remaining); keep IMUs stationary",
+                    elapsed,
+                    remaining,
+                )
+            self._last_calibration_log_time = now
+            self._startup_phase = "calibrating"
+            self._last_data_time = now
+            return False
+        if msg_type == self.MSG_TYPE_ERR_I2C:
+            self._startup_phase = "error_i2c"
+            if self._last_error_msg_type != msg_type:
+                self.logger.error("Pico reported I2C initialization failure")
+                self._last_error_msg_type = msg_type
+            return False
+        if msg_type == self.MSG_TYPE_ERR_IMU:
+            self._startup_phase = "error_imu"
+            if self._last_error_msg_type != msg_type:
+                self.logger.error("Pico reported IMU initialization failure")
+                self._last_error_msg_type = msg_type
+            return False
+        if msg_type == self.MSG_TYPE_ERR_CAL:
+            self._startup_phase = "error_calibration"
+            if self._last_error_msg_type != msg_type:
+                self.logger.error("Pico startup calibration failed; keep robot/IMUs still and power-cycle or reset Pico")
+                self._last_error_msg_type = msg_type
+            return False
+        if msg_type == self.MSG_TYPE_ERROR:
+            self._startup_phase = "error"
+            if self._last_error_msg_type != msg_type:
+                self.logger.error("Pico reported a generic firmware error")
+                self._last_error_msg_type = msg_type
+            return False
+        return False
+
+    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None, calibration_timeout_s=30.0):
         """Wait for binary CFG_OK from Pico, or infer success from streaming.
 
         If CFG_OK is not received within ``timeout_s``, return False and let the
         caller proceed directly to streaming reads using the bytes already buffered.
+        When the Pico reports startup calibration in progress, wait up to
+        ``calibration_timeout_s`` instead of applying the short config timeout.
         """
         if not self.ser or not self.ser.is_open:
             self.logger.warning("Not connected - cannot wait for CFG_OK")
@@ -393,10 +470,19 @@ class USBSerialReader:
 
         start = time.time()
         last_send = start
+        calibration_seen = False
 
         while True:
             now = time.time()
-            if timeout_s is not None and (now - start) >= timeout_s:
+            if calibration_seen:
+                cal_elapsed = now - (self._calibration_wait_start_time or now)
+                if calibration_timeout_s is not None and cal_elapsed >= calibration_timeout_s:
+                    self.logger.warning(
+                        "Pico startup calibration did not finish within %.1fs; proceeding to streaming reads",
+                        calibration_timeout_s,
+                    )
+                    return False
+            elif timeout_s is not None and (now - start) >= timeout_s:
                 self.logger.warning(
                     "CFG_OK not received within %.1fs; proceeding to streaming reads",
                     timeout_s,
@@ -432,17 +518,27 @@ class USBSerialReader:
                             calc_cs = (version + msg_type) & 0xFFFF
                             if calc_cs == expected_cs:
                                 if msg_type == self.MSG_TYPE_CFG_OK:
+                                    self._handle_control_msg(msg_type)
                                     found_cfg_ok = True
                                     self._bin_buf = bytearray(self._bin_buf[idx + 6:])
                                     break
                                 if msg_type == self.MSG_TYPE_CFG_WAIT:
-                                    idx += 6
+                                    self._handle_control_msg(msg_type)
+                                    del self._bin_buf[idx:idx + 6]
+                                    continue
+                                if msg_type == self.MSG_TYPE_CAL_WAIT:
+                                    self._handle_control_msg(msg_type)
+                                    calibration_seen = True
+                                    del self._bin_buf[idx:idx + 6]
                                     continue
                                 if msg_type == self.MSG_TYPE_ERR_I2C:
-                                    self.logger.error("Pico reported I2C initialization failure")
+                                    self._handle_control_msg(msg_type)
                                     return False
                                 if msg_type == self.MSG_TYPE_ERR_IMU:
-                                    self.logger.error("Pico reported IMU initialization failure")
+                                    self._handle_control_msg(msg_type)
+                                    return False
+                                if msg_type == self.MSG_TYPE_ERR_CAL:
+                                    self._handle_control_msg(msg_type)
                                     return False
                             idx += 6
                         elif version == self.FRAME_VERSION_DESC:
@@ -487,6 +583,7 @@ class USBSerialReader:
                     return True
                 if found_stream:
                     self._last_data_time = time.time()
+                    self._startup_phase = "streaming"
                     self.logger.info("Streaming started before CFG_OK was observed")
                     return True
 
@@ -743,9 +840,13 @@ class USBSerialReader:
                 calc_cs = (version + msg_type) & 0xFFFF
                 if calc_cs == expected_cs:
                     if msg_type == self.MSG_TYPE_ERR_I2C:
-                        self.logger.error("Pico reported I2C initialization failure")
+                        self._handle_control_msg(msg_type)
                     elif msg_type == self.MSG_TYPE_ERR_IMU:
-                        self.logger.error("Pico reported IMU initialization failure")
+                        self._handle_control_msg(msg_type)
+                    elif msg_type in (self.MSG_TYPE_CFG_OK, self.MSG_TYPE_CFG_WAIT,
+                                      self.MSG_TYPE_CAL_WAIT, self.MSG_TYPE_ERR_CAL,
+                                      self.MSG_TYPE_ERROR):
+                        self._handle_control_msg(msg_type)
                 del self._bin_buf[:6]
                 continue
 
@@ -835,6 +936,7 @@ class USBSerialReader:
             del self._bin_buf[:frame_len]
             self.last_timestamp_us = ts
             self._last_data_time = time.time()
+            self._startup_phase = "streaming"
             self._update_sps()
             sensor_count_changed = False
             with self._lock:
@@ -1022,7 +1124,7 @@ if __name__ == "__main__":
             gyro_dps=args.gyro_dps,
         )
         if not args.no_wait:
-            if not reader.wait_for_cfg_ok(timeout_s=1.0, resend_s=0.3):
+            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=30.0):
                 reader.logger.warning("CFG_OK not received; continuing anyway")
 
     # Wait briefly for descriptor frame to arrive with first data

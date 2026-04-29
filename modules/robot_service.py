@@ -151,7 +151,7 @@ class RobotService:
     def get_debug_state(self) -> dict:
         """Return debug info for diagnostics without exposing controller internals."""
         state = {
-            'raw_quaternions': self.controller.get_raw_quaternions(),
+            'fk_quaternions': self.controller.get_fk_quaternions(),
             'condition_number': self.controller.get_condition_number(),
             'perf_stats': self.controller.get_performance_stats() or {},
             'robot_config': self.robot_config,
@@ -170,12 +170,12 @@ class RobotService:
     def get_state(self) -> RobotTelemetry:
         measured_pos, measured_rot = self.controller.get_pose()
         joint_angles = self.controller.get_joint_angles()
-        raw_quats = self.controller.get_raw_quaternions()
+        fk_quats = self.controller.get_fk_quaternions()
 
         joint_positions = tuple((0.0, 0.0, 0.0) for _ in range(5))
-        if raw_quats is not None and len(raw_quats) >= 4:
-            jp = get_joint_positions(raw_quats, self.robot_config)
-            ee_pos, _ = get_pose(raw_quats, self.robot_config)
+        if fk_quats is not None and len(fk_quats) >= 4:
+            jp = get_joint_positions(fk_quats, self.robot_config)
+            ee_pos, _ = get_pose(fk_quats, self.robot_config)
             positions = [tuple(float(v) for v in pos) for pos in jp]
             positions.append(tuple(float(v) for v in ee_pos))
             joint_positions = tuple(positions[:5])

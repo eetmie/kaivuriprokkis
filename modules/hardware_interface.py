@@ -195,27 +195,63 @@ class HardwareInterface:
         _imu_mapping = _imu_cfg.get('imu_mapping')
         if _imu_mapping is None or not isinstance(_imu_mapping, dict):
             raise ValueError("imu.imu_mapping is required in control_config.yaml (dict of role -> sensor index)")
+        self._imu_mapping = dict(_imu_mapping)
+        _imu_chain = _imu_cfg.get('chain')
+        if not isinstance(_imu_chain, list):
+            _imu_chain = [
+                {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
+                {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+                {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+                {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+            ]
         _mounting_offsets_cfg = _imu_cfg.get('mounting_offsets_quat', {})
         if _mounting_offsets_cfg is None:
             _mounting_offsets_cfg = {}
         if not isinstance(_mounting_offsets_cfg, dict):
             raise ValueError("imu.mounting_offsets_quat must be a dict of role -> quaternion")
-        # Joint roles that feed into the IK pipeline (order matters: boom, arm, bucket)
-        _JOINT_ROLES = ('boom', 'arm', 'bucket')
-        for role in _JOINT_ROLES:
+        self._imu_chain = _imu_chain
+        # Sensor roles in the order the controller's canonical extraction expects.
+        _sensor_roles = []
+
+        def _add_sensor_role(role):
+            if role and role != 'all' and role in _imu_mapping and role not in _sensor_roles:
+                _sensor_roles.append(role)
+
+        for item in _imu_chain:
+            if not isinstance(item, dict):
+                continue
+            _add_sensor_role(item.get('parent_role'))
+            _add_sensor_role(item.get('role'))
+
+        _joint_roles = []
+        for item in _imu_chain:
+            if not isinstance(item, dict) or not item.get('role'):
+                continue
+            role = item['role']
             if role not in _imu_mapping:
+                if bool(item.get('optional', False)):
+                    continue
                 raise ValueError(f"imu.imu_mapping missing required joint role '{role}'")
-        self._imu_joint_indices = [_imu_mapping[r] for r in _JOINT_ROLES]
-        self._base_imu_index = _imu_mapping.get('base')
-        self._expected_imu_count = len(_imu_mapping)
+            if role not in _joint_roles:
+                _joint_roles.append(role)
         # Validate: all indices distinct and within [0, expected_count)
         all_indices = list(_imu_mapping.values())
         self._imu_all_indices = all_indices
+        if not all_indices:
+            raise ValueError("imu.imu_mapping must contain at least one mapped sensor role")
         if len(set(all_indices)) != len(all_indices):
             raise ValueError(f"imu.imu_mapping has duplicate indices: {_imu_mapping}")
         for role, idx in _imu_mapping.items():
-            if not isinstance(idx, int) or idx < 0 or idx >= self._expected_imu_count:
+            if not isinstance(idx, int) or idx < 0:
+                raise ValueError(f"imu.imu_mapping['{role}'] = {idx} must be a non-negative integer")
+        self._expected_imu_count = max(all_indices) + 1
+        for role, idx in _imu_mapping.items():
+            if idx >= self._expected_imu_count:
                 raise ValueError(f"imu.imu_mapping['{role}'] = {idx} out of range [0, {self._expected_imu_count})")
+        self._imu_sensor_roles = _sensor_roles
+        self._imu_joint_roles = _joint_roles
+        self._imu_joint_indices = [_imu_mapping[r] for r in _joint_roles]
+        self._base_imu_index = _imu_mapping.get('base')
         self._imu_offset_inv_by_index = [np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
                                          for _ in range(self._expected_imu_count)]
         for role, idx in _imu_mapping.items():
@@ -280,6 +316,9 @@ class HardwareInterface:
         self._imu_state = ReadyState.PENDING if self._enable_imu else ReadyState.READY
         self._imu_fault_reason: Optional[str] = None
         self.latest_imu_data = None
+        self.latest_imu_by_role = None
+        self.latest_imu_raw_quat = None
+        self.latest_imu_corrected_quat = None
         self.latest_imu_pitch = None  # radians, if available from stream
         self.latest_base_imu_quat = None   # Base/slew IMU quaternion used by IK yaw extraction
         self.latest_base_imu_gyro = None   # Base IMU gyro [gx, gy, gz] deg/s
@@ -401,7 +440,10 @@ class HardwareInterface:
                     recovery_s=self._imu_recovery_s,
                     offset_s=self._imu_offset_s,
                 )
-                if not self.usb_reader.wait_for_cfg_ok(timeout_s=1.0):
+                self.logger.info(
+                    "Waiting for IMU startup; Pico may spend ~20s doing stationary gyro calibration"
+                )
+                if not self.usb_reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=30.0):
                     self.logger.warning("IMU config acknowledgment not received")
 
                 self.usb_reader.start_background_reader()
@@ -459,9 +501,13 @@ class HardwareInterface:
                 if imu_packets is not None and len(imu_packets) >= self._expected_imu_count:
                     # Extract only the quaternion portion [w,x,y,z] from each IMU packet
                     # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
+                    raw_quat_only = [
+                        quat_normalize(np.array(pkt[:4], dtype=np.float32))
+                        for pkt in imu_packets[:self._expected_imu_count]
+                    ]
                     quat_only = [
-                        self._correct_imu_quaternion(np.array(pkt[:4], dtype=np.float32), i)
-                        for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
+                        self._correct_imu_quaternion(raw_quat_only[i], i)
+                        for i in range(self._expected_imu_count)
                     ]
                     gyro_only = [
                         self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
@@ -485,6 +531,12 @@ class HardwareInterface:
                     if valid_data:
                         # Atomically update latest data
                         with self._imu_lock:
+                            self.latest_imu_by_role = {
+                                role: quat_only[idx].copy()
+                                for role, idx in self._imu_mapping.items()
+                            }
+                            self.latest_imu_raw_quat = [q.copy() for q in raw_quat_only]
+                            self.latest_imu_corrected_quat = [q.copy() for q in quat_only]
                             self.latest_imu_data = [quat_only[i] for i in self._imu_joint_indices]
                             # Extract base IMU quaternion if configured
                             if self._base_imu_index is not None:
@@ -724,13 +776,40 @@ class HardwareInterface:
 
     @_safe_hardware_operation
     def read_all_imu_quaternions(self) -> Optional[List[np.ndarray]]:
-        """Read corrected IMU quaternions in IK order [base, boom, arm, bucket]."""
+        """Read corrected IMU quaternions in configured canonical role order."""
         with self._imu_lock:
             if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read IMU data")
-            if self.latest_base_imu_quat is None or self.latest_imu_data is None:
-                raise RuntimeError("Base or joint IMU data is missing")
-            return [self.latest_base_imu_quat.copy()] + [q.copy() for q in self.latest_imu_data]
+            if self.latest_imu_by_role is None:
+                raise RuntimeError("IMU role data is missing")
+            missing = [role for role in self._imu_sensor_roles if role not in self.latest_imu_by_role]
+            if missing:
+                raise RuntimeError(f"IMU role data is missing for {missing}")
+            return [self.latest_imu_by_role[role].copy() for role in self._imu_sensor_roles]
+
+    def read_imu_debug_quaternions(self) -> Optional[Dict[str, Any]]:
+        """Read raw and mounting-corrected IMU quaternions by physical sensor index.
+
+        This is for bench mapping/debug display only. It deliberately does not
+        project values through the controller's kinematic model.
+        """
+        with self._imu_lock:
+            if self.latest_imu_raw_quat is None or self.latest_imu_corrected_quat is None:
+                return None
+            role_by_index = {idx: role for role, idx in self._imu_mapping.items()}
+            descriptors = []
+            if self.usb_reader is not None:
+                try:
+                    descriptors = self.usb_reader.imu_descriptors
+                except Exception:
+                    descriptors = []
+            return {
+                'raw_quats': [q.copy() for q in self.latest_imu_raw_quat],
+                'corrected_quats': [q.copy() for q in self.latest_imu_corrected_quat],
+                'role_by_index': dict(role_by_index),
+                'descriptors': list(descriptors),
+                'device_timestamp_us': self._imu_last_device_ts,
+            }
 
     @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
@@ -918,6 +997,13 @@ class HardwareInterface:
             'adc_fault': self._adc_fault_reason,
             'latest_imu_timestamp': time.time() if self.latest_imu_data is not None else None,
         }
+        if self.usb_reader is not None:
+            try:
+                imu_status = self.usb_reader.status()
+                status['imu_startup_phase'] = imu_status.get('startup_phase')
+                status['imu_calibration_wait_s'] = imu_status.get('calibration_wait_s', 0.0)
+            except Exception:
+                pass
 
         return status
 

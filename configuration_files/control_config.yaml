@@ -3,7 +3,7 @@
 
 rates:
   # Controller (IK) loop frequency in Hz
-  control_hz: 200.0
+  control_hz: 100.0
 
 imu:
   # IMU sampling rate (Hz) - Pico AHRS loop frequency
@@ -22,10 +22,51 @@ imu:
   # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
   # The mapping length defines the expected IMU count from firmware
   imu_mapping:
-    base: 0
-    boom: 1
-    arm: 3
-    bucket: 2
+    base: 1
+    boom: 2
+    arm: 0
+    bucket: 3
+  # IMU role chain and extraction rules for canonical controller joints.
+  # imu_mapping above can be changed when sensors are wired/enumerated differently.
+  # Use parent_role: null for a gravity/level parent. If base is omitted from
+  # imu_mapping, lift falls back to that same level-gravity parent.
+  chain:
+    - joint: slew
+      output_index: 0
+      source: all
+      axis: z
+      extraction: average_z_yaw
+    - joint: lift
+      role: boom
+      parent_role: base
+      output_index: 1
+      axis: y
+      extraction: gravity_pitch_delta
+    - joint: arm
+      role: arm
+      parent_role: boom
+      output_index: 2
+      axis: y
+      extraction: gravity_pitch_delta
+    - joint: bucket
+      role: bucket
+      parent_role: arm
+      output_index: 3
+      axis: y
+      extraction: gravity_pitch_delta
+    # Future rototilt sketch:
+    # - joint: tool_tilt
+    #   role: tool_tilt
+    #   parent_role: bucket
+    #   output_index: 4
+    #   axis: y
+    #   extraction: relative_axis_twist
+    # - joint: tool_rotate
+    #   role: tool_rotate
+    #   parent_role: tool_tilt
+    #   output_index: 5
+    #   axis: z
+    #   extraction: relative_axis_twist
   # Mounting correction quaternions by logical IMU role [w, x, y, z]
   # Hardware layer removes these offsets before publishing quats/gyro.
   mounting_offsets_quat:
@@ -56,13 +97,13 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 1.8 #2
+    kp: 4.0
     ki: 0.0 #0.25
     kd: 0.0
 
   # Joint 1: Boom (lift arm)
   joint1:
-    kp: 5.0
+    kp: 6.0
     ki: 0.1
     kd: 0.0
 
@@ -150,8 +191,8 @@ ik:
     lambda_val: 0.01  # Base (min) value if adaptive damping is used
 
   # Condition number threshold — discard IK commands when Jacobian condition
-  # number exceeds this value (0 = disabled, typical range: 50–500)
-  condition_number_threshold: 200
+  # number exceeds this value (0 = disabled)
+  condition_number_threshold: 50
 
   # Adaptive damping (DLS method only)
   # Adjusts lambda based on Jacobian condition number for better singularity handling.
@@ -175,9 +216,9 @@ ik:
   # Example: [[-30.0, 30.0], [-65.0, 25.0], [-15.0, 140.0], [-130.0, 75.0]]
   joint_limits_relative:
     - null              # slew: unbounded — allows continuous cab rotation across ±180°
-    - [-180.0, 180.0]   # boom
-    - [-180.0, 180.0]   # arm
-    - [-180.0, 180.0]   # bucket
+    - [-50.0, 30.0]   # boom
+    - [28.0, 144.0]   # arm
+    - [-120.0, 20.0]   # bucket
 
 
 # Pre-flight reachability check (modules/reachability.py).

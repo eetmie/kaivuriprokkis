@@ -18,10 +18,21 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 
-import board
-import busio
-
 from .perf_tracker import LoopPerfTracker
+
+
+PCA9685_I2C_BUS = 1
+PCA9685_I2C_ADDRESS = 0x40
+
+
+def _open_smbus(bus_number: int = PCA9685_I2C_BUS):
+    """Open Raspberry Pi I2C via smbus2/smbus for low-overhead direct writes."""
+    try:
+        import smbus2
+        return smbus2.SMBus(bus_number)
+    except Exception:
+        import smbus as smbus2  # type: ignore
+        return smbus2.SMBus(bus_number)
 
 
 class PWMControllerError(Exception):
@@ -66,7 +77,7 @@ class DirectPWMWriter:
     RESTART = 0x80
     AI = 0x20  # Auto-increment
 
-    def __init__(self, i2c_bus, address: int = 0x40,
+    def __init__(self, i2c_bus, address: int = PCA9685_I2C_ADDRESS,
                  min_channel: int = 0, max_channel: int = 15,
                  frequency: int = 200):
         """Initialize the direct PWM writer.
@@ -87,6 +98,14 @@ class DirectPWMWriter:
         self._min_ch = min_channel
         self._max_ch = max_channel
         self._num_channels = max_channel - min_channel + 1
+        self._lock = threading.Lock()
+        self._uses_busio = all(hasattr(i2c_bus, name) for name in ("try_lock", "writeto", "unlock"))
+        self._uses_smbus = all(hasattr(i2c_bus, name) for name in ("write_byte_data", "write_i2c_block_data"))
+        if not (self._uses_busio or self._uses_smbus):
+            raise TypeError(
+                "i2c_bus must be either busio.I2C-like (try_lock/writeto/unlock) "
+                "or SMBus-like (write_byte_data/write_i2c_block_data)"
+            )
 
         # Pre-allocated buffer: 1 byte register addr + 4 bytes per channel
         self._buf = bytearray(1 + 4 * self._num_channels)
@@ -97,17 +116,22 @@ class DirectPWMWriter:
 
     def _write_reg(self, reg: int, value: int):
         """Write a single byte to a register."""
-        while not self._i2c.try_lock():
-            time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
         try:
+            if self._uses_smbus:
+                with self._lock:
+                    self._i2c.write_byte_data(self._addr, reg, value)
+                return
+
+            while not self._i2c.try_lock():
+                time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
             try:
                 self._i2c.writeto(self._addr, bytes([reg, value]))
-            except Exception as exc:
-                raise PWMHardwareIOError(
-                    f"Failed to write PCA9685 register 0x{reg:02X} at address 0x{self._addr:02X}: {exc}"
-                ) from exc
-        finally:
-            self._i2c.unlock()
+            finally:
+                self._i2c.unlock()
+        except Exception as exc:
+            raise PWMHardwareIOError(
+                f"Failed to write PCA9685 register 0x{reg:02X} at address 0x{self._addr:02X}: {exc}"
+            ) from exc
 
     def _init_chip(self, frequency: int):
         """Initialize PCA9685 and set PWM frequency."""
@@ -184,17 +208,30 @@ class DirectPWMWriter:
             buf[offset + 2] = off_val & 0xFF
             buf[offset + 3] = (off_val >> 8) & 0xFF
 
-        while not self._i2c.try_lock():
-            time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
         try:
+            if self._uses_smbus:
+                with self._lock:
+                    data = buf[1:]
+                    # SMBus block writes are limited to 32 data bytes. Keep
+                    # chunks channel-aligned (8 channels * 4 bytes).
+                    for offset in range(0, len(data), 32):
+                        self._i2c.write_i2c_block_data(
+                            self._addr,
+                            buf[0] + offset,
+                            list(data[offset:offset + 32]),
+                        )
+                return
+
+            while not self._i2c.try_lock():
+                time.sleep(0)  # Yield to scheduler to avoid busy-waiting on I2C lock.
             try:
                 self._i2c.writeto(self._addr, buf)
-            except Exception as exc:
-                raise PWMHardwareIOError(
-                    f"Failed to flush PCA9685 channel buffer at address 0x{self._addr:02X}: {exc}"
-                ) from exc
-        finally:
-            self._i2c.unlock()
+            finally:
+                self._i2c.unlock()
+        except Exception as exc:
+            raise PWMHardwareIOError(
+                f"Failed to flush PCA9685 channel buffer at address 0x{self._addr:02X}: {exc}"
+            ) from exc
 
 
 # ============================================================================
@@ -222,14 +259,13 @@ class ChannelConfig:
     dither_enable: bool = False
     dither_amp_us: float = 8.0  # vibration amplitude in microseconds
     dither_hz: float = 40.0  # vibration frequency
-    dither_taper: bool = False  # taper near pulse bounds instead of expanding clamp
+    dither_taper: bool = False  # fade dither in after the deadband edge
+    dither_taper_us: float = 8.0  # distance after deadband edge before full dither
 
     # Slew rate limiting (microseconds per second) to soften command steps
     ramp_enable: bool = False
     ramp_limit: float = 0.0  # us/s; ignored when ramp_enable is False
     ramp_skip_deadband: bool = False  # if True, deadband jump is instant (slew only applies to usable range)
-    ramp_brake_threshold: float = 0.0  # fraction of working range [0.0–1.0] where braking starts; 0 = disabled
-    ramp_brake_min_rate: float = 80.0  # minimum µs/s at the very end of brake zone (prevents stall near target)
 
     # Symmetric gamma shaping (1.0 = linear). Applied to magnitude for both directions.
     gamma: float = 1.0
@@ -333,8 +369,8 @@ class PWMController:
         # Load config
         self._load_config(config_file)
 
-        # Hardware init - direct I2C, no Adafruit dependency
-        self._i2c = busio.I2C(board.SCL, board.SDA)
+        # Hardware init - direct SMBus I2C, no Adafruit dependency
+        self._i2c = _open_smbus(PCA9685_I2C_BUS)
         self._direct_writer = None
         self._pwm_period_us = 0.0
         self._rebuild_writer(pwm_frequency=pwm_frequency)
@@ -455,7 +491,7 @@ class PWMController:
         required_channel_keys = [
             'output_channel', 'pulse_min', 'pulse_max', 'direction', 'center',
             'deadzone', 'affects_pump', 'toggleable', 'deadband_us_pos', 'deadband_us_neg',
-            'dither_enable', 'dither_amp_us', 'dither_hz', 'dither_taper',
+            'dither_enable', 'dither_amp_us', 'dither_hz', 'dither_taper', 'dither_taper_us',
             'ramp_enable', 'ramp_limit', 'ramp_skip_deadband', 'gamma'
         ]
 
@@ -515,11 +551,10 @@ class PWMController:
                 dither_amp_us = _as_float(scope, 'dither_amp_us', cfg['dither_amp_us'])
                 dither_hz = _as_float(scope, 'dither_hz', cfg['dither_hz'])
                 dither_taper = _as_bool(scope, 'dither_taper', cfg['dither_taper'])
+                dither_taper_us = _as_float(scope, 'dither_taper_us', cfg['dither_taper_us'])
                 ramp_enable = _as_bool(scope, 'ramp_enable', cfg['ramp_enable'])
                 ramp_limit = _as_float(scope, 'ramp_limit', cfg['ramp_limit'])
                 ramp_skip_deadband = _as_bool(scope, 'ramp_skip_deadband', cfg['ramp_skip_deadband'])
-                ramp_brake_threshold = _as_float(scope, 'ramp_brake_threshold', cfg.get('ramp_brake_threshold', 0.0))
-                ramp_brake_min_rate = _as_float(scope, 'ramp_brake_min_rate', cfg.get('ramp_brake_min_rate', 80.0))
                 gamma = _as_float(scope, 'gamma', cfg['gamma'])
                 if len(config_errors) != item_errors_before:
                     continue
@@ -540,12 +575,11 @@ class PWMController:
                     dither_amp_us=float(dither_amp_us),
                     dither_hz=float(dither_hz),
                     dither_taper=dither_taper,
+                    dither_taper_us=float(dither_taper_us),
                     # Ramp/slew limiting - opt-in per channel
                     ramp_enable=ramp_enable,
                     ramp_limit=float(ramp_limit),
                     ramp_skip_deadband=ramp_skip_deadband,
-                    ramp_brake_threshold=float(ramp_brake_threshold),
-                    ramp_brake_min_rate=float(ramp_brake_min_rate),
                     # Symmetric gamma shaping
                     gamma=float(gamma),
                 )
@@ -627,13 +661,11 @@ class PWMController:
                     errors.append(f"Channel '{name}': dither_amp_us must be > 0 when dither_enable is true")
                 if float(config.dither_hz) <= 0.0:
                     errors.append(f"Channel '{name}': dither_hz must be > 0 when dither_enable is true")
+                if config.dither_taper and float(config.dither_taper_us) <= 0.0:
+                    errors.append(f"Channel '{name}': dither_taper_us must be > 0 when dither_taper is true")
             # ramp limits: enabled channels need a positive rate
             if config.ramp_enable and float(config.ramp_limit) <= 0.0:
                 errors.append(f"Channel '{name}': ramp_limit must be > 0 when ramp_enable is true")
-            if not (0.0 <= float(config.ramp_brake_threshold) <= 1.0):
-                errors.append(f"Channel '{name}': ramp_brake_threshold must be in [0.0, 1.0]")
-            if float(config.ramp_brake_min_rate) <= 0.0:
-                errors.append(f"Channel '{name}': ramp_brake_min_rate must be > 0")
             # gamma shaping bounds (keep reasonable)
             if float(config.gamma) <= 0.0 or float(config.gamma) > 5.0:
                 errors.append(f"Channel '{name}': gamma must be within (0, 5]")
@@ -840,20 +872,17 @@ class PWMController:
             and float(config.dither_hz) != 0.0
             and dither_active
         )
-        pulse = self._apply_dither(config, base_pulse, now) if use_dither else base_pulse
-
-        # Clamp to limits (optionally expanded when dither is active to preserve full amplitude)
         if use_dither:
-            if config.dither_taper:
-                pulse_min = float(config.pulse_min)
-                pulse_max = float(config.pulse_max)
-            else:
-                amp = max(0.0, float(config.dither_amp_us))
-                pulse_min = float(config.pulse_min) - amp
-                pulse_max = float(config.pulse_max) + amp
+            dither_amp = self._dither_amplitude(config, base_pulse)
+            base_pulse = self._clamp_base_for_dither(config, base_pulse, dither_amp)
+            dither_amp = self._dither_amplitude(config, base_pulse)
+            pulse = self._apply_dither(config, base_pulse, now, dither_amp)
         else:
-            pulse_min = float(config.pulse_min)
-            pulse_max = float(config.pulse_max)
+            pulse = base_pulse
+
+        # Final safety clamp: configured pulse limits are hard limits.
+        pulse_min = float(config.pulse_min)
+        pulse_max = float(config.pulse_max)
         pulse = max(pulse_min, min(pulse_max, pulse))
         return pulse
 
@@ -875,16 +904,36 @@ class PWMController:
             working_range = base - float(config.pulse_min)
             return base - abs(float(value)) * working_range
 
-    def _apply_dither(self, config: ChannelConfig, pulse: float, now: float) -> float:
+    def _dither_amplitude(self, config: ChannelConfig, pulse: float) -> float:
+        amp = float(config.dither_amp_us)
+        if not config.dither_taper:
+            return amp
+
+        center = float(config.center)
+        if pulse > center:
+            deadband_edge = center + float(config.deadband_us_pos)
+            distance_from_edge = pulse - deadband_edge
+        else:
+            deadband_edge = center - float(config.deadband_us_neg)
+            distance_from_edge = deadband_edge - pulse
+        taper_us = max(float(config.dither_taper_us), 1e-6)
+        taper_gain = max(0.0, min(1.0, distance_from_edge / taper_us))
+        return amp * taper_gain
+
+    def _clamp_base_for_dither(self, config: ChannelConfig, pulse: float, dither_amp: float) -> float:
+        pulse_min = float(config.pulse_min)
+        pulse_max = float(config.pulse_max)
+        lower = pulse_min + max(0.0, dither_amp)
+        upper = pulse_max - max(0.0, dither_amp)
+        if lower > upper:
+            return (pulse_min + pulse_max) * 0.5
+        return max(lower, min(upper, pulse))
+
+    def _apply_dither(self, config: ChannelConfig, pulse: float, now: float, dither_amp: float) -> float:
         # Dither to prevent valve stiction (only when actively commanding)
         # Per-channel phase offset using output_channel index to avoid perfect sync
         phase = config._dither_omega * now + config._dither_phase_offset
-        if config.dither_taper:
-            headroom = min(pulse - float(config.pulse_min), float(config.pulse_max) - pulse)
-            allowed_amp = max(0.0, min(float(config.dither_amp_us), headroom))
-            dither = allowed_amp * math.sin(phase)
-        else:
-            dither = float(config.dither_amp_us) * math.sin(phase)
+        dither = dither_amp * math.sin(phase)
         return pulse + dither
 
     def _apply_ramp(self, config: ChannelConfig, target_pulse: float, now: float) -> float:
@@ -943,31 +992,8 @@ class PWMController:
             self._channel_ramp_state[config.output_channel] = (last_pulse, now, 0.0)
             return last_pulse
 
-        # Linear ramp with optional brake zone near target.
-        # Brake zone: when within ramp_brake_threshold fraction of the working range from the
-        # target, linearly taper the rate limit down to ramp_brake_min_rate.
-        # This allows a high ramp_limit for fast response through the working range while
-        # preventing overshoot / valve slam at the destination.
         delta = target_pulse - last_pulse
-        effective_limit = float(config.ramp_limit)
-        brake_threshold = float(config.ramp_brake_threshold)
-        if brake_threshold > 0.0:
-            center = float(config.center)
-            # Pick working range for the side we are currently travelling toward.
-            # Use target direction to select side (matches _compute_base_pulse convention).
-            if target_pulse >= center:
-                working_range = float(config.pulse_max) - (center + float(config.deadband_us_pos))
-            else:
-                working_range = (center - float(config.deadband_us_neg)) - float(config.pulse_min)
-            working_range = max(working_range, 1.0)  # guard against degenerate config
-            brake_dist = brake_threshold * working_range
-            dist_to_target = abs(delta)
-            if dist_to_target < brake_dist:
-                # Linearly interpolate: 0 at target → ramp_brake_min_rate; brake_dist → ramp_limit
-                t = dist_to_target / brake_dist
-                min_rate = max(float(config.ramp_brake_min_rate), 1.0)
-                effective_limit = min_rate + t * (float(config.ramp_limit) - min_rate)
-        allowed_step = effective_limit * dt  # microseconds permitted in this interval
+        allowed_step = float(config.ramp_limit) * dt  # microseconds permitted in this interval
         if abs(delta) <= allowed_step:
             new_pulse = target_pulse
         else:
@@ -1157,13 +1183,17 @@ class PWMController:
 
     def reload_config(self, config_file: str) -> bool:
         config_path = None
+        was_monitoring = self.running
         try:
-            config_path, channel_configs, pump_config, pwm_frequency = self._read_config_data(config_file)
-            was_monitoring = self.running
             if was_monitoring:
                 self._stop_monitoring()
 
             with self._lock:
+                # Hold outputs neutral while the config file is parsed/swapped.
+                # This blocks concurrent command writes until reload completes.
+                self.reset(reset_pump=True)
+
+                config_path, channel_configs, pump_config, pwm_frequency = self._read_config_data(config_file)
                 writer_state = self._build_writer_state(
                     channel_configs=channel_configs,
                     pump_config=pump_config,
@@ -1186,9 +1216,13 @@ class PWMController:
         except PWMConfigError as exc:
             location = config_path if config_path is not None else config_file
             self.logger.error(f"Configuration reload failed for '{location}': {exc}")
+            if was_monitoring:
+                self._start_monitoring()
             return False
         except Exception as exc:
             self.logger.error(f"Unexpected error reloading configuration '{config_file}': {exc}")
+            if was_monitoring:
+                self._start_monitoring()
             return False
 
     def set_log_level(self, level: str) -> None:

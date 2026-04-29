@@ -60,32 +60,126 @@ def average_axis_twist_quaternion(quats: np.ndarray, axis: np.ndarray) -> np.nda
     return quat_normalize(accum)
 
 
+def gravity_pitch_from_quat(quat: np.ndarray) -> np.float32:
+    """Extract link pitch against gravity from a corrected IMU quaternion."""
+    q = quat_normalize(np.asarray(quat, dtype=np.float32))
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    gx = np.float32(2.0) * (x * z - w * y)
+    gz = np.float32(1.0) - np.float32(2.0) * (x * x + y * y)
+    return np.float32(np.arctan2(-gx, gz))
+
+
+def _wrap_angle_pi(angle: np.float32) -> np.float32:
+    """Wrap an angle in radians to [-pi, pi)."""
+    return np.float32((angle + np.pi) % (np.float32(2.0) * np.pi) - np.pi)
+
+
+def _configured_sensor_role_order(robot_config: RobotConfig) -> list[str]:
+    """Role order expected for IMU quaternion arrays."""
+    cached_roles = getattr(robot_config, 'imu_sensor_roles', None)
+    if cached_roles:
+        return list(cached_roles)
+
+    chain = getattr(robot_config, 'imu_chain', None) or []
+    mapping = getattr(robot_config, 'imu_mapping', None) or {}
+    roles = []
+
+    def add_role(role):
+        if role and role != 'all' and role in mapping and role not in roles:
+            roles.append(role)
+
+    for item in chain:
+        if not isinstance(item, dict):
+            continue
+        add_role(item.get('parent_role'))
+        add_role(item.get('role'))
+
+    if roles:
+        return roles
+    return ['base', 'boom', 'arm', 'bucket']
+
+
+def _axis_from_config(axis_name: str, fallback: np.ndarray) -> np.ndarray:
+    if axis_name == 'x':
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    if axis_name == 'y':
+        return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if axis_name == 'z':
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return np.asarray(fallback, dtype=np.float32)
+
+
 def canonical_joint_angles_from_imus(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
     """Convert four corrected absolute IMU quats to canonical joint angles.
 
-    Input order is [base, boom, arm, bucket].  Common slew yaw is estimated by
-    averaging the Z-axis twist from all four IMUs, then removed before extracting
-    relative Y-axis hinge rotations.
+    The configured default sensor order is [base, boom/lift, arm, bucket].
+    The returned controller order remains [slew, boom/lift, arm, bucket]:
+      - slew: common Z-axis yaw from available IMUs
+      - boom/lift: lift IMU pitch against base IMU pitch, or level gravity if base is absent
+      - arm: arm IMU pitch against lift IMU pitch
+      - bucket: bucket IMU pitch against arm IMU pitch
+
+    Additional joints can be described in ``imu.chain`` using
+    ``gravity_pitch_delta`` or ``relative_axis_twist`` extraction.
     """
     imu_quats = np.asarray(imu_quats, dtype=np.float32)
-    if imu_quats.shape != (4, 4):
-        raise ValueError(f"Expected four IMU quaternions with shape (4, 4), got {imu_quats.shape}")
+    if imu_quats.ndim != 2 or imu_quats.shape[1] != 4:
+        raise ValueError(f"Expected IMU quaternions with shape (n, 4), got {imu_quats.shape}")
+
+    role_order = _configured_sensor_role_order(robot_config)
+    if len(imu_quats) != len(role_order):
+        if len(imu_quats) == 4:
+            role_order = ['base', 'boom', 'arm', 'bucket']
+        else:
+            raise ValueError(f"Expected {len(role_order)} IMU quaternions for roles {role_order}, got {len(imu_quats)}")
+
+    role_quats = {role: imu_quats[i] for i, role in enumerate(role_order)}
+    chain = getattr(robot_config, 'imu_chain', None) or []
 
     z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
     slew_quat = average_axis_twist_quaternion(imu_quats, z_axis)
-    slew_inv = quat_conjugate(slew_quat)
 
-    body_quats = np.zeros_like(imu_quats, dtype=np.float32)
-    for i in range(4):
-        body_quats[i] = quat_normalize(quat_multiply(slew_inv, imu_quats[i]))
+    angles = np.zeros(robot_config.num_joints, dtype=np.float32)
 
-    angles = np.zeros(4, dtype=np.float32)
-    angles[0] = extract_axis_rotation(slew_quat, z_axis)
+    if not chain:
+        chain = [
+            {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
+            {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+            {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+            {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
+        ]
 
-    for i in range(1, 4):
-        parent_inv = quat_conjugate(body_quats[i - 1])
-        rel_quat = quat_normalize(quat_multiply(parent_inv, body_quats[i]))
-        angles[i] = extract_axis_rotation(rel_quat, robot_config.rotation_axes[i])
+    for item in chain:
+        if not isinstance(item, dict) or 'output_index' not in item:
+            continue
+        output_index = int(item['output_index'])
+        if output_index < 0 or output_index >= len(angles):
+            continue
+
+        extraction = item.get('extraction')
+        if extraction == 'average_z_yaw':
+            axis = _axis_from_config(item.get('axis', 'z'), z_axis)
+            angles[output_index] = extract_axis_rotation(slew_quat, axis)
+            continue
+
+        role = item.get('role')
+        if role not in role_quats:
+            raise ValueError(f"IMU role '{role}' is required for joint '{item.get('joint', output_index)}'")
+        parent_role = item.get('parent_role')
+
+        if extraction == 'gravity_pitch_delta':
+            parent_pitch = gravity_pitch_from_quat(role_quats[parent_role]) if parent_role in role_quats else np.float32(0.0)
+            child_pitch = gravity_pitch_from_quat(role_quats[role])
+            angles[output_index] = _wrap_angle_pi(child_pitch - parent_pitch)
+        elif extraction == 'relative_axis_twist':
+            axis = _axis_from_config(item.get('axis', 'y'), robot_config.rotation_axes[output_index])
+            if parent_role in role_quats:
+                rel_quat = quat_normalize(quat_multiply(quat_conjugate(role_quats[parent_role]), role_quats[role]))
+            else:
+                rel_quat = role_quats[role]
+            angles[output_index] = extract_axis_rotation(rel_quat, axis)
+        else:
+            raise ValueError(f"Unsupported IMU extraction mode '{extraction}'")
 
     return angles
 

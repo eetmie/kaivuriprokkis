@@ -91,21 +91,13 @@ def check_reachability(
     target_pos = np.asarray(target_pos, dtype=np.float32)
     angles = np.asarray(current_joint_angles, dtype=np.float32).copy()
 
-    # Tool pitch is defined in the body frame (upper body), so compose it
-    # with the current slew rotation to express the target in world frame.
     pitch_quat = quat_from_axis_angle(
         np.array([0.0, 1.0, 0.0], dtype=np.float32),
         np.float32(np.radians(target_rot_y_deg)),
     )
-    slew_quat = quat_from_axis_angle(
-        np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        np.float32(angles[0]),
-    )
-    target_quat = quat_normalize(quat_multiply(slew_quat, pitch_quat))
 
     sim_ik = copy.deepcopy(ik_controller)
     sim_ik.ee_pos_des = target_pos.copy()
-    sim_ik.ee_quat_des = target_quat
 
     err_history: list = []
     ee_pos = np.zeros(3, dtype=np.float32)
@@ -117,6 +109,13 @@ def check_reachability(
         ee_pos, ee_quat = get_pose_from_joint_angles(angles, robot_config)
         ee_pos = np.asarray(ee_pos, dtype=np.float32)
         ee_quat = np.asarray(ee_quat, dtype=np.float32)
+        # Live IK composes tool pitch with the current slew every control tick
+        # so yaw error stays zero while slew remains free to chase position.
+        slew_quat = quat_from_axis_angle(
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            np.float32(angles[0]),
+        )
+        sim_ik.ee_quat_des = quat_normalize(quat_multiply(slew_quat, pitch_quat))
         if cond_threshold > 0.0:
             sim_ik.last_condition_number = float(
                 compute_condition_number(

@@ -72,6 +72,23 @@ class ReachabilityTests(unittest.TestCase):
                         msg=f"err={result.pos_error_m:.4f}m closest={result.closest_position}")
         self.assertLess(result.pos_error_m, 5e-3)
 
+    def test_pose_mode_centerline_target_can_change_slew(self):
+        ik = _build_ik(self.rc, command_type="pose", enable_joint_limit_avoidance=True)
+        angles = np.radians([9.6, -24.0, 72.0, -28.0]).astype(np.float32)
+        target = np.array([0.6, 0.0, 0.0], dtype=np.float32)
+
+        result = check_reachability(
+            ik, self.rc, current_joint_angles=angles, target_pos=target,
+            target_rot_y_deg=0.0, pos_tol=5e-3, max_iters=80,
+            cond_threshold=100.0, dt=0.01,
+        )
+
+        self.assertTrue(
+            result.reachable,
+            msg=f"err={result.pos_error_m:.4f}m closest={result.closest_position}",
+        )
+        self.assertLess(abs(float(result.closest_position[1])), 5e-3)
+
     def test_out_of_reach_returns_closest_envelope(self):
         ik = _build_ik(self.rc)
         start = _nominal_start()
@@ -184,7 +201,7 @@ class ControllerIntegrationTests(unittest.TestCase):
         controller._last_reachability_result = None
         # Seed a "current" joint state.
         start = _nominal_start()
-        controller._current_raw_quats = build_absolute_quaternions(start, rc)
+        controller._current_fk_quats = build_absolute_quaternions(start, rc)
         from types import SimpleNamespace
         controller.config = SimpleNamespace(control_frequency=200.0)
         return controller

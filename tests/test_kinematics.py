@@ -168,6 +168,68 @@ class ForwardKinematicsTests(unittest.TestCase):
                 msg=f"yaw {deg}: recovered {recovered} vs {angles}",
             )
 
+    def test_four_imu_canonical_extraction_uses_gravity_pitch_chain(self):
+        """Hinge angles are link gravity-pitch differences: lift/base, arm/lift, bucket/arm."""
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        slew = math.radians(35.0)
+        base_pitch = math.radians(7.0)
+        lift = math.radians(12.0)
+        bucket = math.radians(-18.0)
+
+        for arm_deg in (-35.0, -10.0, 0.0, 25.0, 50.0):
+            arm = math.radians(arm_deg)
+            cumulative_pitches = np.array([
+                base_pitch,
+                base_pitch + lift,
+                base_pitch + lift + arm,
+                base_pitch + lift + arm + bucket,
+            ], dtype=np.float32)
+            slew_quat = quat_from_axis_angle(z_axis, np.float32(slew))
+            imu_quats = np.array([
+                quat_normalize(quat_multiply(
+                    slew_quat,
+                    quat_from_axis_angle(y_axis, np.float32(pitch)),
+                ))
+                for pitch in cumulative_pitches
+            ], dtype=np.float32)
+
+            recovered = canonical_joint_angles_from_imus(imu_quats, self.rc)
+            expected = np.array([slew, lift, arm, bucket], dtype=np.float32)
+            diff = np.asarray(recovered - expected, dtype=np.float64)
+            diff[0] = math.atan2(math.sin(diff[0]), math.cos(diff[0]))
+            self.assertTrue(
+                np.all(np.abs(diff) < 6e-4),
+                msg=f"arm {arm_deg}: recovered {recovered} vs {expected}",
+            )
+
+    def test_canonical_extraction_can_run_without_base_imu(self):
+        """When base is not mapped, lift is measured against level gravity."""
+        rc_no_base = RobotConfig(
+            link_lengths=self.rc.link_lengths.tolist(),
+            link_directions=[v.copy() for v in self.rc.link_directions],
+            rotation_axes=[v.copy() for v in self.rc.rotation_axes],
+            ee_offset=self.rc.ee_offset.copy(),
+            origin_offset=self.rc.origin_offset.copy(),
+            imu_chain=self.rc.imu_chain,
+            imu_mapping={'boom': 0, 'arm': 1, 'bucket': 2},
+        )
+        angles = np.array([
+            math.radians(25.0),
+            math.radians(14.0),
+            math.radians(-22.0),
+            math.radians(9.0),
+        ], dtype=np.float32)
+        imu_quats = build_absolute_quaternions(angles, self.rc)[1:]
+
+        recovered = canonical_joint_angles_from_imus(imu_quats, rc_no_base)
+        diff = np.asarray(recovered - angles, dtype=np.float64)
+        diff[0] = math.atan2(math.sin(diff[0]), math.cos(diff[0]))
+        self.assertTrue(
+            np.all(np.abs(diff) < 6e-4),
+            msg=f"recovered {recovered} vs {angles}",
+        )
+
     def test_yaw_average_handles_quaternion_sign_flip_at_wrap(self):
         angles = np.array([math.radians(179.0), -0.45, 0.35, -0.2], dtype=np.float32)
         imu_quats = build_absolute_quaternions(angles, self.rc)

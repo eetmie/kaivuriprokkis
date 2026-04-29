@@ -117,6 +117,10 @@ def main() -> int:
     )
 
     try:
+        if not args.sim:
+            reader.send_config()
+            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=30.0):
+                print("Warning: CFG_OK not received; continuing anyway", file=sys.stderr)
         reader.start_background_reader()
         print(f"Capturing IMU {args.imu} with tool-axis {args.tool_axis.tolist()} and gravity {args.gravity.tolist()}")
 

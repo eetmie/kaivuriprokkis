@@ -120,6 +120,15 @@ class RobotConfig:
     origin_offset: Optional[np.ndarray] = None
     """Origin offset - position of first joint relative to world origin [x, y, z]."""
 
+    imu_chain: Optional[List[Dict[str, Any]]] = None
+    """Configured IMU-to-joint extraction chain."""
+
+    imu_mapping: Optional[Dict[str, int]] = None
+    """Logical IMU role -> physical sensor index mapping."""
+
+    imu_sensor_roles: Optional[List[str]] = None
+    """Configured IMU role order expected by canonical extraction."""
+
     def __post_init__(self):
         if not self.link_lengths:
             raise ValueError("link_lengths cannot be empty")
@@ -150,6 +159,56 @@ class RobotConfig:
         # Set default origin_offset if not provided
         if self.origin_offset is None:
             self.origin_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        if self.imu_chain is None:
+            self.imu_chain = [
+                {
+                    'joint': 'slew',
+                    'output_index': 0,
+                    'source': 'all',
+                    'axis': 'z',
+                    'extraction': 'average_z_yaw',
+                },
+                {
+                    'joint': 'lift',
+                    'role': 'boom',
+                    'parent_role': 'base',
+                    'output_index': 1,
+                    'axis': 'y',
+                    'extraction': 'gravity_pitch_delta',
+                },
+                {
+                    'joint': 'arm',
+                    'role': 'arm',
+                    'parent_role': 'boom',
+                    'output_index': 2,
+                    'axis': 'y',
+                    'extraction': 'gravity_pitch_delta',
+                },
+                {
+                    'joint': 'bucket',
+                    'role': 'bucket',
+                    'parent_role': 'arm',
+                    'output_index': 3,
+                    'axis': 'y',
+                    'extraction': 'gravity_pitch_delta',
+                },
+            ]
+        if self.imu_mapping is None:
+            self.imu_mapping = {'base': 0, 'boom': 1, 'arm': 2, 'bucket': 3}
+
+        sensor_roles: List[str] = []
+
+        def add_sensor_role(role):
+            if role and role != 'all' and role in self.imu_mapping and role not in sensor_roles:
+                sensor_roles.append(role)
+
+        for item in self.imu_chain:
+            if not isinstance(item, dict):
+                continue
+            add_sensor_role(item.get('parent_role'))
+            add_sensor_role(item.get('role'))
+        self.imu_sensor_roles = sensor_roles if sensor_roles else ['base', 'boom', 'arm', 'bucket']
 
         # ENSURE ALL ARRAYS ARE FLOAT32
         self.link_lengths = np.asarray(self.link_lengths, dtype=np.float32)  # Convert list to numpy array!
@@ -323,6 +382,10 @@ def load_excavator_robot_config(path: str = "configuration_files/control_config.
         raise RuntimeError("robot.links.boom_mount_offset_m must not be zero")
     slew_direction = boom_mount_offset / slew_length
 
+    imu_cfg = cfg.get('imu', {}) if isinstance(cfg, dict) else {}
+    imu_chain = imu_cfg.get('chain') if isinstance(imu_cfg, dict) else None
+    imu_mapping = imu_cfg.get('imu_mapping') if isinstance(imu_cfg, dict) else None
+
     return RobotConfig(
         link_lengths=[slew_length, boom_length_m, arm_length_m, coupler_length_m],
         link_directions=[
@@ -339,6 +402,8 @@ def load_excavator_robot_config(path: str = "configuration_files/control_config.
         ],
         ee_offset=tool_tip_offset,
         origin_offset=np.array([0.0, 0.0, origin_height_m], dtype=np.float32),
+        imu_chain=imu_chain,
+        imu_mapping=imu_mapping,
     )
 
 

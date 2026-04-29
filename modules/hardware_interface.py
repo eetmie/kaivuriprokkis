@@ -20,15 +20,12 @@ import threading
 import yaml
 
 from .PCA9685_controller import PWMController
-from .imu_stream_reader import USBSerialReader
-from .ADC import SimpleADC
+from .usb_serial_reader import USBSerialReader
 from .quaternion_math import (
-    quat_from_axis_angle,
     quat_normalize,
     quat_multiply,
     quat_conjugate,
     quat_rotate_vector,
-    wrap_to_pi,
 )
 from .perf_tracker import IntervalTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
@@ -92,94 +89,15 @@ def _safe_hardware_operation(func):
     return wrapper
 
 
-class EncoderTracker:
-    def __init__(self, gear_ratio, min_voltage=0.5, max_voltage=4.5, flip_direction=False):
-        """
-        Initialize encoder tracker with simple continuous angle tracking.
-
-        :param gear_ratio: Gear ratio (encoder_rotations / actual_rotations)
-        :param min_voltage: Minimum voltage of encoder range
-        :param max_voltage: Maximum voltage of encoder range
-        :param flip_direction: If True, flip encoder direction (needed when gearing causes mechanical inversion)
-        """
-        self.min_voltage = min_voltage
-        self.max_voltage = max_voltage
-        self.voltage_range = max_voltage - min_voltage
-        self.gear_ratio = gear_ratio
-        self.flip_direction = flip_direction
-        self.z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # Z-axis for rotation
-
-        # Simple wrapping tracking
-        self.last_wrapped_angle = None
-        self.total_rotations = 0.0
-        self.zero_offset = None  # Will be set from first reading
-
-    def update(self, raw_voltage: float) -> dict:
-        """
-        Update encoder tracking with simple wrap detection and zero calibration.
-
-        :param raw_voltage: Raw voltage from encoder
-        :return: Dictionary with tracking information
-        """
-        # Convert voltage to angle in [0, 2π] range first
-        # Clamp voltage to valid range and normalize
-        clamped_voltage = max(self.min_voltage, min(self.max_voltage, raw_voltage))
-        voltage_fraction = (clamped_voltage - self.min_voltage) / self.voltage_range
-        raw_angle = voltage_fraction * 2 * np.pi  # Map [0,1] to [0,2π]
-
-        # Convert to [-π, π] range
-        wrapped_angle = wrap_to_pi(np.array([raw_angle]))[0]
-
-        # Set zero offset from first reading
-        if self.zero_offset is None:
-            self.zero_offset = wrapped_angle
-
-        # Handle wrap-around detection
-        if self.last_wrapped_angle is not None:
-            angle_diff = wrapped_angle - self.last_wrapped_angle
-
-            # Detect wrap-around (crossing ±π boundary)
-            if angle_diff > np.pi:
-                # Wrapped from +π to -π (backward rotation)
-                self.total_rotations -= 1.0
-            elif angle_diff < -np.pi:
-                # Wrapped from -π to +π (forward rotation)
-                self.total_rotations += 1.0
-
-        # Calculate continuous angle
-        continuous_angle = wrapped_angle + self.total_rotations * 2 * np.pi
-
-        # Apply zero offset (subtract to make first reading = 0)
-        zero_referenced_angle = continuous_angle - self.zero_offset
-
-        # Adjust for gear ratio and flip direction if needed
-        # Flip is required when encoder gearing causes mechanical inversion:
-        # physical slew rotates CW → gears cause encoder to rotate CCW
-        actual_angle = zero_referenced_angle / self.gear_ratio
-        if self.flip_direction:
-            actual_angle = -actual_angle
-
-        # Store for next iteration
-        self.last_wrapped_angle = wrapped_angle
-
-        # Convert to quaternion
-        quaternion = quat_from_axis_angle(self.z_axis, actual_angle)
-
-        return {
-            'angle_radians': actual_angle,
-            'quaternion': quaternion
-        }
-
-
 class HardwareInterface:
     """Hardware interface for excavator control system.
 
-    Manages PWM control, IMU data, and encoder readings with background threads.
+    Manages PWM control, IMU data, and optional pressure-sensor ADC readings.
     """
     
     def __init__(self,
                  config_file: str = "configuration_files/servo_config_200.yaml",
-                 pump_variable: bool = False,
+                 pump_auto_mode: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
                  input_rate_threshold: int = 0,
@@ -214,7 +132,7 @@ class HardwareInterface:
 
         Args:
             config_file: Path to PWM controller configuration
-            pump_variable: Whether to use variable/static pump speed
+            pump_auto_mode: Whether to use valve-activity-based auto pump speed (True) or static speed (False)
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
             input_rate_threshold: Input rate threshold for PWM controller safety monitoring.
                                   If > 0, enables rate checking and resets PWM if rate drops below threshold.
@@ -263,7 +181,7 @@ class HardwareInterface:
         self._imu_cpu_core = imu_cpu_core
         self._adc_cpu_core = adc_cpu_core
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
-        self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name, is_slew}
+        self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name}
 
         # IMU AHRS settings - load from config file, with constructor overrides
         _cfg = _load_control_config()
@@ -292,6 +210,7 @@ class HardwareInterface:
         self._expected_imu_count = len(_imu_mapping)
         # Validate: all indices distinct and within [0, expected_count)
         all_indices = list(_imu_mapping.values())
+        self._imu_all_indices = all_indices
         if len(set(all_indices)) != len(all_indices):
             raise ValueError(f"imu.imu_mapping has duplicate indices: {_imu_mapping}")
         for role, idx in _imu_mapping.items():
@@ -315,7 +234,7 @@ class HardwareInterface:
             try:
                 self.pwm_controller = PWMController(
                     config_file=config_file,
-                    pump_variable=pump_variable,
+                    pump_auto_mode=pump_auto_mode,
                     toggle_channels=toggle_channels,
                     input_rate_threshold=input_rate_threshold,
                     stale_timeout_s=stale_timeout_s,
@@ -362,7 +281,7 @@ class HardwareInterface:
         self._imu_fault_reason: Optional[str] = None
         self.latest_imu_data = None
         self.latest_imu_pitch = None  # radians, if available from stream
-        self.latest_base_imu_quat = None   # Base IMU quaternion (supplementary, not in IK)
+        self.latest_base_imu_quat = None   # Base/slew IMU quaternion used by IK yaw extraction
         self.latest_base_imu_gyro = None   # Base IMU gyro [gx, gy, gz] deg/s
         self._imu_lock = threading.Lock()
         self._imu_expected_hz = None
@@ -385,15 +304,12 @@ class HardwareInterface:
         # If disabled, mark as READY (not needed = OK)
         self._adc_state = ReadyState.PENDING if self._enable_adc else ReadyState.READY
         self._adc_fault_reason: Optional[str] = None
-        self.latest_slew_angle = 0.0
-        self.latest_slew_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Identity
         self._adc_lock = threading.Lock()
         self._adc_expected_hz = None
         self._latest_adc_readings = {}
         self._latest_adc_timestamp = None
         self.adc_thread = None
         self.adc = None
-        self.encoder_tracker = None
         # ADC/encoder expected rate (constructor arg, no config fallback)
         if self._enable_adc:
             self._adc_expected_hz = float(adc_sample_hz)
@@ -558,9 +474,9 @@ class HardwareInterface:
                         if self._base_imu_index is not None:
                             self.latest_base_imu_gyro = gyro_only[self._base_imu_index].copy()
 
-                    # Validate quaternion magnitudes for joint IMUs (should be ~1.0)
+                    # Validate quaternion magnitudes for all configured IMUs (should be ~1.0)
                     valid_data = True
-                    for i in self._imu_joint_indices:
+                    for i in self._imu_all_indices:
                         mag = np.linalg.norm(quat_only[i])
                         if mag < 0.95 or mag > 1.05:
                             valid_data = False
@@ -601,17 +517,15 @@ class HardwareInterface:
                 time.sleep(0.1)  # Back off on error
 
     def _ensure_adc_initialized(self) -> bool:
-        """Create ADC and encoder helper if not already initialized."""
+        """Create ADC helper if not already initialized."""
         if self.adc is None:
             try:
+                from .ADC import SimpleADC
                 self.adc = SimpleADC()
             except Exception as e:
                 self.logger.error(f"ADC initialization failed: {e}")
                 self.adc = None
                 return False
-        if self.encoder_tracker is None:
-            # flip_direction=True because slew encoder gearing inverts rotation direction
-            self.encoder_tracker = EncoderTracker(gear_ratio=2.60, min_voltage=0.5, max_voltage=4.5, flip_direction=True)
         if self._adc_channel_plan is None:
             self._adc_channel_plan = self._build_adc_channel_plan()
         return True
@@ -621,7 +535,16 @@ class HardwareInterface:
         if self.adc is None:
             raise RuntimeError("ADC not initialized")
 
-        requests = self._adc_channel_requests if self._adc_channel_requests is not None else ["Slew encoder rot"]
+        default_pressure_channels = [
+            "LiftBoom retract ps",
+            "LiftBoom extend ps",
+            "TiltBoom retract ps",
+            "TiltBoom extend ps",
+            "Scoop extend ps",
+            "Scoop retract ps",
+            "Pump ps",
+        ]
+        requests = self._adc_channel_requests if self._adc_channel_requests is not None else default_pressure_channels
         if not requests:
             raise ValueError("adc_channels must contain at least one channel")
 
@@ -640,12 +563,10 @@ class HardwareInterface:
             else:
                 raise ValueError(f"Invalid adc_channels entry: {item}")
 
-            is_slew = (name == "Slew encoder rot") or (board_name == "b1" and int(channel) == 8)
             plan.append({
                 'board': board_name,
                 'channel': int(channel),
                 'name': name,
-                'is_slew': is_slew,
             })
 
         return plan
@@ -680,17 +601,6 @@ class HardwareInterface:
             self.logger.error(f"Failed to start ADC streaming: {e}")
             return False
 
-    def _ensure_slew_channel_configured(self) -> None:
-        """Raise if slew encoder is not part of the configured ADC sampling plan."""
-        if not self._enable_adc:
-            raise RuntimeError("ADC disabled - slew encoder not available")
-        if self._adc_channel_plan is None:
-            if not self._ensure_adc_initialized():
-                raise RuntimeError("ADC not initialized - cannot check slew channel")
-        has_slew = any(ch.get('is_slew') for ch in (self._adc_channel_plan or []))
-        if not has_slew:
-            raise RuntimeError("Slew encoder channel not configured in adc_channels")
-
     def _adc_reader_thread(self) -> None:
         """Background thread for continuous ADC reading."""
         if self._adc_rt_priority > 0 or self._rt_lock_memory or self._adc_cpu_core is not None:
@@ -721,16 +631,7 @@ class HardwareInterface:
             try:
                 # Sample configured channels
                 for ch in self._adc_channel_plan:
-                    if ch['is_slew']:
-                        # Slew encoder: 1x oversample for 200Hz support (4.16ms vs 8.32ms)
-                        voltage = self.adc.read_channel_fast(ch['board'], ch['channel'], oversample=1)
-                    else:
-                        voltage = self.adc.read_channel(ch['board'], ch['channel'])
-                    if ch['is_slew']:
-                        slew_data = self.encoder_tracker.update(voltage)
-                        with self._adc_lock:
-                            self.latest_slew_angle = slew_data['angle_radians']
-                            self.latest_slew_quat = slew_data['quaternion']
+                    voltage = self.adc.read_channel(ch['board'], ch['channel'])
                     with self._adc_lock:
                         self._latest_adc_readings[ch['name']] = voltage
                         self._latest_adc_timestamp = time.time()
@@ -806,7 +707,7 @@ class HardwareInterface:
             }
 
     def read_base_imu(self) -> Optional[Dict[str, Any]]:
-        """Read latest corrected base IMU data (supplementary, not used in IK).
+        """Read latest corrected base/slew IMU data.
 
         Returns {'quat': ndarray[4], 'gyro': ndarray[3]} or None if base IMU
         is not configured or no data has arrived yet.
@@ -822,6 +723,16 @@ class HardwareInterface:
             return result
 
     @_safe_hardware_operation
+    def read_all_imu_quaternions(self) -> Optional[List[np.ndarray]]:
+        """Read corrected IMU quaternions in IK order [base, boom, arm, bucket]."""
+        with self._imu_lock:
+            if self._imu_state != ReadyState.READY:
+                raise RuntimeError("IMU not ready - cannot read IMU data")
+            if self.latest_base_imu_quat is None or self.latest_imu_data is None:
+                raise RuntimeError("Base or joint IMU data is missing")
+            return [self.latest_base_imu_quat.copy()] + [q.copy() for q in self.latest_imu_data]
+
+    @_safe_hardware_operation
     def read_imu_pitch(self) -> Optional[List[float]]:
         """Read latest IMU pitch angles (radians) if provided by the serial stream.
 
@@ -833,57 +744,6 @@ class HardwareInterface:
             if self.latest_imu_pitch is None:
                 raise RuntimeError("IMU pitch data is None (may not be streamed by device)")
             return list(self.latest_imu_pitch)
-
-    @_safe_hardware_operation
-    def read_slew_voltage(self) -> float:
-        """
-        Read slew encoder voltage from ADC (with EMA filtering).
-
-        Returns:
-            Filtered voltage reading from slew encoder
-
-        Raises:
-            RuntimeError: If ADC is not ready or read fails (SAFETY: PWM reset + pump stopped before raising)
-        """
-        self._ensure_slew_channel_configured()
-        with self._adc_lock:
-            if self._adc_state != ReadyState.READY:
-                raise RuntimeError("ADC not ready - cannot read slew voltage")
-            for ch in self._adc_channel_plan:
-                if ch['is_slew']:
-                    name = ch['name']
-                    break
-            else:
-                raise RuntimeError("Slew channel not in ADC plan")
-            if name not in self._latest_adc_readings:
-                raise RuntimeError("Slew voltage not yet sampled")
-            return float(self._latest_adc_readings[name])
-
-    @_safe_hardware_operation
-    def read_slew_angle(self) -> float:
-        """Read latest slew angle in radians.
-
-        Raises:
-            RuntimeError: If ADC is not ready (SAFETY: PWM reset + pump stopped before raising)
-        """
-        self._ensure_slew_channel_configured()
-        with self._adc_lock:
-            if self._adc_state != ReadyState.READY:
-                raise RuntimeError("ADC not ready - cannot read slew angle")
-            return self.latest_slew_angle
-
-    @_safe_hardware_operation
-    def read_slew_quaternion(self) -> np.ndarray:
-        """Read latest slew quaternion [w, x, y, z].
-
-        Raises:
-            RuntimeError: If ADC is not ready (SAFETY: PWM reset + pump stopped before raising)
-        """
-        self._ensure_slew_channel_configured()
-        with self._adc_lock:
-            if self._adc_state != ReadyState.READY:
-                raise RuntimeError("ADC not ready - cannot read slew quaternion")
-            return self.latest_slew_quat.copy()
 
     def get_latest_adc_readings(self) -> Dict[str, float]:
         """Get a copy of the latest ADC readings sampled by the background thread."""
@@ -966,14 +826,12 @@ class HardwareInterface:
 
     def send_named_pwm_commands(self, commands: Dict[str, float], *,
                                 unset_to_zero: Optional[bool] = None,
-                                one_shot_pump_override: bool = True,
                                 command_ts: Optional[float] = None) -> bool:
         """Convenience method: send name-based PWM commands.
 
         Args:
             commands: Mapping from channel name to command value [-1, 1]. Unknown names ignored.
             unset_to_zero: If None, use controller default; otherwise override per call.
-            one_shot_pump_override: If True, a provided 'pump' value only applies for this update.
             command_ts: Optional monotonic timestamp of when command was generated (e.g., UDP receive time).
                         If provided and PWM controller has stale_timeout_s configured, commands older
                         than the timeout will be rejected for safety.
@@ -983,7 +841,6 @@ class HardwareInterface:
         try:
             self.pwm_controller.update_named(commands,
                                              unset_to_zero=unset_to_zero,
-                                             one_shot_pump_override=one_shot_pump_override,
                                              command_ts=command_ts)
             return True
         except Exception as e:
@@ -999,6 +856,32 @@ class HardwareInterface:
             return True
         except Exception as e:
             self.logger.error(f"Pump toggle error: {e}")
+            return False
+
+    def set_pump_speed_us(self, pulse_us, *, flush: bool = True) -> bool:
+        """Set pump speed directly in microseconds, bypassing auto/static logic.
+
+        Clamped to [pulse_min, pulse_max] from config.
+        Pass None to release direct control and return to auto/static mode.
+        """
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return False
+        try:
+            self.pwm_controller.set_pump_speed_us(pulse_us, flush=flush)
+            return True
+        except Exception as e:
+            self.logger.error(f"Pump direct speed error: {e}")
+            return False
+
+    def set_pump_auto(self, auto: bool) -> bool:
+        """Enable (True) or disable (False) valve-activity-based auto pump speed scaling."""
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return False
+        try:
+            self.pwm_controller.set_pump_auto(auto)
+            return True
+        except Exception as e:
+            self.logger.error(f"Pump auto mode error: {e}")
             return False
 
     def get_pwm_channel_names(self, include_pump: bool = True) -> List[str]:
@@ -1034,7 +917,6 @@ class HardwareInterface:
             'imu_fault': self._imu_fault_reason,
             'adc_fault': self._adc_fault_reason,
             'latest_imu_timestamp': time.time() if self.latest_imu_data is not None else None,
-            'slew_angle': self.latest_slew_angle
         }
 
         return status

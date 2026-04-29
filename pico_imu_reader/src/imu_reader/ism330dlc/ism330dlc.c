@@ -6,6 +6,8 @@
 #include "pico/time.h"
 #include <math.h>
 
+#define I2C_REG_TIMEOUT_US 2000u
+
 typedef struct ActiveImu {
     i2c_inst_t *i2c_port;
     uint8_t bus_index;
@@ -13,6 +15,7 @@ typedef struct ActiveImu {
 } ActiveImu;
 
 static ActiveImu active_imus[MAX_SENSORS];
+static FusionVector active_gyro_biases[MAX_SENSORS];
 static uint8_t active_sensor_count = 0;
 
 static bool ism330dhcx_probe(i2c_inst_t *i2c_port, uint8_t device_addr) {
@@ -26,15 +29,15 @@ static bool ism330dhcx_probe(i2c_inst_t *i2c_port, uint8_t device_addr) {
 // Function to write to ISM330DHCX register
 bool ism330dhcx_write_reg(i2c_inst_t *i2c_port, uint8_t device_addr, uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
-    int result = i2c_write_blocking(i2c_port, device_addr, buf, 2, false);
+    int result = i2c_write_timeout_us(i2c_port, device_addr, buf, 2, false, I2C_REG_TIMEOUT_US);
     return result == 2;
 }
 
 // Function to read from ISM330DHCX register
 bool ism330dhcx_read_reg(i2c_inst_t *i2c_port, uint8_t device_addr, uint8_t reg, uint8_t* value, uint8_t read_count) {
-    int result = i2c_write_blocking(i2c_port, device_addr, &reg, 1, true);
+    int result = i2c_write_timeout_us(i2c_port, device_addr, &reg, 1, true, I2C_REG_TIMEOUT_US);
     if (result != 1) return false;
-    result = i2c_read_blocking(i2c_port, device_addr, value, read_count, false);
+    result = i2c_read_timeout_us(i2c_port, device_addr, value, read_count, false, I2C_REG_TIMEOUT_US);
     return result == read_count;
 }
 
@@ -144,13 +147,19 @@ int initialize_sensors(void) {
         uint8_t bus_index;
         uint8_t device_addr;
     } candidates[MAX_SENSORS] = {
+        // Must match pico_imu_simulator and control_config.yaml imu_mapping:
+        // [0] base=I2C1:0x6B, [1] boom=I2C0:0x6A,
+        // [2] bucket=I2C0:0x6B, [3] arm=I2C1:0x6A.
+        {I2C_PORT_1, 1, ISM330DHCX_ADDR_DO_HIGH},
         {I2C_PORT_0, 0, ISM330DHCX_ADDR_DO_LOW},
         {I2C_PORT_0, 0, ISM330DHCX_ADDR_DO_HIGH},
         {I2C_PORT_1, 1, ISM330DHCX_ADDR_DO_LOW},
-        {I2C_PORT_1, 1, ISM330DHCX_ADDR_DO_HIGH},
     };
 
     active_sensor_count = 0;
+    for (uint8_t i = 0; i < MAX_SENSORS; i++) {
+        active_gyro_biases[i] = FUSION_VECTOR_ZERO;
+    }
     cdc_write_line("Probing IMUs on I2C0/I2C1 @ 0x6A/0x6B...");
 
     for (uint8_t i = 0; i < MAX_SENSORS; i++) {
@@ -231,16 +240,66 @@ bool ism330dhcx_read_accelerometer(i2c_inst_t* i2c_port, uint8_t device_addr, Fu
     return true;
 }
 
-void read_all_sensors(Sensor* sensors) {
+static bool ism330dhcx_read_motion(i2c_inst_t* i2c_port, uint8_t device_addr,
+                                   FusionVector* accelerometer, FusionVector* gyroscope) {
+    uint8_t raw_values[12];
+    if (!ism330dhcx_read_reg(i2c_port, device_addr, OUTX_L_G, raw_values, sizeof(raw_values))) {
+        return false;
+    }
+
+    const int16_t raw_gyro_x = combine_8_bits(raw_values[0], raw_values[1]);
+    const int16_t raw_gyro_y = combine_8_bits(raw_values[2], raw_values[3]);
+    const int16_t raw_gyro_z = combine_8_bits(raw_values[4], raw_values[5]);
+    const int16_t raw_acc_x = combine_8_bits(raw_values[6], raw_values[7]);
+    const int16_t raw_acc_y = combine_8_bits(raw_values[8], raw_values[9]);
+    const int16_t raw_acc_z = combine_8_bits(raw_values[10], raw_values[11]);
+
+    const float gyro_range = (imu_reader_settings.gyroRangeDps > 0.0f) ? imu_reader_settings.gyroRangeDps : 500.0f;
+    gyroscope->axis.x = ((float)raw_gyro_x / 32768.0f) * gyro_range;
+    gyroscope->axis.y = ((float)raw_gyro_y / 32768.0f) * gyro_range;
+    gyroscope->axis.z = ((float)raw_gyro_z / 32768.0f) * gyro_range;
+
+    accelerometer->axis.x = ((float)raw_acc_x / 32768.0f) * (float)XL_G_RANGE;
+    accelerometer->axis.y = ((float)raw_acc_y / 32768.0f) * (float)XL_G_RANGE;
+    accelerometer->axis.z = ((float)raw_acc_z / 32768.0f) * (float)XL_G_RANGE;
+    return true;
+}
+
+bool read_active_sensor_motion_unbiased(uint8_t sensor_index, FusionVector* accelerometer, FusionVector* gyroscope) {
+    if ((sensor_index >= active_sensor_count) || (accelerometer == NULL) || (gyroscope == NULL)) {
+        return false;
+    }
+
+    return ism330dhcx_read_motion(
+        active_imus[sensor_index].i2c_port,
+        active_imus[sensor_index].device_addr,
+        accelerometer,
+        gyroscope);
+}
+
+void set_active_sensor_gyro_bias(uint8_t sensor_index, FusionVector gyro_bias) {
+    if (sensor_index >= active_sensor_count) {
+        return;
+    }
+    active_gyro_biases[sensor_index] = gyro_bias;
+}
+
+void read_all_sensors(Sensor* sensors, bool sensor_valid[]) {
     for (uint8_t i = 0; i < active_sensor_count; i++) {
-        if (!ism330dhcx_read_accelerometer(active_imus[i].i2c_port, active_imus[i].device_addr, &sensors[i].accelerometer) ||
-            !ism330dhcx_read_gyro(active_imus[i].i2c_port, active_imus[i].device_addr, &sensors[i].gyroscope)) {
-            sensors[i].accelerometer.axis.x = NAN;
-            sensors[i].accelerometer.axis.y = NAN;
-            sensors[i].accelerometer.axis.z = NAN;
-            sensors[i].gyroscope.axis.x = NAN;
-            sensors[i].gyroscope.axis.y = NAN;
-            sensors[i].gyroscope.axis.z = NAN;
+        FusionVector accelerometer;
+        FusionVector gyroscope;
+        const bool ok = ism330dhcx_read_motion(
+            active_imus[i].i2c_port,
+            active_imus[i].device_addr,
+            &accelerometer,
+            &gyroscope);
+
+        if (ok) {
+            sensors[i].accelerometer = accelerometer;
+            sensors[i].gyroscope = FusionVectorSubtract(gyroscope, active_gyro_biases[i]);
+        }
+        if (sensor_valid != NULL) {
+            sensor_valid[i] = ok;
         }
         sensors[i].timestamp = time_us_64();
     }

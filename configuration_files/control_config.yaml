@@ -120,24 +120,9 @@ controller:
     # Bias adaptation gain per control update (0..1)
     adaptation_rate: 0.01
 
-  # Slew angle fusion: complementary filter blending encoder + averaged IMU gyro Z-axis.
-  # This is a yaw-rate proxy taken from the three boom/arm/bucket IMUs, not a direct yaw angle.
-  # Assumption: pitch joints are approximately planar and IMU local Z remains a usable proxy for slew yaw.
-  # If links pitch far from neutral, local IMU Z underestimates global yaw by roughly cos(pitch).
-  slew_fusion:
-    enabled: True                # false = pure encoder (current behavior)
-    alpha: 0.0                   # Weight on encoder (0..1). Higher = trust encoder more
-    aggregation: "mean"           # "mean" or "median" for combining 3 IMU Z-rates
-    gyro_bias_comp:
-      enabled: False
-      stationarity_degps: 0.7
-      adaptation_rate: 0.005
-    max_gyro_degps: 180.0         # Clamp on aggregated IMU Z-rate before fusion
-
-
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController
-ik
+ik:
   # Command type: "position" (3D) or "pose" (6D with orientation)
   command_type: "pose"
 
@@ -166,7 +151,7 @@ ik
 
   # Condition number threshold — discard IK commands when Jacobian condition
   # number exceeds this value (0 = disabled, typical range: 50–500)
-  condition_number_threshold: 0
+  condition_number_threshold: 200
 
   # Adaptive damping (DLS method only)
   # Adjusts lambda based on Jacobian condition number for better singularity handling.
@@ -177,12 +162,30 @@ ik
   adaptive_damping_scaling: 0.5        # How aggressively lambda increases near singularities
   adaptive_damping_max_multiplier: 10.0  # Maximum lambda = lambda_val * max_multiplier
 
-  # Orientation axes to exclude from IK solving.
-  # Uncontrollable axes (e.g. roll) are auto-detected and always excluded. No hurt done if written here though.
-  # Slew rotation does Yaw, but we cannot separate rotation from Cartesian Y movement.
-  ignore_axes: [yaw]
+  # Orientation axes that cannot be physically produced are auto-detected from
+  # joint rotation axes and always excluded from IK solving. No manual ignore_axes
+  # needed: target orientation is constructed in the robot's local frame by the
+  # controller (pitch composed with current slew quaternion), so yaw error is
+  # zero by construction.
+  # TODO: add orientation_mode config here (pitch_follows_slew / full_pose) for rototilt support.
 
   # Relative joint limits (degrees) for [slew, boom, arm, bucket]
-  # Leave empty [] to use default [-π, π] for all joints
+  # Leave empty [] to use default [-π, π] for all joints.
+  # Per-joint null = unbounded (np.clip with ±inf, joint-limit-avoidance skipped).
   # Example: [[-30.0, 30.0], [-65.0, 25.0], [-15.0, 140.0], [-130.0, 75.0]]
-  joint_limits_relative: []
+  joint_limits_relative:
+    - null              # slew: unbounded — allows continuous cab rotation across ±180°
+    - [-180.0, 180.0]   # boom
+    - [-180.0, 180.0]   # arm
+    - [-180.0, 180.0]   # bucket
+
+
+# Pre-flight reachability check (modules/reachability.py).
+# Runs a simulated IK rollout when give_pose() is called and rejects targets
+# that the geometry cannot satisfy before any hydraulic motion starts.
+# Returns the closest reachable position so the GUI can snap the target.
+reachability:
+  enabled: true
+  pos_tol_m: 0.005          # Convergence tolerance (m)
+  max_iters: 80             # Hard iteration cap per check
+  min_target_delta_m: 0.002 # Skip re-check when joystick moves less than this

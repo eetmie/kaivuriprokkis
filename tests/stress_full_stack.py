@@ -102,10 +102,10 @@ def main() -> int:
         hardware = HardwareInterface(
             config_file=str(ROOT / "configuration_files" / "servo_config_200.yaml"),
             log_level=args.log_level.upper(),
-            pump_variable=True,
+            pump_auto_mode=True,
             cleanup_disable_osc=False,
-            adc_channels=["Slew encoder rot"],
-            adc_sample_hz=target_hz,
+            enable_adc=False,
+            start_adc_reader=False,
             imu_expected_hz=target_imu_hz,
             rt_lock_memory=args.lock_memory,
             usb_rt_priority=args.fifo_priority,

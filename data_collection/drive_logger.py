@@ -481,7 +481,7 @@ def main():
     # ---- Hardware ----
     print("Initializing hardware...")
     hardware = HardwareInterface(
-        pump_variable=False,
+        pump_auto_mode=False,
         toggle_channels=True,
         stale_timeout_s=0.5,
         adc_channels=[

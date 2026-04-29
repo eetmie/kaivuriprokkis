@@ -27,8 +27,109 @@ from .differential_ik import (
     ik_method_damped_least_squares,
 )
 from .quaternion_math import (
-    quat_normalize, quat_multiply, quat_conjugate,
+    quat_normalize, quat_multiply, quat_conjugate, quat_from_axis_angle,
 )
+
+
+def average_axis_twist_quaternion(quats: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Average the twist component of multiple quaternions about one axis.
+
+    This keeps yaw/pitch extraction in quaternion space and avoids Euler-angle
+    wrap issues.  Quaternion signs are hemisphere-aligned before summing so
+    +179/-179 degree samples average to 180 instead of cancelling.
+    """
+    quats = np.asarray(quats, dtype=np.float32)
+    axis = np.asarray(axis, dtype=np.float32)
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    if quats.ndim != 2 or quats.shape[1] != 4 or len(quats) == 0:
+        raise ValueError("Expected quats with shape (n, 4)")
+
+    accum = np.zeros(4, dtype=np.float32)
+    reference = None
+    for q in quats:
+        angle = extract_axis_rotation(q, axis)
+        twist = quat_from_axis_angle(axis, np.float32(angle))
+        if reference is None:
+            reference = twist.copy()
+        elif float(np.dot(reference, twist)) < 0.0:
+            twist = -twist
+        accum += twist
+
+    if float(np.linalg.norm(accum)) < 1e-9:
+        return reference if reference is not None else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return quat_normalize(accum)
+
+
+def canonical_joint_angles_from_imus(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
+    """Convert four corrected absolute IMU quats to canonical joint angles.
+
+    Input order is [base, boom, arm, bucket].  Common slew yaw is estimated by
+    averaging the Z-axis twist from all four IMUs, then removed before extracting
+    relative Y-axis hinge rotations.
+    """
+    imu_quats = np.asarray(imu_quats, dtype=np.float32)
+    if imu_quats.shape != (4, 4):
+        raise ValueError(f"Expected four IMU quaternions with shape (4, 4), got {imu_quats.shape}")
+
+    z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
+    slew_quat = average_axis_twist_quaternion(imu_quats, z_axis)
+    slew_inv = quat_conjugate(slew_quat)
+
+    body_quats = np.zeros_like(imu_quats, dtype=np.float32)
+    for i in range(4):
+        body_quats[i] = quat_normalize(quat_multiply(slew_inv, imu_quats[i]))
+
+    angles = np.zeros(4, dtype=np.float32)
+    angles[0] = extract_axis_rotation(slew_quat, z_axis)
+
+    for i in range(1, 4):
+        parent_inv = quat_conjugate(body_quats[i - 1])
+        rel_quat = quat_normalize(quat_multiply(parent_inv, body_quats[i]))
+        angles[i] = extract_axis_rotation(rel_quat, robot_config.rotation_axes[i])
+
+    return angles
+
+
+def absolute_link_angles_from_quats(
+    quats: np.ndarray, robot_config: RobotConfig
+) -> np.ndarray:
+    """Per-link absolute angles in radians.
+
+    For the excavator chain (slew about Z, boom/arm/bucket about body Y) this
+    returns:
+      - angles[0]  = world-frame slew yaw (twist of quats[0] about Z)
+      - angles[i>=1] = cab-frame twist of link i about its own rotation axis,
+        i.e. cumulative pitch from horizontal as a link-mounted inclinometer
+        would read it.
+
+    The slew yaw is removed before extracting downstream twists so the result
+    is independent of cab heading. Generalises naturally to a future rototilt
+    tool (roll about X, yaw about Z) because each joint's own rotation axis
+    drives the extraction.
+
+    Mounting offsets are NOT re-applied here — the hardware layer has already
+    mounting-corrected the IMU quaternions (see ``imu.mounting_offsets_quat``
+    in ``control_config.yaml`` and ``hardware_interface._correct_imu_quaternion``)
+    before they reach the controller, so the canonical absolute link quats are
+    the right inputs as-is.
+    """
+    quats = np.asarray(quats, dtype=np.float32)
+    n = len(quats)
+    out = np.zeros(n, dtype=np.float32)
+    if n == 0:
+        return out
+
+    z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
+    out[0] = extract_axis_rotation(quats[0], z_axis)
+
+    if n > 1:
+        slew_quat = quat_from_axis_angle(z_axis, np.float32(out[0]))
+        slew_inv = quat_conjugate(slew_quat)
+        for i in range(1, n):
+            body_q = quat_normalize(quat_multiply(slew_inv, quats[i]))
+            axis_i = np.asarray(robot_config.rotation_axes[i], dtype=np.float32)
+            out[i] = extract_axis_rotation(body_q, axis_i)
+    return out
 
 
 def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
@@ -83,15 +184,14 @@ def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) 
 
 
 def get_joint_positions(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """Get joint positions with origin_offset applied (no ee_offset).
+    """Get joint positions from absolute link quats with origin_offset applied.
 
     Returns:
         np.ndarray: Joint positions [n x 3] including origin_offset, without end-effector offset
     """
     quats = np.asarray(quats, dtype=np.float32)
-    propagated_quats = propagate_base_rotation(quats, robot_config)
     return forward_kinematics_core(
-        propagated_quats,
+        quats,
         robot_config.link_lengths,
         robot_config.link_directions,
         robot_config.origin_offset
@@ -105,7 +205,7 @@ def get_all_poses(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndar
     Zero overhead compared to get_pose() since all values are computed anyway.
 
     Args:
-        quats: Joint quaternions from IMUs
+        quats: Absolute link quaternions from canonical joint angles
         robot_config: Robot configuration
 
     Returns:
@@ -116,22 +216,21 @@ def get_all_poses(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndar
         - ee_orientation [4]: End-effector orientation [w, x, y, z]
     """
     quats = np.asarray(quats, dtype=np.float32)
-    propagated_quats = propagate_base_rotation(quats, robot_config)
 
     # Get joint positions and ee_position with offsets
     joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
-        propagated_quats,
+        quats,
         robot_config.link_lengths,
         robot_config.link_directions,
         robot_config.origin_offset,
         robot_config.ee_offset
     )
 
-    # Joint orientations are the propagated quaternions
-    joint_orientations = propagated_quats.copy()
+    # Joint orientations are the supplied absolute link quaternions
+    joint_orientations = quats.copy()
 
     # End-effector orientation is the last joint's orientation
-    ee_orientation = propagated_quats[-1].copy()
+    ee_orientation = quats[-1].copy()
 
     return joint_positions, joint_orientations, ee_position, ee_orientation
 
@@ -142,7 +241,7 @@ def get_pose(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndarray, 
     Convenience wrapper around get_all_poses() for when you only need EE pose.
 
     Args:
-        quats: Joint quaternions from IMUs
+        quats: Absolute link quaternions from canonical joint angles
         robot_config: Robot configuration
 
     Returns:

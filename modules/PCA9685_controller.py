@@ -228,6 +228,8 @@ class ChannelConfig:
     ramp_enable: bool = False
     ramp_limit: float = 0.0  # us/s; ignored when ramp_enable is False
     ramp_skip_deadband: bool = False  # if True, deadband jump is instant (slew only applies to usable range)
+    ramp_brake_threshold: float = 0.0  # fraction of working range [0.0–1.0] where braking starts; 0 = disabled
+    ramp_brake_min_rate: float = 80.0  # minimum µs/s at the very end of brake zone (prevents stall near target)
 
     # Symmetric gamma shaping (1.0 = linear). Applied to magnitude for both directions.
     gamma: float = 1.0
@@ -247,8 +249,9 @@ class PumpConfig:
     output_channel: int
     pulse_min: int
     pulse_max: int
-    base_command: float
-    activity_gain: float
+    static_pulse_us: float   # fixed pulse width (µs) used when auto mode is off
+    base_pulse_us: float     # idle pulse (µs) in auto mode with no valve activity
+    activity_gain_us: float  # extra µs added at full average valve activity (auto mode)
 
 
 class PWMConstants:
@@ -274,7 +277,7 @@ class PWMConstants:
 class PWMController:
     """Simple PWM controller with piecewise deadband and dither for valve testing."""
 
-    def __init__(self, config_file: str, pump_variable: bool = False,
+    def __init__(self, config_file: str, pump_auto_mode: bool = False,
                  toggle_channels: bool = True, input_rate_threshold: float = 0,
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
                  stale_timeout_s: float = 0.0, perf_enabled: bool = False,
@@ -283,7 +286,7 @@ class PWMController:
 
         Args:
             config_file: Path to YAML configuration file
-            pump_variable: Enable variable pump speed
+            pump_auto_mode: Enable auto pump speed (scales with valve activity).
             toggle_channels: Enable toggleable channels
             input_rate_threshold: Input rate threshold for safety monitoring
             default_unset_to_zero: Default unset channels to zero
@@ -306,13 +309,12 @@ class PWMController:
             self.logger.addHandler(handler)
 
         self._lock = threading.RLock()
-        self.pump_variable = pump_variable
+        self.pump_auto_mode = bool(pump_auto_mode)
         self.toggle_channels = toggle_channels
         self.pump_enabled = True
-        self._pump_command_bias = 0.0
+        self._pump_direct_us: Optional[float] = None  # set by set_pump_speed_us; None = auto/static
         self.pump_activity_sum = 0.0
         self.pump_activity_count = 0
-        self._pump_override_throttle: Optional[float] = None
         self._stale_timeout_s = max(0.0, float(stale_timeout_s))
         self._last_command_ts = time.monotonic()
 
@@ -448,7 +450,7 @@ class PWMController:
             return None
 
         required_pump_keys = [
-            'output_channel', 'pulse_min', 'pulse_max', 'base_command', 'activity_gain'
+            'output_channel', 'pulse_min', 'pulse_max', 'static_pulse_us', 'base_pulse_us', 'activity_gain_us'
         ]
         required_channel_keys = [
             'output_channel', 'pulse_min', 'pulse_max', 'direction', 'center',
@@ -476,16 +478,18 @@ class PWMController:
                 output_channel = _as_int(scope, 'output_channel', cfg['output_channel'])
                 pulse_min = _as_int(scope, 'pulse_min', cfg['pulse_min'])
                 pulse_max = _as_int(scope, 'pulse_max', cfg['pulse_max'])
-                base_command = _as_float(scope, 'base_command', cfg['base_command'])
-                activity_gain = _as_float(scope, 'activity_gain', cfg['activity_gain'])
+                static_pulse_us = _as_float(scope, 'static_pulse_us', cfg['static_pulse_us'])
+                base_pulse_us = _as_float(scope, 'base_pulse_us', cfg['base_pulse_us'])
+                activity_gain_us = _as_float(scope, 'activity_gain_us', cfg['activity_gain_us'])
                 if len(config_errors) != item_errors_before:
                     continue
                 pump_config = PumpConfig(
                     output_channel=output_channel,
                     pulse_min=pulse_min,
                     pulse_max=pulse_max,
-                    base_command=base_command,
-                    activity_gain=activity_gain,
+                    static_pulse_us=static_pulse_us,
+                    base_pulse_us=base_pulse_us,
+                    activity_gain_us=activity_gain_us,
                 )
             else:
                 missing = [k for k in required_channel_keys if k not in cfg]
@@ -514,6 +518,8 @@ class PWMController:
                 ramp_enable = _as_bool(scope, 'ramp_enable', cfg['ramp_enable'])
                 ramp_limit = _as_float(scope, 'ramp_limit', cfg['ramp_limit'])
                 ramp_skip_deadband = _as_bool(scope, 'ramp_skip_deadband', cfg['ramp_skip_deadband'])
+                ramp_brake_threshold = _as_float(scope, 'ramp_brake_threshold', cfg.get('ramp_brake_threshold', 0.0))
+                ramp_brake_min_rate = _as_float(scope, 'ramp_brake_min_rate', cfg.get('ramp_brake_min_rate', 80.0))
                 gamma = _as_float(scope, 'gamma', cfg['gamma'])
                 if len(config_errors) != item_errors_before:
                     continue
@@ -538,6 +544,8 @@ class PWMController:
                     ramp_enable=ramp_enable,
                     ramp_limit=float(ramp_limit),
                     ramp_skip_deadband=ramp_skip_deadband,
+                    ramp_brake_threshold=float(ramp_brake_threshold),
+                    ramp_brake_min_rate=float(ramp_brake_min_rate),
                     # Symmetric gamma shaping
                     gamma=float(gamma),
                 )
@@ -622,6 +630,10 @@ class PWMController:
             # ramp limits: enabled channels need a positive rate
             if config.ramp_enable and float(config.ramp_limit) <= 0.0:
                 errors.append(f"Channel '{name}': ramp_limit must be > 0 when ramp_enable is true")
+            if not (0.0 <= float(config.ramp_brake_threshold) <= 1.0):
+                errors.append(f"Channel '{name}': ramp_brake_threshold must be in [0.0, 1.0]")
+            if float(config.ramp_brake_min_rate) <= 0.0:
+                errors.append(f"Channel '{name}': ramp_brake_min_rate must be > 0")
             # gamma shaping bounds (keep reasonable)
             if float(config.gamma) <= 0.0 or float(config.gamma) > 5.0:
                 errors.append(f"Channel '{name}': gamma must be within (0, 5]")
@@ -639,10 +651,12 @@ class PWMController:
             if pump_config.pulse_min >= pump_config.pulse_max:
                 errors.append("Pump: pulse_min must be less than pulse_max")
 
-            if not PWMConstants.NORMALIZED_COMMAND_MIN <= pump_config.base_command <= PWMConstants.NORMALIZED_COMMAND_MAX:
-                errors.append("Pump: base_command must be within [-1.0, 1.0]")
-            if not 0.0 <= pump_config.activity_gain <= 1.0:
-                errors.append("Pump: activity_gain must be within [0.0, 1.0]")
+            if not (pump_config.pulse_min <= pump_config.static_pulse_us <= pump_config.pulse_max):
+                errors.append("Pump: static_pulse_us must be within [pulse_min, pulse_max]")
+            if not (pump_config.pulse_min <= pump_config.base_pulse_us <= pump_config.pulse_max):
+                errors.append("Pump: base_pulse_us must be within [pulse_min, pulse_max]")
+            if not 0.0 <= pump_config.activity_gain_us <= (pump_config.pulse_max - pump_config.pulse_min):
+                errors.append("Pump: activity_gain_us must be within [0, pulse_max - pulse_min]")
 
         if errors:
             raise PWMConfigValidationError("Configuration validation failed:\n" + "\n".join(errors))
@@ -738,7 +752,7 @@ class PWMController:
                         self.is_safe_state = False
 
     def update_named(self, commands: Dict[str, float], *, unset_to_zero: Optional[bool] = None,
-                     one_shot_pump_override: bool = True, command_ts: Optional[float] = None):
+                     command_ts: Optional[float] = None):
         # Performance tracking (before lock to capture full update time)
         self._perf_tracker.tick_start()
 
@@ -753,13 +767,6 @@ class PWMController:
                 self.input_event.set()
                 if not self.is_safe_state:
                     return
-
-            if 'pump' in commands and self.pump_config:
-                try:
-                    pump_val = float(commands['pump'])
-                    self._pump_override_throttle = max(-1.0, min(1.0, pump_val))
-                except Exception:
-                    pass
 
             do_zero = self._default_unset_to_zero if unset_to_zero is None else unset_to_zero
             if do_zero:
@@ -786,9 +793,6 @@ class PWMController:
             self._update_channels()
             self._update_pump()
             self._direct_writer.flush()  # Single I2C transaction for all channels + pump
-
-            if one_shot_pump_override:
-                self._pump_override_throttle = None
 
         # Performance tracking (after lock released, captures full update cycle)
         self._perf_tracker.tick_end()
@@ -939,9 +943,31 @@ class PWMController:
             self._channel_ramp_state[config.output_channel] = (last_pulse, now, 0.0)
             return last_pulse
 
-        # Linear ramp: limit step size per interval
-        allowed_step = float(config.ramp_limit) * dt  # microseconds permitted in this interval
+        # Linear ramp with optional brake zone near target.
+        # Brake zone: when within ramp_brake_threshold fraction of the working range from the
+        # target, linearly taper the rate limit down to ramp_brake_min_rate.
+        # This allows a high ramp_limit for fast response through the working range while
+        # preventing overshoot / valve slam at the destination.
         delta = target_pulse - last_pulse
+        effective_limit = float(config.ramp_limit)
+        brake_threshold = float(config.ramp_brake_threshold)
+        if brake_threshold > 0.0:
+            center = float(config.center)
+            # Pick working range for the side we are currently travelling toward.
+            # Use target direction to select side (matches _compute_base_pulse convention).
+            if target_pulse >= center:
+                working_range = float(config.pulse_max) - (center + float(config.deadband_us_pos))
+            else:
+                working_range = (center - float(config.deadband_us_neg)) - float(config.pulse_min)
+            working_range = max(working_range, 1.0)  # guard against degenerate config
+            brake_dist = brake_threshold * working_range
+            dist_to_target = abs(delta)
+            if dist_to_target < brake_dist:
+                # Linearly interpolate: 0 at target → ramp_brake_min_rate; brake_dist → ramp_limit
+                t = dist_to_target / brake_dist
+                min_rate = max(float(config.ramp_brake_min_rate), 1.0)
+                effective_limit = min_rate + t * (float(config.ramp_limit) - min_rate)
+        allowed_step = effective_limit * dt  # microseconds permitted in this interval
         if abs(delta) <= allowed_step:
             new_pulse = target_pulse
         else:
@@ -1002,24 +1028,26 @@ class PWMController:
         with self._lock:
             if not self.pump_config:
                 return
-            if self._pump_override_throttle is not None:
-                throttle = self._pump_override_throttle
-            elif not self.pump_enabled:
-                throttle = -1.0
+            if not self.pump_enabled:
+                pulse = float(self.pump_config.pulse_min)
+            elif self._pump_direct_us is not None:
+                # Direct control: caller owns the pulse, no auto logic applied
+                pulse = max(float(self.pump_config.pulse_min),
+                            min(float(self.pump_config.pulse_max), self._pump_direct_us))
+            elif self.pump_auto_mode:
+                # Auto mode: scale between base_pulse_us and base+activity_gain based on valve activity
+                denom = max(1, self.pump_activity_count)
+                avg_activity = self.pump_activity_sum / denom  # 0.0 – 1.0
+                pulse = self.pump_config.base_pulse_us + (
+                    self.pump_config.activity_gain_us * avg_activity
+                )
+                pulse = max(float(self.pump_config.pulse_min),
+                            min(float(self.pump_config.pulse_max), pulse))
             else:
-                if self.pump_variable:
-                    denom = max(1, self.pump_activity_count)
-                    throttle = self.pump_config.base_command + (
-                        self.pump_config.activity_gain * self.pump_activity_sum / denom
-                    )
-                else:
-                    # Preserve the legacy fixed-speed behavior as a small bias above base_command.
-                    throttle = self.pump_config.base_command + (self.pump_config.activity_gain / 10.0)
-                throttle += self._pump_command_bias
+                # Static mode: fixed speed from config
+                pulse = max(float(self.pump_config.pulse_min),
+                            min(float(self.pump_config.pulse_max), self.pump_config.static_pulse_us))
 
-            throttle = max(-1.0, min(1.0, throttle))
-            pulse_range = self.pump_config.pulse_max - self.pump_config.pulse_min
-            pulse = self.pump_config.pulse_min + pulse_range * ((throttle + 1) / 2)
             duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
             duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
             self._direct_writer.set_channel(self.pump_config.output_channel, duty_cycle)
@@ -1031,7 +1059,7 @@ class PWMController:
             self.values = [0.0] * PWMConstants.MAX_CHANNELS
             self.pump_activity_sum = 0.0
             self.pump_activity_count = 0
-            self._pump_command_bias = 0.0
+            self._pump_direct_us = None
             for name, config in self.channel_configs.items():
                 duty_cycle = int((config.center / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
                 duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
@@ -1044,7 +1072,6 @@ class PWMController:
             self._direct_writer.flush()
             self.is_safe_state = False
             self.input_counter = 0
-            self._pump_override_throttle = None
 
     def get_average_input_rate(self) -> float:
         current_time = time.time()
@@ -1087,21 +1114,31 @@ class PWMController:
             if flush:
                 self._update_pump(flush=True)
 
-    def toggle_pump_variable(self, variable: bool):
-        self.pump_variable = variable
+    def set_pump_auto(self, auto: bool):
+        """Enable (True) or disable (False) valve-activity-based auto speed scaling."""
+        with self._lock:
+            self.pump_auto_mode = bool(auto)
 
-    def update_pump_bias(self, adjustment: float):
-        self._pump_command_bias = max(-1.0, min(0.3, self._pump_command_bias + adjustment / 10.0))
+    def set_pump_speed_us(self, pulse_us: Optional[float], flush: bool = True):
+        """Set pump speed directly in microseconds, bypassing auto/static logic.
 
-    def reset_pump_bias(self):
-        self._pump_command_bias = 0.0
-        self._update_pump(flush=True)
+        The pulse is clamped to [pulse_min, pulse_max] from config.
+        Pass None to release direct control and return to auto/static mode.
+        """
+        with self._lock:
+            if pulse_us is None:
+                self._pump_direct_us = None
+            else:
+                if self.pump_config:
+                    self._pump_direct_us = max(float(self.pump_config.pulse_min),
+                                               min(float(self.pump_config.pulse_max), float(pulse_us)))
+                else:
+                    self._pump_direct_us = float(pulse_us)
+            if flush:
+                self._update_pump(flush=True)
 
     def disable_channels(self, disabled: bool):
         self.toggle_channels = not disabled
-
-    def clear_pump_override(self):
-        self._pump_override_throttle = None
 
     def get_channel_names(self, include_pump: bool = True) -> List[str]:
         names = list(self.channel_configs.keys())

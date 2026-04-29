@@ -94,8 +94,8 @@ def main():
 
     hw_log_level = "WARNING" if quiet else args.log_level.upper()
     hardware = HardwareInterface(
-        log_level=hw_log_level, pump_variable=True, cleanup_disable_osc=False,
-        adc_channels=["Slew encoder rot"], adc_sample_hz=200.0,
+        log_level=hw_log_level, pump_auto_mode=True, cleanup_disable_osc=False,
+        enable_adc=False, start_adc_reader=False,
         rt_lock_memory=args.lock_memory,
         usb_rt_priority=args.fifo_priority,
         imu_rt_priority=args.fifo_priority,

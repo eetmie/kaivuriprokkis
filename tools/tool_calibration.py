@@ -15,7 +15,7 @@ Assumptions:
 - Tool length is handled elsewhere; this helper only solves orientation offset.
 
 Example:
-    python -m modules.tool_calibration --imu 4 --samples 200 --tool-axis 0,0,-1
+    python -m tools.tool_calibration --imu 4 --samples 200 --tool-axis 0,0,-1
 """
 
 from __future__ import annotations
@@ -27,24 +27,14 @@ from typing import Iterable
 
 import numpy as np
 
-try:
-    from .imu_stream_reader import USBSerialReader
-    from .quaternion_math import (
-        quat_conjugate,
-        quat_multiply,
-        quat_normalize,
-        quat_rotate_vector,
-        euler_xyz_from_quat,
-    )
-except ImportError:  # pragma: no cover - script mode fallback
-    from imu_stream_reader import USBSerialReader
-    from quaternion_math import (
-        quat_conjugate,
-        quat_multiply,
-        quat_normalize,
-        quat_rotate_vector,
-        euler_xyz_from_quat,
-    )
+from modules.usb_serial_reader import USBSerialReader
+from modules.quaternion_math import (
+    quat_conjugate,
+    quat_multiply,
+    quat_normalize,
+    quat_rotate_vector,
+    euler_xyz_from_quat,
+)
 
 
 def _parse_vec3(text: str) -> np.ndarray:

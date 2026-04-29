@@ -17,6 +17,14 @@
 
 // MAX_SENSORS and FLOATS_PER_SENSOR defined in output.h
 
+#define STARTUP_CALIBRATION_SETTLE_MS 5000u
+#define STARTUP_CALIBRATION_DURATION_MS 15000u
+#define STARTUP_CALIBRATION_SAMPLE_PERIOD_US 10000u
+#define CALIBRATION_MAX_GYRO_STD_DPS 0.5f
+#define CALIBRATION_MAX_ACCEL_STD_G 0.05f
+#define CALIBRATION_MIN_ACCEL_NORM_G 0.75f
+#define CALIBRATION_MAX_ACCEL_NORM_G 1.25f
+
 typedef struct imu_stream_slot_t {
     uint32_t sequence;
     uint32_t timestamp_us;
@@ -44,9 +52,51 @@ typedef struct sensor_runtime_t {
     Sensor sensors[MAX_SENSORS];
 } sensor_runtime_t;
 
+typedef struct calibration_stats_t {
+    uint32_t count;
+    FusionVector gyro_sum;
+    FusionVector gyro_sum_sq;
+    FusionVector accel_sum;
+    FusionVector accel_sum_sq;
+} calibration_stats_t;
+
 static sensor_runtime_t g_sensor_runtime = {0};
 
 static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR], Sensor* sensors, uint8_t sensor_count);
+
+static inline FusionVector vector_add_square(FusionVector sum, FusionVector value) {
+    sum.axis.x += value.axis.x * value.axis.x;
+    sum.axis.y += value.axis.y * value.axis.y;
+    sum.axis.z += value.axis.z * value.axis.z;
+    return sum;
+}
+
+static inline FusionVector vector_divide(FusionVector vector, float scalar) {
+    vector.axis.x /= scalar;
+    vector.axis.y /= scalar;
+    vector.axis.z /= scalar;
+    return vector;
+}
+
+static inline FusionVector vector_std(FusionVector sum, FusionVector sum_sq, float count) {
+    const FusionVector mean = vector_divide(sum, count);
+    FusionVector variance = vector_divide(sum_sq, count);
+    variance.axis.x -= mean.axis.x * mean.axis.x;
+    variance.axis.y -= mean.axis.y * mean.axis.y;
+    variance.axis.z -= mean.axis.z * mean.axis.z;
+
+    FusionVector stddev;
+    stddev.axis.x = sqrtf(fmaxf(variance.axis.x, 0.0f));
+    stddev.axis.y = sqrtf(fmaxf(variance.axis.y, 0.0f));
+    stddev.axis.z = sqrtf(fmaxf(variance.axis.z, 0.0f));
+    return stddev;
+}
+
+static inline float vector_norm(FusionVector vector) {
+    return sqrtf((vector.axis.x * vector.axis.x) +
+                 (vector.axis.y * vector.axis.y) +
+                 (vector.axis.z * vector.axis.z));
+}
 
 static inline FusionQuaternion enforce_quaternion_continuity(FusionQuaternion q, FusionQuaternion q_ref) {
     // Choose hemisphere (q or -q) closest to reference quaternion
@@ -72,6 +122,175 @@ static inline float tilt_pitch_deg_from_gravity(const FusionVector gravity) {
 
 static inline float tilt_roll_deg_from_gravity(const FusionVector gravity) {
     return (180.0f / (float)M_PI) * atan2f(gravity.axis.y, gravity.axis.z);
+}
+
+static inline bool fusion_vector_is_finite(const FusionVector vector) {
+    return isfinite(vector.axis.x) && isfinite(vector.axis.y) && isfinite(vector.axis.z);
+}
+
+static inline bool fusion_quaternion_is_finite(const FusionQuaternion quaternion) {
+    return isfinite(quaternion.element.w) && isfinite(quaternion.element.x) &&
+           isfinite(quaternion.element.y) && isfinite(quaternion.element.z);
+}
+
+static inline float clamp_delta_time(float delta_time_s, float nominal_s) {
+    if (!isfinite(delta_time_s) || (delta_time_s <= 0.0f)) {
+        return nominal_s;
+    }
+    if (delta_time_s < nominal_s * 0.5f) {
+        return nominal_s * 0.5f;
+    }
+    if (delta_time_s > nominal_s * 2.0f) {
+        return nominal_s * 2.0f;
+    }
+    return delta_time_s;
+}
+
+static inline void write_sensor_output(float output[FLOATS_PER_SENSOR], FusionQuaternion quaternion, FusionVector gyroscope) {
+    output[0] = quaternion.element.w;
+    output[1] = quaternion.element.x;
+    output[2] = quaternion.element.y;
+    output[3] = quaternion.element.z;
+    output[4] = gyroscope.axis.x;
+    output[5] = gyroscope.axis.y;
+    output[6] = gyroscope.axis.z;
+}
+
+static void send_cfg_ok_window(void) {
+    const uint64_t start_us = time_us_64();
+    uint64_t last_ok_us = start_us;
+
+    while ((time_us_64() - start_us) < 500000u) {
+        tud_task();
+        const uint64_t now_us = time_us_64();
+        if ((now_us - last_ok_us) >= 100000u) {
+            send_control_msg(MSG_TYPE_CFG_OK);
+            last_ok_us = now_us;
+        }
+        sleep_ms(10);
+    }
+}
+
+static void calibration_service_until(uint64_t deadline_us) {
+    static uint64_t next_cal_wait_us = 0;
+    static uint64_t next_led_toggle_us = 0;
+    static bool led_on = true;
+
+    while (time_us_64() < deadline_us) {
+        tud_task();
+        const uint64_t now_us = time_us_64();
+
+        if (now_us >= next_cal_wait_us) {
+            send_control_msg(MSG_TYPE_CAL_WAIT);
+            next_cal_wait_us = now_us + 200000u;
+        }
+
+        if (now_us >= next_led_toggle_us) {
+            if (led_on) {
+                status_led_set(STATUS_CALIBRATE);
+            } else {
+                status_led_off();
+            }
+            led_on = !led_on;
+            next_led_toggle_us = now_us + 250000u;
+        }
+
+        const uint64_t remaining_us = deadline_us - now_us;
+        if (remaining_us > 1000u) {
+            sleep_us(500);
+        } else {
+            tight_loop_contents();
+        }
+    }
+}
+
+static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
+    calibration_stats_t stats[MAX_SENSORS] = {0};
+    const uint64_t settle_end_us = time_us_64() + ((uint64_t)STARTUP_CALIBRATION_SETTLE_MS * 1000u);
+
+    status_led_set(STATUS_CALIBRATE);
+    while (time_us_64() < settle_end_us) {
+        calibration_service_until(time_us_64() + 10000u);
+    }
+
+    const uint64_t calibration_end_us = time_us_64() + ((uint64_t)STARTUP_CALIBRATION_DURATION_MS * 1000u);
+    uint64_t next_sample_us = time_us_64();
+
+    while (time_us_64() < calibration_end_us) {
+        const uint64_t now_us = time_us_64();
+        if (now_us < next_sample_us) {
+            calibration_service_until(next_sample_us);
+            continue;
+        }
+        next_sample_us += STARTUP_CALIBRATION_SAMPLE_PERIOD_US;
+
+        for (uint8_t i = 0; i < sensor_count; i++) {
+            FusionVector accelerometer;
+            FusionVector gyroscope;
+            if (!read_active_sensor_motion_unbiased(i, &accelerometer, &gyroscope) ||
+                !fusion_vector_is_finite(accelerometer) ||
+                !fusion_vector_is_finite(gyroscope)) {
+                return false;
+            }
+
+            stats[i].count++;
+            stats[i].gyro_sum = FusionVectorAdd(stats[i].gyro_sum, gyroscope);
+            stats[i].gyro_sum_sq = vector_add_square(stats[i].gyro_sum_sq, gyroscope);
+            stats[i].accel_sum = FusionVectorAdd(stats[i].accel_sum, accelerometer);
+            stats[i].accel_sum_sq = vector_add_square(stats[i].accel_sum_sq, accelerometer);
+        }
+    }
+
+    for (uint8_t i = 0; i < sensor_count; i++) {
+        if (stats[i].count < 100u) {
+            return false;
+        }
+
+        const float count = (float)stats[i].count;
+        const FusionVector gyro_mean = vector_divide(stats[i].gyro_sum, count);
+        const FusionVector gyro_std = vector_std(stats[i].gyro_sum, stats[i].gyro_sum_sq, count);
+        const FusionVector accel_mean = vector_divide(stats[i].accel_sum, count);
+        const FusionVector accel_std = vector_std(stats[i].accel_sum, stats[i].accel_sum_sq, count);
+        const float accel_norm = vector_norm(accel_mean);
+
+        if ((gyro_std.axis.x > CALIBRATION_MAX_GYRO_STD_DPS) ||
+            (gyro_std.axis.y > CALIBRATION_MAX_GYRO_STD_DPS) ||
+            (gyro_std.axis.z > CALIBRATION_MAX_GYRO_STD_DPS) ||
+            (accel_std.axis.x > CALIBRATION_MAX_ACCEL_STD_G) ||
+            (accel_std.axis.y > CALIBRATION_MAX_ACCEL_STD_G) ||
+            (accel_std.axis.z > CALIBRATION_MAX_ACCEL_STD_G) ||
+            (accel_norm < CALIBRATION_MIN_ACCEL_NORM_G) ||
+            (accel_norm > CALIBRATION_MAX_ACCEL_NORM_G)) {
+            return false;
+        }
+
+        set_active_sensor_gyro_bias(i, gyro_mean);
+    }
+
+    status_led_set(STATUS_INIT);
+    return true;
+}
+
+static void calibration_error_forever(void) {
+    bool led_on = true;
+    uint64_t next_msg_us = 0;
+
+    while (true) {
+        tud_task();
+        const uint64_t now_us = time_us_64();
+        if (now_us >= next_msg_us) {
+            send_control_msg(MSG_TYPE_ERR_CAL);
+            next_msg_us = now_us + 200000u;
+        }
+
+        if (led_on) {
+            status_led_set_rgb(24, 0, 0);
+        } else {
+            status_led_off();
+        }
+        led_on = !led_on;
+        sleep_ms(150);
+    }
 }
 
 static void stream_publish_descriptor(uint16_t sample_rate_hz, uint8_t sensor_count,
@@ -178,18 +397,31 @@ static void usb_transport_loop(void) {
 
 static void sensor_core1_main(void) {
     float sensors_data[MAX_SENSORS][FLOATS_PER_SENSOR] = {{0.0f}};
+    for (uint8_t i = 0; i < MAX_SENSORS; i++) {
+        write_sensor_output(sensors_data[i], FUSION_IDENTITY_QUATERNION, FUSION_VECTOR_ZERO);
+    }
     update_loop(g_sensor_runtime.period_ms, sensors_data, g_sensor_runtime.sensors, g_sensor_runtime.sensor_count);
 }
 
 // Main sensor loop - clean AHRS, no software filtering
 static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR], Sensor* sensors, uint8_t sensor_count) {
     const uint64_t target_us = (uint64_t)(period_ms * 1000.0f + 0.5f);
+    const float nominal_delta_time_s = period_ms / 1000.0f;
+    bool sensor_valid[MAX_SENSORS] = {false};
     uint64_t next_loop_us = time_us_64();
 
     while (true) {
-        read_all_sensors(sensors);
+        read_all_sensors(sensors, sensor_valid);
 
         for (uint8_t i = 0; i < sensor_count; i++) {
+            if (!sensor_valid[i] ||
+                !fusion_vector_is_finite(sensors[i].accelerometer) ||
+                !fusion_vector_is_finite(sensors[i].gyroscope)) {
+                sensors[i].previousTimestamp = sensors[i].timestamp;
+                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion, FUSION_VECTOR_ZERO);
+                continue;
+            }
+
             // Apply calibration (identity by default)
             sensors[i].gyroscope = FusionCalibrationInertial(
                 sensors[i].gyroscope,
@@ -203,18 +435,29 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
                 sensors[i].calibration.accelerometerSensitivity,
                 sensors[i].calibration.accelerometerOffset);
 
-            // Gyro offset tracking (stationary bias removal)
-            sensors[i].gyroscope = FusionOffsetUpdate(&sensors[i].offset, sensors[i].gyroscope);
+            if (!fusion_vector_is_finite(sensors[i].accelerometer) ||
+                !fusion_vector_is_finite(sensors[i].gyroscope)) {
+                sensors[i].previousTimestamp = sensors[i].timestamp;
+                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion, FUSION_VECTOR_ZERO);
+                continue;
+            }
 
             // Compute delta time
-            const float deltaTime = (float)(sensors[i].timestamp - sensors[i].previousTimestamp) / 1e6f;
+            const float deltaTime = clamp_delta_time(
+                (float)(sensors[i].timestamp - sensors[i].previousTimestamp) / 1e6f,
+                nominal_delta_time_s);
             sensors[i].previousTimestamp = sensors[i].timestamp;
 
-            // AHRS update (no magnetometer, heading fixed at 0)
-            FusionAhrsUpdateExternalHeading(&sensors[i].ahrs, sensors[i].gyroscope, sensors[i].accelerometer, 0.0f, deltaTime);
+            // AHRS update without magnetometer. Yaw is relative gyro integration;
+            // do not force an external zero heading or slew motion is suppressed.
+            FusionAhrsUpdate(&sensors[i].ahrs, sensors[i].gyroscope, sensors[i].accelerometer, FUSION_VECTOR_ZERO, deltaTime);
 
             // Get quaternion and enforce continuity
             FusionQuaternion quat = FusionAhrsGetQuaternion(&sensors[i].ahrs);
+            if (!fusion_quaternion_is_finite(quat)) {
+                FusionAhrsReset(&sensors[i].ahrs);
+                quat = FUSION_IDENTITY_QUATERNION;
+            }
             quat = enforce_quaternion_continuity(quat, sensors[i].previousQuaternion);
             sensors[i].previousQuaternion = quat;
 
@@ -223,14 +466,7 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
             sensors[i].pitchDeg = tilt_pitch_deg_from_gravity(gravity);
             sensors[i].rollDeg = tilt_roll_deg_from_gravity(gravity);
 
-            // Output: quaternion + gyro
-            sensors_data[i][0] = quat.element.w;
-            sensors_data[i][1] = quat.element.x;
-            sensors_data[i][2] = quat.element.y;
-            sensors_data[i][3] = quat.element.z;
-            sensors_data[i][4] = sensors[i].gyroscope.axis.x;
-            sensors_data[i][5] = sensors[i].gyroscope.axis.y;
-            sensors_data[i][6] = sensors[i].gyroscope.axis.z;
+            write_sensor_output(sensors_data[i], quat, sensors[i].gyroscope);
         }
 
         uint64_t out_ts = time_us_64();
@@ -260,17 +496,17 @@ int main() {
     status_led_init();
     status_led_set(STATUS_BOOT);  // Amber — waiting for USB
 
-    // Setup I2C buses
-    if (!setup_I2C_pins()) {
-        status_led_set(STATUS_ERROR);
-        send_control_msg(MSG_TYPE_ERR_I2C);
-        while (1) { tud_task(); sleep_ms(100); }
-    }
-
     while (!tud_cdc_connected()) {
         status_led_set(STATUS_BOOT);
         tud_task();
         sleep_ms(10);
+    }
+
+    // Setup I2C after CDC is connected so fatal init errors reach the host.
+    if (!setup_I2C_pins()) {
+        status_led_set(STATUS_ERROR);
+        send_control_msg(MSG_TYPE_ERR_I2C);
+        while (1) { tud_task(); sleep_ms(100); }
     }
 
     status_led_set(STATUS_CFG_WAIT);
@@ -293,12 +529,17 @@ int main() {
         sensor_addrs[i] = get_active_sensor_addr(i);
     }
 
+    if (!startup_calibrate_gyro_biases(sensor_count)) {
+        calibration_error_forever();
+    }
+
     g_sensor_runtime.sensor_count = sensor_count;
     g_sensor_runtime.period_ms = 1000.0f / (float)imu_reader_settings.sampleRate;
     initialize_sensors_values(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_calibrations(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_algos(g_sensor_runtime.sensors, MAX_SENSORS);
 
+    send_cfg_ok_window();
     stream_publish_descriptor((uint16_t)imu_reader_settings.sampleRate, sensor_count, sensor_bus_ids, sensor_addrs);
     status_led_set(STATUS_STREAM);
     multicore_launch_core1(sensor_core1_main);

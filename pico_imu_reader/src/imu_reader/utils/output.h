@@ -13,6 +13,8 @@
 #define MSG_TYPE_ERROR     0x04
 #define MSG_TYPE_ERR_I2C   0x05  // I2C bus init failed
 #define MSG_TYPE_ERR_IMU   0x06  // No IMU detected
+#define MSG_TYPE_CAL_WAIT  0x07  // Startup gyro-bias calibration in progress
+#define MSG_TYPE_ERR_CAL   0x08  // Startup calibration failed, robot moved
 
 void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR], uint8_t sensor_count);
 void send_control_msg(uint8_t msg_type);

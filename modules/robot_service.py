@@ -4,7 +4,8 @@ from typing import Optional
 
 import numpy as np
 
-from . import diff_ik_V2 as diff_ik
+from .differential_ik_cfg import load_excavator_robot_config
+from .excavator_ik_utils import get_joint_positions, get_pose
 from .control_protocol import (
     ControlCommand,
     ControlMode,
@@ -12,6 +13,7 @@ from .control_protocol import (
     PoseTarget,
     RobotTelemetry,
 )
+from .reachability import ReachabilityResult
 
 
 @dataclass
@@ -29,7 +31,7 @@ class RobotService:
     def __init__(self, controller, hardware):
         self.controller = controller
         self.hardware = hardware
-        self.robot_config = diff_ik.load_excavator_robot_config()
+        self.robot_config = load_excavator_robot_config()
         self.state = RobotServiceState()
         self._telemetry_sequence = 0
 
@@ -51,7 +53,13 @@ class RobotService:
         except Exception:
             pass
 
-    def submit_command(self, command: ControlCommand) -> None:
+    def submit_command(self, command: ControlCommand) -> Optional[ReachabilityResult]:
+        """Apply ``command`` to the controller.
+
+        Returns the ``ReachabilityResult`` for the pose check when a pose
+        was submitted (None for direct mode, paused commands, or when the
+        reachability check is disabled).
+        """
         self.state.last_command_sequence = int(command.sequence)
 
         if command.reload_config:
@@ -99,17 +107,23 @@ class RobotService:
                     "scoop": self.state.direct_command.bucket,
                 })
         else:
-            self.state.target_pose = PoseTarget(
+            requested_pose = PoseTarget(
                 float(command.pose.x),
                 float(command.pose.y),
                 float(command.pose.z),
                 float(command.pose.rot_y_deg),
             )
             if not self.state.paused:
-                self.controller.give_pose(
-                    np.array([self.state.target_pose.x, self.state.target_pose.y, self.state.target_pose.z], dtype=np.float32),
-                    float(self.state.target_pose.rot_y_deg),
+                result = self.controller.give_pose(
+                    np.array([requested_pose.x, requested_pose.y, requested_pose.z], dtype=np.float32),
+                    float(requested_pose.rot_y_deg),
                 )
+                if result is not None and not result.reachable:
+                    return result
+                self.state.target_pose = requested_pose
+                return result
+            self.state.target_pose = requested_pose
+        return None
 
     # ---- Lifecycle wrappers ----
 
@@ -160,8 +174,8 @@ class RobotService:
 
         joint_positions = tuple((0.0, 0.0, 0.0) for _ in range(5))
         if raw_quats is not None and len(raw_quats) >= 4:
-            jp = diff_ik.get_joint_positions(raw_quats, self.robot_config)
-            ee_pos, _ = diff_ik.get_pose(raw_quats, self.robot_config)
+            jp = get_joint_positions(raw_quats, self.robot_config)
+            ee_pos, _ = get_pose(raw_quats, self.robot_config)
             positions = [tuple(float(v) for v in pos) for pos in jp]
             positions.append(tuple(float(v) for v in ee_pos))
             joint_positions = tuple(positions[:5])

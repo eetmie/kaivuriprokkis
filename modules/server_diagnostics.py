@@ -197,7 +197,7 @@ class ServerDiagnostics:
             return
 
         try:
-            from .diff_ik_V2 import compute_jacobian, extract_axis_rotation, project_to_rotation_axes
+            from .differential_ik import compute_jacobian, extract_axis_rotation, project_to_rotation_axes
 
             J = compute_jacobian(raw_quats, robot_config)
             J_pos = J[0:3, :]

@@ -14,6 +14,7 @@ typedef enum {
     STATUS_INIT      = 2,   // Blue    — initializing I2C / IMU
     STATUS_STREAM    = 3,   // Green   — streaming data
     STATUS_ERROR     = 4,   // Red flash — error
+    STATUS_CALIBRATE = 5,   // Orange  — stationary gyro-bias calibration
 } status_led_state_t;
 
 void status_led_init(void);

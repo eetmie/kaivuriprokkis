@@ -11,8 +11,8 @@ are relative to where the sensor was when you started.
 
 Usage:
     1. Place sensor flat on table
-    2. Run: python -m modules.ism_visualizer
-       (or: python modules/ism_visualizer.py)
+    2. Run: python -m tools.ism_visualizer
+       (or: python tools/ism_visualizer.py from repo root)
     3. Tilt the sensor and watch the cube follow!
     4. Ctrl+C to stop
 """
@@ -26,9 +26,9 @@ import time
 
 import numpy as np
 
-from ascii_cube import render_frame, clear_screen
-from imu_stream_reader import USBSerialReader
-from quaternion_math import (
+from tools.ascii_cube import render_frame, clear_screen
+from modules.usb_serial_reader import USBSerialReader
+from modules.quaternion_math import (
     quat_normalize,
     quat_conjugate,
     quat_multiply,

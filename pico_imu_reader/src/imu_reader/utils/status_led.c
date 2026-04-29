@@ -48,6 +48,7 @@ void status_led_set(status_led_state_t state) {
         case STATUS_INIT:       status_led_set_rgb( 0,  0,  3); break;  // Blue
         case STATUS_STREAM:     status_led_set_rgb( 0,  3,  0); break;  // Green
         case STATUS_ERROR:      status_led_set_rgb( 5,  0,  0); break;  // Red
+        case STATUS_CALIBRATE:  status_led_set_rgb(24,  8,  0); break;  // Bright orange
         default:                status_led_off();                break;
     }
 }

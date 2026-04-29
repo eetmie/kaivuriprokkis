@@ -9,6 +9,7 @@ Contains:
 
 IMPORTANT: Origin and end-effector offset handling:
 - forward_kinematics_core(): Returns joint positions (includes origin_offset, no ee_offset)
+- _compute_ee_position_core(): Shared helper that applies ee_offset in last joint's local frame
 - forward_kinematics_with_ee_offset_core(): Returns joint positions + ee position with both offsets
 - origin_offset: Applied to all positions - shifts entire robot from world origin
 - ee_offset: Applied in last joint's local coordinate frame - extends end-effector
@@ -18,7 +19,9 @@ Notes:
 - We assume corrected joint-frame quaternions on input; no mounting-offset correction is applied here.
 - We assume FULL quaternions on input; no axis projection is applied.
   Orientation components are filtered in IK via the ignore_axes system.
-- Base rotation propagation handles slew (Z-axis) from encoder.
+- The active controller uses canonical joint angles as the source of truth;
+  quaternion inputs are already absolute link orientations unless explicitly
+  converted from joint angles in this module.
 """
 
 import numpy as np
@@ -121,6 +124,15 @@ def forward_kinematics_core(quats, link_lengths, link_directions, origin_offset)
 
 
 @numba.njit(fastmath=True, nogil=True)
+def _compute_ee_position_core(joint_positions, quats, origin_offset, ee_offset):
+    """Apply ee_offset in the last joint's local frame to get end-effector world position."""
+    if len(joint_positions) > 0:
+        world_ee_offset = quat_rotate_vector(quats[-1], ee_offset)
+        return joint_positions[-1] + world_ee_offset
+    return np.asarray(origin_offset, dtype=np.float32).copy()
+
+
+@numba.njit(fastmath=True, nogil=True)
 def forward_kinematics_with_ee_offset_core(quats, link_lengths, link_directions, origin_offset, ee_offset):
     """
     Forward kinematics with full end-effector offset calculation.
@@ -139,15 +151,7 @@ def forward_kinematics_with_ee_offset_core(quats, link_lengths, link_directions,
         Tuple of (joint_positions, ee_position) both with offsets applied
     """
     joint_positions = forward_kinematics_core(quats, link_lengths, link_directions, origin_offset)
-
-    # Apply ee_offset in the last joint's local frame
-    if len(joint_positions) > 0:
-        last_joint_quat = quats[-1]
-        world_ee_offset = quat_rotate_vector(last_joint_quat, ee_offset)
-        ee_position = joint_positions[-1] + world_ee_offset
-    else:
-        ee_position = np.asarray(origin_offset, dtype=np.float32).copy()
-
+    ee_position = _compute_ee_position_core(joint_positions, quats, origin_offset, ee_offset)
     return joint_positions, ee_position
 
 
@@ -157,23 +161,19 @@ def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, o
     jacobian = np.zeros((6, n), dtype=np.float32)
 
     joint_positions = forward_kinematics_core(quats, link_lengths, link_directions, origin_offset)
+    ee_pos = _compute_ee_position_core(joint_positions, quats, origin_offset, ee_offset)
 
-    # Calculate actual end-effector position with offset
-    if len(joint_positions) > 0:
-        last_joint_quat = quats[-1]
-        world_ee_offset = quat_rotate_vector(last_joint_quat, ee_offset)
-        ee_pos = joint_positions[-1] + world_ee_offset
-    else:
-        ee_pos = np.asarray(origin_offset, dtype=np.float32).copy()
-
-    # Base position is now the origin offset
+    # Base position is now the origin offset.  `quats` are absolute link
+    # orientations, so joint axes are rotated by the parent link orientation,
+    # not by cumulatively multiplying absolute quaternions again.
     base_pos = np.asarray(origin_offset, dtype=np.float32).copy()
-    rot = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     for i in range(n):
-        # Normalize after multiplication
-        rot = quat_normalize(quat_multiply(rot, quats[i]))
-        world_axis = quat_rotate_vector(rot, np.asarray(rotation_axes[i], dtype=np.float32))
+        local_axis = np.asarray(rotation_axes[i], dtype=np.float32)
+        if i == 0:
+            world_axis = local_axis
+        else:
+            world_axis = quat_rotate_vector(quats[i - 1], local_axis)
 
         if i == 0:
             joint_pos = base_pos
@@ -186,6 +186,53 @@ def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, o
         jacobian[3:6, i] = world_axis
 
     return jacobian
+
+
+def joint_angles_to_absolute_quaternions(joint_angles: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
+    """Compose absolute link quaternions from canonical relative joint angles."""
+    joint_angles = np.asarray(joint_angles, dtype=np.float32)
+    axes = robot_config.rotation_axes
+    absolute = np.zeros((len(joint_angles), 4), dtype=np.float32)
+
+    cumulative = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    for i, angle in enumerate(joint_angles):
+        local = quat_from_axis_angle(axes[i], np.float32(angle))
+        cumulative = quat_normalize(quat_multiply(cumulative, local))
+        absolute[i] = cumulative
+
+    return absolute
+
+
+def get_all_poses_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
+    """Return joint poses and EE pose from canonical joint angles."""
+    quats = joint_angles_to_absolute_quaternions(joint_angles, robot_config)
+    joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
+        quats,
+        robot_config.link_lengths,
+        robot_config.link_directions,
+        robot_config.origin_offset,
+        robot_config.ee_offset,
+    )
+    return joint_positions, quats, ee_position, quats[-1].copy()
+
+
+def get_pose_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
+    """Return end-effector pose from canonical joint angles."""
+    _, _, ee_position, ee_orientation = get_all_poses_from_joint_angles(joint_angles, robot_config)
+    return ee_position, ee_orientation
+
+
+def compute_jacobian_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
+    """Compute the geometric Jacobian from canonical joint angles."""
+    quats = joint_angles_to_absolute_quaternions(joint_angles, robot_config)
+    return compute_jacobian_core(
+        quats,
+        robot_config.link_lengths,
+        robot_config.link_directions,
+        robot_config.rotation_axes,
+        robot_config.origin_offset,
+        robot_config.ee_offset,
+    )
 
 
 # ----------------------------
@@ -293,15 +340,10 @@ def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.
 
 
 def compute_jacobian(quats: np.ndarray, robot_config: RobotConfig):
-    """Jacobian computation wrapper using RobotConfig.
-
-    Pipeline (FULL input):
-      1) Propagate base (slew) rotation to downstream joints
-    """
+    """Jacobian computation wrapper using absolute link quaternions."""
     quats = np.asarray(quats, dtype=np.float32)
-    propagated_quats = propagate_base_rotation(quats, robot_config)
     return compute_jacobian_core(
-        propagated_quats,
+        quats,
         robot_config.link_lengths,
         robot_config.link_directions,
         robot_config.rotation_axes,
@@ -419,14 +461,6 @@ class IKController:
             controllable.append(4)  # Pitch
         if has_z_rotation:
             controllable.append(5)  # Yaw
-
-        # Also exclude user-specified ignore_axes
-        if self.cfg.ignore_axes:
-            axis_to_dof = {"roll": 3, "pitch": 4, "yaw": 5}
-            for axis in self.cfg.ignore_axes:
-                dof = axis_to_dof.get(axis)
-                if dof is not None and dof in controllable:
-                    controllable.remove(dof)
 
         return controllable
 
@@ -593,7 +627,8 @@ class IKController:
             ee_pos: Current end-effector position [x, y, z]
             ee_quat: Current end-effector quaternion [w, x, y, z]
             joint_angles: Current RELATIVE joint angles in radians (for limit checking)
-            joint_quats: Current joint quaternions in joint frames (absolute, already corrected)
+            joint_quats: Legacy argument accepted for compatibility; canonical
+                absolute quaternions are rebuilt from ``joint_angles``.
             desired_ee_velocity: Optional desired EE twist (position 3D or pose 6D) for velocity mode
             dt: Optional timestep (seconds). Defaults to self.default_dt.
             current_joint_velocities: Optional measured joint velocities (rad/s) for future adaptive use
@@ -601,7 +636,7 @@ class IKController:
         Returns:
             Target joint angles (relative)
 
-        Note: joint_angles should be computed using compute_relative_joint_angles() from joint_quats
+        Note: joint_angles are canonical relative joint angles [slew, boom, arm, bucket].
         """
 
         ee_pos = np.asarray(ee_pos, dtype=np.float32)
@@ -610,36 +645,43 @@ class IKController:
         dt_val = self.default_dt if dt is None else float(dt)
         dt_val = float(np.clip(dt_val, 1e-4, 1.0))
 
-        # Require joint quaternions (no implicit fallback construction from angles)
-        if joint_quats is None:
-            raise ValueError("joint_quats is required for IK.compute; no fallback from joint_angles")
-        joint_quats = np.asarray(joint_quats, dtype=np.float32)
+        # Canonical joint angles are the source of truth for IK.  Rebuild the
+        # absolute link quaternions from them so FK, Jacobian, limits and PID all
+        # agree on one representation.
+        joint_quats = joint_angles_to_absolute_quaternions(joint_angles, self.robot_config)
 
-        # Compute full Jacobian (uses absolute quaternions after propagation)
-        jacobian_full = compute_jacobian(joint_quats, self.robot_config)
+        # Compute full Jacobian from canonical joint angles.
+        jacobian_full = compute_jacobian_core(
+            joint_quats,
+            self.robot_config.link_lengths,
+            self.robot_config.link_directions,
+            self.robot_config.rotation_axes,
+            self.robot_config.origin_offset,
+            self.robot_config.ee_offset,
+        )
 
-        # Optional frame transform: express everything in base (cab) frame to
-        # avoid world-frame coupling between slew yaw and pitch commands.
+        # Frame transform: express position and Jacobian in base (cab) frame to
+        # avoid world-frame coupling between slew yaw and Cartesian position commands.
         current_pos = ee_pos
         target_pos = self.ee_pos_des
-        if self.cfg.enable_frame_transform:
-            # Extract slew angle (joint 0 rotates around Z)
-            slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
-            c = float(np.cos(-slew_angle))
-            s = float(np.sin(-slew_angle))
-            base_rot = np.array([
-                [c, -s, 0.0],
-                [s,  c, 0.0],
-                [0.0, 0.0, 1.0]
-            ], dtype=np.float32)
 
-            # Rotate poses into base frame
-            current_pos = (base_rot @ current_pos.astype(np.float32)).astype(np.float32)
-            target_pos = (base_rot @ target_pos.astype(np.float32)).astype(np.float32)
+        # Extract slew angle (joint 0 rotates around Z)
+        slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
+        c = float(np.cos(-slew_angle))
+        s = float(np.sin(-slew_angle))
+        base_rot = np.array([
+            [c, -s, 0.0],
+            [s,  c, 0.0],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
 
-            # Rotate full Jacobian rows before reduction (matches sim pipeline)
-            jacobian_full[:3, :] = base_rot @ jacobian_full[:3, :]
-            jacobian_full[3:, :] = base_rot @ jacobian_full[3:, :]
+        # Rotate poses into base frame
+        current_pos = (base_rot @ current_pos.astype(np.float32)).astype(np.float32)
+        target_pos = (base_rot @ target_pos.astype(np.float32)).astype(np.float32)
+
+        # Rotate full Jacobian rows before reduction (matches sim pipeline)
+        jacobian_full[:3, :] = base_rot @ jacobian_full[:3, :]
+        jacobian_full[3:, :] = base_rot @ jacobian_full[3:, :]
 
         # Extract reduced Jacobian (always -- auto-detected + ignore_axes)
         jacobian = self._get_reduced_jacobian(jacobian_full)
@@ -655,37 +697,41 @@ class IKController:
             # Use only position rows of the reduced Jacobian
             jacobian = jacobian[0:3, :]
         else:
-            # Transform both current and target orientations to robot's local frame if enabled
-            # This makes pitch/roll errors relative to robot heading, not global frame
-            # Critical for avoiding pitch->roll coupling at large slew angles
-            if self.cfg.enable_frame_transform:
-                ee_quat_local = self._transform_to_robot_local_frame(ee_quat, joint_quats)
-                target_quat_local = self._transform_to_robot_local_frame(self.ee_quat_des, joint_quats)
-            else:
-                ee_quat_local = ee_quat
-                target_quat_local = self.ee_quat_des
+            # Pose error is computed in world frame, then rotated into base (cab)
+            # frame to match the body-frame Jacobian and body-frame position error
+            # built above.  This is what makes a body-frame pitch command (boom/arm
+            # /bucket Y axes) appear in the pitch row of the reduced Jacobian at
+            # any slew angle — without it, at slew=π/2 the pitch error becomes
+            # pure roll in world frame and is discarded by the controllable-DOF
+            # reduction (no X-axis joint on the excavator).
+            # The current target-quat recipe (slew_quat * pitch_quat) keeps the
+            # yaw error at zero by construction, but rototilt roll/yaw axes will
+            # be body-frame too — so this transform is forward-compatible.
+            ee_quat_local = ee_quat
+            target_quat_local = self.ee_quat_des
 
-            # Debug: show frame transformation
+            # Debug: show orientation error
             if self.logger.level <= logging.DEBUG:
                 try:
                     slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
                     slew_deg = float(np.degrees(slew_angle))
                     self.logger.debug(
-                        "[IK dbg] slew_deg=%.2f | target_global=%s target_local=%s | ee_local=%s",
+                        "[IK dbg] slew_deg=%.2f | target_quat=%s | ee_quat=%s",
                         slew_deg,
                         np.round(self.ee_quat_des, 4),
-                        np.round(target_quat_local, 4),
                         np.round(ee_quat_local, 4),
                     )
                 except Exception:
                     pass
 
-            # Compute pose error in local frame
+            # Compute pose error in world frame, then rotate the orientation
+            # component into base (cab) frame to match the body-frame Jacobian.
             position_error, axis_angle_error = compute_pose_error(
                 current_pos, ee_quat_local, target_pos, target_quat_local
             )
+            axis_angle_error = (base_rot @ axis_angle_error.astype(np.float32)).astype(np.float32)
 
-            # Get reduced error vector (only controllable DOFs -- ignored axes already excluded)
+            # Get reduced error vector (only auto-detected controllable DOFs)
             reduced_error = self._get_reduced_error(position_error, axis_angle_error)
 
         # Choose task vector based on mode (position vs velocity)
@@ -715,7 +761,12 @@ class IKController:
                 delta_joint_angles, joint_angles
             )
 
-        return joint_angles + delta_joint_angles
+        target_joint_angles = joint_angles + delta_joint_angles
+        if self.joint_limits is not None:
+            for i, (q_min, q_max) in enumerate(self.joint_limits):
+                target_joint_angles[i] = np.clip(target_joint_angles[i], q_min, q_max)
+
+        return target_joint_angles
 
     def _compute_adaptive_damping(self) -> float:
         """Compute adaptive damping factor based on Jacobian conditioning.
@@ -776,13 +827,13 @@ class IKController:
 
             # Repulsion from lower limit
             if joint_angles[i] < q_min + margin:
-                distance_ratio = (joint_angles[i] - q_min) / margin
+                distance_ratio = np.clip((joint_angles[i] - q_min) / margin, 0.0, 1.0)
                 repulsion = repulsion_strength * (1.0 - distance_ratio) ** 2
                 modified_delta[i] += repulsion
 
             # Repulsion from upper limit
             elif joint_angles[i] > q_max - margin:
-                distance_ratio = (q_max - joint_angles[i]) / margin
+                distance_ratio = np.clip((q_max - joint_angles[i]) / margin, 0.0, 1.0)
                 repulsion = repulsion_strength * (1.0 - distance_ratio) ** 2
                 modified_delta[i] -= repulsion
 

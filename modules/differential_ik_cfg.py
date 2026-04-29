@@ -44,15 +44,6 @@ class IKControllerConfig:
     Optional: ``joint_weights`` (list of per-joint weights). Higher weight = more
     movement for that joint. Uses sqrt(w) internally for linear effective weighting."""
 
-    ignore_axes: Optional[List[str]] = None
-    """Axes to ignore in orientation error when solving IK.
-    Any of ["roll", "pitch", "yaw"]. Example for excavator: ["roll", "yaw"]."""
-
-    enable_frame_transform: bool = True
-    """Transform target orientation to robot's local frame when using ignore_axes.
-    Ensures pitch commands are relative to robot heading, not global frame.
-    Critical for slew-based systems to prevent wonky behavior at large yaw angles."""
-
     enable_velocity_limiting: bool = True
     """Enable joint velocity limiting (safety feature)."""
 
@@ -108,22 +99,6 @@ class IKControllerConfig:
             raise ValueError(
                 f"Missing required ik_params for method '{self.ik_method}': {missing_keys}"
             )
-
-        # Validate and normalize ignore_axes
-        allowed = {"roll", "pitch", "yaw"}
-        if self.ignore_axes is not None:
-            normalized = []
-            seen = set()
-            for a in self.ignore_axes:
-                al = str(a).strip().lower()
-                if al not in allowed:
-                    raise ValueError(f"Invalid axis in ignore_axes: {a}. Must be one of {allowed}")
-                if al not in seen:
-                    normalized.append(al)
-                    seen.add(al)
-            self.ignore_axes = normalized
-        else:
-            self.ignore_axes = []
 
 
 @dataclass

@@ -4,6 +4,7 @@ Input handling for excavator GUI — keyboard + gamepad merge logic.
 Extracted from client_gui.py to make input testable and decoupled from UI.
 """
 
+import math
 from typing import Optional, Set, Tuple
 
 from modules.excavator_target_state import IKControlSpace
@@ -40,6 +41,7 @@ class InputHandler:
         step_pos: float,
         step_rot: float,
         control_space: IKControlSpace = IKControlSpace.CARTESIAN,
+        radius: float = 0.6,
     ) -> Tuple[float, float, float, float]:
         """Compute IK-mode deltas from keyboard + gamepad.
 
@@ -48,7 +50,7 @@ class InputHandler:
             Radial: (dr, d_slew_deg, dz, drot)
         """
         if control_space == IKControlSpace.RADIAL:
-            return self.tick_ik_radial(keys_down, controller_state, step_pos, step_rot)
+            return self.tick_ik_radial(keys_down, controller_state, step_pos, step_rot, radius)
         return self.tick_ik_cartesian(keys_down, controller_state, step_pos, step_rot)
 
     def tick_ik_cartesian(
@@ -109,11 +111,14 @@ class InputHandler:
         controller_state: Optional[dict],
         step_pos: float,
         step_rot: float,
+        radius: float = 0.6,
     ) -> Tuple[float, float, float, float]:
         """Compute radial IK deltas (dr, d_slew_deg, dz, drot)."""
         mult = self.FAST_MULTIPLIER if 'shift' in keys_down else 1.0
         dp = step_pos * mult
         dr = step_rot * mult
+        # Convert linear step to angular step so arc-length matches step_pos
+        d_slew = math.degrees(step_pos / max(radius, 0.01)) * mult
 
         # Keyboard: W/S=radius, A/D=slew, Q/E=vertical, R/F=tool pitch
         kbd_radius = kbd_slew = kbd_dz = kbd_drot = 0.0
@@ -122,9 +127,9 @@ class InputHandler:
         if 's' in keys_down:
             kbd_radius -= dp
         if 'a' in keys_down:
-            kbd_slew -= dr
+            kbd_slew -= d_slew
         if 'd' in keys_down:
-            kbd_slew += dr
+            kbd_slew += d_slew
         if 'q' in keys_down:
             kbd_dz -= dp
         if 'e' in keys_down:
@@ -142,7 +147,8 @@ class InputHandler:
             ayaw, syaw = self.GAMEPAD_IK_RADIAL['d_slew']
             az, sz = self.GAMEPAD_IK_RADIAL['dz']
             ctrl_radius = sr * controller_state[ar] * fast_dp
-            ctrl_slew = syaw * controller_state[ayaw] * fast_dr
+            fast_d_slew = math.degrees(step_pos * self.GAMEPAD_POS_MULTIPLIER / max(radius, 0.01))
+            ctrl_slew = syaw * controller_state[ayaw] * fast_d_slew
             ctrl_dz = sz * controller_state[az] * fast_dp
             ctrl_drot = (controller_state['RightTrigger'] - controller_state['LeftTrigger']) * fast_dr
 

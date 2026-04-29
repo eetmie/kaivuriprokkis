@@ -1,10 +1,13 @@
 // pico_imu_simulator.ino
-// Simulates 3 IMUs over USB serial using the same binary protocol as pico_imu_reader.
+// Simulates 4 IMUs over USB serial using the same binary protocol as pico_imu_reader.
 // Target: Seeed XIAO RP2040 (Arduino IDE, board: "Seeed XIAO RP2040")
 //
-// Pitch and yaw oscillate as sine waves in [-45, +45] degrees.
-// All 3 IMUs share the same yaw plane (same yaw angle) with small gyro noise.
-// Each IMU has a different pitch phase offset to look realistic.
+// Sensor layout matches control_config.yaml imu_mapping:
+//   [0] base   — slew/yaw dominant (±45° Z), no pitch, small roll noise
+//   [1] boom   — pitch oscillation 0.15 Hz
+//   [2] bucket — pitch oscillation 0.12 Hz
+//   [3] arm    — pitch oscillation 0.18 Hz
+// All sensors share the same yaw plane. Roll adds a small slow oscillation on all.
 
 #include <math.h>
 
@@ -17,9 +20,8 @@
 
 #define MSG_TYPE_CFG_OK   0x01
 #define MSG_TYPE_CFG_WAIT 0x02
-#define MSG_TYPE_ZERO_ACK 0x03
 
-#define NUM_SENSORS        3
+#define NUM_SENSORS        4
 #define FLOATS_PER_SENSOR  7   // w, x, y, z, gx, gy, gz
 
 // ---- Settings (populated from host config string) ----
@@ -27,19 +29,26 @@ static int   sampleRate   = 200;
 static float gyroRangeDps = 500.0f;
 
 // ---- Simulation state ----
-static bool     configured = false;
 static uint32_t loopPeriodUs;
 static float    simTime = 0.0f;
 
-// Pitch oscillation: each IMU gets a phase offset so they don't move identically
-static const float pitchFreqHz[NUM_SENSORS]   = { 0.15f, 0.12f, 0.18f };
-static const float pitchPhaseRad[NUM_SENSORS]  = { 0.0f,  1.0f,  2.0f };
-// Yaw: single shared oscillation (same plane) with tiny per-IMU noise
-static const float yawFreqHz  = 0.10f;
+// Per-IMU pitch: [0]=base has no pitch, [1..3]=arm links oscillate ±45°
+static const float pitchAmpDeg[NUM_SENSORS]   = {  0.0f, 45.0f, 45.0f, 45.0f };
+static const float pitchFreqHz[NUM_SENSORS]   = {  0.0f,  0.15f, 0.12f, 0.18f };
+static const float pitchPhaseRad[NUM_SENSORS]  = {  0.0f,  0.0f,  1.0f,  2.0f };
 
-// ---- Descriptor info (fake I2C addresses matching real firmware) ----
-static const uint8_t imuBus[NUM_SENSORS]  = { 0, 0, 1 };
-static const uint8_t imuAddr[NUM_SENSORS] = { 0x6A, 0x6B, 0x6A };
+// Per-IMU roll: small slow oscillation on all sensors
+static const float rollAmpDeg[NUM_SENSORS]    = {  2.0f,  3.0f,  3.0f,  3.0f };
+static const float rollFreqHz[NUM_SENSORS]    = {  0.08f, 0.07f, 0.09f, 0.06f };
+static const float rollPhaseRad[NUM_SENSORS]  = {  0.0f,  2.1f,  0.8f,  3.5f };
+
+// Yaw: single shared oscillation (same plane for all)
+static const float yawFreqHz = 0.10f;
+
+// ---- Descriptor info (I2C addresses matching real firmware layout) ----
+// [0] base=bus1:0x6B  [1] boom=bus0:0x6A  [2] bucket=bus0:0x6B  [3] arm=bus1:0x6A
+static const uint8_t imuBus[NUM_SENSORS]  = { 1, 0, 0, 1 };
+static const uint8_t imuAddr[NUM_SENSORS] = { 0x6B, 0x6A, 0x6B, 0x6A };
 
 // ---- Settings buffer ----
 #define SETTINGS_BUF_LEN 256
@@ -163,59 +172,31 @@ static bool parseConfig(const char* buf) {
   return true;
 }
 
-// ---- Euler to quaternion helpers ----
-// Pitch = rotation about Y axis, Yaw = rotation about Z axis
-// Combined quaternion: q = q_yaw * q_pitch  (yaw applied first in world frame)
-static void eulerToQuat(float pitchDeg, float yawDeg, float* w, float* x, float* y, float* z) {
-  float pitchRad = pitchDeg * (float)M_PI / 180.0f;
-  float yawRad   = yawDeg   * (float)M_PI / 180.0f;
-
-  // q_pitch = rotation about Y
-  float cp = cosf(pitchRad / 2.0f);
-  float sp = sinf(pitchRad / 2.0f);
-  // q_pitch = (cp, 0, sp, 0)
-
-  // q_yaw = rotation about Z
-  float cy = cosf(yawRad / 2.0f);
-  float sy = sinf(yawRad / 2.0f);
-  // q_yaw = (cy, 0, 0, sy)
-
-  // q = q_yaw * q_pitch
-  *w = cy * cp - sy * sp;     // was: cy*cp
-  *x = cy * 0  + sy * sp;     // simplifies:  0  (pitch only in Y, yaw only in Z cross gives X)
-  *x = 0.0f;                  // no X rotation component for pure Y+Z
-  // Let me just do the full quaternion multiply:
-  // q_yaw   = (cy, 0, 0, sy)
-  // q_pitch = (cp, 0, sp, 0)
-  // q = q_yaw * q_pitch:
-  //   w = cy*cp - 0*0 - 0*sp - sy*0 = cy*cp
-  //   x = cy*0 + 0*cp + 0*0 - sy*sp = -sy*sp
-  //   y = cy*sp - 0*0 + 0*cp + sy*0 = cy*sp
-  //   z = cy*0 + 0*sp - 0*cp + sy*cp = sy*cp
-  *w = cy * cp;
-  *x = -sy * sp;
-  *y = cy * sp;
-  *z = sy * cp;
+// Euler to quaternion: q = q_yaw * q_pitch * q_roll  (intrinsic RPY)
+static void eulerToQuat(float rollDeg, float pitchDeg, float yawDeg,
+                        float* w, float* x, float* y, float* z) {
+  float cr = cosf(rollDeg  * (float)M_PI / 360.0f);
+  float sr = sinf(rollDeg  * (float)M_PI / 360.0f);
+  float cp = cosf(pitchDeg * (float)M_PI / 360.0f);
+  float sp = sinf(pitchDeg * (float)M_PI / 360.0f);
+  float cy = cosf(yawDeg   * (float)M_PI / 360.0f);
+  float sy = sinf(yawDeg   * (float)M_PI / 360.0f);
+  *w =  cy*cp*cr + sy*sp*sr;
+  *x =  cy*cp*sr - sy*sp*cr;
+  *y =  cy*sp*cr + sy*cp*sr;
+  *z =  sy*cp*cr - cy*sp*sr;
 }
 
-// ---- Arduino setup ----
-void setup() {
-  Serial.begin(115200);
-  randomSeed(analogRead(A0));  // seed RNG from floating analog pin
-  loopPeriodUs = 1000000UL / (uint32_t)sampleRate;
-}
+// ---- Wait for config (blocking, mirrors pico_imu_reader behavior) ----
+static void wait_for_config() {
+  uint32_t lastBeat = millis();
 
-// ---- Arduino loop ----
-void loop() {
-  // --- Phase 1: wait for config from host ---
-  if (!configured) {
-    static uint32_t lastWaitBeat = 0;
+  while (true) {
+    // Send CFG_WAIT heartbeat every 200ms
     uint32_t now = millis();
-
-    // Send CFG_WAIT heartbeat every 1 s
-    if (now - lastWaitBeat >= 1000) {
+    if (now - lastBeat >= 200) {
       sendControlMsg(MSG_TYPE_CFG_WAIT);
-      lastWaitBeat = now;
+      lastBeat = now;
     }
 
     // Read incoming bytes
@@ -228,15 +209,15 @@ void loop() {
 
       if (c == '\n' || settingsIdx >= SETTINGS_BUF_LEN - 1) {
         if (parseConfig(settingsBuf)) {
-          // Send CFG_OK for ~500 ms
+          // Send CFG_OK for ~500ms
           uint32_t t0 = millis();
           while (millis() - t0 < 500) {
             sendControlMsg(MSG_TYPE_CFG_OK);
             delay(100);
           }
-          // Send descriptor so host knows sensor layout
+          // Send descriptor once
           sendDescriptor();
-          configured = true;
+          return;
         }
         settingsIdx = 0;
         settingsBuf[0] = '\0';
@@ -244,41 +225,57 @@ void loop() {
     }
 
     delay(10);
-    return;
+  }
+}
+
+// ---- Arduino setup ----
+void setup() {
+  Serial.begin(115200);
+  randomSeed(analogRead(A0));  // seed RNG from floating analog pin
+  loopPeriodUs = 1000000UL / (uint32_t)sampleRate;
+}
+
+// ---- Arduino loop ----
+void loop() {
+  // Wait for config once (blocking)
+  static bool configured = false;
+  if (!configured) {
+    wait_for_config();
+    configured = true;
   }
 
-  // --- Phase 2: streaming simulation data ---
+  // Stream simulation data
   uint32_t loopStart = micros();
 
   float dt = 1.0f / (float)sampleRate;
   simTime += dt;
 
-  // Shared yaw angle (same plane for all 3 IMUs)
-  float yawDeg = 45.0f * sinf(2.0f * (float)M_PI * yawFreqHz * simTime);
+  // Shared yaw angle (same plane for all IMUs)
+  float yawDeg  = 45.0f * sinf(2.0f * (float)M_PI * yawFreqHz * simTime);
+  float yawRate = 45.0f * 2.0f * (float)M_PI * yawFreqHz
+                  * cosf(2.0f * (float)M_PI * yawFreqHz * simTime);
 
-  // Gyro noise standard deviation (deg/s) - small realistic sensor noise
+  // Gyro noise standard deviation (deg/s)
   const float gyroNoiseSigma = 0.3f;
 
   float sensorData[NUM_SENSORS][FLOATS_PER_SENSOR];
 
   for (int i = 0; i < NUM_SENSORS; i++) {
-    // Per-IMU pitch with unique frequency and phase
-    float pitchDeg = 45.0f * sinf(2.0f * (float)M_PI * pitchFreqHz[i] * simTime + pitchPhaseRad[i]);
+    float pitchDeg = pitchAmpDeg[i] * sinf(2.0f * (float)M_PI * pitchFreqHz[i] * simTime + pitchPhaseRad[i]);
+    float rollDeg  = rollAmpDeg[i]  * sinf(2.0f * (float)M_PI * rollFreqHz[i]  * simTime + rollPhaseRad[i]);
 
-    // Quaternion from pitch + yaw
     float w, x, y, z;
-    eulerToQuat(pitchDeg, yawDeg, &w, &x, &y, &z);
+    eulerToQuat(rollDeg, pitchDeg, yawDeg, &w, &x, &y, &z);
 
-    // Analytical angular velocities (derivative of sine) + noise
-    float pitchRate = 45.0f * 2.0f * (float)M_PI * pitchFreqHz[i]
+    // Analytical derivatives + noise
+    float pitchRate = pitchAmpDeg[i] * 2.0f * (float)M_PI * pitchFreqHz[i]
                       * cosf(2.0f * (float)M_PI * pitchFreqHz[i] * simTime + pitchPhaseRad[i]);
-    float yawRate   = 45.0f * 2.0f * (float)M_PI * yawFreqHz
-                      * cosf(2.0f * (float)M_PI * yawFreqHz * simTime);
+    float rollRate  = rollAmpDeg[i]  * 2.0f * (float)M_PI * rollFreqHz[i]
+                      * cosf(2.0f * (float)M_PI * rollFreqHz[i]  * simTime + rollPhaseRad[i]);
 
-    // Gyro output: approximate body-frame rates + noise
-    float gx = gyroNoise(gyroNoiseSigma);                    // roll rate ~0 + noise
-    float gy = pitchRate + gyroNoise(gyroNoiseSigma);         // pitch rate around Y
-    float gz = yawRate   + gyroNoise(gyroNoiseSigma);         // yaw rate around Z
+    float gx = rollRate  + gyroNoise(gyroNoiseSigma);
+    float gy = pitchRate + gyroNoise(gyroNoiseSigma);
+    float gz = yawRate   + gyroNoise(gyroNoiseSigma);
 
     sensorData[i][0] = w;
     sensorData[i][1] = x;
@@ -292,16 +289,6 @@ void loop() {
   // Send binary data frame
   uint32_t ts = micros();
   sendDataFrame(ts, sensorData);
-
-  // Check for runtime commands (ZERO)
-  if (Serial.available()) {
-    char cmdBuf[64];
-    int n = Serial.readBytesUntil('\n', cmdBuf, sizeof(cmdBuf) - 1);
-    cmdBuf[n] = '\0';
-    if (strstr(cmdBuf, "CMD=ZERO")) {
-      sendControlMsg(MSG_TYPE_ZERO_ACK);
-    }
-  }
 
   // Maintain target loop rate
   uint32_t elapsed = micros() - loopStart;

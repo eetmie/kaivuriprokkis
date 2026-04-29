@@ -225,7 +225,7 @@ def run_hardware_test(joints_to_test, amplitudes_to_test, duration_per_test=10.0
     try:
         print("[hw] Initializing hardware...")
         hardware = HardwareInterface(
-            pump_variable=False,
+            pump_auto_mode=False,
             toggle_channels=True,
             stale_timeout_s=0.5,
             adc_channels=[

@@ -23,5 +23,7 @@ int initialize_sensors(void);
 uint8_t get_active_sensor_count(void);
 uint8_t get_active_sensor_bus(uint8_t sensor_index);
 uint8_t get_active_sensor_addr(uint8_t sensor_index);
-void read_all_sensors(Sensor* sensors);
+bool read_active_sensor_motion_unbiased(uint8_t sensor_index, FusionVector* accelerometer, FusionVector* gyroscope);
+void set_active_sensor_gyro_bias(uint8_t sensor_index, FusionVector gyro_bias);
+void read_all_sensors(Sensor* sensors, bool sensor_valid[]);
 #endif

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Excavator — Web Control</title>
+<link rel="stylesheet" href="/style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/": "https://unpkg.com/three@0.160.0/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">Excavator 3D — Web Control</div>
+    <div class="status-line">
+      <span id="status">Status: Disconnected</span>
+      <span id="hz">Send Hz: 0.0</span>
+      <span id="recv">Recv: None</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="viewport"></div>
+
+    <aside id="sidebar">
+      <section>
+        <h3>Target / Measured</h3>
+        <div class="pose">
+          <div><span class="lbl">X</span> T:<span id="tx">+0.000</span> M:<span id="mx">+0.000</span></div>
+          <div><span class="lbl">Y</span> T:<span id="ty">+0.000</span> M:<span id="my">+0.000</span></div>
+          <div><span class="lbl">Z</span> T:<span id="tz">+0.000</span> M:<span id="mz">+0.000</span></div>
+          <div><span class="lbl">Rot</span> T:<span id="trot">+0.0</span> M:<span id="mrot">+0.0</span></div>
+        </div>
+      </section>
+
+      <section>
+        <h3>Control</h3>
+        <div class="row">
+          <label>Move step (m)</label>
+          <input id="step-pos" type="number" step="0.001" min="0.001" max="0.025" value="0.001" autocomplete="off" />
+        </div>
+        <div class="row">
+          <label>Rot step (deg)</label>
+          <input id="step-rot" type="number" step="0.1" min="0.1" max="1.0" value="0.1" autocomplete="off" />
+        </div>
+        <div class="hint">Hold <kbd>Shift</kbd> for 5× step.</div>
+      </section>
+
+      <section>
+        <h3>UDP</h3>
+        <div class="row"><label>Host</label><input id="host" type="text" placeholder="e.g. 192.168.0.132" autocomplete="off" spellcheck="false" /></div>
+        <div class="row"><label>Port</label><input id="port" type="number" placeholder="8080" autocomplete="off" /></div>
+        <div class="row"><label>Rate (Hz)</label><input id="rate" type="number" step="0.1" placeholder="20" autocomplete="off" /></div>
+
+        <div class="btn-grid">
+          <button id="btn-connect">Connect</button>
+          <button id="btn-stream" disabled>Start Streaming</button>
+          <button id="btn-pause" disabled>Pause</button>
+          <button id="btn-resume" disabled>Resume</button>
+          <button id="btn-reload" disabled>Reload</button>
+          <button id="btn-direct" disabled>Direct Mode</button>
+          <button id="btn-ik-space">IK Space: Cartesian</button>
+          <button id="btn-reset">Reset</button>
+        </div>
+      </section>
+
+      <section>
+        <div id="hint" class="hint mono"></div>
+      </section>
+    </aside>
+  </main>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

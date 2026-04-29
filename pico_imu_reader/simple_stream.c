@@ -80,6 +80,7 @@ static void apply_simple_settings(void) {
 
 static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
     float sensors_data[MAX_SENSORS][FLOATS_PER_SENSOR] = {{0.0f}};
+    bool sensor_valid[MAX_SENSORS] = {false};
     const uint64_t period_us = 1000000u / SIMPLE_STREAM_RATE_HZ;
     uint64_t next_loop_us = time_us_64();
     uint64_t previous_loop_start_us = next_loop_us;
@@ -90,9 +91,20 @@ static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
         previous_loop_start_us = loop_start_us;
 
         tud_task();
-        read_all_sensors(sensors);
+        read_all_sensors(sensors, sensor_valid);
 
         for (uint8_t i = 0; i < sensor_count; i++) {
+            if (!sensor_valid[i]) {
+                sensors_data[i][0] = sensors[i].previousQuaternion.element.w;
+                sensors_data[i][1] = sensors[i].previousQuaternion.element.x;
+                sensors_data[i][2] = sensors[i].previousQuaternion.element.y;
+                sensors_data[i][3] = sensors[i].previousQuaternion.element.z;
+                sensors_data[i][4] = 0.0f;
+                sensors_data[i][5] = 0.0f;
+                sensors_data[i][6] = 0.0f;
+                continue;
+            }
+
             FusionVector gyroscope = FusionCalibrationInertial(
                 sensors[i].gyroscope,
                 sensors[i].calibration.gyroscopeMisalignment,
@@ -106,7 +118,7 @@ static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
                 sensors[i].calibration.accelerometerOffset);
 
             gyroscope = FusionOffsetUpdate(&sensors[i].offset, gyroscope);
-            FusionAhrsUpdateNoMagnetometer(&sensors[i].ahrs, gyroscope, accelerometer, delta_time_s);
+            FusionAhrsUpdate(&sensors[i].ahrs, gyroscope, accelerometer, FUSION_VECTOR_ZERO, delta_time_s);
 
             FusionQuaternion quaternion = FusionAhrsGetQuaternion(&sensors[i].ahrs);
             quaternion = enforce_quaternion_continuity(quaternion, sensors[i].previousQuaternion);

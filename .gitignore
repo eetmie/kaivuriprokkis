@@ -179,3 +179,21 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Pico IMU reader local builds
+/pico_imu_reader/build/
+/pico_imu_reader/build_ninja/
+/pico_imu_reader/cmake-build-*/
+/pico_imu_reader/CMakeFiles/
+/pico_imu_reader/CMakeCache.txt
+/pico_imu_reader/cmake_install.cmake
+/pico_imu_reader/compile_commands.json
+/pico_imu_reader/build.ninja
+/pico_imu_reader/.ninja_*
+/pico_imu_reader/generated/
+/pico_imu_reader/*.bin
+/pico_imu_reader/*.dis
+/pico_imu_reader/*.elf
+/pico_imu_reader/*.elf.map
+/pico_imu_reader/*.hex
+/pico_imu_reader/*.uf2

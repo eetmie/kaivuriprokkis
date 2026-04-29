@@ -54,15 +54,15 @@ static bool read_cdc_line(char *line, size_t line_len) {
 }
 
 static void extract_part(const char* key, const char* buf, settings_enum setting) {
-    char *pos = strstr(buf, key);
+    const char *pos = strstr(buf, key);
     if (pos == NULL) return;  // Optional - skip if not found
 
     char part_buffer[64];
     memset(part_buffer, 0, sizeof(part_buffer));
-    int cursor = 0;
-    int part_index = (pos - buf) + strlen(key);
+    size_t cursor = 0;
+    size_t part_index = (size_t)(pos - buf) + strlen(key);
 
-    for (int j = part_index; j < SETTINGS_BUF_LEN - part_index && cursor < 63; j++) {
+    for (size_t j = part_index; buf[j] != '\0' && cursor < sizeof(part_buffer) - 1; j++) {
         if (buf[j] == '|' || buf[j] == '\n' || buf[j] == '\0') break;
         part_buffer[cursor++] = buf[j];
     }
@@ -70,22 +70,22 @@ static void extract_part(const char* key, const char* buf, settings_enum setting
 
     switch (setting) {
         case S_SAMPLE_RATE:
-            imu_reader_settings.sampleRate = atoi(part_buffer);
+            (void)sscanf(part_buffer, "%d", &imu_reader_settings.sampleRate);
             break;
         case S_GYRO_RANGE:
-            sscanf(part_buffer, "%f", &imu_reader_settings.gyroRangeDps);
+            (void)sscanf(part_buffer, "%f", &imu_reader_settings.gyroRangeDps);
             break;
         case S_AHRS_GAIN:
-            sscanf(part_buffer, "%f", &imu_reader_settings.ahrsGain);
+            (void)sscanf(part_buffer, "%f", &imu_reader_settings.ahrsGain);
             break;
         case S_AHRS_ACCEL_REJ:
-            sscanf(part_buffer, "%f", &imu_reader_settings.ahrsAccelRejection);
+            (void)sscanf(part_buffer, "%f", &imu_reader_settings.ahrsAccelRejection);
             break;
         case S_AHRS_RECOVERY_S:
-            sscanf(part_buffer, "%f", &imu_reader_settings.ahrsRecoveryPeriodS);
+            (void)sscanf(part_buffer, "%f", &imu_reader_settings.ahrsRecoveryPeriodS);
             break;
         case S_OFFSET_TIMEOUT_S:
-            sscanf(part_buffer, "%f", &imu_reader_settings.offsetTimeoutS);
+            (void)sscanf(part_buffer, "%f", &imu_reader_settings.offsetTimeoutS);
             break;
     }
     cdc_writef("Config: %s%s\n", key, part_buffer);
@@ -106,7 +106,11 @@ static void parse_settings(const char* buf) {
     if (imu_reader_settings.sampleRate < 10) imu_reader_settings.sampleRate = 100;
     if (imu_reader_settings.sampleRate > 1000) imu_reader_settings.sampleRate = 1000;
     if (imu_reader_settings.gyroRangeDps < 125.0f) imu_reader_settings.gyroRangeDps = 500.0f;
+    if (imu_reader_settings.gyroRangeDps > 2000.0f) imu_reader_settings.gyroRangeDps = 2000.0f;
     if (imu_reader_settings.ahrsGain <= 0.0f) imu_reader_settings.ahrsGain = 0.5f;
+    if (imu_reader_settings.ahrsAccelRejection < 0.0f) imu_reader_settings.ahrsAccelRejection = 20.0f;
+    if (imu_reader_settings.ahrsRecoveryPeriodS <= 0.0f) imu_reader_settings.ahrsRecoveryPeriodS = 0.5f;
+    if (imu_reader_settings.offsetTimeoutS < 0.0f) imu_reader_settings.offsetTimeoutS = 0.5f;
 
     cdc_writef("Settings: SR=%d Hz, GYRO=%.0f dps, GAIN=%.2f, ACC_REJ=%.1f, RECOV=%.2fs, OFFSET=%.2fs\n",
            imu_reader_settings.sampleRate,
@@ -140,17 +144,7 @@ void wait_for_settings() {
             if (strstr(buf, "SR=")) {
                 parse_settings(buf);
                 g_settings_ready = true;
-                // Send CFG_OK for a short window, then exit to streaming
-                absolute_time_t cfg_ok_start = get_absolute_time();
-                absolute_time_t last_cfg_ok = cfg_ok_start;
-                while (absolute_time_diff_us(cfg_ok_start, get_absolute_time()) < 500 * 1000) {
-                    tud_task();
-                    if (absolute_time_diff_us(last_cfg_ok, get_absolute_time()) >= 100 * 1000) {
-                        send_control_msg(MSG_TYPE_CFG_OK);
-                        last_cfg_ok = get_absolute_time();
-                    }
-                    sleep_ms(10);
-                }
+                // CFG_OK is sent after IMU init and startup calibration succeed.
                 return;
             }
         }

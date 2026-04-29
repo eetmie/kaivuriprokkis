@@ -150,7 +150,7 @@ def main():
         print(f"[test] Initializing hardware (ctrl={ctrl_hz}Hz imu={imu_hz}Hz adc={adc_hz}Hz)...")
         hardware = HardwareInterface(
             config_file=str(_ROOT / "configuration_files" / "servo_config_200.yaml"),
-            pump_variable=False,
+            pump_auto_mode=False,
             toggle_channels=True,
             stale_timeout_s=0.5,
             adc_channels=[

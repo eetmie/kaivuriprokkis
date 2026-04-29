@@ -41,7 +41,7 @@ class _FakeHardware:
 
 
 class RobotServicePumpToggleTests(unittest.TestCase):
-    @patch("modules.robot_service.diff_ik.load_excavator_robot_config", return_value=object())
+    @patch("modules.robot_service.load_excavator_robot_config", return_value=object())
     def test_pause_and_resume_toggle_pump(self, _mock_robot_cfg):
         controller = _FakeController()
         hardware = _FakeHardware()

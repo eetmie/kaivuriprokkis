@@ -11,12 +11,12 @@ pwm_frequency: 200
 CHANNEL_CONFIGS:
 
     pump:
-        # TODO: update physical connection to match!
         output_channel: 9
         pulse_min: 1000
         pulse_max: 1700
-        base_command: 0.50    # normalized command applied when pump is enabled
-        activity_gain: 0.40   # extra normalized command from average valve activity when pump_variable=True
+        static_pulse_us: 1530  # fixed pulse width (us) used when auto mode is off
+        base_pulse_us: 1525    # idle pulse (us) in auto mode with no valve activity
+        activity_gain_us: 140  # extra us added at full average valve activity in auto mode
 
 
     lift_boom:
@@ -40,6 +40,12 @@ CHANNEL_CONFIGS:
         ramp_enable: True    # linear slew limit on pulse changes
         ramp_limit: 800.0    # 750 max rate in us/s; lower = smoother, less overshoot
         ramp_skip_deadband: False  # if True, deadband jump is instant (slew only for usable range)
+        # Tuning sequence:
+        #   1. Set ramp_brake_threshold: 0.0, raise ramp_limit until fast but no jump on release
+        #   2. Enable brake: start ramp_brake_threshold around 0.15, shrink until jumps return, back off a little
+        #   3. Adjust ramp_brake_min_rate if arrival is sluggish (raise) or still slams (lower)
+        ramp_brake_threshold: 0.0  # [0.0–1.0] fraction of working range where braking begins; 0 = disabled
+        ramp_brake_min_rate: 80.0  # minimum µs/s at end of brake zone — keep high enough to avoid stalling near target
 
         gamma: 1.0          # curve shaping; <1 = more sensitive near center
 
@@ -63,6 +69,8 @@ CHANNEL_CONFIGS:
         ramp_enable: True
         ramp_limit: 900.0 # 900
         ramp_skip_deadband: False
+        ramp_brake_threshold: 0.0
+        ramp_brake_min_rate: 80.0
         gamma: 1.2
 
     scoop:
@@ -83,6 +91,8 @@ CHANNEL_CONFIGS:
         ramp_enable: True
         ramp_limit: 800.0
         ramp_skip_deadband: False
+        ramp_brake_threshold: 0.0
+        ramp_brake_min_rate: 80.0
         gamma: 1.2
 
     rotate:
@@ -103,4 +113,6 @@ CHANNEL_CONFIGS:
         ramp_enable: True
         ramp_limit: 250.0
         ramp_skip_deadband: False
+        ramp_brake_threshold: 0.0
+        ramp_brake_min_rate: 80.0
         gamma: 1.5

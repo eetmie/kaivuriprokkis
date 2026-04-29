@@ -345,6 +345,7 @@ class ExcavatorGUI3D:
                 self.step_pos,
                 self.step_rot,
                 control_space=self.ik_control_space,
+                radius=self.target_state.radius,
             )
             if d0 or d1 or dz or drot:
                 if self.ik_control_space == IKControlSpace.CARTESIAN:

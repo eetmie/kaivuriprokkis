@@ -3,11 +3,19 @@
 
 Usage:
     sudo python simple_drive.py
+    sudo python simple_drive.py --linkage-rate-correction
 
 Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
     Button 1: reload PWM/servo config
     Button 2: toggle hydraulic pump
+    Button 3: cycle compensation mode — OFF → raw summary → universal smooth
+
+Left paddle (bench mode): slowly trims pump auto-mode activity_gain_us base level while held.
+    Push forward = more gain, pull back = less. Prints current base value when it changes.
+    In mode 2 (pump gain), the base is further modulated each tick by the universal linkage
+    shape so slow positions get a boost and fast positions are reduced — valve commands stay
+    completely untouched. Also drives left track as normal — fine on the bench.
 
 The controller runs in DIRECT mode — joystick axes go straight to valves,
 IK/PID are bypassed. Useful for sanity-checking joint readouts (e.g., after
@@ -18,6 +26,7 @@ from __future__ import annotations
 
 import sys
 import time
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -29,10 +38,18 @@ if str(_ROOT) not in sys.path:
 from modules.udp_socket import UDPSocket
 from modules.hardware_interface import HardwareInterface, HardwareFaultError
 from modules.excavator_controller import ExcavatorController
+from tools.linkage_rate_compensation import (
+    DEFAULT_TABLE,
+    DEFAULT_UNIVERSAL_TABLE,
+    LinkageRateCompensator,
+    UniversalShapeCompensator,
+)
 
 
 SAMPLING_FREQUENCY = 100              # main loop Hz
 PRINT_DECIMATION = 10                 # print every Nth iteration when enabled (~10Hz)
+PUMP_GAIN_ADJUST_RATE = 80.0         # µs/s per unit of paddle input for bench gain trim
+PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
 
@@ -124,7 +141,30 @@ def format_imu_debug_line(payload, joint_angles_deg=None, joint_names=None, imu_
     )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Bench driving helper with optional linkage-rate correction")
+    parser.add_argument(
+        "--linkage-rate-correction",
+        action="store_true",
+        help="Start with prototype linkage-rate command correction enabled",
+    )
+    parser.add_argument(
+        "--linkage-rate-table",
+        default=str(DEFAULT_TABLE),
+        help="Path to processed linkage-rate *_summary.csv",
+    )
+    parser.add_argument(
+        "--linkage-rate-universal-table",
+        default=str(DEFAULT_UNIVERSAL_TABLE),
+        help="Path to processed linkage-rate *_universal_shape.csv",
+    )
+    parser.add_argument("--linkage-rate-min-factor", type=float, default=0.35)
+    parser.add_argument("--linkage-rate-max-factor", type=float, default=2.25)
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     # ---- UDP (mirror drive_logger.py wire format exactly) ----
     server = UDPSocket(local_id=2)
     server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
@@ -161,6 +201,44 @@ def main():
     imu_role_order = get_imu_role_order(controller)
     print("Controller in DIRECT mode.")
 
+    linkage_compensator = None
+    universal_compensator = None
+    # comp_mode: 0=OFF, 1=raw summary, 2=universal smooth
+    comp_mode = 1 if args.linkage_rate_correction else 0
+    COMP_LABELS = ["OFF", "valve scale (raw)", "pump gain (universal shape)"]
+
+    try:
+        linkage_compensator = LinkageRateCompensator(
+            args.linkage_rate_table,
+            min_factor=args.linkage_rate_min_factor,
+            max_factor=args.linkage_rate_max_factor,
+        )
+        print(f"Raw linkage-rate table loaded: {linkage_compensator.table_path}")
+    except Exception as e:
+        print(f"Raw linkage-rate correction unavailable: {e}")
+
+    try:
+        universal_compensator = UniversalShapeCompensator(
+            args.linkage_rate_universal_table,
+            min_factor=args.linkage_rate_min_factor,
+            max_factor=args.linkage_rate_max_factor,
+        )
+        print(f"Universal shape table loaded: {universal_compensator.table_path}")
+    except Exception as e:
+        print(f"Universal shape correction unavailable: {e}")
+
+    print(f"Compensation mode: {COMP_LABELS[comp_mode]}")
+
+    # ---- Pump gain trim state ----
+    pwm = hardware.pwm_controller
+    pump_gain_available = pwm is not None and pwm.pump_config is not None and pwm.pump_auto_mode
+    pump_gain_us = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
+    pump_gain_last_printed = pump_gain_us
+    if pump_gain_available:
+        print(f"Pump auto gain trim enabled (left paddle). Initial activity_gain_us={pump_gain_us:.1f} µs")
+    else:
+        print("Pump gain trim unavailable (no pump config or auto mode off).")
+
     # ---- UDP handshake ----
     print("Waiting for remote controller...")
     if not server.handshake(timeout=30.0):
@@ -170,7 +248,11 @@ def main():
         hardware.shutdown()
         raise SystemExit(1)
     server.start_receiving()
-    print("Connected. Drive with the gamepad. Button 0 prints IMU/joint angles, Button 1 reloads config.\n")
+    print(
+        "Connected. Drive with the gamepad. "
+        "Button 0 prints IMU/joint angles, Button 1 reloads config, "
+        "Button 3 cycles compensation mode (OFF / raw / universal smooth).\n"
+    )
 
     # ---- Loop state ----
     loop_period = 1.0 / SAMPLING_FREQUENCY
@@ -215,6 +297,15 @@ def main():
                         hardware.pwm_controller.set_pump_enabled(new_state)
                         print(f"\n[Button 2] pump {'ON' if new_state else 'OFF'}")
 
+                # Button 3: cycle compensation mode OFF → raw → universal smooth.
+                if buttons[3] > button_threshold and button_prev[3] <= button_threshold:
+                    comp_mode = (comp_mode + 1) % 3
+                    if comp_mode == 1 and linkage_compensator is None:
+                        comp_mode = (comp_mode + 1) % 3
+                    if comp_mode == 2 and universal_compensator is None:
+                        comp_mode = (comp_mode + 1) % 3
+                    print(f"\n[Button 3] compensation mode: {COMP_LABELS[comp_mode]}")
+
                 button_prev = buttons
 
             # Direct-mode commands straight from the joystick.
@@ -226,7 +317,39 @@ def main():
                 'trackR':    right_paddle,
                 'trackL':    left_paddle,
             }
+            # TODO: replace open-loop shape compensation with closed-loop joint velocity
+            # control. Joystick → desired deg/s → PID → valve command, with gyro angular
+            # rates as feedback. IMU gyros give rate directly (no differentiation noise),
+            # but will need a low-pass (e.g. exponential smoothing) to suppress vibration
+            # before feeding the PID error. Would make feel consistent across full range
+            # regardless of linkage geometry, pressure, or temperature drift.
+            # NOTE: valve response is slow, so PID needs oscillation prevention —
+            # derivative damping and/or a command deadband are likely necessary to avoid
+            # chatter at steady state while waiting for pressure to build.
+            joint_angles = controller.get_joint_angles()
+
+            # Mode 1: scale valve commands per-joint (valve curves are affected).
+            # Mode 2: valve commands untouched — correction goes to pump gain only.
+            if comp_mode == 1 and linkage_compensator is not None:
+                commands = linkage_compensator.apply(commands, joint_angles)
             controller.give_direct_commands(commands)
+
+            # Left paddle: trim the pump activity_gain_us base level.
+            # In mode 2 this base is then further modulated by linkage position below.
+            if pump_gain_available and abs(left_paddle) > 0.05:
+                raw = pump_gain_us + left_paddle * PUMP_GAIN_ADJUST_RATE * loop_period
+                pump_gain_us = float(np.clip(raw, 0.0, pwm.pump_config.pulse_max - pwm.pump_config.pulse_min))
+                if abs(pump_gain_us - pump_gain_last_printed) >= PUMP_GAIN_PRINT_THRESHOLD:
+                    print(f"\n[pump gain base] activity_gain_us={pump_gain_us:.1f} µs")
+                    pump_gain_last_printed = pump_gain_us
+
+            # Apply pump gain: base level, optionally modulated by linkage shape (mode 2).
+            if pump_gain_available:
+                if comp_mode == 2 and universal_compensator is not None:
+                    factor = universal_compensator.pump_correction_factor(commands, joint_angles)
+                else:
+                    factor = 1.0
+                pwm.set_pump_activity_gain_us(pump_gain_us * factor)
 
             # Live IMU readout — only when toggled on, decimated to ~10Hz.
             iter_count += 1

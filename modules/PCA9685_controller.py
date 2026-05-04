@@ -1145,6 +1145,20 @@ class PWMController:
         with self._lock:
             self.pump_auto_mode = bool(auto)
 
+    def set_pump_activity_gain_us(self, gain_us: float) -> float:
+        """Set the auto-mode activity_gain_us at runtime. Returns the clamped value."""
+        with self._lock:
+            if not self.pump_config:
+                return 0.0
+            clamped = max(0.0, min(float(gain_us), float(self.pump_config.pulse_max - self.pump_config.pulse_min)))
+            self.pump_config.activity_gain_us = clamped
+            return clamped
+
+    def get_pump_activity_gain_us(self) -> float:
+        """Return current auto-mode activity_gain_us, or 0 if no pump configured."""
+        with self._lock:
+            return float(self.pump_config.activity_gain_us) if self.pump_config else 0.0
+
     def set_pump_speed_us(self, pulse_us: Optional[float], flush: bool = True):
         """Set pump speed directly in microseconds, bypassing auto/static logic.
 

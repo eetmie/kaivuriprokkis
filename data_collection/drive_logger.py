@@ -11,12 +11,16 @@ Uses the kaivuriprokkis ExcavatorController in direct mode (bypass IK/PID).
 Usage:
     python data_collection/drive_logger.py
     python data_collection/drive_logger.py --perf
+    python data_collection/drive_logger.py --sine
+    python data_collection/drive_logger.py --sine --sine_pump
+    python data_collection/drive_logger.py --auto-pump
+    python data_collection/drive_logger.py --enable_slew
 
 Button Controls (remote gamepad):
     Button 0: Start / Stop data logging (saves on stop)
-    Button 1: Toggle sine excitation on / off
+    Button 1: Toggle sine excitation on / off (only when --sine is used)
     Button 2: Toggle hydraulic pump
-    Button 3: Cycle sine amplitude (0.1 -> 0.2 -> 0.3 -> 0.4 -> 0.5 -> 0.1)
+    Button 3: Cycle sine amplitude (only when --sine is used)
 """
 
 import sys
@@ -36,6 +40,7 @@ from modules.udp_socket import UDPSocket
 from modules.hardware_interface import HardwareInterface, HardwareFaultError
 from modules.excavator_controller import ExcavatorController
 from modules.perf_tracker import LoopPerfTracker
+from modules.rt_utils import apply_rt_to_thread, SCHED_FIFO
 
 # ============================================================
 # SETTINGS
@@ -55,13 +60,10 @@ JOINT_NAMES = ['rotate', 'lift_boom', 'tilt_boom', 'scoop']
 # Sine amplitude presets (cycled by button 3)
 AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
-# NOTE: Pump is currently static (toggle on/off only via button 2).
-# The Egli papers note that engine RPM variations affect actuator behavior.
-# If initial data collection demos work well, a future iteration could add:
-#   - Variable pump speed as a logged input channel
-#   - Pump speed as a training input (like RPM/oil temp in the papers)
-#   - Automatic pump speed modulation during excitation
-# For now, keep pump constant during recording sessions for simpler modeling.
+# Pump modes:
+# - default: fixed static pulse from config
+# - --sine --sine_pump: direct sine modulation around static_pulse_us
+# - --auto-pump: valve-activity-based automatic pump speed
 
 
 # ============================================================
@@ -84,6 +86,7 @@ class SineExcitationGenerator:
         self.speed_scale = 1.0
         self._amplitude_idx = 2  # index into AMPLITUDE_PRESETS (0.3)
         self.start_time = None
+        self.pump_phases = (0.785, 1.047)
 
         # Per-joint phase offsets (phi1, phi2) — different phases per joint
         self.joint_phases = {
@@ -121,6 +124,17 @@ class SineExcitationGenerator:
     def get_all_signals(self, t):
         """Compute excitation signals for all joints. Returns dict."""
         return {name: self.get_signal(name, t) for name in JOINT_NAMES}
+
+    def get_pump_signal(self, t):
+        """Compute normalized pump excitation signal in [-amplitude_scale, +amplitude_scale]."""
+        if not self.enabled or self.start_time is None:
+            return 0.0
+        elapsed = t - self.start_time
+        phi1, phi2 = self.pump_phases
+        s = self.speed_scale
+        envelope = np.sin(2.0 * np.pi * 0.02 * s * elapsed + phi1)
+        carrier = np.sin(2.0 * np.pi * (elapsed + 0.99 * np.sin(2.0 * np.pi * 0.1 * elapsed) + phi2))
+        return self.amplitude_scale * envelope * carrier
 
 
 # ============================================================
@@ -161,14 +175,24 @@ class DataLogger:
         self.sine_cmds = []
         self.combined_cmds = []
 
-        # Joint state — (N, 4) for [slew, boom, arm, bucket]
-        self.joint_positions = []   # degrees
-        self.joint_velocities = []  # deg/s
+        # Joint positions (N, 4): [slew, boom, arm, bucket] in degrees
+        self.joint_positions = []
+        # Joint velocities from IMU gyro Y-axis projection (deg/s)
+        self.joint_vel_boom = []
+        self.joint_vel_arm = []
+        self.joint_vel_bucket = []
+        # Raw IMU gyro vectors [gx, gy, gz] in deg/s per joint
+        self.imu_gyro_boom = []
+        self.imu_gyro_arm = []
+        self.imu_gyro_bucket = []
 
         # Pressures — (N, 3) for [lift, tilt, scoop]
         self.pressures_extend = []
         self.pressures_retract = []
         self.pump_pressures = []
+        self.pump_sine_commands_us = []
+        self.pump_commands_us = []
+        self.pump_modes = []
         self.pressure_timestamps = []
 
         # Quality flags
@@ -176,6 +200,7 @@ class DataLogger:
         self.cmd_age_seconds = []
         self.pressure_stale_flags = []
         self.sine_enabled_flags = []
+        self.pump_enabled_flags = []
 
         # Pressure sample-and-hold state
         self._last_pressure_extend = None
@@ -209,7 +234,8 @@ class DataLogger:
         print(f"[RESUME] Started new logging segment #{self.segment_id}")
 
     def log_sample(self, manual, sine, combined, controller, hardware,
-                   cmd_age_s, cmd_stale, sine_enabled):
+                   cmd_age_s, cmd_stale, sine_enabled,
+                   pump_sine_us, pump_command_us, pump_enabled, pump_mode):
         """Log one data sample at 100Hz.
 
         Args:
@@ -221,17 +247,33 @@ class DataLogger:
             cmd_age_s: age of last UDP command in seconds
             cmd_stale: bool, True if command is stale
             sine_enabled: bool, True if sine excitation is active
+            pump_sine_us: direct pump sine component in microseconds
+            pump_command_us: actual commanded pump pulse width in microseconds
+            pump_enabled: bool, True if pump output is enabled
+            pump_mode: one of disabled/static/auto/sine
         """
         if not self.is_logging:
             return
 
         current_time = time.perf_counter() - self.start_time_mono
 
-        # --- Joint state from controller ---
+        # --- Joint state ---
         joint_angles = controller.get_joint_angles()  # [slew, boom, arm, bucket] degrees
-        joint_vels = controller.get_joint_velocities_degps()  # [slew, boom, arm, bucket] deg/s or None
-        if joint_vels is None:
-            joint_vels = [np.nan, np.nan, np.nan, np.nan]
+
+        # --- IMU gyro velocities (Y-axis projection; boom/arm/bucket rotate about Y) ---
+        gyro_payload = hardware.try_read_imu_gyro()
+        if gyro_payload is not None:
+            gyros = gyro_payload['gyro']  # [boom, arm, bucket] per _imu_joint_indices order
+            boom_g = list(gyros[0]) if len(gyros) > 0 else [np.nan, np.nan, np.nan]
+            arm_g  = list(gyros[1]) if len(gyros) > 1 else [np.nan, np.nan, np.nan]
+            buck_g = list(gyros[2]) if len(gyros) > 2 else [np.nan, np.nan, np.nan]
+        else:
+            boom_g = [np.nan, np.nan, np.nan]
+            arm_g  = [np.nan, np.nan, np.nan]
+            buck_g = [np.nan, np.nan, np.nan]
+        vel_boom   = boom_g[1]
+        vel_arm    = arm_g[1]
+        vel_bucket = buck_g[1]
 
         # --- Commands in fixed order [rotate, lift, tilt, scoop] ---
         manual_row = [manual.get(n, 0.0) for n in JOINT_NAMES]
@@ -297,15 +339,24 @@ class DataLogger:
         self.sine_cmds.append(sine_row)
         self.combined_cmds.append(combined_row)
         self.joint_positions.append(list(joint_angles))
-        self.joint_velocities.append(list(joint_vels))
+        self.joint_vel_boom.append(float(vel_boom))
+        self.joint_vel_arm.append(float(vel_arm))
+        self.joint_vel_bucket.append(float(vel_bucket))
+        self.imu_gyro_boom.append(boom_g)
+        self.imu_gyro_arm.append(arm_g)
+        self.imu_gyro_bucket.append(buck_g)
         self.pressures_extend.append(p_extend)
         self.pressures_retract.append(p_retract)
         self.pump_pressures.append(pump_ps)
+        self.pump_sine_commands_us.append(float(pump_sine_us))
+        self.pump_commands_us.append(float(pump_command_us) if np.isfinite(pump_command_us) else np.nan)
+        self.pump_modes.append(str(pump_mode))
         self.pressure_timestamps.append(pressure_ts)
         self.cmd_stale_flags.append(int(bool(cmd_stale)))
         self.cmd_age_seconds.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
         self.pressure_stale_flags.append(int(bool(pressure_stale)))
         self.sine_enabled_flags.append(int(bool(sine_enabled)))
+        self.pump_enabled_flags.append(int(bool(pump_enabled)))
 
     def get_elapsed_time(self):
         """Elapsed time in minutes since logging start."""
@@ -331,13 +382,15 @@ class DataLogger:
 
         save_start = time.perf_counter()
 
-        manual = np.array(self.manual_cmds)       # (N, 4)
-        sine = np.array(self.sine_cmds)            # (N, 4)
-        combined = np.array(self.combined_cmds)    # (N, 4)
-        joint_pos = np.array(self.joint_positions)  # (N, 4)
-        joint_vel = np.array(self.joint_velocities) # (N, 4)
-        p_ext = np.array(self.pressures_extend)     # (N, 3)
-        p_ret = np.array(self.pressures_retract)    # (N, 3)
+        manual = np.array(self.manual_cmds)         # (N, 4)
+        sine = np.array(self.sine_cmds)              # (N, 4)
+        combined = np.array(self.combined_cmds)      # (N, 4)
+        joint_pos = np.array(self.joint_positions)   # (N, 4)
+        imu_boom = np.array(self.imu_gyro_boom)      # (N, 3)
+        imu_arm  = np.array(self.imu_gyro_arm)       # (N, 3)
+        imu_buck = np.array(self.imu_gyro_bucket)    # (N, 3)
+        p_ext = np.array(self.pressures_extend)      # (N, 3)
+        p_ret = np.array(self.pressures_retract)     # (N, 3)
 
         data = {
             'timestamp': np.array(self.timestamps),
@@ -363,11 +416,14 @@ class DataLogger:
             'joint_pos_boom': joint_pos[:, 1],
             'joint_pos_arm': joint_pos[:, 2],
             'joint_pos_bucket': joint_pos[:, 3],
-            # Joint velocities (deg/s)
-            'joint_vel_slew': joint_vel[:, 0],
-            'joint_vel_boom': joint_vel[:, 1],
-            'joint_vel_arm': joint_vel[:, 2],
-            'joint_vel_bucket': joint_vel[:, 3],
+            # Joint velocities from IMU gyro Y-axis projection (deg/s)
+            'joint_vel_boom': np.array(self.joint_vel_boom),
+            'joint_vel_arm': np.array(self.joint_vel_arm),
+            'joint_vel_bucket': np.array(self.joint_vel_bucket),
+            # Raw IMU gyro vectors (deg/s)
+            'imu_gx_boom': imu_boom[:, 0], 'imu_gy_boom': imu_boom[:, 1], 'imu_gz_boom': imu_boom[:, 2],
+            'imu_gx_arm':  imu_arm[:, 0],  'imu_gy_arm':  imu_arm[:, 1],  'imu_gz_arm':  imu_arm[:, 2],
+            'imu_gx_bucket': imu_buck[:, 0], 'imu_gy_bucket': imu_buck[:, 1], 'imu_gz_bucket': imu_buck[:, 2],
             # Pressures (V)
             'pext_lift': p_ext[:, 0],
             'pext_tilt': p_ext[:, 1],
@@ -376,12 +432,16 @@ class DataLogger:
             'pret_tilt': p_ret[:, 1],
             'pret_scoop': p_ret[:, 2],
             'pump_ps': np.array(self.pump_pressures),
+            'pump_sine_us': np.array(self.pump_sine_commands_us),
+            'pump_cmd_us': np.array(self.pump_commands_us),
+            'pump_mode': np.array(self.pump_modes, dtype=object),
             'pressure_ts': np.array(self.pressure_timestamps),
             # Quality flags
             'cmd_stale': np.array(self.cmd_stale_flags),
             'cmd_age_s': np.array(self.cmd_age_seconds),
             'pressure_stale': np.array(self.pressure_stale_flags),
             'sine_enabled': np.array(self.sine_enabled_flags),
+            'pump_enabled': np.array(self.pump_enabled_flags),
         }
 
         df = pd.DataFrame(data)
@@ -439,6 +499,8 @@ class DataLogger:
         print(f"  Stale pressures: {100.0 * df['pressure_stale'].mean():.1f}%")
         sine_pct = 100.0 * df['sine_enabled'].mean()
         print(f"  Sine enabled: {sine_pct:.1f}% of samples")
+        pump_pct = 100.0 * df['pump_enabled'].mean()
+        print(f"  Pump enabled: {pump_pct:.1f}% of samples")
 
         # Combined command ranges
         print(f"\n  Combined Commands:")
@@ -455,13 +517,16 @@ class DataLogger:
             d = df[col].values
             print(f"    {label:>6s}: [{d.min():+.1f}, {d.max():+.1f}]")
 
-        # Joint velocity ranges
         print(f"\n  Joint Velocities (deg/s):")
-        for label in ['slew', 'boom', 'arm', 'bucket']:
+        for label in ['boom', 'arm', 'bucket']:
             col = f'joint_vel_{label}'
             d = df[col].dropna().values
             if len(d) > 0:
                 print(f"    {label:>6s}: max |v| = {np.abs(d).max():.1f}")
+
+        pump_cmd = df['pump_cmd_us'].dropna().values
+        if len(pump_cmd) > 0:
+            print(f"\n  Pump Command (us): [{pump_cmd.min():.1f}, {pump_cmd.max():.1f}]")
 
 
 # ============================================================
@@ -470,7 +535,29 @@ class DataLogger:
 def main():
     parser = argparse.ArgumentParser(description="Excavator data logger with sine excitation")
     parser.add_argument("--perf", action="store_true", help="Show performance metrics")
+    parser.add_argument("--sine", action="store_true", help="Enable joint sine excitation mode")
+    parser.add_argument(
+        "--sine_pump",
+        action="store_true",
+        help="When used with --sine, apply sine modulation to the pump too",
+    )
+    parser.add_argument(
+        "--auto-pump",
+        action="store_true",
+        dest="auto_pump",
+        help="Use valve-activity-based automatic pump speed",
+    )
+    parser.add_argument(
+        "--enable_slew",
+        action="store_true",
+        help="Allow slew/rotate commands. By default slew is held at zero.",
+    )
     args = parser.parse_args()
+
+    if args.sine_pump and not args.sine:
+        parser.error("--sine_pump requires --sine")
+    if args.sine_pump and args.auto_pump:
+        parser.error("--sine_pump cannot be used together with --auto-pump")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -481,7 +568,7 @@ def main():
     # ---- Hardware ----
     print("Initializing hardware...")
     hardware = HardwareInterface(
-        pump_auto_mode=False,
+        pump_auto_mode=args.auto_pump,
         toggle_channels=True,
         stale_timeout_s=0.5,
         adc_channels=[
@@ -521,6 +608,20 @@ def main():
     time.sleep(2.0)  # warmup (numba JIT)
     controller.enter_direct_mode()
     print("Controller in DIRECT mode (IK/PID bypassed)")
+    if args.enable_slew:
+        print("Slew axis enabled")
+    else:
+        print("Slew axis disabled (use --enable_slew to allow rotate commands)")
+    if args.auto_pump:
+        print("Pump mode: AUTO")
+    elif args.sine_pump:
+        print("Pump mode: SINE-COUPLED")
+    else:
+        print("Pump mode: STATIC")
+    if args.sine:
+        print("Sine mode armed (Button 1 toggles, Button 3 changes amplitude)")
+    else:
+        print("Sine mode disabled (use --sine to enable it)")
 
     # ---- Perf tracking ----
     main_loop_perf = LoopPerfTracker(enabled=args.perf)
@@ -534,6 +635,7 @@ def main():
     # ---- Helpers ----
     sine_gen = SineExcitationGenerator()
     logger = DataLogger()
+    hardware.set_pump_speed_us(None)
 
     # ---- UDP handshake ----
     print("Waiting for remote controller...")
@@ -566,6 +668,8 @@ def main():
     last_status_time = time.time()
     last_auto_save_time = time.time()
 
+    apply_rt_to_thread(priority=75, policy=SCHED_FIFO, lock_memory=False)
+
     try:
         while True:
             main_loop_perf.tick_start()
@@ -597,26 +701,36 @@ def main():
 
                 # Button 1: Toggle sine excitation
                 if buttons[1] > button_threshold and button_prev[1] <= button_threshold:
-                    sine_gen.toggle()
-                    state = "ON" if sine_gen.enabled else "OFF"
-                    print(f"\n[Button 1] Sine excitation {state} (amp={sine_gen.amplitude_scale:.2f})")
+                    if args.sine:
+                        sine_gen.toggle()
+                        if not sine_gen.enabled and args.sine_pump:
+                            hardware.set_pump_speed_us(None)
+                        state = "ON" if sine_gen.enabled else "OFF"
+                        pump_text = ", pump coupled" if args.sine_pump else ""
+                        print(f"\n[Button 1] Sine excitation {state} (amp={sine_gen.amplitude_scale:.2f}{pump_text})")
+                    else:
+                        print("\n[Button 1] Ignored (--sine not enabled)")
 
                 # Button 2: Toggle pump
                 if buttons[2] > button_threshold and button_prev[2] <= button_threshold:
-                    print("\n[Button 2] Toggling pump...")
-                    if hardware.pwm_controller:
-                        hardware.pwm_controller.set_pump_enabled(not hardware.pwm_controller.pump_enabled)
+                    if hardware.pwm_controller is not None:
+                        new_state = not hardware.pwm_controller.pump_enabled
+                        hardware.set_pump_enabled(new_state)
+                        print(f"\n[Button 2] Pump {'ON' if new_state else 'OFF'}")
 
                 # Button 3: Cycle sine amplitude
                 if buttons[3] > button_threshold and button_prev[3] <= button_threshold:
-                    sine_gen.cycle_amplitude()
-                    print(f"\n[Button 3] Sine amplitude -> {sine_gen.amplitude_scale:.2f}")
+                    if args.sine:
+                        sine_gen.cycle_amplitude()
+                        print(f"\n[Button 3] Sine amplitude -> {sine_gen.amplitude_scale:.2f}")
+                    else:
+                        print("\n[Button 3] Ignored (--sine not enabled)")
 
                 button_prev = buttons
 
             # --- 2. Build manual commands ---
             manual_cmds = {
-                'rotate': left_rl,
+                'rotate': left_rl if args.enable_slew else 0.0,
                 'lift_boom': right_ud,
                 'tilt_boom': left_ud,
                 'scoop': right_rl,
@@ -625,6 +739,8 @@ def main():
             # --- 3. Compute sine overlay ---
             t = time.perf_counter()
             sine_cmds = sine_gen.get_all_signals(t)
+            if not args.enable_slew:
+                sine_cmds['rotate'] = 0.0
 
             # --- 4. Combine and clamp ---
             combined_cmds = {}
@@ -632,6 +748,35 @@ def main():
                 combined_cmds[name] = float(np.clip(
                     manual_cmds[name] + sine_cmds[name], -1.0, 1.0
                 ))
+
+            pump_enabled = bool(hardware.pwm_controller and hardware.pwm_controller.pump_enabled)
+            pump_sine_us = 0.0
+            pump_command_us = np.nan
+            pump_mode = "disabled"
+            pump_config = hardware.pwm_controller.pump_config if hardware.pwm_controller else None
+            if pump_config is not None:
+                if pump_enabled:
+                    if args.auto_pump:
+                        pump_mode = "auto"
+                        pump_command_us = np.nan
+                        hardware.set_pump_speed_us(None)
+                    else:
+                        pump_mode = "static"
+                        pump_command_us = float(pump_config.static_pulse_us)
+                    if args.sine_pump and sine_gen.enabled:
+                        pump_mode = "sine"
+                        pump_sine_us = float(sine_gen.get_pump_signal(t) * pump_config.activity_gain_us)
+                        pump_command_us = float(np.clip(
+                            pump_command_us + pump_sine_us,
+                            pump_config.pulse_min,
+                            pump_config.pulse_max,
+                        ))
+                        hardware.set_pump_speed_us(pump_command_us)
+                    elif not args.auto_pump:
+                        hardware.set_pump_speed_us(None)
+                else:
+                    pump_command_us = float(pump_config.pulse_min)
+                    hardware.set_pump_speed_us(None)
 
             # Add tracks (no sine overlay, just pass through)
             combined_cmds['trackR'] = right_paddle
@@ -652,6 +797,7 @@ def main():
                     manual_cmds, sine_cmds, combined_cmds,
                     controller, hardware,
                     cmd_age_s, cmd_stale, sine_gen.enabled,
+                    pump_sine_us, pump_command_us, pump_enabled, pump_mode,
                 )
 
             # --- 7. Auto-save ---
@@ -675,9 +821,16 @@ def main():
                     save_str = "n/a"
 
                 sine_state = f"ON amp={sine_gen.amplitude_scale:.2f}" if sine_gen.enabled else "OFF"
+                pump_state = "OFF"
+                if pump_config is not None:
+                    if args.auto_pump and pump_enabled:
+                        pump_state = "ON auto"
+                    else:
+                        pump_state = f"{'ON' if pump_enabled else 'OFF'} cmd={pump_command_us:.1f}us"
 
                 print(f"[STATUS] Logging={log_state} | {elapsed_min:.1f}min | {samples} samples | Save in {save_str}")
                 print(f"[SINE]   {sine_state}")
+                print(f"[PUMP]   {pump_state}")
 
                 # Joint angles
                 angles = controller.get_joint_angles()

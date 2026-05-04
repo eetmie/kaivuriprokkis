@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
-"""Sine excitation valve response test.
+"""Simple IMU-based sine speed sweep for one hydraulic joint at a time.
 
-Hardware test that commands ONE valve at a time with a sine sweep and
-observes the IMU joint angle response. This answers:
+The script captures the current joint angle as the center, then tries to move
+that joint around ``center +/- target_swing_deg``. A simple direct-mode valve
+controller tracks a sine target while the sine frequency is increased step by
+step until the IMU reports basically no movement.
 
-1. Does the sine signal actually produce valve movement?
-2. What amplitude is needed per joint to get visible motion?
-3. Does the ramp limiter clip the sine at higher amplitudes?
-4. What is the joint angle excursion at each amplitude preset?
-
-For each joint, the test:
-- Sends a simple low-frequency sine (0.2Hz) at each amplitude preset
-- Records the IMU-measured joint angle over ~10 seconds
-- Reports whether movement was detected and the angle range
-
-Also includes an offline analysis section that reads servo_config_200.yaml
-to analyze deadband/ramp interaction without hardware.
-
-Usage:
-    python data_collection/test_sine_valve_range.py                    # offline analysis only
-    python data_collection/test_sine_valve_range.py --hardware         # run on real hardware
-    python data_collection/test_sine_valve_range.py --hardware --joint lift_boom
-    python data_collection/test_sine_valve_range.py --plot             # generate matplotlib plots
+Results are saved as a plain text file.
 """
+
+from __future__ import annotations
 
 import argparse
 import math
@@ -31,192 +18,258 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import yaml
-
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from drive_logger import SineExcitationGenerator, JOINT_NAMES, AMPLITUDE_PRESETS
+from drive_logger import JOINT_NAMES
+
 
 RESULTS_DIR = Path(__file__).parent / "test_results"
-CONFIG_PATH = _ROOT / "configuration_files" / "servo_config_200.yaml"
 
-# Map drive_logger joint names to IMU joint indices
 # controller.get_joint_angles() returns [slew, boom, arm, bucket]
 JOINT_TO_IMU_IDX = {
-    'rotate': 0,     # slew
-    'lift_boom': 1,  # boom
-    'tilt_boom': 2,  # arm
-    'scoop': 3,      # bucket
+    "rotate": 0,
+    "lift_boom": 1,
+    "tilt_boom": 2,
+    "scoop": 3,
 }
 
-
-# ============================================================
-# OFFLINE ANALYSIS (no hardware needed)
-# ============================================================
-
-def load_valve_config():
-    """Load servo config and extract per-joint valve characteristics."""
-    with open(CONFIG_PATH, 'r') as f:
-        raw = yaml.safe_load(f)
-
-    configs = {}
-    for name, cfg in raw.get('CHANNEL_CONFIGS', {}).items():
-        if name == 'pump':
-            continue
-        center = cfg.get('center', (cfg['pulse_min'] + cfg['pulse_max']) / 2)
-        db_pos = cfg.get('deadband_us_pos', 0.0)
-        db_neg = cfg.get('deadband_us_neg', 0.0)
-
-        configs[name] = {
-            'center': center,
-            'pulse_min': cfg['pulse_min'],
-            'pulse_max': cfg['pulse_max'],
-            'deadband_us_pos': db_pos,
-            'deadband_us_neg': db_neg,
-            'usable_range_pos_us': cfg['pulse_max'] - (center + db_pos),
-            'usable_range_neg_us': (center - db_neg) - cfg['pulse_min'],
-            'total_range_us': cfg['pulse_max'] - cfg['pulse_min'],
-            'direction': cfg.get('direction', 1),
-            'gamma': cfg.get('gamma', 1.0),
-            'ramp_limit_us_s': cfg.get('ramp_limit', 0.0),
-            'dither_enable': cfg.get('dither_enable', False),
-            'dither_amp_us': cfg.get('dither_amp_us', 0.0),
-        }
-    return configs
+DEFAULT_JOINTS = ["lift_boom", "tilt_boom", "scoop"]
+DEFAULT_TARGET_SWING_DEG = 20.0
+DEFAULT_START_FREQ_HZ = 0.10
+DEFAULT_FREQ_STEP_HZ = 0.05
+DEFAULT_MAX_FREQ_HZ = 2.00
+DEFAULT_MOVEMENT_THRESHOLD_DEG = 3.0
+DEFAULT_CONTROL_HZ = 100.0
+DEFAULT_KP = 0.06
+DEFAULT_KD = 0.002
+DEFAULT_MIN_COMMAND = 0.08
+DEFAULT_MAX_COMMAND = 1.0
+DEFAULT_SETTLE_S = 1.0
+MIN_TRACKING_ERROR_FOR_COMMAND = 1.0
 
 
-def compute_base_pulse(cfg, value):
-    """Replicate PWM controller's deadband compression logic."""
-    s = float(value) * float(cfg['direction'])
-    center = float(cfg['center'])
-    if s == 0.0:
-        return center
-    elif s > 0.0:
-        base = center + float(cfg['deadband_us_pos'])
-        working = float(cfg['pulse_max']) - base
-        return base + abs(float(value)) * working
-    else:
-        base = center - float(cfg['deadband_us_neg'])
-        working = base - float(cfg['pulse_min'])
-        return base - abs(float(value)) * working
+def make_zero_commands() -> dict[str, float]:
+    return {name: 0.0 for name in JOINT_NAMES}
 
 
-def run_offline_analysis(valve_configs):
-    """Analyze sine vs valve characteristics without hardware."""
+def clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def sign_or_zero(value: float) -> float:
+    if value > 0.0:
+        return 1.0
+    if value < 0.0:
+        return -1.0
+    return 0.0
+
+
+def get_joint_angle_deg(controller, joint_name: str) -> float:
+    angles = controller.get_joint_angles()
+    return float(angles[JOINT_TO_IMU_IDX[joint_name]])
+
+
+def wait_for_hardware_ready(hardware, timeout_s: float = 15.0) -> None:
+    deadline = time.time() + timeout_s
+    while not hardware.is_hardware_ready():
+        if time.time() >= deadline:
+            raise TimeoutError(f"Hardware not ready within {timeout_s:.0f}s")
+        time.sleep(0.1)
+
+
+def settle_joint(controller, settle_s: float) -> None:
+    controller.give_direct_commands(make_zero_commands())
+    time.sleep(settle_s)
+
+
+def format_step_line(result: dict[str, float | bool]) -> str:
+    status = "INTERRUPTED" if result["interrupted"] else (
+        "STOP" if result["movement_detected"] is False else "OK"
+    )
+    return (
+        f"  freq={result['freq_hz']:.2f} Hz | duration={result['duration_s']:.1f}s | "
+        f"angle_range={result['angle_range_deg']:.2f} deg | "
+        f"max_cmd={result['max_abs_command']:.3f} | {status}"
+    )
+
+
+def run_frequency_step(
+    controller,
+    joint_name: str,
+    center_deg: float,
+    freq_hz: float,
+    target_swing_deg: float,
+    movement_threshold_deg: float,
+    control_hz: float,
+    kp: float,
+    kd: float,
+    min_command: float,
+    max_command: float,
+) -> dict[str, float | bool]:
+    loop_period = 1.0 / control_hz
+    duration_s = min(max(2.0 / freq_hz, 6.0), 15.0)
+    angles: list[float] = []
+    commands: list[float] = []
+    last_error_deg = 0.0
+    interrupted = False
+
+    start = time.perf_counter()
+    next_run = start
+
+    try:
+        while (time.perf_counter() - start) < duration_s:
+            elapsed = time.perf_counter() - start
+            target_angle_deg = center_deg + target_swing_deg * math.sin(2.0 * math.pi * freq_hz * elapsed)
+            current_angle_deg = get_joint_angle_deg(controller, joint_name)
+            error_deg = target_angle_deg - current_angle_deg
+            error_rate_deg_s = (error_deg - last_error_deg) / loop_period
+            command = kp * error_deg + kd * error_rate_deg_s
+
+            if abs(error_deg) >= MIN_TRACKING_ERROR_FOR_COMMAND and 0.0 < abs(command) < min_command:
+                command = sign_or_zero(command) * min_command
+
+            command = clip(command, -max_command, max_command)
+            cmd_dict = make_zero_commands()
+            cmd_dict[joint_name] = command
+            controller.give_direct_commands(cmd_dict)
+
+            angles.append(current_angle_deg)
+            commands.append(command)
+            last_error_deg = error_deg
+
+            next_run += loop_period
+            sleep_time = next_run - time.perf_counter()
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+            else:
+                next_run = time.perf_counter()
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        controller.give_direct_commands(make_zero_commands())
+
+    if not angles:
+        raise RuntimeError(f"No IMU samples collected for {joint_name} at {freq_hz:.2f} Hz")
+
+    angle_min = min(angles)
+    angle_max = max(angles)
+    angle_range_deg = angle_max - angle_min
+    max_abs_command = max(abs(cmd) for cmd in commands) if commands else 0.0
+
+    return {
+        "freq_hz": freq_hz,
+        "duration_s": time.perf_counter() - start,
+        "angle_min_deg": angle_min,
+        "angle_max_deg": angle_max,
+        "angle_range_deg": angle_range_deg,
+        "max_abs_command": max_abs_command,
+        "movement_detected": angle_range_deg >= movement_threshold_deg,
+        "interrupted": interrupted,
+    }
+
+
+def run_joint_sweep(
+    controller,
+    joint_name: str,
+    target_swing_deg: float,
+    start_freq_hz: float,
+    freq_step_hz: float,
+    max_freq_hz: float,
+    movement_threshold_deg: float,
+    control_hz: float,
+    kp: float,
+    kd: float,
+    min_command: float,
+    max_command: float,
+    settle_s: float,
+) -> tuple[list[str], bool]:
+    settle_joint(controller, settle_s)
+    center_deg = get_joint_angle_deg(controller, joint_name)
+
     lines = []
-    lines.append("=" * 70)
-    lines.append("  OFFLINE: VALVE DEADBAND vs SINE EXCITATION ANALYSIS")
-    lines.append("=" * 70)
-
-    # 1. Valve physical characteristics
     lines.append("")
-    lines.append("1. VALVE PHYSICAL CHARACTERISTICS")
-    lines.append("-" * 50)
-    lines.append(f"  {'Joint':<12} {'Center':>8} {'DB+':>6} {'DB-':>6} "
-                 f"{'Usable+':>9} {'Usable-':>9} {'Gamma':>6} {'Ramp':>8}")
-
-    for name in JOINT_NAMES:
-        cfg = valve_configs[name]
-        lines.append(
-            f"  {name:<12} {cfg['center']:8.1f} {cfg['deadband_us_pos']:6.1f} "
-            f"{cfg['deadband_us_neg']:6.1f} {cfg['usable_range_pos_us']:9.1f} "
-            f"{cfg['usable_range_neg_us']:9.1f} "
-            f"{cfg['gamma']:6.1f} {cfg['ramp_limit_us_s']:8.1f}")
-
-    lines.append("")
-    lines.append("  NOTE: Deadband compression means ANY non-zero command jumps over")
-    lines.append("  the dead zone instantly. The sine signal is never 'eaten' by deadband.")
+    lines.append(f"Joint: {joint_name}")
+    lines.append(f"  Center angle at start: {center_deg:+.2f} deg")
+    lines.append(f"  Target motion: center +/- {target_swing_deg:.1f} deg")
+    lines.append(f"  Movement threshold: {movement_threshold_deg:.1f} deg peak-to-peak")
+    lines.append(f"  Sweep: {start_freq_hz:.2f} Hz -> {max_freq_hz:.2f} Hz in {freq_step_hz:.2f} Hz steps")
     lines.append("")
 
-    # 2. Ramp limit vs sine slew rate
-    lines.append("2. RAMP LIMIT vs SINE SLEW RATE (amp=0.3, speed=1.0)")
-    lines.append("-" * 50)
+    freq_hz = start_freq_hz
+    largest_command_overall = 0.0
+    largest_command_at_stop = 0.0
+    stop_reason = "reached_max_frequency"
+    stop_freq_hz = max_freq_hz
+    interrupted = False
 
-    sine_gen = SineExcitationGenerator()
-    sine_gen.amplitude_scale = 0.3
-    sine_gen.enabled = True
-    sine_gen.start_time = 0.0
+    while freq_hz <= max_freq_hz + 1e-9:
+        result = run_frequency_step(
+            controller=controller,
+            joint_name=joint_name,
+            center_deg=center_deg,
+            freq_hz=freq_hz,
+            target_swing_deg=target_swing_deg,
+            movement_threshold_deg=movement_threshold_deg,
+            control_hz=control_hz,
+            kp=kp,
+            kd=kd,
+            min_command=min_command,
+            max_command=max_command,
+        )
 
-    dt = 0.01  # 100Hz
-    t_values = np.arange(0, 10, dt)
+        largest_command_overall = max(largest_command_overall, float(result["max_abs_command"]))
+        print(format_step_line(result))
+        lines.append(format_step_line(result))
 
-    for name in JOINT_NAMES:
-        cfg = valve_configs[name]
-        ramp_limit = cfg['ramp_limit_us_s']
+        if result["interrupted"]:
+            stop_reason = "keyboard_interrupt"
+            stop_freq_hz = freq_hz
+            largest_command_at_stop = float(result["max_abs_command"])
+            interrupted = True
+            break
 
-        signals = np.array([sine_gen.get_signal(name, t) for t in t_values])
-        pulses = np.array([compute_base_pulse(cfg, s) for s in signals])
+        if result["movement_detected"] is False:
+            stop_reason = "imu_movement_below_threshold"
+            stop_freq_hz = freq_hz
+            largest_command_at_stop = float(result["max_abs_command"])
+            break
 
-        slew_rates = np.abs(np.diff(pulses)) / dt
-        max_slew = slew_rates.max() if len(slew_rates) > 0 else 0
-        pct_exceeds = (np.sum(slew_rates > ramp_limit) / max(1, len(slew_rates))) * 100
-
-        status = "OK" if pct_exceeds < 1.0 else f"CLIPPED {pct_exceeds:.0f}% of time"
-        lines.append(
-            f"  {name:<12} ramp={ramp_limit:.0f} us/s | "
-            f"sine_slew: max={max_slew:.0f} us/s | {status}")
-
-    lines.append("")
-    lines.append("  CLIPPED means the ramp limiter smooths/lags the sine output.")
-    lines.append("  The blackbox model learns this lag from the data — not a problem.")
-    lines.append("")
-
-    # 3. Combined signal clipping
-    lines.append("3. COMBINED SIGNAL CLIPPING (lift_boom, amp=0.3)")
-    lines.append("-" * 50)
-    lines.append(f"  {'Manual':>7} | {'Clip%':>6} | {'Effective sine RMS':>22} | {'Range':>16}")
-
-    t_values = np.arange(0, 30, 0.01)
-    for manual in [0.0, 0.3, 0.5, 0.7, 0.9]:
-        signals = np.array([sine_gen.get_signal('lift_boom', t) for t in t_values])
-        combined = np.clip(manual + signals, -1.0, 1.0)
-        unclamped = manual + signals
-        clip_pct = (np.sum(np.abs(unclamped) > 1.0) / len(unclamped)) * 100
-        eff_rms = np.sqrt(np.mean((combined - manual)**2))
-        orig_rms = np.sqrt(np.mean(signals**2))
-        retention = (eff_rms / orig_rms * 100) if orig_rms > 0 else 0
-
-        lines.append(
-            f"  {manual:+7.2f} | {clip_pct:5.1f}% | "
-            f"rms={eff_rms:.3f} ({retention:.0f}% retained) | "
-            f"[{combined.min():+.3f}, {combined.max():+.3f}]")
+        largest_command_at_stop = float(result["max_abs_command"])
+        freq_hz += freq_step_hz
 
     lines.append("")
-    lines.append("  Above ~0.7 manual, sine gets partially clipped. This is fine —")
-    lines.append("  Egli papers say ~50% of data should be unperturbed anyway.")
+    lines.append("Summary:")
+    lines.append(f"  stop_reason: {stop_reason}")
+    lines.append(f"  stop_freq_hz: {stop_freq_hz:.2f}")
+    lines.append(f"  largest_command_at_stop: {largest_command_at_stop:.3f}")
+    lines.append(f"  largest_command_overall: {largest_command_overall:.3f}")
     lines.append("")
 
-    return lines
+    return lines, interrupted
 
 
-# ============================================================
-# HARDWARE TEST: single-valve sine + IMU observation
-# ============================================================
-
-def run_hardware_test(joints_to_test, amplitudes_to_test, duration_per_test=10.0):
-    """Command one valve at a time with sine, observe IMU response.
-
-    For each (joint, amplitude) pair:
-    1. Send simple sine (0.2Hz) to that one valve
-    2. Record IMU joint angle at 100Hz
-    3. Report angle range and whether movement detected
-    """
-    from modules.hardware_interface import HardwareInterface, HardwareFaultError
+def run_hardware_test(args) -> list[str]:
     from modules.excavator_controller import ExcavatorController
+    from modules.hardware_interface import HardwareInterface
 
     lines = []
-    lines.append("")
     lines.append("=" * 70)
-    lines.append("  HARDWARE: SINGLE-VALVE SINE RESPONSE TEST")
+    lines.append("SIMPLE SINE SPEED SWEEP")
     lines.append("=" * 70)
-    lines.append(f"  Sine frequency: 0.2 Hz (5s period)")
-    lines.append(f"  Duration per test: {duration_per_test}s")
-    lines.append(f"  Joints: {', '.join(joints_to_test)}")
-    lines.append(f"  Amplitudes: {amplitudes_to_test}")
+    lines.append(f"timestamp: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"joints: {', '.join(args.joints)}")
+    lines.append(f"target_swing_deg: {args.target_swing_deg:.1f}")
+    lines.append(f"start_freq_hz: {args.start_freq_hz:.2f}")
+    lines.append(f"freq_step_hz: {args.freq_step_hz:.2f}")
+    lines.append(f"max_freq_hz: {args.max_freq_hz:.2f}")
+    lines.append(f"movement_threshold_deg: {args.movement_threshold_deg:.1f}")
+    lines.append(f"control_hz: {args.control_hz:.1f}")
+    lines.append(f"kp: {args.kp:.3f}")
+    lines.append(f"kd: {args.kd:.4f}")
+    lines.append(f"min_command: {args.min_command:.3f}")
     lines.append("")
 
     hardware = None
@@ -236,112 +289,49 @@ def run_hardware_test(joints_to_test, amplitudes_to_test, duration_per_test=10.0
             adc_sample_hz=20,
             enable_pwm=True,
             enable_imu=True,
-            enable_adc=True,
+            enable_adc=False,
             cleanup_disable_osc=False,
             log_level="WARNING",
         )
-
-        deadline = time.time() + 15.0
-        while not hardware.is_hardware_ready():
-            if time.time() >= deadline:
-                raise TimeoutError("Hardware not ready within 15s")
-            time.sleep(0.1)
+        wait_for_hardware_ready(hardware)
         print("[hw] Hardware ready")
 
-        print("[hw] Starting controller (direct mode)...")
         controller = ExcavatorController(
-            hardware, config=None,
+            hardware,
+            config=None,
             enable_perf_tracking=False,
             log_level="WARNING",
         )
         controller.start()
         time.sleep(2.0)
         controller.enter_direct_mode()
-        print("[hw] Ready\n")
+        print("[hw] Controller ready in direct mode")
 
-        # Let IMU settle — record baseline angles
-        time.sleep(1.0)
-        baseline = np.array(controller.get_joint_angles())
-        lines.append(f"  Baseline angles: slew={baseline[0]:+.1f} boom={baseline[1]:+.1f} "
-                     f"arm={baseline[2]:+.1f} bucket={baseline[3]:+.1f} deg")
-        lines.append("")
-
-        # Results table header
-        lines.append(f"  {'Joint':<12} {'Amp':>5} | {'Angle min':>10} {'Angle max':>10} "
-                     f"{'Range':>7} {'Movement':>10}")
-        lines.append("  " + "-" * 62)
-
-        sine_freq = 0.2  # Hz, simple sine
-
-        for joint_name in joints_to_test:
-            imu_idx = JOINT_TO_IMU_IDX[joint_name]
-
-            for amp in amplitudes_to_test:
-                # Zero all valves first, let arm settle
-                controller.give_direct_commands({n: 0.0 for n in JOINT_NAMES})
-                time.sleep(1.0)
-
-                # Record angles during sine excitation
-                angles_recorded = []
-                test_start = time.perf_counter()
-                loop_period = 0.01  # 100Hz
-                next_run = test_start
-
-                print(f"  Testing {joint_name} amp={amp:.2f} ...", end="", flush=True)
-
-                while (time.perf_counter() - test_start) < duration_per_test:
-                    t = time.perf_counter() - test_start
-                    sine_value = amp * math.sin(2.0 * math.pi * sine_freq * t)
-
-                    # Command ONLY this joint
-                    cmds = {n: 0.0 for n in JOINT_NAMES}
-                    cmds[joint_name] = sine_value
-                    controller.give_direct_commands(cmds)
-
-                    # Read IMU angle
-                    angles = controller.get_joint_angles()
-                    angles_recorded.append(angles[imu_idx])
-
-                    next_run += loop_period
-                    sleep_time = next_run - time.perf_counter()
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    else:
-                        next_run = time.perf_counter()
-
-                # Zero the valve
-                controller.give_direct_commands({n: 0.0 for n in JOINT_NAMES})
-
-                # Analyze
-                angles_arr = np.array(angles_recorded)
-                angle_min = angles_arr.min()
-                angle_max = angles_arr.max()
-                angle_range = angle_max - angle_min
-
-                # Movement threshold: >0.5 degrees is "real" movement
-                moved = "YES" if angle_range > 0.5 else "NO"
-
-                lines.append(
-                    f"  {joint_name:<12} {amp:5.2f} | "
-                    f"{angle_min:+10.2f} {angle_max:+10.2f} "
-                    f"{angle_range:7.2f} {moved:>10}")
-                print(f" range={angle_range:.2f} deg {'OK' if moved == 'YES' else 'NO MOVEMENT'}")
-
-        lines.append("")
-        lines.append("  Movement threshold: >0.5 degrees = detected")
-        lines.append("  If NO movement: check pump is on, valve is connected, amplitude too low")
-        lines.append("")
-
-    except Exception as e:
-        print(f"[FAIL] {e}")
-        import traceback
-        traceback.print_exc()
-        lines.append(f"\n  ERROR: {e}")
+        for joint_name in args.joints:
+            print(f"\n[joint] {joint_name}")
+            joint_lines, interrupted = run_joint_sweep(
+                controller=controller,
+                joint_name=joint_name,
+                target_swing_deg=args.target_swing_deg,
+                start_freq_hz=args.start_freq_hz,
+                freq_step_hz=args.freq_step_hz,
+                max_freq_hz=args.max_freq_hz,
+                movement_threshold_deg=args.movement_threshold_deg,
+                control_hz=args.control_hz,
+                kp=args.kp,
+                kd=args.kd,
+                min_command=args.min_command,
+                max_command=DEFAULT_MAX_COMMAND,
+                settle_s=args.settle_s,
+            )
+            lines.extend(joint_lines)
+            if interrupted:
+                break
 
     finally:
         if controller is not None:
             try:
-                controller.give_direct_commands({n: 0.0 for n in JOINT_NAMES})
+                controller.give_direct_commands(make_zero_commands())
                 time.sleep(0.3)
                 controller.exit_direct_mode()
                 controller.stop()
@@ -356,164 +346,57 @@ def run_hardware_test(joints_to_test, amplitudes_to_test, duration_per_test=10.0
     return lines
 
 
-# ============================================================
-# PLOTS (offline, no hardware)
-# ============================================================
-
-def generate_plots(valve_configs):
-    """Generate matplotlib plots."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plots")
-        return
-
-    plot_dir = RESULTS_DIR / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    sine_gen = SineExcitationGenerator()
-    sine_gen.enabled = True
-    sine_gen.start_time = 0.0
-    sine_gen.amplitude_scale = 0.3
-
-    # Plot 1: Sine signals for all joints over 30s
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-    t = np.arange(0, 30, 0.01)
-
-    for i, name in enumerate(JOINT_NAMES):
-        signals = [sine_gen.get_signal(name, ti) for ti in t]
-        axes[i].plot(t, signals, linewidth=0.5)
-        axes[i].set_ylabel(name)
-        axes[i].set_ylim(-0.5, 0.5)
-        axes[i].axhline(y=0, color='gray', linewidth=0.3)
-        axes[i].grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Time (s)")
-    fig.suptitle("Modulated sine excitation (amp=0.3, speed=1.0x)", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(plot_dir / "sine_signals_30s.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved: {plot_dir / 'sine_signals_30s.png'}")
-
-    # Plot 2: Amplitude comparison
-    fig, axes = plt.subplots(len(AMPLITUDE_PRESETS), 1, figsize=(14, 12), sharex=True)
-    t_med = np.arange(0, 15, 0.01)
-
-    for i, amp in enumerate(AMPLITUDE_PRESETS):
-        sine_gen.amplitude_scale = amp
-        sig = np.array([sine_gen.get_signal('lift_boom', ti) for ti in t_med])
-        axes[i].plot(t_med, sig, linewidth=0.5)
-        axes[i].set_ylabel(f"amp={amp}")
-        axes[i].set_ylim(-0.6, 0.6)
-        axes[i].axhline(y=0, color='gray', linewidth=0.3)
-        axes[i].grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Time (s)")
-    fig.suptitle("Sine at each amplitude preset (lift_boom)", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(plot_dir / "amplitude_comparison.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved: {plot_dir / 'amplitude_comparison.png'}")
-
-    # Plot 3: Commanded pulse vs ramp-limited pulse (simulated)
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-    t_short = np.arange(0, 10, 0.005)  # 200Hz to simulate ramp
-    sine_gen.amplitude_scale = 0.3
-
-    for i, name in enumerate(JOINT_NAMES):
-        cfg = valve_configs[name]
-        ramp_limit = cfg['ramp_limit_us_s']
-
-        sigs = np.array([sine_gen.get_signal(name, ti) for ti in t_short])
-        commanded = np.array([compute_base_pulse(cfg, s) for s in sigs])
-
-        # Simulate ramp limiting
-        ramped = np.copy(commanded)
-        dt_sim = 0.005
-        for j in range(1, len(ramped)):
-            max_change = ramp_limit * dt_sim
-            diff = commanded[j] - ramped[j-1]
-            if abs(diff) > max_change:
-                ramped[j] = ramped[j-1] + np.sign(diff) * max_change
-            else:
-                ramped[j] = commanded[j]
-
-        axes[i].plot(t_short, commanded - cfg['center'], linewidth=0.5, label='commanded', alpha=0.7)
-        axes[i].plot(t_short, ramped - cfg['center'], linewidth=0.5, label='after ramp limit')
-        axes[i].set_ylabel(f"{name}\n(us from center)")
-        axes[i].legend(loc='upper right', fontsize=7)
-        axes[i].grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Time (s)")
-    fig.suptitle("Commanded vs ramp-limited pulse (amp=0.3)", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(plot_dir / "ramp_limiting.png", dpi=150)
-    plt.close(fig)
-    print(f"  Saved: {plot_dir / 'ramp_limiting.png'}")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Sine excitation valve response test. "
-                    "Runs offline analysis by default. "
-                    "Use --hardware to command real valves and observe IMU.")
-    parser.add_argument("--hardware", action="store_true",
-                        help="Run real hardware test (commands valves, reads IMU)")
-    parser.add_argument("--joint", type=str, default=None,
-                        choices=JOINT_NAMES,
-                        help="Test only this joint (default: all except rotate)")
-    parser.add_argument("--amps", type=str, default=None,
-                        help="Comma-separated amplitudes to test (default: all presets)")
-    parser.add_argument("--duration-per-test", type=float, default=10.0,
-                        help="Seconds per (joint, amplitude) test (default: 10)")
-    parser.add_argument("--plot", action="store_true",
-                        help="Generate matplotlib plots (offline)")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Simple IMU-based sine speed sweep.")
+    parser.add_argument(
+        "--joint",
+        dest="joints",
+        action="append",
+        choices=JOINT_NAMES,
+        help="Joint to test. Repeat to test multiple joints. Default: lift_boom, tilt_boom, scoop",
+    )
+    parser.add_argument("--target-swing-deg", type=float, default=DEFAULT_TARGET_SWING_DEG)
+    parser.add_argument("--start-freq-hz", type=float, default=DEFAULT_START_FREQ_HZ)
+    parser.add_argument("--freq-step-hz", type=float, default=DEFAULT_FREQ_STEP_HZ)
+    parser.add_argument("--max-freq-hz", type=float, default=DEFAULT_MAX_FREQ_HZ)
+    parser.add_argument("--movement-threshold-deg", type=float, default=DEFAULT_MOVEMENT_THRESHOLD_DEG)
+    parser.add_argument("--control-hz", type=float, default=DEFAULT_CONTROL_HZ)
+    parser.add_argument("--kp", type=float, default=DEFAULT_KP)
+    parser.add_argument("--kd", type=float, default=DEFAULT_KD)
+    parser.add_argument("--min-command", type=float, default=DEFAULT_MIN_COMMAND)
+    parser.add_argument("--settle-s", type=float, default=DEFAULT_SETTLE_S)
     args = parser.parse_args()
 
+    if args.joints is None:
+        args.joints = list(DEFAULT_JOINTS)
+    if args.target_swing_deg <= 0.0:
+        parser.error("--target-swing-deg must be > 0")
+    if args.start_freq_hz <= 0.0:
+        parser.error("--start-freq-hz must be > 0")
+    if args.freq_step_hz <= 0.0:
+        parser.error("--freq-step-hz must be > 0")
+    if args.max_freq_hz < args.start_freq_hz:
+        parser.error("--max-freq-hz must be >= --start-freq-hz")
+    if args.movement_threshold_deg <= 0.0:
+        parser.error("--movement-threshold-deg must be > 0")
+    if args.control_hz <= 0.0:
+        parser.error("--control-hz must be > 0")
+    if args.min_command < 0.0:
+        parser.error("--min-command must be >= 0")
+    if args.settle_s < 0.0:
+        parser.error("--settle-s must be >= 0")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_lines = []
+    lines = run_hardware_test(args)
 
-    # Always run offline analysis
-    print("Loading valve config...")
-    valve_configs = load_valve_config()
-
-    print("Running offline analysis...\n")
-    offline_lines = run_offline_analysis(valve_configs)
-    all_lines.extend(offline_lines)
-    for line in offline_lines:
-        print(line)
-
-    # Hardware test if requested
-    if args.hardware:
-        if args.joint:
-            joints = [args.joint]
-        else:
-            # Default: all arm joints, skip rotate (safety — rotation can tip the machine)
-            joints = ['lift_boom', 'tilt_boom', 'scoop']
-
-        if args.amps:
-            amps = [float(a) for a in args.amps.split(',')]
-        else:
-            amps = AMPLITUDE_PRESETS
-
-        hw_lines = run_hardware_test(joints, amps, args.duration_per_test)
-        all_lines.extend(hw_lines)
-        for line in hw_lines:
-            print(line)
-
-    # Save results
-    results_path = RESULTS_DIR / f"sine_valve_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    results_path.write_text("\n".join(all_lines) + "\n", encoding="utf-8")
+    results_path = RESULTS_DIR / f"sine_valve_range_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    results_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"\nResults saved to: {results_path}")
-
-    if args.plot:
-        print("\nGenerating plots...")
-        generate_plots(valve_configs)
 
 
 if __name__ == "__main__":

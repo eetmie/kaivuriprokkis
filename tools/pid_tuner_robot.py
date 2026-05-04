@@ -113,6 +113,7 @@ def main() -> int:
     last_reset_flag = 0.0
     last_reload_flag = 0.0
     output = 0.0
+    last_joint_angles: np.ndarray | None = None
 
     period = 1.0 / max(1.0, float(args.rate))
     next_t = time.perf_counter()
@@ -122,8 +123,8 @@ def main() -> int:
         while True:
             command = server.get_latest()
             if command is not None and len(command) >= COMMAND_SIZE:
-                joint_id = _safe_joint_id(command[0])
-                target_deg = _clamp(command[1], -180.0, 180.0)
+                requested_joint_id = _safe_joint_id(command[0])
+                requested_target_deg = _clamp(command[1], -180.0, 180.0)
                 kp = _clamp(command[2], 0.0, 50.0)
                 ki = _clamp(command[3], 0.0, 20.0)
                 kd = _clamp(command[4], 0.0, 20.0)
@@ -132,15 +133,22 @@ def main() -> int:
                 reload_flag = float(command[7])
                 reset_flag = float(command[8])
                 max_output = _clamp(command[9], 0.05, 1.0)
+                joint_changed = requested_joint_id != last_joint_id
+                joint_id = requested_joint_id
+                target_deg = requested_target_deg
 
                 gains = (kp, ki, kd)
-                if gains != last_gains or joint_id != last_joint_id:
+                if gains != last_gains or joint_changed:
                     pid = PIDController(kp=kp, ki=ki, kd=kd, min_output=-max_output, max_output=max_output)
                     last_gains = gains
                     last_joint_id = joint_id
                 else:
                     pid.min_output = -max_output
                     pid.max_output = max_output
+
+                if joint_changed and last_joint_angles is not None:
+                    target_deg = float(math.degrees(last_joint_angles[joint_id]))
+                    pid.reset()
 
                 if reset_flag > 0.5 and last_reset_flag <= 0.5:
                     pid.reset()
@@ -155,9 +163,13 @@ def main() -> int:
                     hardware.set_pump_enabled(pump_enabled)
             else:
                 enabled = False
+                if pump_enabled:
+                    pump_enabled = False
+                    hardware.set_pump_enabled(False)
 
             try:
                 joint_angles = _read_joint_angles(hardware, robot_config)
+                last_joint_angles = joint_angles.copy()
                 current_rad = float(joint_angles[joint_id])
                 target_rad = math.radians(target_deg)
                 error = _angle_error(target_rad, current_rad)

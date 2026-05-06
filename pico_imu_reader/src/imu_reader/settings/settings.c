@@ -12,8 +12,7 @@ imu_reader_settings_t imu_reader_settings = {
     .gyroRangeDps = 500.0f,
     .ahrsGain = 0.5f,
     .ahrsAccelRejection = 10.0f,
-    .ahrsRecoveryPeriodS = 1.0f,
-    .offsetTimeoutS = 1.0f
+    .ahrsRecoveryPeriodS = 1.0f
 };
 settings_enum settings_option;
 static volatile bool g_settings_ready = false;
@@ -84,9 +83,6 @@ static void extract_part(const char* key, const char* buf, settings_enum setting
         case S_AHRS_RECOVERY_S:
             (void)sscanf(part_buffer, "%f", &imu_reader_settings.ahrsRecoveryPeriodS);
             break;
-        case S_OFFSET_TIMEOUT_S:
-            (void)sscanf(part_buffer, "%f", &imu_reader_settings.offsetTimeoutS);
-            break;
     }
     cdc_writef("Config: %s%s\n", key, part_buffer);
 }
@@ -100,7 +96,6 @@ static void parse_settings(const char* buf) {
     extract_part("GAIN=", buf, S_AHRS_GAIN);
     extract_part("ACC_REJ=", buf, S_AHRS_ACCEL_REJ);
     extract_part("RECOV_S=", buf, S_AHRS_RECOVERY_S);
-    extract_part("OFFSET_S=", buf, S_OFFSET_TIMEOUT_S);
 
     // Validate
     if (imu_reader_settings.sampleRate < 10) imu_reader_settings.sampleRate = 100;
@@ -110,15 +105,13 @@ static void parse_settings(const char* buf) {
     if (imu_reader_settings.ahrsGain <= 0.0f) imu_reader_settings.ahrsGain = 0.5f;
     if (imu_reader_settings.ahrsAccelRejection < 0.0f) imu_reader_settings.ahrsAccelRejection = 20.0f;
     if (imu_reader_settings.ahrsRecoveryPeriodS <= 0.0f) imu_reader_settings.ahrsRecoveryPeriodS = 0.5f;
-    if (imu_reader_settings.offsetTimeoutS < 0.0f) imu_reader_settings.offsetTimeoutS = 0.5f;
 
-    cdc_writef("Settings: SR=%d Hz, GYRO=%.0f dps, GAIN=%.2f, ACC_REJ=%.1f, RECOV=%.2fs, OFFSET=%.2fs\n",
+    cdc_writef("Settings: SR=%d Hz, GYRO=%.0f dps, GAIN=%.2f, ACC_REJ=%.1f, RECOV=%.2fs\n",
            imu_reader_settings.sampleRate,
            imu_reader_settings.gyroRangeDps,
            imu_reader_settings.ahrsGain,
            imu_reader_settings.ahrsAccelRejection,
-           imu_reader_settings.ahrsRecoveryPeriodS,
-           imu_reader_settings.offsetTimeoutS);
+           imu_reader_settings.ahrsRecoveryPeriodS);
 }
 
 void wait_for_settings() {

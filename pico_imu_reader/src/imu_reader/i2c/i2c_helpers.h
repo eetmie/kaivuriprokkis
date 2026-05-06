@@ -6,7 +6,7 @@
 #include <pico/error.h>
 #include "imu_reader.h"
 bool reserved_addr(uint8_t addr);
-int setup_I2C_pins();
+int setup_I2C_pins(uint baud_rate);
 void i2c_scan(i2c_inst_t *i2c_port);
 // Fixed Seeed XIAO RP2040 IMU wiring:
 // - I2C0 uses P28/P29

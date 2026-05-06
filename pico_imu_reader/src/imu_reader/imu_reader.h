@@ -13,7 +13,6 @@ typedef struct imu_reader_settings_t {
     float ahrsGain;
     float ahrsAccelRejection;
     float ahrsRecoveryPeriodS;
-    float offsetTimeoutS;
 } imu_reader_settings_t;
 
 enum settings_enum_e {
@@ -21,8 +20,7 @@ enum settings_enum_e {
     S_GYRO_RANGE,
     S_AHRS_GAIN,
     S_AHRS_ACCEL_REJ,
-    S_AHRS_RECOVERY_S,
-    S_OFFSET_TIMEOUT_S
+    S_AHRS_RECOVERY_S
 };
 typedef enum settings_enum_e settings_enum;
 

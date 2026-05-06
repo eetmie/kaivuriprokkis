@@ -77,3 +77,57 @@ Notes from Mar 26, 2026 troubleshooting:
   - Remove heartbeat-driven re-init and periodic status traffic from the hot loop.
   - If re-init is still needed, prefer an explicit host-triggered re-enter-config action,
     not automatic timeout-based fallback during streaming.
+
+  Startup calibration improvement: auto stationary check
+
+  Goal:
+
+  - Favor better gyro bias estimation over fast boot.
+  - Reduce user-facing tuning knobs; keep calibration acceptance logic in firmware.
+  - Base acceptance thresholds on measured machine data, not guessed values.
+
+  Implemented firmware behavior:
+
+  - Separate startup settle phase removed.
+  - Startup gyro-bias measurement window increased to 30 s.
+  - During that 30 s window, continuously collects per-IMU gyro and accel statistics:
+      - sample count
+      - gyro mean (used as bias)
+      - gyro stddev per axis
+      - accel mean per axis
+      - accel stddev per axis
+      - accel norm mean/min/max
+      - read error count
+  - Sends CAL_WAIT during the full measurement period so the host shows
+    that calibration is still running.
+  - At the end of the 30 s window:
+      - if stats pass the stationary test, apply the measured gyro mean as bias
+      - report measured stats to the host in the startup handshake
+      - if stats fail, stay in ERR_CAL as today
+  - Removed the unused user-facing offset_s / OFFSET_S setting from the host,
+    config file, and Pico settings parser.
+
+  Proposed data collection / tuning process:
+
+  - Use the host-side boot-time logging that prints one concise calibration report per IMU.
+  - Collect several clean power-up runs with the machine intentionally left fully still.
+  - Collect a few disturbed runs with small bumps / vibration so we can see what bad
+    calibration windows look like.
+  - Save the reported stats from both groups and compare:
+      - worst good-case gyro stddev
+      - worst good-case accel stddev
+      - accel norm range during good cases
+      - separation margin versus disturbed cases
+
+  Threshold-setting rule:
+
+  - Set each stationary threshold just above the worst clean-run value, with some margin.
+  - Verify that those thresholds still reject the disturbed runs.
+  - Keep accel-norm bounds broad unless real data shows they should be tightened.
+  - Do not expose these thresholds as normal user config unless a real field need appears.
+
+  Expected outcome:
+
+  - Better startup gyro bias from a longer measurement window.
+  - Less reliance on guessed hard-coded values.
+  - Fewer user-visible settings; calibration behavior becomes mostly automatic.

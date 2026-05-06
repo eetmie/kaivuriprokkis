@@ -33,9 +33,9 @@ void i2c_scan(i2c_inst_t *i2c_port) {
     }
 }
 
-int setup_I2C_pins() {
-    // Initialize i2c0 bus and gpio pins (200 kHz)
-    uint BAUD_RATE = 200*1000;
+int setup_I2C_pins(uint baud_rate) {
+    // Initialize i2c0 bus and gpio pins
+    uint BAUD_RATE = baud_rate;
     uint result = i2c_init(I2C_PORT_0, BAUD_RATE);
     if (result == 0) return 0;
     gpio_set_function(I2C_SDA_0, GPIO_FUNC_I2C);

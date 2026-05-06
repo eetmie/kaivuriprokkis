@@ -13,12 +13,11 @@
 #include <stdint.h>
 
 #define SIMPLE_STREAM_SENSOR_COUNT 4u
-#define SIMPLE_STREAM_RATE_HZ 200
+#define SIMPLE_STREAM_RATE_HZ 416
 #define SIMPLE_STREAM_GYRO_DPS 250.0f
 #define SIMPLE_STREAM_AHRS_GAIN 5.0f
 #define SIMPLE_STREAM_ACCEL_REJECTION 20.0f
 #define SIMPLE_STREAM_RECOVERY_S 0.5f
-#define SIMPLE_STREAM_OFFSET_S 0.5f
 
 static inline FusionQuaternion enforce_quaternion_continuity(FusionQuaternion q, FusionQuaternion q_ref) {
     const float dot = q.element.w * q_ref.element.w +
@@ -75,7 +74,6 @@ static void apply_simple_settings(void) {
     imu_reader_settings.ahrsGain = SIMPLE_STREAM_AHRS_GAIN;
     imu_reader_settings.ahrsAccelRejection = SIMPLE_STREAM_ACCEL_REJECTION;
     imu_reader_settings.ahrsRecoveryPeriodS = SIMPLE_STREAM_RECOVERY_S;
-    imu_reader_settings.offsetTimeoutS = SIMPLE_STREAM_OFFSET_S;
 }
 
 static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
@@ -161,7 +159,7 @@ int main(void) {
 
     apply_simple_settings();
 
-    if (!setup_I2C_pins()) {
+    if (!setup_I2C_pins(400*1000)) {
         error_forever(MSG_TYPE_ERR_I2C);
     }
 

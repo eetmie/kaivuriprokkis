@@ -17,9 +17,10 @@
 
 // MAX_SENSORS and FLOATS_PER_SENSOR defined in output.h
 
-#define STARTUP_CALIBRATION_SETTLE_MS 5000u
-#define STARTUP_CALIBRATION_DURATION_MS 15000u
+#define STARTUP_CALIBRATION_SETTLE_MS 3000u
+#define STARTUP_CALIBRATION_DURATION_MS 30000u
 #define STARTUP_CALIBRATION_SAMPLE_PERIOD_US 10000u
+#define STARTUP_CALIBRATION_MIN_SAMPLES 1000u
 #define CALIBRATION_MAX_GYRO_STD_DPS 0.5f
 #define CALIBRATION_MAX_ACCEL_STD_G 0.05f
 #define CALIBRATION_MIN_ACCEL_NORM_G 0.75f
@@ -53,11 +54,11 @@ typedef struct sensor_runtime_t {
 } sensor_runtime_t;
 
 typedef struct calibration_stats_t {
-    uint32_t count;
     FusionVector gyro_sum;
     FusionVector gyro_sum_sq;
     FusionVector accel_sum;
     FusionVector accel_sum_sq;
+    float accel_norm_sum;
 } calibration_stats_t;
 
 static sensor_runtime_t g_sensor_runtime = {0};
@@ -96,6 +97,14 @@ static inline float vector_norm(FusionVector vector) {
     return sqrtf((vector.axis.x * vector.axis.x) +
                  (vector.axis.y * vector.axis.y) +
                  (vector.axis.z * vector.axis.z));
+}
+
+static inline calibration_vector_t calibration_vector_from_fusion(FusionVector vector) {
+    return (calibration_vector_t){
+        .x = vector.axis.x,
+        .y = vector.axis.y,
+        .z = vector.axis.z,
+    };
 }
 
 static inline FusionQuaternion enforce_quaternion_continuity(FusionQuaternion q, FusionQuaternion q_ref) {
@@ -204,18 +213,40 @@ static void calibration_service_until(uint64_t deadline_us) {
     }
 }
 
+static void send_calibration_report_window(uint32_t duration_ms, uint8_t sensor_count, uint8_t flags,
+                                           const calibration_report_sensor_t *reports) {
+    const uint64_t start_us = time_us_64();
+    uint64_t next_report_us = start_us;
+
+    while ((time_us_64() - start_us) < 500000u) {
+        tud_task();
+        const uint64_t now_us = time_us_64();
+        if (now_us >= next_report_us) {
+            send_calibration_report(
+                duration_ms,
+                sensor_count,
+                flags,
+                CALIBRATION_MAX_GYRO_STD_DPS,
+                CALIBRATION_MAX_ACCEL_STD_G,
+                CALIBRATION_MIN_ACCEL_NORM_G,
+                CALIBRATION_MAX_ACCEL_NORM_G,
+                reports);
+            next_report_us = now_us + 100000u;
+        }
+        sleep_ms(5);
+    }
+}
+
 static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
     calibration_stats_t stats[MAX_SENSORS] = {0};
-    const uint64_t settle_end_us = time_us_64() + ((uint64_t)STARTUP_CALIBRATION_SETTLE_MS * 1000u);
+    calibration_report_sensor_t reports[MAX_SENSORS] = {0};
 
+    // Let sensor ODR cycles fill output registers before collecting samples.
     status_led_set(STATUS_CALIBRATE);
-    while (time_us_64() < settle_end_us) {
-        calibration_service_until(time_us_64() + 10000u);
-    }
+    calibration_service_until(time_us_64() + ((uint64_t)STARTUP_CALIBRATION_SETTLE_MS * 1000u));
 
     const uint64_t calibration_end_us = time_us_64() + ((uint64_t)STARTUP_CALIBRATION_DURATION_MS * 1000u);
     uint64_t next_sample_us = time_us_64();
-
     while (time_us_64() < calibration_end_us) {
         const uint64_t now_us = time_us_64();
         if (now_us < next_sample_us) {
@@ -230,41 +261,85 @@ static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
             if (!read_active_sensor_motion_unbiased(i, &accelerometer, &gyroscope) ||
                 !fusion_vector_is_finite(accelerometer) ||
                 !fusion_vector_is_finite(gyroscope)) {
-                return false;
+                reports[i].read_error_count++;
+                continue;
             }
 
-            stats[i].count++;
+            const float accel_norm_sample = vector_norm(accelerometer);
+            if (reports[i].sample_count == 0u) {
+                reports[i].accel_norm_min = accel_norm_sample;
+                reports[i].accel_norm_max = accel_norm_sample;
+            } else {
+                reports[i].accel_norm_min = fminf(reports[i].accel_norm_min, accel_norm_sample);
+                reports[i].accel_norm_max = fmaxf(reports[i].accel_norm_max, accel_norm_sample);
+            }
+            reports[i].sample_count++;
             stats[i].gyro_sum = FusionVectorAdd(stats[i].gyro_sum, gyroscope);
             stats[i].gyro_sum_sq = vector_add_square(stats[i].gyro_sum_sq, gyroscope);
             stats[i].accel_sum = FusionVectorAdd(stats[i].accel_sum, accelerometer);
             stats[i].accel_sum_sq = vector_add_square(stats[i].accel_sum_sq, accelerometer);
+            stats[i].accel_norm_sum += accel_norm_sample;
         }
     }
 
+    bool accepted = true;
+
     for (uint8_t i = 0; i < sensor_count; i++) {
-        if (stats[i].count < 100u) {
-            return false;
+        calibration_report_sensor_t *report = &reports[i];
+        if (report->sample_count < STARTUP_CALIBRATION_MIN_SAMPLES) {
+            report->failure_flags |= CAL_FAIL_INSUFFICIENT_SAMPLES;
+            accepted = false;
+            continue;
         }
 
-        const float count = (float)stats[i].count;
+        const float count = (float)report->sample_count;
         const FusionVector gyro_mean = vector_divide(stats[i].gyro_sum, count);
         const FusionVector gyro_std = vector_std(stats[i].gyro_sum, stats[i].gyro_sum_sq, count);
         const FusionVector accel_mean = vector_divide(stats[i].accel_sum, count);
         const FusionVector accel_std = vector_std(stats[i].accel_sum, stats[i].accel_sum_sq, count);
-        const float accel_norm = vector_norm(accel_mean);
+        const float accel_norm = stats[i].accel_norm_sum / count;
+
+        report->gyro_mean = calibration_vector_from_fusion(gyro_mean);
+        report->gyro_std = calibration_vector_from_fusion(gyro_std);
+        report->accel_mean = calibration_vector_from_fusion(accel_mean);
+        report->accel_std = calibration_vector_from_fusion(accel_std);
+        report->accel_norm_mean = accel_norm;
 
         if ((gyro_std.axis.x > CALIBRATION_MAX_GYRO_STD_DPS) ||
             (gyro_std.axis.y > CALIBRATION_MAX_GYRO_STD_DPS) ||
-            (gyro_std.axis.z > CALIBRATION_MAX_GYRO_STD_DPS) ||
-            (accel_std.axis.x > CALIBRATION_MAX_ACCEL_STD_G) ||
+            (gyro_std.axis.z > CALIBRATION_MAX_GYRO_STD_DPS)) {
+            report->failure_flags |= CAL_FAIL_GYRO_STD;
+        }
+        if ((accel_std.axis.x > CALIBRATION_MAX_ACCEL_STD_G) ||
             (accel_std.axis.y > CALIBRATION_MAX_ACCEL_STD_G) ||
-            (accel_std.axis.z > CALIBRATION_MAX_ACCEL_STD_G) ||
-            (accel_norm < CALIBRATION_MIN_ACCEL_NORM_G) ||
+            (accel_std.axis.z > CALIBRATION_MAX_ACCEL_STD_G)) {
+            report->failure_flags |= CAL_FAIL_ACCEL_STD;
+        }
+        if ((accel_norm < CALIBRATION_MIN_ACCEL_NORM_G) ||
             (accel_norm > CALIBRATION_MAX_ACCEL_NORM_G)) {
-            return false;
+            report->failure_flags |= CAL_FAIL_ACCEL_NORM;
         }
 
-        set_active_sensor_gyro_bias(i, gyro_mean);
+        if (report->failure_flags != 0u) {
+            accepted = false;
+        }
+    }
+
+    send_calibration_report_window(
+        STARTUP_CALIBRATION_DURATION_MS,
+        sensor_count,
+        accepted ? CAL_REPORT_ACCEPTED : 0u,
+        reports);
+
+    // Always apply the measured gyro bias and proceed — the report is
+    // informational. Threshold failures indicate noisy conditions but the
+    // bias mean is still valid and better than nothing.
+    for (uint8_t i = 0; i < sensor_count; i++) {
+        FusionVector gyro_bias;
+        gyro_bias.axis.x = reports[i].gyro_mean.x;
+        gyro_bias.axis.y = reports[i].gyro_mean.y;
+        gyro_bias.axis.z = reports[i].gyro_mean.z;
+        set_active_sensor_gyro_bias(i, gyro_bias);
     }
 
     status_led_set(STATUS_INIT);
@@ -503,7 +578,7 @@ int main() {
     }
 
     // Setup I2C after CDC is connected so fatal init errors reach the host.
-    if (!setup_I2C_pins()) {
+    if (!setup_I2C_pins(200*1000)) {
         status_led_set(STATUS_ERROR);
         send_control_msg(MSG_TYPE_ERR_I2C);
         while (1) { tud_task(); sleep_ms(100); }

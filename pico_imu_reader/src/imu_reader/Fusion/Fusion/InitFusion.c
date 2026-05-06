@@ -51,12 +51,6 @@ void initialize_algos(Sensor* sensors, int count) {
     for (int i = 0; i < count; i++) {
         // Initialize gyro offset tracker
         FusionOffsetInitialise(&sensors[i].offset, imu_reader_settings.sampleRate);
-        if (imu_reader_settings.offsetTimeoutS > 0.0f) {
-            sensors[i].offset.timeout = (unsigned int)(imu_reader_settings.offsetTimeoutS * imu_reader_settings.sampleRate);
-            if (sensors[i].offset.timeout < 1) {
-                sensors[i].offset.timeout = 1;
-            }
-        }
 
         // Initialize AHRS
         FusionAhrsInitialise(&sensors[i].ahrs);

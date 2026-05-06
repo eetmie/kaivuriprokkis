@@ -183,7 +183,7 @@ class PIDTunerRobotTests(unittest.TestCase):
 
         hardware = _FakeHardware.instances[0]
         self.assertEqual(hardware.kwargs["config_file"], "configuration_files/servo_config_200.yaml")
-        self.assertTrue(hardware.kwargs["pump_auto_mode"])
+        self.assertFalse(hardware.kwargs["pump_auto_mode"])
         self.assertFalse(hardware.kwargs["enable_adc"])
         self.assertFalse(hardware.kwargs["start_adc_reader"])
         self.assertEqual(hardware.pump_log, [True])

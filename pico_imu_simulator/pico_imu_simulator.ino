@@ -12,21 +12,35 @@
 #include <math.h>
 
 // ---- Protocol constants (must match pico_imu_reader / usb_serial_reader.py) ----
-#define FRAME_SYNC_0      0xAA
-#define FRAME_SYNC_1      0x55
-#define FRAME_VERSION_DATA 1
-#define FRAME_VERSION_CTRL 2
-#define FRAME_VERSION_DESC 3
+#define FRAME_SYNC_0           0xAA
+#define FRAME_SYNC_1           0x55
+#define FRAME_VERSION_DATA     1
+#define FRAME_VERSION_CTRL     2
+#define FRAME_VERSION_DESC     3
+#define FRAME_VERSION_CAL_REPORT 5
 
-#define MSG_TYPE_CFG_OK   0x01
-#define MSG_TYPE_CFG_WAIT 0x02
+#define MSG_TYPE_CFG_OK        0x01
+#define MSG_TYPE_CFG_WAIT      0x02
+#define MSG_TYPE_ERROR         0x04
+#define MSG_TYPE_ERR_I2C       0x05
+#define MSG_TYPE_ERR_IMU       0x06
+#define MSG_TYPE_CAL_WAIT      0x07
+#define MSG_TYPE_ERR_CAL       0x08
+
+#define CAL_REPORT_ACCEPTED    0x01
 
 #define NUM_SENSORS        4
 #define FLOATS_PER_SENSOR  7   // w, x, y, z, gx, gy, gz
 
+// Simulated calibration duration in milliseconds (keep short for fast iteration)
+#define SIM_CAL_DURATION_MS 3000
+
 // ---- Settings (populated from host config string) ----
-static int   sampleRate   = 200;
-static float gyroRangeDps = 500.0f;
+static int   sampleRate       = 200;
+static float gyroRangeDps     = 250.0f;
+static float ahrsGain         = 5.0f;
+static float accelRejectionDeg = 20.0f;
+static float recoveryS        = 0.5f;
 
 // ---- Simulation state ----
 static uint32_t loopPeriodUs;
@@ -57,7 +71,6 @@ static int  settingsIdx = 0;
 
 // ---- Helpers ----
 
-// Simple 16-bit additive checksum over buf[start..end-1]
 static uint16_t calcChecksum(const uint8_t* buf, size_t start, size_t end) {
   uint16_t cs = 0;
   for (size_t i = start; i < end; i++) {
@@ -66,13 +79,12 @@ static uint16_t calcChecksum(const uint8_t* buf, size_t start, size_t end) {
   return cs;
 }
 
-// Small gaussian-ish noise from uniform RNG (Box-Muller lite: sum of 6 uniforms)
 static float gyroNoise(float sigma) {
   float sum = 0.0f;
   for (int i = 0; i < 6; i++) {
     sum += (float)random(-1000, 1001) / 1000.0f;
   }
-  return sum * sigma / 3.0f;   // approx N(0, sigma)
+  return sum * sigma / 3.0f;
 }
 
 // ---- Send control frame (version=2) ----
@@ -91,7 +103,6 @@ static void sendControlMsg(uint8_t msgType) {
 
 // ---- Send descriptor frame (version=3) ----
 static void sendDescriptor() {
-  // Frame: sync(2) + ver(1) + count(1) + sps(2) + N*2 + checksum(2)
   const size_t frameLen = 2 + 1 + 1 + 2 + NUM_SENSORS * 2 + 2;
   uint8_t frame[frameLen];
   size_t idx = 0;
@@ -101,17 +112,75 @@ static void sendDescriptor() {
   frame[idx++] = FRAME_VERSION_DESC;
   frame[idx++] = NUM_SENSORS;
 
-  // Target SPS (little-endian 16-bit)
   frame[idx++] = (uint8_t)(sampleRate & 0xFF);
   frame[idx++] = (uint8_t)((sampleRate >> 8) & 0xFF);
 
-  // Per-sensor: bus, addr
   for (int i = 0; i < NUM_SENSORS; i++) {
     frame[idx++] = imuBus[i];
     frame[idx++] = imuAddr[i];
   }
 
-  // Checksum (from version byte to end of payload)
+  uint16_t cs = calcChecksum(frame, 2, idx);
+  frame[idx++] = (uint8_t)(cs & 0xFF);
+  frame[idx++] = (uint8_t)((cs >> 8) & 0xFF);
+
+  Serial.write(frame, idx);
+  Serial.flush();
+}
+
+// ---- Send calibration report frame (version=5) ----
+static void sendCalibrationReport() {
+  // Frame: sync(2) + ver(1) + count(1) + duration_ms(4) + flags(1) + reserved(1)
+  //        + thresholds(4*4=16) + N*(sample_count(4)+read_errors(4)+fail_flags(2)+reserved(2)+vals(15*4=60))
+  //        + checksum(2)
+  // = 28 + N*72
+  const size_t perSensor = 72;
+  const size_t frameLen = 28 + NUM_SENSORS * perSensor;
+  uint8_t frame[frameLen];
+  size_t idx = 0;
+
+  frame[idx++] = FRAME_SYNC_0;
+  frame[idx++] = FRAME_SYNC_1;
+  frame[idx++] = FRAME_VERSION_CAL_REPORT;
+  frame[idx++] = NUM_SENSORS;
+
+  // duration_ms
+  uint32_t dur = SIM_CAL_DURATION_MS;
+  memcpy(&frame[idx], &dur, 4); idx += 4;
+
+  // flags (accepted) + reserved
+  frame[idx++] = CAL_REPORT_ACCEPTED;
+  frame[idx++] = 0;
+
+  // thresholds: gyro_std_limit, accel_std_limit, accel_norm_min, accel_norm_max
+  float thresholds[4] = { 0.5f, 0.02f, 0.9f, 1.1f };
+  memcpy(&frame[idx], thresholds, 16); idx += 16;
+
+  // Per-sensor data
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    uint32_t sampleCount = (uint32_t)(SIM_CAL_DURATION_MS * sampleRate / 1000);
+    uint32_t readErrors  = 0;
+    uint16_t failFlags   = 0;
+    uint16_t reserved    = 0;
+    memcpy(&frame[idx], &sampleCount, 4); idx += 4;
+    memcpy(&frame[idx], &readErrors,  4); idx += 4;
+    memcpy(&frame[idx], &failFlags,   2); idx += 2;
+    memcpy(&frame[idx], &reserved,    2); idx += 2;
+
+    // 15 floats: gyro_bias(3) gyro_std(3) accel_mean(3) accel_std(3)
+    //            accel_norm_mean accel_norm_min accel_norm_max
+    float vals[15] = {
+      0.01f,  0.01f,  0.01f,   // gyro_bias_dps
+      0.05f,  0.05f,  0.05f,   // gyro_std_dps
+      0.0f,   0.0f,   1.0f,    // accel_mean_g (Z-up)
+      0.001f, 0.001f, 0.001f,  // accel_std_g
+      1.0f,                     // accel_norm_mean_g
+      0.99f,                    // accel_norm_min_g
+      1.01f,                    // accel_norm_max_g
+    };
+    memcpy(&frame[idx], vals, 60); idx += 60;
+  }
+
   uint16_t cs = calcChecksum(frame, 2, idx);
   frame[idx++] = (uint8_t)(cs & 0xFF);
   frame[idx++] = (uint8_t)((cs >> 8) & 0xFF);
@@ -122,7 +191,6 @@ static void sendDescriptor() {
 
 // ---- Send data frame (version=1) ----
 static void sendDataFrame(uint32_t timestampUs, float data[][FLOATS_PER_SENSOR]) {
-  // Frame: sync(2) + ver(1) + count(1) + ts(4) + N*7*4 + checksum(2)
   const size_t payloadLen = 4 + NUM_SENSORS * FLOATS_PER_SENSOR * 4;
   const size_t frameLen   = 2 + 1 + 1 + payloadLen + 2;
   uint8_t frame[frameLen];
@@ -133,11 +201,9 @@ static void sendDataFrame(uint32_t timestampUs, float data[][FLOATS_PER_SENSOR])
   frame[idx++] = FRAME_VERSION_DATA;
   frame[idx++] = NUM_SENSORS;
 
-  // Timestamp (little-endian 32-bit)
   memcpy(&frame[idx], &timestampUs, 4);
   idx += 4;
 
-  // Sensor floats
   for (int i = 0; i < NUM_SENSORS; i++) {
     for (int j = 0; j < FLOATS_PER_SENSOR; j++) {
       float v = data[i][j];
@@ -146,7 +212,6 @@ static void sendDataFrame(uint32_t timestampUs, float data[][FLOATS_PER_SENSOR])
     }
   }
 
-  // Checksum
   uint16_t cs = calcChecksum(frame, 2, idx);
   frame[idx++] = (uint8_t)(cs & 0xFF);
   frame[idx++] = (uint8_t)((cs >> 8) & 0xFF);
@@ -168,6 +233,15 @@ static bool parseConfig(const char* buf) {
   p = strstr(buf, "GYRO_DPS=");
   if (p) gyroRangeDps = atof(p + 9);
 
+  p = strstr(buf, "GAIN=");
+  if (p) ahrsGain = atof(p + 5);
+
+  p = strstr(buf, "ACC_REJ=");
+  if (p) accelRejectionDeg = atof(p + 8);
+
+  p = strstr(buf, "RECOV_S=");
+  if (p) recoveryS = atof(p + 8);
+
   loopPeriodUs = 1000000UL / (uint32_t)sampleRate;
   return true;
 }
@@ -187,19 +261,18 @@ static void eulerToQuat(float rollDeg, float pitchDeg, float yawDeg,
   *z =  sy*cp*cr - cy*sp*sr;
 }
 
-// ---- Wait for config (blocking, mirrors pico_imu_reader behavior) ----
+// ---- Wait for config, then simulate calibration, then start streaming ----
 static void wait_for_config() {
   uint32_t lastBeat = millis();
 
+  // Phase 1: wait for host config
   while (true) {
-    // Send CFG_WAIT heartbeat every 200ms
     uint32_t now = millis();
     if (now - lastBeat >= 200) {
       sendControlMsg(MSG_TYPE_CFG_WAIT);
       lastBeat = now;
     }
 
-    // Read incoming bytes
     while (Serial.available()) {
       char c = Serial.read();
       if (settingsIdx < SETTINGS_BUF_LEN - 1) {
@@ -215,9 +288,7 @@ static void wait_for_config() {
             sendControlMsg(MSG_TYPE_CFG_OK);
             delay(100);
           }
-          // Send descriptor once
-          sendDescriptor();
-          return;
+          goto calibration;
         }
         settingsIdx = 0;
         settingsBuf[0] = '\0';
@@ -226,36 +297,52 @@ static void wait_for_config() {
 
     delay(10);
   }
+
+calibration:
+  // Phase 2: simulate startup calibration (send CAL_WAIT heartbeats)
+  {
+    uint32_t calStart = millis();
+    uint32_t lastCalBeat = millis();
+    while (millis() - calStart < SIM_CAL_DURATION_MS) {
+      uint32_t now = millis();
+      if (now - lastCalBeat >= 200) {
+        sendControlMsg(MSG_TYPE_CAL_WAIT);
+        lastCalBeat = now;
+      }
+      delay(10);
+    }
+    // Send calibration report (accepted)
+    sendCalibrationReport();
+  }
+
+  // Phase 3: send descriptor and begin streaming
+  sendDescriptor();
 }
 
 // ---- Arduino setup ----
 void setup() {
   Serial.begin(115200);
-  randomSeed(analogRead(A0));  // seed RNG from floating analog pin
+  randomSeed(analogRead(A0));
   loopPeriodUs = 1000000UL / (uint32_t)sampleRate;
 }
 
 // ---- Arduino loop ----
 void loop() {
-  // Wait for config once (blocking)
   static bool configured = false;
   if (!configured) {
     wait_for_config();
     configured = true;
   }
 
-  // Stream simulation data
   uint32_t loopStart = micros();
 
   float dt = 1.0f / (float)sampleRate;
   simTime += dt;
 
-  // Shared yaw angle (same plane for all IMUs)
   float yawDeg  = 45.0f * sinf(2.0f * (float)M_PI * yawFreqHz * simTime);
   float yawRate = 45.0f * 2.0f * (float)M_PI * yawFreqHz
                   * cosf(2.0f * (float)M_PI * yawFreqHz * simTime);
 
-  // Gyro noise standard deviation (deg/s)
   const float gyroNoiseSigma = 0.3f;
 
   float sensorData[NUM_SENSORS][FLOATS_PER_SENSOR];
@@ -267,7 +354,6 @@ void loop() {
     float w, x, y, z;
     eulerToQuat(rollDeg, pitchDeg, yawDeg, &w, &x, &y, &z);
 
-    // Analytical derivatives + noise
     float pitchRate = pitchAmpDeg[i] * 2.0f * (float)M_PI * pitchFreqHz[i]
                       * cosf(2.0f * (float)M_PI * pitchFreqHz[i] * simTime + pitchPhaseRad[i]);
     float rollRate  = rollAmpDeg[i]  * 2.0f * (float)M_PI * rollFreqHz[i]
@@ -286,11 +372,9 @@ void loop() {
     sensorData[i][6] = gz;
   }
 
-  // Send binary data frame
   uint32_t ts = micros();
   sendDataFrame(ts, sensorData);
 
-  // Maintain target loop rate
   uint32_t elapsed = micros() - loopStart;
   if (elapsed < loopPeriodUs) {
     delayMicroseconds(loopPeriodUs - elapsed);

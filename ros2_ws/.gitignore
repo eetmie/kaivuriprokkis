@@ -1,0 +1,6 @@
+build/
+install/
+log/
+.ros/
+__pycache__/
+*.py[cod]

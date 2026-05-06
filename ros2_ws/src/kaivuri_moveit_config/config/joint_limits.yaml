@@ -1,0 +1,17 @@
+joint_limits:
+  revolute_cabin:
+    has_velocity_limits: true
+    max_velocity: 1.0471976
+    has_acceleration_limits: false
+  revolute_lift:
+    has_velocity_limits: true
+    max_velocity: 2.0943951
+    has_acceleration_limits: false
+  revolute_tilt:
+    has_velocity_limits: true
+    max_velocity: 2.0943951
+    has_acceleration_limits: false
+  revolute_scoop:
+    has_velocity_limits: true
+    max_velocity: 2.0943951
+    has_acceleration_limits: false

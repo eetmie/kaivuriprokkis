@@ -212,8 +212,8 @@ class RobotConfig:
 
         # ENSURE ALL ARRAYS ARE FLOAT32
         self.link_lengths = np.asarray(self.link_lengths, dtype=np.float32)  # Convert list to numpy array!
-        self.link_directions = [np.asarray(arr, dtype=np.float32) for arr in self.link_directions]
-        self.rotation_axes = [np.asarray(arr, dtype=np.float32) for arr in self.rotation_axes]
+        self.link_directions = np.array([np.asarray(arr, dtype=np.float32) for arr in self.link_directions])
+        self.rotation_axes = np.array([np.asarray(arr, dtype=np.float32) for arr in self.rotation_axes])
         self.ee_offset = np.asarray(self.ee_offset, dtype=np.float32)
         self.origin_offset = np.asarray(self.origin_offset, dtype=np.float32)
 

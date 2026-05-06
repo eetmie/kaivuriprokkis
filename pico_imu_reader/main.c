@@ -17,6 +17,9 @@
 
 // MAX_SENSORS and FLOATS_PER_SENSOR defined in output.h
 
+#define SENSOR_INTERNAL_ODR_HZ 416u
+#define SENSOR_OUTPUT_HZ       200u
+
 #define STARTUP_CALIBRATION_SETTLE_MS 3000u
 #define STARTUP_CALIBRATION_DURATION_MS 30000u
 #define STARTUP_CALIBRATION_SAMPLE_PERIOD_US 10000u
@@ -482,8 +485,10 @@ static void sensor_core1_main(void) {
 static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR], Sensor* sensors, uint8_t sensor_count) {
     const uint64_t target_us = (uint64_t)(period_ms * 1000.0f + 0.5f);
     const float nominal_delta_time_s = period_ms / 1000.0f;
+    const uint64_t output_period_us = 1000000u / SENSOR_OUTPUT_HZ;
     bool sensor_valid[MAX_SENSORS] = {false};
     uint64_t next_loop_us = time_us_64();
+    uint64_t next_output_us = time_us_64();
 
     while (true) {
         read_all_sensors(sensors, sensor_valid);
@@ -544,8 +549,13 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
             write_sensor_output(sensors_data[i], quat, sensors[i].gyroscope);
         }
 
-        uint64_t out_ts = time_us_64();
-        stream_publish_frame(out_ts, sensors_data, sensor_count);
+        const uint64_t now_us = time_us_64();
+        if (now_us >= next_output_us) {
+            stream_publish_frame(now_us, sensors_data, sensor_count);
+            next_output_us += output_period_us;
+            if (now_us >= next_output_us)
+                next_output_us = now_us + output_period_us;
+        }
 
         // Maintain a stable absolute deadline instead of sleeping relative to
         // the loop start each iteration.
@@ -578,7 +588,7 @@ int main() {
     }
 
     // Setup I2C after CDC is connected so fatal init errors reach the host.
-    if (!setup_I2C_pins(200*1000)) {
+    if (!setup_I2C_pins(400*1000)) {
         status_led_set(STATUS_ERROR);
         send_control_msg(MSG_TYPE_ERR_I2C);
         while (1) { tud_task(); sleep_ms(100); }
@@ -589,7 +599,7 @@ int main() {
 
     status_led_set(STATUS_INIT);
 
-    if (!initialize_sensors()) {
+    if (!initialize_sensors(SENSOR_INTERNAL_ODR_HZ)) {
         status_led_set(STATUS_ERROR);
         send_control_msg(MSG_TYPE_ERR_IMU);
         while (1) { tud_task(); sleep_ms(100); }
@@ -609,13 +619,13 @@ int main() {
     }
 
     g_sensor_runtime.sensor_count = sensor_count;
-    g_sensor_runtime.period_ms = 1000.0f / (float)imu_reader_settings.sampleRate;
+    g_sensor_runtime.period_ms = 1000.0f / (float)SENSOR_INTERNAL_ODR_HZ;
     initialize_sensors_values(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_calibrations(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_algos(g_sensor_runtime.sensors, MAX_SENSORS);
 
     send_cfg_ok_window();
-    stream_publish_descriptor((uint16_t)imu_reader_settings.sampleRate, sensor_count, sensor_bus_ids, sensor_addrs);
+    stream_publish_descriptor(SENSOR_OUTPUT_HZ, sensor_count, sensor_bus_ids, sensor_addrs);
     status_led_set(STATUS_STREAM);
     multicore_launch_core1(sensor_core1_main);
     usb_transport_loop();

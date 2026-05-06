@@ -110,7 +110,6 @@ class HardwareInterface:
                  imu_ahrs_gain: Optional[float] = None,
                  imu_accel_rejection: Optional[float] = None,
                  imu_recovery_s: Optional[float] = None,
-                 imu_offset_s: Optional[float] = None,
                  adc_sample_hz: float = 200.0,
                  adc_channels: Optional[List[Any]] = None,
                  log_level: str = "INFO",
@@ -190,7 +189,6 @@ class HardwareInterface:
         self._imu_ahrs_gain = float(imu_ahrs_gain if imu_ahrs_gain is not None else _imu_cfg.get('ahrs_gain', 0.5))
         self._imu_accel_rejection = float(imu_accel_rejection if imu_accel_rejection is not None else _imu_cfg.get('accel_rejection', 10.0))
         self._imu_recovery_s = float(imu_recovery_s if imu_recovery_s is not None else _imu_cfg.get('recovery_s', 1.0))
-        self._imu_offset_s = float(imu_offset_s if imu_offset_s is not None else _imu_cfg.get('offset_s', 1.0))
         # Named IMU mapping: logical role -> physical sensor index
         _imu_mapping = _imu_cfg.get('imu_mapping')
         if _imu_mapping is None or not isinstance(_imu_mapping, dict):
@@ -329,7 +327,7 @@ class HardwareInterface:
         if self._enable_imu:
             _cfg = _load_control_config()
             _imu_cfg = _cfg.get('imu', {})
-        self._imu_expected_hz = float(imu_expected_hz if imu_expected_hz is not None else _imu_cfg.get('sample_rate', 100))
+        # imu_expected_hz / sample_rate no longer sent to Pico — output is fixed 200 Hz in firmware.
         # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
@@ -433,17 +431,15 @@ class HardwareInterface:
 
                 # Send config and wait for acknowledgment
                 self.usb_reader.send_config(
-                    sample_rate=int(self._imu_expected_hz),
                     gyro_dps=self._imu_gyro_dps,
                     gain=self._imu_ahrs_gain,
                     accel_rejection=self._imu_accel_rejection,
                     recovery_s=self._imu_recovery_s,
-                    offset_s=self._imu_offset_s,
                 )
                 self.logger.info(
-                    "Waiting for IMU startup; Pico may spend ~20s doing stationary gyro calibration"
+                    "Waiting for IMU startup; Pico spends ~30s doing stationary gyro calibration"
                 )
-                if not self.usb_reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=30.0):
+                if not self.usb_reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=120.0):
                     self.logger.warning("IMU config acknowledgment not received")
 
                 self.usb_reader.start_background_reader()
@@ -1002,6 +998,7 @@ class HardwareInterface:
                 imu_status = self.usb_reader.status()
                 status['imu_startup_phase'] = imu_status.get('startup_phase')
                 status['imu_calibration_wait_s'] = imu_status.get('calibration_wait_s', 0.0)
+                status['imu_calibration_report'] = imu_status.get('calibration_report')
             except Exception:
                 pass
 

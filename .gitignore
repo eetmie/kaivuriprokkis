@@ -197,3 +197,4 @@ cython_debug/
 /pico_imu_reader/*.elf.map
 /pico_imu_reader/*.hex
 /pico_imu_reader/*.uf2
+.claude/settings.local.json

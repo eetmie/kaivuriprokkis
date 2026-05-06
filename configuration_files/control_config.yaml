@@ -6,8 +6,10 @@ rates:
   control_hz: 100.0
 
 imu:
-  # IMU sampling rate (Hz) - Pico AHRS loop frequency
-  sample_rate: 200
+  # IMU output is fixed at 200 Hz in Pico firmware — no sample_rate config needed.
+  # TODO: gyro_dps/ahrs_gain/accel_rejection/recovery_s below are still sent to Pico
+  # via the settings handshake. Once hardcoded in firmware and wait_for_settings()
+  # is removed, these can be omitted too.
   # Gyroscope full-scale range (125/250/500/1000/2000 dps)
   gyro_dps: 250
   # AHRS filter gain (higher = faster response, more noise)
@@ -16,8 +18,8 @@ imu:
   accel_rejection: 20.0
   # Recovery period (seconds) - time before re-enabling accel after rejection
   recovery_s: 0.5
-  # Gyro offset tracking timeout (seconds)
-  offset_s: 0.5
+  # Startup gyro-bias calibration is automatic in Pico firmware: 30 s stationary
+  # measurement, firmware-owned thresholds, and a host calibration report.
   # Named IMU mapping: logical role -> physical sensor index
   # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
   # The mapping length defines the expected IMU count from firmware
@@ -78,7 +80,7 @@ imu:
 robot:
   frame:
     # Ground to slew/cabin rotation origin
-    origin_height_m: 0.075
+    origin_height_m: 0.07 #0.075
   links:
     # Vector from slew origin to first boom pivot in slew-local coordinates
     boom_mount_offset_m: [0.0165, 0.0, 0.0645]
@@ -97,27 +99,27 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 4.0
-    ki: 0.0 #0.25
-    kd: 0.0
+    kp: 6.000
+    ki: 0.200
+    kd: 0.100
 
   # Joint 1: Boom (lift arm)
   joint1:
-    kp: 6.0
-    ki: 0.1
-    kd: 0.0
+    kp: 10.000
+    ki: 0.400
+    kd: 0.000
 
   # Joint 2: Arm (tilt)
   joint2:
-    kp: 6.0
-    ki: 0.1
-    kd: 0.0
+    kp: 10.000
+    ki: 0.400
+    kd: 0.000
 
   # Joint 3: Bucket (scoop)
   joint3:
-    kp: 5.0
-    ki: 0.1
-    kd: 0.0
+    kp: 5.000
+    ki: 0.250
+    kd: 0.000
 
 controller:
   # PID output limits (normalized to)
@@ -142,10 +144,6 @@ controller:
   # Only used when gyro_velocity_mode: "fused"
   gyro_blend_alpha: 0.30
 
-  # Low-pass filter cutoff (Hz) on gyro-derived joint velocity
-  # Set to 0 to disable LPF
-  gyro_lpf_hz: 0.0 #12
-
   # Gyro data freshness timeout (seconds)
   # If gyro sample is stale longer than this, controller falls back to FD
   gyro_timeout_s: 0.08
@@ -169,7 +167,7 @@ ik:
 
   # Whether commands are relative to current pose (delta commands)
   use_relative_mode: False
-  # IK solving method: "pinv", "svd", "trans", or "dls" (damped least squares)
+  # IK solving method: "pinv", "svd", "trans", or "dls"
   method: "dls"
 
   # Velocity mode: interpret commands as desired EE velocities
@@ -188,11 +186,11 @@ ik:
     min_singular_value: 1.0e-5
 
     # For dls
-    lambda_val: 0.01  # Base (min) value if adaptive damping is used
+    lambda_val: 0.001  # Base (min) value if adaptive damping is used
 
   # Condition number threshold — discard IK commands when Jacobian condition
   # number exceeds this value (0 = disabled)
-  condition_number_threshold: 50
+  condition_number_threshold: 40
 
   # Adaptive damping (DLS method only)
   # Adjusts lambda based on Jacobian condition number for better singularity handling.
@@ -200,8 +198,8 @@ ik:
   # Clamped to: lambda_val <= lambda_adaptive <= lambda_val * max_multiplier
 
   enable_adaptive_damping: False
-  adaptive_damping_scaling: 0.5        # How aggressively lambda increases near singularities
-  adaptive_damping_max_multiplier: 10.0  # Maximum lambda = lambda_val * max_multiplier
+  adaptive_damping_scaling: 0.10        # How aggressively lambda increases near singularities
+  adaptive_damping_max_multiplier: 2.0  # Maximum lambda = lambda_val * max_multiplier
 
   # Orientation axes that cannot be physically produced are auto-detected from
   # joint rotation axes and always excluded from IK solving. No manual ignore_axes

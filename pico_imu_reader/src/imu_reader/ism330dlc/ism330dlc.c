@@ -92,14 +92,14 @@ static inline uint8_t gyro_range_mask(float dps) {
 }
 
 // Initialize ISM330DHCX
-bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr) {
+bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr, uint internal_odr_hz) {
     // Optional: enable auto-increment + BDU for clean multi-byte reads
     const uint8_t CTRL3_C_IF_INC = 0x04;   // bit2
     const uint8_t CTRL3_C_BDU    = 0x40;   // bit6
     (void)ism330dhcx_write_reg(i2c_port, device_addr, CTRL3_C, CTRL3_C_IF_INC | CTRL3_C_BDU);
 
-    // Map requested sample rate to nearest supported ODR at or above request
-    const uint8_t odr_bits = select_odr_bits(imu_reader_settings.sampleRate);
+    // Map requested internal ODR to nearest supported hardware ODR at or above request
+    const uint8_t odr_bits = select_odr_bits(internal_odr_hz);
 
     // Configure accelerometer: ODR + ±2g
     const uint8_t xl_cntrl1_val = odr_bits | XL_G_RANGE_MASK;
@@ -132,16 +132,18 @@ bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr) {
         uint8_t ctrl6 = 0;
         (void)ism330dhcx_read_reg(i2c_port, device_addr, CTRL6_C, &ctrl6, 1);
         ctrl6 &= (uint8_t)~0x0F;     // clear FTYPE[3:0]
-        ctrl6 |= 0x03;               // FTYPE = 0x3 (mid bandwidth)
+        // FTYPE=5 (~48 Hz) gave best quat noise at 416 Hz ODR across all tests.
+        // FTYPE=7 (~12 Hz) caused phase lag on gravity axis; FTYPE=1 let in excess jitter.
+        ctrl6 |= 0x05;               // FTYPE = 0x5 (~48 Hz at 416 Hz ODR)
         (void)ism330dhcx_write_reg(i2c_port, device_addr, CTRL6_C, ctrl6);
     }
 
-    cdc_write_line("ISM330: accel LPF2 enabled (HPCF=1); gyro LPF1 FTYPE=3");
+    cdc_write_line("ISM330: accel LPF2 enabled (HPCF=1); gyro LPF1 FTYPE=5 (~48 Hz)");
 
     return true;
 }
 
-int initialize_sensors(void) {
+int initialize_sensors(uint internal_odr_hz) {
     static const struct {
         i2c_inst_t *i2c_port;
         uint8_t bus_index;
@@ -171,7 +173,7 @@ int initialize_sensors(void) {
             continue;
         }
 
-        if (!ism330dhcx_init(candidates[i].i2c_port, addr)) {
+        if (!ism330dhcx_init(candidates[i].i2c_port, addr, internal_odr_hz)) {
             cdc_writef("Probe OK but init failed: I2C%d @ 0x%02x\n", bus, addr);
             continue;
         }

@@ -504,9 +504,8 @@ class ExcavatorController:
             raise RuntimeError(
                 "Invalid 'controller.gyro_velocity_mode' in control_config.yaml. "
                 "Expected one of: fd_only, gyro_only, fused"
-            )
+        )
         self._gyro_blend_alpha = float(np.clip(float(ctrl_cfg.get('gyro_blend_alpha', 0.30)), 0.0, 1.0))
-        self._gyro_lpf_hz = float(max(0.0, float(ctrl_cfg.get('gyro_lpf_hz', 12.0))))
         self._gyro_timeout_s = float(max(0.0, float(ctrl_cfg.get('gyro_timeout_s', 0.08))))
         self._gyro_max_abs_radps = float(np.radians(max(1e-3, float(ctrl_cfg.get('gyro_max_abs_degps', 180.0)))))
 
@@ -677,8 +676,8 @@ class ExcavatorController:
         self._prev_joint_angles = None
         self._prev_joint_time = None
         self._last_joint_vel_radps = None
+        self._last_joint_vel_time: Optional[float] = None
         self._last_joint_vel_source = 'none'
-        self._gyro_joint_vel_lpf_radps = None
         self._gyro_bias_radps = np.zeros(3, dtype=np.float32)
         self._last_gyro_wall_t = None
         self._last_gyro_device_ts_us = None
@@ -1125,6 +1124,20 @@ class ExcavatorController:
         if hasattr(self.ik_controller, 'verbose'):
             self.ik_controller.verbose = ik_verbose
 
+    def set_velocity_mode(self, mode: str) -> None:
+        """Set joint velocity estimation mode: 'fd_only', 'gyro_only', or 'fused'."""
+        valid = ('fd_only', 'gyro_only', 'fused')
+        mode = mode.strip().lower()
+        if mode not in valid:
+            raise ValueError(f"velocity mode must be one of {valid}, got {mode!r}")
+        self._gyro_velocity_mode = mode
+
+    def get_joint_velocities_with_age(self) -> tuple:
+        """Return (velocities_degps, age_s). age=inf if never computed."""
+        if self._last_joint_vel_radps is None or self._last_joint_vel_time is None:
+            return None, float('inf')
+        return list(np.degrees(self._last_joint_vel_radps)), time.perf_counter() - self._last_joint_vel_time
+
     def get_last_pid_outputs(self):
         """Return last per-joint PID outputs [slew, boom, arm, bucket] or None if not captured."""
         return None if self._last_pi_outputs is None else list(self._last_pi_outputs)
@@ -1222,7 +1235,7 @@ class ExcavatorController:
         self._prev_joint_time = now_t
         return fd_joint_vel
 
-    def _compute_gyro_joint_velocity(self, now_t: float, loop_dt: float) -> Optional[np.ndarray]:
+    def _compute_gyro_joint_velocity(self, now_t: float) -> Optional[np.ndarray]:
         """Estimate joint velocity from IMU gyro and project to joint axes (rad/s)."""
         if self._gyro_velocity_mode == 'fd_only':
             return None
@@ -1271,17 +1284,6 @@ class ExcavatorController:
 
         joint_rates = np.clip(joint_rates, -self._gyro_max_abs_radps, self._gyro_max_abs_radps)
 
-        if self._gyro_lpf_hz > 0.0:
-            tau = 1.0 / (2.0 * np.pi * self._gyro_lpf_hz)
-            alpha = float(np.clip(loop_dt / (tau + loop_dt), 0.0, 1.0))
-            if self._gyro_joint_vel_lpf_radps is None:
-                self._gyro_joint_vel_lpf_radps = joint_rates.copy()
-            else:
-                self._gyro_joint_vel_lpf_radps = (
-                    self._gyro_joint_vel_lpf_radps + alpha * (joint_rates - self._gyro_joint_vel_lpf_radps)
-                )
-            joint_rates = self._gyro_joint_vel_lpf_radps.copy()
-
         out = np.zeros(4, dtype=np.float32)
         out[1:] = joint_rates
         return out
@@ -1326,6 +1328,15 @@ class ExcavatorController:
         out[1:] = alpha * gyro_joint_vel[1:] + (1.0 - alpha) * fd_joint_vel[1:]
         self._last_joint_vel_source = 'fused'
         return out
+
+    def _update_joint_velocity_estimate(self, current_joint_angles: np.ndarray, now_t: float) -> None:
+        """Update joint velocity telemetry/control estimate from current state and IMU gyro."""
+        fd_joint_vel = self._compute_fd_joint_velocity(current_joint_angles, now_t)
+        gyro_joint_vel = self._compute_gyro_joint_velocity(now_t=now_t)
+        selected_joint_vel = self._select_joint_velocity(fd_joint_vel, gyro_joint_vel)
+        if selected_joint_vel is not None:
+            self._last_joint_vel_radps = selected_joint_vel
+            self._last_joint_vel_time = now_t
 
     def reset_performance_stats(self) -> None:
         """Reset performance statistics."""
@@ -1483,8 +1494,10 @@ class ExcavatorController:
                 self._current_joint_angles = joint_angles
                 self._current_ee_quat_full = ee_quat
 
-            # Update simple EE velocity estimates for smoother seeding
             now_t = time.perf_counter()
+            self._update_joint_velocity_estimate(joint_angles, now_t)
+
+            # Update simple EE velocity estimates for smoother seeding
             if self._prev_pose_time is not None:
                 dt = max(1e-6, now_t - self._prev_pose_time)
                 pos_delta = ee_pos - (self._prev_pose if self._prev_pose is not None else ee_pos)
@@ -1574,12 +1587,6 @@ class ExcavatorController:
             if joint_angles is None or joint_quats is None:
                 return
             current_joint_angles = joint_angles
-            now_t = time.perf_counter()
-            fd_joint_vel = self._compute_fd_joint_velocity(current_joint_angles, now_t)
-            gyro_joint_vel = self._compute_gyro_joint_velocity(now_t=now_t, loop_dt=loop_dt)
-            selected_joint_vel = self._select_joint_velocity(fd_joint_vel, gyro_joint_vel)
-            if selected_joint_vel is not None:
-                self._last_joint_vel_radps = selected_joint_vel
 
             # Outer Loop: Task-space IK control
             # Note: Using current_ee_quat_full (including Z-rotation from slew) for IK.

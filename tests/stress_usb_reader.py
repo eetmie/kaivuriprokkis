@@ -58,7 +58,7 @@ def main() -> int:
             rt_cpu_core=args.cpu_core,
         )
         reader.send_config(sample_rate=args.target_hz)
-        reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=30.0)
+        reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=120.0)
         reader.start_background_reader()
 
         apply_rt_to_thread(

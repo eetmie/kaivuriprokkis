@@ -40,7 +40,7 @@ from configuration_files.pathing_config import (
 )
 from modules.excavator_controller import ExcavatorController
 from modules.hardware_interface import HardwareInterface
-from modules.quaternion_math import quat_from_y_deg
+from modules.quaternion_math import quat_from_axis_angle
 from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread, reset_to_normal
 from pathing import path_planning_algorithms as planner_algos
 from pathing import path_utils as path_utils_mod
@@ -117,6 +117,14 @@ TRAJECTORY_CSV_COLUMNS = [
 ]
 
 
+def quat_from_y_deg(angle_deg: float) -> np.ndarray:
+    """Return a [w, x, y, z] quaternion for pitch about the Y axis."""
+    return quat_from_axis_angle(
+        np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        np.float32(np.radians(float(angle_deg))),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task presets
 # ---------------------------------------------------------------------------
@@ -137,7 +145,7 @@ def make_task_preset(task_name: str) -> TaskPreset:
     if task_name == "in-and-out":
         return TaskPreset(
             name="in-and-out",
-            goals=((0.55, 0.25, -0.035), (0.55, -0.25, -0.06)),
+            goals=((0.55, 0.25, -0.15), (0.55, -0.25, -0.2)),
             rotations_deg=(0.0, 0.0),
             labels=("A_INSIDE", "B_OUTSIDE"),
         )
@@ -220,7 +228,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test", action="store_true", help="Direct A/B pose commands every 10s — no planner.")
     parser.add_argument("--rt-priority", type=int, default=75, help="RT priority for control loop (0=disable).")
     parser.add_argument("--imu-priority", type=int, default=70, help="RT priority for IMU thread (0=normal).")
-    parser.add_argument("--adc-priority", type=int, default=70, help="RT priority for ADC thread (0=normal).")
+    parser.add_argument("--adc-priority", type=int, default=70, help="Deprecated/ignored; run_hw_v2 does not initialize ADC.")
     return parser
 
 
@@ -1024,7 +1032,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("=" * 60)
     logger.info("Task: %s | Algorithm: %s", args.task, args.algorithm_name)
     logger.info("Debug=%s, Log=%s, Once=%s", args.debug, args.log, args.once)
-    logger.info("RT priorities: ctrl=%d, imu=%d, adc=%d", args.rt_priority, args.imu_priority, args.adc_priority)
+    logger.info("RT priorities: ctrl=%d, imu=%d", args.rt_priority, args.imu_priority)
 
     targets: List[Tuple[np.ndarray, float]] = [
         (np.asarray(g, dtype=np.float32), float(r))
@@ -1051,10 +1059,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     hardware = HardwareInterface(
         perf_enabled=bool(args.debug),
         cleanup_disable_osc=False,
-        adc_channels=["Slew encoder rot"],
-        adc_sample_hz=100.0,
+        enable_adc=False,
+        start_adc_reader=False,
         imu_rt_priority=args.imu_priority,
-        adc_rt_priority=args.adc_priority,
     )
 
     logger.info("Initializing excavator controller...")

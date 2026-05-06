@@ -12,14 +12,6 @@ from dataclasses import dataclass
 class EnvironmentConfig:
     """Environment setup configuration for both sim and real systems."""
 
-    # Point A configuration
-    point_a_pos: Tuple[float, float, float] = (0.43, 0.075, -0.20)
-    point_a_rotation_deg: float = 0.0 # y axis rotation. 0 = horizontal
-    
-    # Point B configuration  
-    point_b_pos: Tuple[float, float, float] = (0.63, -0.075, -0.20)
-    point_b_rotation_deg: float = 0.0
-    
     # Single wall configuration (matches real hardware format)
     wall_size: Tuple[float, float, float] = (0.03, 0.50, 0.60)  # [width, depth, height]
     wall_pos: Tuple[float, float, float] = (0.55, 0.0, -0.45)     # Wall center position
@@ -32,25 +24,21 @@ class PathExecutionConfig:
 
     # Motion parameters ------------------------------
     speed_mps: float = 0.030  #(0.02...70worked good) Target constant speed for standardized execution (m/s)
+    # Jerk-limited controller smoothing settings.
+    # NOTE: This jerk system is not hardware-tested yet and probably does not
+    # work reliably; keep these values conservative until it is validated.
+    max_accel_mps2: float = 0.5
+    max_decel_mps2: float = 0.5
+    max_jerk_mps3: float = 2.0
+    enable_jerk: bool = False
     update_frequency: float = 100.0  # Hz - target harware loop frequency / simulation update rate
-    # TODO: ass name, change someday haha
-    dt: float = 0.02          # 50Hz Pathing Execution sample period for standardized paths (s). NOT the hw/sim_dt time!
+    dt: float = 1 / 60        # Pathing waypoint sample period — matches sim physics dt (60 Hz).
 
-
-    # TODO: very experimental
-    enable_jerk: bool = False  # Enable jerk-limited motion smoothing (S-curve)
-    # S-curve velocity profile parameters (jerk-limited motion)
-    max_jerk_mps3: float = 2.0  # Maximum jerk (rate of change of acceleration) in m/s^3
-    max_accel_mps2: float = 0.5  # Maximum acceleration in m/s^2
-    max_decel_mps2: float = 0.5  # Maximum deceleration in m/s^2
 
     # Normalization / trajectory representation options
     # These are forwarded into NormalizerParams for all planners.
     normalizer_return_poses: bool = True  # Whether normalized planners return poses alongside positions (7D).
-    # TODO: returns identity quaternions at the moment!
-
-
-    normalizer_force_goal: bool = True    # Force exact goal as final waypoint when collision-free. (instead of the nearest planned point)
+    normalizer_force_goal: bool = True    # Force exact goal as final waypoint when collision-free.
 
 
 

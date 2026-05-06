@@ -135,7 +135,7 @@ def main():
 
     if not args.sim:
         reader.send_config(sample_rate=args.sr, gyro_dps=args.gyro_dps)
-        if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=30.0):
+        if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0):
             print("Warning: CFG_OK not received; continuing anyway", file=sys.stderr)
 
     zero_q_inv = None

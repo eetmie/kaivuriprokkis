@@ -24,6 +24,7 @@ class USBSerialReader:
     FRAME_VERSION_CTRL = 2
     FRAME_VERSION_DESC = 3
     FRAME_VERSION_STATUS = 4  # legacy firmware only
+    FRAME_VERSION_CAL_REPORT = 5
 
     # Control frame message types (version=2)
     MSG_TYPE_CFG_OK = 0x01
@@ -38,14 +39,20 @@ class USBSerialReader:
     STATUS_FLAG_HOST_ALIVE = 0x02
 
     # Tuned AHRS defaults (tested)
-    DEFAULT_SAMPLE_RATE = 100
+    # TODO: once wait_for_settings() is removed from Pico firmware, gyro_dps/gain/
+    # accel_rejection/recovery_s below can also be hardcoded in firmware and send_config()
+    # removed entirely along with the CFG_WAIT/CFG_OK handshake.
     DEFAULT_GYRO_DPS = 250
     DEFAULT_GAIN = 5.0
     DEFAULT_ACCEL_REJ = 20.0
     DEFAULT_RECOVERY_S = 0.5
-    DEFAULT_OFFSET_S = 0.5
-    STARTUP_CALIBRATION_SETTLE_S = 5.0
-    STARTUP_CALIBRATION_DURATION_S = 15.0
+    STARTUP_CALIBRATION_DURATION_S = 30.0
+
+    CAL_REPORT_ACCEPTED = 0x01
+    CAL_FAIL_INSUFFICIENT_SAMPLES = 0x0001
+    CAL_FAIL_GYRO_STD = 0x0002
+    CAL_FAIL_ACCEL_STD = 0x0004
+    CAL_FAIL_ACCEL_NORM = 0x0008
 
     def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False,
                  log_level: str = "INFO", port: str | None = None, debug: bool = False,
@@ -108,6 +115,7 @@ class USBSerialReader:
         self._startup_phase = "disconnected"
         self._calibration_wait_start_time = None
         self._last_calibration_log_time = 0.0
+        self._calibration_report = None
         self._last_error_msg_type = None
         self._lock = threading.Lock()
         self._reader_thread = None
@@ -137,6 +145,16 @@ class USBSerialReader:
     # ------------------------------------------------------------------
     # Status API
     # ------------------------------------------------------------------
+
+    def _copy_calibration_report(self):
+        report = self._calibration_report
+        if report is None:
+            return None
+        return {
+            **report,
+            "thresholds": dict(report.get("thresholds", {})),
+            "sensors": [dict(sensor) for sensor in report.get("sensors", [])],
+        }
 
     def status(self):
         """Return current connection status as a dict.
@@ -178,6 +196,7 @@ class USBSerialReader:
                 time.time() - self._calibration_wait_start_time
                 if self._calibration_wait_start_time is not None else 0.0
             ),
+            "calibration_report": self._copy_calibration_report(),
             "checksum_failures": self._checksum_failures,
             "header_failures": self._header_failures,
             "reconnect_count": self._reconnect_count,
@@ -311,6 +330,7 @@ class USBSerialReader:
         self._startup_phase = "connected"
         self._calibration_wait_start_time = None
         self._last_calibration_log_time = 0.0
+        self._calibration_report = None
         self._last_error_msg_type = None
         self._last_data_time = time.time()
         self._connect_time = time.time()
@@ -362,32 +382,30 @@ class USBSerialReader:
 
     def send_config(
         self,
-        sample_rate=None,
         gyro_dps=None,
         gain=None,
         accel_rejection=None,
         recovery_s=None,
-        offset_s=None,
     ):
-        """Send configuration to Pico. Uses tuned defaults for omitted values."""
+        """Send configuration to Pico. Uses tuned defaults for omitted values.
+
+        SR is fixed at 200 Hz in firmware and not configurable here.
+        """
         if not self.ser or not self.ser.is_open:
             self.logger.warning("Not connected - cannot send config")
             return False
 
-        sr = sample_rate if sample_rate is not None else self.DEFAULT_SAMPLE_RATE
         gyro = gyro_dps if gyro_dps is not None else self.DEFAULT_GYRO_DPS
         g = gain if gain is not None else self.DEFAULT_GAIN
         ar = accel_rejection if accel_rejection is not None else self.DEFAULT_ACCEL_REJ
         rs = recovery_s if recovery_s is not None else self.DEFAULT_RECOVERY_S
-        os_ = offset_s if offset_s is not None else self.DEFAULT_OFFSET_S
 
         config = (
-            f"SR={sr}|"
+            f"SR=200|"
             f"GYRO_DPS={gyro}|"
             f"GAIN={g}|"
             f"ACC_REJ={ar}|"
-            f"RECOV_S={rs}|"
-            f"OFFSET_S={os_}|\n"
+            f"RECOV_S={rs}|\n"
         )
         self._last_config = config
         try:
@@ -415,11 +433,11 @@ class USBSerialReader:
                 self.logger.info(
                     "Pico startup calibration in progress; keep IMUs stationary "
                     "(~%.0fs total after config)",
-                    self.STARTUP_CALIBRATION_SETTLE_S + self.STARTUP_CALIBRATION_DURATION_S,
+                    self.STARTUP_CALIBRATION_DURATION_S,
                 )
             elif (now - self._last_calibration_log_time) >= 5.0:
                 elapsed = now - self._calibration_wait_start_time
-                total = self.STARTUP_CALIBRATION_SETTLE_S + self.STARTUP_CALIBRATION_DURATION_S
+                total = self.STARTUP_CALIBRATION_DURATION_S
                 remaining = max(0.0, total - elapsed)
                 self.logger.info(
                     "Pico startup calibration still running (%.0fs elapsed, ~%.0fs remaining); keep IMUs stationary",
@@ -456,7 +474,7 @@ class USBSerialReader:
             return False
         return False
 
-    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None, calibration_timeout_s=30.0):
+    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None, calibration_timeout_s=120.0):
         """Wait for binary CFG_OK from Pico, or infer success from streaming.
 
         If CFG_OK is not received within ``timeout_s``, return False and let the
@@ -489,7 +507,7 @@ class USBSerialReader:
                 )
                 return False
 
-            if resend_s is not None and (now - last_send) >= resend_s:
+            if resend_s is not None and not calibration_seen and (now - last_send) >= resend_s:
                 # Resend last config if available
                 if self._last_config:
                     try:
@@ -557,6 +575,21 @@ class USBSerialReader:
                                 continue
                             else:
                                 idx += 1
+                        elif version == self.FRAME_VERSION_CAL_REPORT:
+                            sensor_count = self._bin_buf[idx + 3]
+                            if 1 <= sensor_count <= self.MAX_SENSORS:
+                                frame_len = self._calibration_report_frame_len(sensor_count)
+                                if idx + frame_len <= len(self._bin_buf):
+                                    cs_off = idx + frame_len - 2
+                                    exp_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
+                                    cal_cs = sum(self._bin_buf[idx + 2:cs_off]) & 0xFFFF
+                                    if cal_cs == exp_cs:
+                                        report = self._parse_calibration_report_payload(idx, sensor_count)
+                                        self._apply_calibration_report(report)
+                                    del self._bin_buf[idx:idx + frame_len]
+                                    continue
+                                break
+                            idx += 1
                         elif version == self.FRAME_VERSION_DATA:
                             sensor_count = self._bin_buf[idx + 3]
                             if 1 <= sensor_count <= self.MAX_SENSORS:
@@ -790,6 +823,92 @@ class USBSerialReader:
                 labels,
             )
 
+    def _calibration_failure_names(self, flags):
+        names = []
+        if flags & self.CAL_FAIL_INSUFFICIENT_SAMPLES:
+            names.append("insufficient_samples")
+        if flags & self.CAL_FAIL_GYRO_STD:
+            names.append("gyro_std")
+        if flags & self.CAL_FAIL_ACCEL_STD:
+            names.append("accel_std")
+        if flags & self.CAL_FAIL_ACCEL_NORM:
+            names.append("accel_norm")
+        return names
+
+    def _calibration_report_frame_len(self, sensor_count):
+        return 28 + sensor_count * 72
+
+    def _parse_calibration_report_payload(self, start, sensor_count):
+        offset = start + 4
+        duration_ms = struct.unpack_from("<I", self._bin_buf, offset)[0]
+        offset += 4
+        flags = self._bin_buf[offset]
+        offset += 2  # flags + reserved
+        gyro_std_limit, accel_std_limit, accel_norm_min, accel_norm_max = struct.unpack_from(
+            "<ffff", self._bin_buf, offset
+        )
+        offset += 16
+
+        sensors = []
+        for index in range(sensor_count):
+            sample_count, read_error_count, failure_flags = struct.unpack_from("<IIH", self._bin_buf, offset)
+            offset += 12  # sample_count + read_error_count + failure_flags + reserved
+            values = struct.unpack_from("<fffffffffffffff", self._bin_buf, offset)
+            offset += 60
+            sensors.append({
+                "index": index,
+                "sample_count": sample_count,
+                "read_error_count": read_error_count,
+                "failure_flags": failure_flags,
+                "failures": self._calibration_failure_names(failure_flags),
+                "gyro_bias_dps": values[0:3],
+                "gyro_std_dps": values[3:6],
+                "accel_mean_g": values[6:9],
+                "accel_std_g": values[9:12],
+                "accel_norm_mean_g": values[12],
+                "accel_norm_min_g": values[13],
+                "accel_norm_max_g": values[14],
+            })
+
+        return {
+            "accepted": bool(flags & self.CAL_REPORT_ACCEPTED),
+            "duration_s": duration_ms / 1000.0,
+            "flags": flags,
+            "thresholds": {
+                "gyro_std_dps": gyro_std_limit,
+                "accel_std_g": accel_std_limit,
+                "accel_norm_min_g": accel_norm_min,
+                "accel_norm_max_g": accel_norm_max,
+            },
+            "sensors": sensors,
+        }
+
+    def _apply_calibration_report(self, report):
+        with self._lock:
+            already_logged = self._calibration_report is not None
+            self._calibration_report = report
+
+        if already_logged:
+            return
+
+        state = "accepted" if report["accepted"] else "rejected"
+        self.logger.info("IMU startup calibration %s after %.1fs", state, report["duration_s"])
+        for sensor in report["sensors"]:
+            failure_text = ",".join(sensor["failures"]) if sensor["failures"] else "ok"
+            self.logger.info(
+                "  cal[%d] samples=%d read_errors=%d gyro_bias=%s dps gyro_std=%s dps accel_std=%s g accel_norm=%.4f/%.4f/%.4f result=%s",
+                sensor["index"],
+                sensor["sample_count"],
+                sensor["read_error_count"],
+                tuple(round(v, 4) for v in sensor["gyro_bias_dps"]),
+                tuple(round(v, 4) for v in sensor["gyro_std_dps"]),
+                tuple(round(v, 5) for v in sensor["accel_std_g"]),
+                sensor["accel_norm_min_g"],
+                sensor["accel_norm_mean_g"],
+                sensor["accel_norm_max_g"],
+                failure_text,
+            )
+
     def _read_binary_frame(self, refill=True):
         """Parse binary IMU frame from serial buffer."""
         if not self.ser or not self.ser.is_open:
@@ -856,6 +975,31 @@ class USBSerialReader:
                 parsed = self._parse_status_payload()
                 if parsed is None:
                     return None
+                continue
+
+            if version == self.FRAME_VERSION_CAL_REPORT:
+                if refill:
+                    self._fill_binary_buffer(min_bytes=8)
+                if len(self._bin_buf) < 8:
+                    return None
+                sensor_count = self._bin_buf[3]
+                if sensor_count < 1 or sensor_count > self.MAX_SENSORS:
+                    del self._bin_buf[:1]
+                    continue
+                frame_len = self._calibration_report_frame_len(sensor_count)
+                if refill:
+                    self._fill_binary_buffer(min_bytes=frame_len)
+                if len(self._bin_buf) < frame_len:
+                    return None
+                checksum_offset = frame_len - 2
+                expected = struct.unpack_from("<H", self._bin_buf, checksum_offset)[0]
+                calc = sum(self._bin_buf[2:checksum_offset]) & 0xFFFF
+                if calc == expected:
+                    report = self._parse_calibration_report_payload(0, sensor_count)
+                    self._apply_calibration_report(report)
+                else:
+                    self._checksum_failures += 1
+                del self._bin_buf[:frame_len]
                 continue
 
             # Handle IMU descriptor frame (version=3)
@@ -1090,8 +1234,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Read 1-4 IMU quaternions over USB serial")
     parser.add_argument("--port", help="Serial port (auto-detect if not specified)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
-    parser.add_argument("--sr", type=int, default=USBSerialReader.DEFAULT_SAMPLE_RATE,
-                        help="Sample rate Hz")
     parser.add_argument("--gyro-dps", type=int, default=USBSerialReader.DEFAULT_GYRO_DPS,
                         help="Gyro range (125/250/500/1000/2000)")
     parser.add_argument("--sim", action="store_true", help="Simulation mode")
@@ -1120,11 +1262,10 @@ if __name__ == "__main__":
 
     if not args.sim:
         reader.send_config(
-            sample_rate=args.sr,
             gyro_dps=args.gyro_dps,
         )
         if not args.no_wait:
-            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=30.0):
+            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0):
                 reader.logger.warning("CFG_OK not received; continuing anyway")
 
     # Wait briefly for descriptor frame to arrive with first data

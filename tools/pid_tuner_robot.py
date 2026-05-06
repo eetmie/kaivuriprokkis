@@ -90,7 +90,7 @@ def main() -> int:
 
     hardware = HardwareInterface(
         config_file=args.config_file,
-        pump_auto_mode=True,
+        pump_auto_mode=False,
         cleanup_disable_osc=False,
         enable_adc=False,
         start_adc_reader=False,

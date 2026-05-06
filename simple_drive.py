@@ -9,7 +9,7 @@ Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
     Button 1: reload PWM/servo config
     Button 2: toggle hydraulic pump
-    Button 3: cycle compensation mode — OFF → raw summary → universal smooth
+    Button 3: cycle compensation mode — OFF → raw summary → universal smooth → velocity PID
 
 Left paddle (bench mode): slowly trims pump auto-mode activity_gain_us base level while held.
     Push forward = more gain, pull back = less. Prints current base value when it changes.
@@ -52,6 +52,43 @@ PUMP_GAIN_ADJUST_RATE = 80.0         # µs/s per unit of paddle input for bench 
 PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
+
+# Velocity PID: joystick command → desired deg/s → PI → valve command.
+# Slew (rotate) has no gyro so it stays open-loop; only boom/arm/bucket are controlled.
+_VEL_CTRL_JOINTS = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
+
+
+class JointVelocityController:
+    def __init__(self, kp: float, ki: float, ki_max: float, deadband_degps: float, max_degps: float):
+        self.kp = kp
+        self.ki = ki
+        self.ki_max = ki_max
+        self.deadband = deadband_degps
+        self.max_degps = max_degps
+        self._integral: dict[str, float] = {name: 0.0 for name in _VEL_CTRL_JOINTS}
+
+    def apply(self, commands: dict, joint_vels_degps, dt: float) -> dict:
+        out = dict(commands)
+        for name, vel_idx in _VEL_CTRL_JOINTS.items():
+            if name not in out or vel_idx >= len(joint_vels_degps):
+                continue
+            desired = float(out[name]) * self.max_degps
+            if abs(desired) < self.deadband:
+                self._integral[name] = 0.0
+                out[name] = 0.0
+                continue
+            actual = float(joint_vels_degps[vel_idx])
+            err = desired - actual
+            self._integral[name] = float(np.clip(
+                self._integral[name] + err * dt, -self.ki_max, self.ki_max,
+            ))
+            cmd = self.kp * err + self.ki * self._integral[name]
+            out[name] = float(np.clip(cmd, -1.0, 1.0))
+        return out
+
+    def reset(self) -> None:
+        for k in self._integral:
+            self._integral[k] = 0.0
 
 
 def euler_pry_deg_from_quat(quat) -> tuple[float, float, float]:
@@ -160,6 +197,11 @@ def parse_args():
     )
     parser.add_argument("--linkage-rate-min-factor", type=float, default=0.35)
     parser.add_argument("--linkage-rate-max-factor", type=float, default=2.25)
+    parser.add_argument("--vel-kp",        type=float, default=0.04,  help="Velocity PI — proportional gain (cmd units / deg_s error)")
+    parser.add_argument("--vel-ki",        type=float, default=0.008, help="Velocity PI — integral gain")
+    parser.add_argument("--vel-ki-max",    type=float, default=0.4,   help="Velocity PI — I-term anti-windup clamp")
+    parser.add_argument("--vel-deadband",  type=float, default=2.0,   help="Velocity PI — error deadband (deg/s)")
+    parser.add_argument("--vel-max-degps", type=float, default=30.0,  help="Velocity PI — joystick full deflection = this many deg/s")
     return parser.parse_args()
 
 
@@ -197,15 +239,23 @@ def main():
     controller.start()
     time.sleep(2.0)                 # numba JIT warmup
     controller.enter_direct_mode()
+    controller.set_velocity_mode('gyro_only')
     control_joint_names = get_control_joint_names(controller)
     imu_role_order = get_imu_role_order(controller)
-    print("Controller in DIRECT mode.")
+    print("Controller in DIRECT mode (velocity feedback: gyro_only).")
 
     linkage_compensator = None
     universal_compensator = None
-    # comp_mode: 0=OFF, 1=raw summary, 2=universal smooth
+    # comp_mode: 0=OFF, 1=raw summary, 2=universal smooth, 3=velocity PID
     comp_mode = 1 if args.linkage_rate_correction else 0
-    COMP_LABELS = ["OFF", "valve scale (raw)", "pump gain (universal shape)"]
+    COMP_LABELS = ["OFF", "valve scale (raw)", "pump gain (universal shape)", "velocity PID"]
+    vel_controller = JointVelocityController(
+        kp=args.vel_kp,
+        ki=args.vel_ki,
+        ki_max=args.vel_ki_max,
+        deadband_degps=args.vel_deadband,
+        max_degps=args.vel_max_degps,
+    )
 
     try:
         linkage_compensator = LinkageRateCompensator(
@@ -257,6 +307,7 @@ def main():
     # ---- Loop state ----
     loop_period = 1.0 / SAMPLING_FREQUENCY
     next_run_time = time.perf_counter()
+    prev_loop_time = time.perf_counter()
 
     right_rl = right_ud = left_rl = left_ud = 0.0
     right_paddle = left_paddle = 0.0
@@ -268,6 +319,10 @@ def main():
 
     try:
         while True:
+            now = time.perf_counter()
+            actual_dt = now - prev_loop_time
+            prev_loop_time = now
+
             float_data = server.get_latest_floats()
             if float_data:
                 right_rl = float_data[9]   # scoop
@@ -297,13 +352,17 @@ def main():
                         hardware.pwm_controller.set_pump_enabled(new_state)
                         print(f"\n[Button 2] pump {'ON' if new_state else 'OFF'}")
 
-                # Button 3: cycle compensation mode OFF → raw → universal smooth.
+                # Button 3: cycle compensation mode OFF → raw → universal smooth → velocity PID.
                 if buttons[3] > button_threshold and button_prev[3] <= button_threshold:
-                    comp_mode = (comp_mode + 1) % 3
+                    old_comp_mode = comp_mode
+                    comp_mode = (comp_mode + 1) % 4
                     if comp_mode == 1 and linkage_compensator is None:
-                        comp_mode = (comp_mode + 1) % 3
+                        comp_mode = (comp_mode + 1) % 4
                     if comp_mode == 2 and universal_compensator is None:
-                        comp_mode = (comp_mode + 1) % 3
+                        comp_mode = (comp_mode + 1) % 4
+                    # reset integrator when leaving velocity PID mode
+                    if old_comp_mode == 3 and comp_mode != 3:
+                        vel_controller.reset()
                     print(f"\n[Button 3] compensation mode: {COMP_LABELS[comp_mode]}")
 
                 button_prev = buttons
@@ -317,21 +376,23 @@ def main():
                 'trackR':    right_paddle,
                 'trackL':    left_paddle,
             }
-            # TODO: replace open-loop shape compensation with closed-loop joint velocity
-            # control. Joystick → desired deg/s → PID → valve command, with gyro angular
-            # rates as feedback. IMU gyros give rate directly (no differentiation noise),
-            # but will need a low-pass (e.g. exponential smoothing) to suppress vibration
-            # before feeding the PID error. Would make feel consistent across full range
-            # regardless of linkage geometry, pressure, or temperature drift.
-            # NOTE: valve response is slow, so PID needs oscillation prevention —
-            # derivative damping and/or a command deadband are likely necessary to avoid
-            # chatter at steady state while waiting for pressure to build.
             joint_angles = controller.get_joint_angles()
 
             # Mode 1: scale valve commands per-joint (valve curves are affected).
             # Mode 2: valve commands untouched — correction goes to pump gain only.
+            # Mode 3: closed-loop velocity PI — joystick sets desired deg/s, gyro is feedback.
             if comp_mode == 1 and linkage_compensator is not None:
                 commands = linkage_compensator.apply(commands, joint_angles)
+            elif comp_mode == 3:
+                # TODO: add linkage feed-forward — apply linkage_compensator to commands first,
+                # then run vel_controller on top. Reduces initial tracking error at positions
+                # where valve effectiveness drops (e.g. full arm extension), without relying
+                # solely on the integrator to catch up.
+                joint_vels, vel_age = controller.get_joint_velocities_with_age()
+                if vel_age < 0.05:
+                    commands = vel_controller.apply(commands, joint_vels, actual_dt)
+                else:
+                    vel_controller.reset()
             controller.give_direct_commands(commands)
 
             # Left paddle: trim the pump activity_gain_us base level.

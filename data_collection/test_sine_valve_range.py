@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Simple IMU-based sine speed sweep for one hydraulic joint at a time.
 
+MANUAL HARDWARE TEST — requires real hardware. Not a unit test.
+
 The script captures the current joint angle as the center, then tries to move
 that joint around ``center +/- target_swing_deg``. A simple direct-mode valve
 controller tracks a sine target while the sine frequency is increased step by

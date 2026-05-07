@@ -285,13 +285,13 @@ def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray,
     jac_f32 = np.asarray(jacobian, dtype=np.float32)
     delta_f32 = np.asarray(delta_pose, dtype=np.float32)
 
-    # (J * J^T + lambda^2 I)^-1
+    # Solve (J * J^T + lambda^2 I) directly instead of forming an explicit inverse.
     jjt = np.dot(jac_f32, jac_f32.T)
     lambda_matrix = (lambda_val ** 2) * np.eye(jjt.shape[0], dtype=np.float32)
-    jjt_lambda_inv = np.linalg.inv(jjt + lambda_matrix)
+    solved = np.linalg.solve(jjt + lambda_matrix, delta_f32)
 
     # delta_q = J^T * (J*J^T + lambda^2 I)^-1 * dp
-    return np.dot(jac_f32.T, np.dot(jjt_lambda_inv, delta_f32))
+    return np.dot(jac_f32.T, solved)
 
 
 # ----------------------------
@@ -312,7 +312,7 @@ def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.
 
     Args:
         quats: Input quaternions [base, link1, link2, ...] where base rotation is
-               measured by encoder and downstream orientations are from IMUs
+               provided as a clean Z-rotation and downstream orientations are from IMUs
         robot_config: Robot configuration containing rotation axes for each joint
 
     Returns:
@@ -321,7 +321,7 @@ def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.
     quats = np.asarray(quats, dtype=np.float32)
     propagated_quats = quats.copy()
 
-    # Base stays as-is (slew from encoder, already a clean Z-rotation)
+    # Base stays as-is (already a clean Z-rotation)
     base_quat = quats[0]
 
     # Project downstream joints to their rotation axes (removes roll/yaw drift)
@@ -614,7 +614,7 @@ class IKController:
         ee_pos: np.ndarray,
         ee_quat: np.ndarray,
         joint_angles: np.ndarray,
-        joint_quats: np.ndarray,
+        joint_quats: Optional[np.ndarray] = None,
         desired_ee_velocity: Optional[np.ndarray] = None,
         dt: Optional[float] = None,
         current_joint_velocities: Optional[np.ndarray] = None,
@@ -627,8 +627,8 @@ class IKController:
             ee_pos: Current end-effector position [x, y, z]
             ee_quat: Current end-effector quaternion [w, x, y, z]
             joint_angles: Current RELATIVE joint angles in radians (for limit checking)
-            joint_quats: Legacy argument accepted for compatibility; canonical
-                absolute quaternions are rebuilt from ``joint_angles``.
+            joint_quats: Optional canonical absolute quaternions matching
+                ``joint_angles``. Rebuilt from angles only when omitted.
             desired_ee_velocity: Optional desired EE twist (position 3D or pose 6D) for velocity mode
             dt: Optional timestep (seconds). Defaults to self.default_dt.
             current_joint_velocities: Optional measured joint velocities (rad/s) for future adaptive use
@@ -645,12 +645,14 @@ class IKController:
         dt_val = self.default_dt if dt is None else float(dt)
         dt_val = float(np.clip(dt_val, 1e-4, 1.0))
 
-        # Canonical joint angles are the source of truth for IK.  Rebuild the
-        # absolute link quaternions from them so FK, Jacobian, limits and PID all
-        # agree on one representation.
-        joint_quats = joint_angles_to_absolute_quaternions(joint_angles, self.robot_config)
+        # Reuse caller-provided canonical quats so FK/reachability/IK evaluate
+        # the same orientation set; rebuild only as a fallback.
+        if joint_quats is None:
+            joint_quats = joint_angles_to_absolute_quaternions(joint_angles, self.robot_config)
+        else:
+            joint_quats = np.asarray(joint_quats, dtype=np.float32)
 
-        # Compute full Jacobian from canonical joint angles.
+        # Compute full Jacobian from the canonical absolute orientations.
         jacobian_full = compute_jacobian_core(
             joint_quats,
             self.robot_config.link_lengths,
@@ -705,7 +707,7 @@ class IKController:
             # pure roll in world frame and is discarded by the controllable-DOF
             # reduction (no X-axis joint on the excavator).
             # The current target-quat recipe (slew_quat * pitch_quat) keeps the
-            # yaw error at zero by construction, but rototilt roll/yaw axes will
+            # yaw error at zero by construction, but extra tool roll/yaw axes will
             # be body-frame too — so this transform is forward-compatible.
             ee_quat_local = ee_quat
             target_quat_local = self.ee_quat_des
@@ -811,7 +813,7 @@ class IKController:
 
         Args:
             delta_joint_angles: Current desired joint changes
-            joint_angles: Current RELATIVE joint angles (computed from IMU quaternions)
+            joint_angles: Current RELATIVE joint angles
 
         Returns:
             Modified joint changes with limit avoidance
@@ -863,7 +865,7 @@ class IKController:
         else:
             w_sqrt = None
 
-        # Compute condition number
+        # Keep this telemetry: adaptive damping and reachability both consume it.
         self.last_condition_number = float(compute_condition_number(jacobian))
 
         # Compute adaptive damping (uses self.last_condition_number)

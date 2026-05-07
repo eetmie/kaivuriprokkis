@@ -6,6 +6,7 @@ state machine without hitting any real hardware.
 
 import math
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -238,6 +239,28 @@ class ServiceSubmitCommandTests(unittest.TestCase):
         service, _, hardware = self._make_service()
         service.submit_command(ControlCommand(sequence=1, reload_config=True))
         self.assertEqual(hardware.reload_log, 1)
+
+    def test_get_state_sequences_are_unique_under_concurrent_reads(self):
+        service, _, _ = self._make_service()
+        sequences = []
+        seq_lock = threading.Lock()
+
+        def worker(count):
+            local = []
+            for _ in range(count):
+                local.append(service.get_state().sequence)
+            with seq_lock:
+                sequences.extend(local)
+
+        threads = [threading.Thread(target=worker, args=(50,)) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(sequences), 200)
+        self.assertEqual(len(set(sequences)), 200)
+        self.assertEqual(sorted(sequences), list(range(1, 201)))
 
 
 class ProtocolEncodeDecodeTests(unittest.TestCase):

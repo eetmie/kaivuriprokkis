@@ -9,13 +9,10 @@
 #define FLOATS_PER_SENSOR 7
 
 // Message types for control frames (version=2)
-#define MSG_TYPE_CFG_OK    0x01
-#define MSG_TYPE_CFG_WAIT  0x02
-#define MSG_TYPE_ERROR     0x04
 #define MSG_TYPE_ERR_I2C   0x05  // I2C bus init failed
 #define MSG_TYPE_ERR_IMU   0x06  // No IMU detected
 #define MSG_TYPE_CAL_WAIT  0x07  // Startup gyro-bias calibration in progress
-#define MSG_TYPE_ERR_CAL   0x08  // Startup calibration failed, robot moved
+#define MSG_TYPE_ERR_CAL   0x08  // Startup calibration failed (robot moved during cal)
 
 #define CAL_REPORT_ACCEPTED 0x01
 

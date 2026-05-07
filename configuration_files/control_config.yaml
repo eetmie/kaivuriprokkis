@@ -6,18 +6,9 @@ rates:
   control_hz: 100.0
 
 imu:
-  # IMU output is fixed at 200 Hz in Pico firmware — no sample_rate config needed.
-  # TODO: gyro_dps/ahrs_gain/accel_rejection/recovery_s below are still sent to Pico
-  # via the settings handshake. Once hardcoded in firmware and wait_for_settings()
-  # is removed, these can be omitted too.
-  # Gyroscope full-scale range (125/250/500/1000/2000 dps)
-  gyro_dps: 250
-  # AHRS filter gain (higher = faster response, more noise)
-  ahrs_gain: 5.0
-  # Accelerometer rejection threshold (degrees) - reject accel when orientation deviates
-  accel_rejection: 20.0
-  # Recovery period (seconds) - time before re-enabling accel after rejection
-  recovery_s: 0.5
+  # IMU output is fixed at 200 Hz in Pico firmware. AHRS settings (gyro_dps, gain,
+  # accel_rejection, recovery_s) are hardcoded in firmware — no Python handshake needed.
+  # The Pico self-calibrates for ~30 s after power-on, then streams autonomously.
   # Startup gyro-bias calibration is automatic in Pico firmware: 30 s stationary
   # measurement, firmware-owned thresholds, and a host calibration report.
   # Named IMU mapping: logical role -> physical sensor index
@@ -99,9 +90,9 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 6.000
+    kp: 5.500 #6
     ki: 0.200
-    kd: 0.100
+    kd: 0.250 # try to increase?
 
   # Joint 1: Boom (lift arm)
   joint1:

@@ -126,17 +126,7 @@ def main() -> int:
     parser.add_argument("--csv", type=Path, default=None, help="Optional CSV output path")
     parser.add_argument("--raw", action="store_true", help="Also plot gx/gy/gz traces, not just vector magnitude")
     parser.add_argument("--no-plot", action="store_true", help="Do not open matplotlib plot; print/log only")
-    parser.add_argument("--sim", action="store_true", help="Use USB reader simulation mode")
     parser.add_argument("--debug", action="store_true", help="Log raw serial bytes")
-    parser.add_argument("--no-wait", action="store_true", help="Skip waiting for Pico CFG_OK")
-    parser.add_argument("--sr", type=int, default=200, help="Pico sample rate Hz")
-    parser.add_argument("--gyro-dps", type=int, default=USBSerialReader.DEFAULT_GYRO_DPS,
-                        help="Pico gyro range dps")
-    parser.add_argument("--gain", type=float, default=USBSerialReader.DEFAULT_GAIN, help="Pico AHRS gain")
-    parser.add_argument("--accel-rejection", type=float, default=USBSerialReader.DEFAULT_ACCEL_REJ,
-                        help="Pico AHRS accel rejection")
-    parser.add_argument("--recovery-s", type=float, default=USBSerialReader.DEFAULT_RECOVERY_S,
-                        help="Pico AHRS recovery period")
     args = parser.parse_args()
 
     if args.rate <= 0:
@@ -147,15 +137,11 @@ def main() -> int:
         parser.error("--max-imus must be > 0")
 
     print("USB-only IMU gyro spike plotter. No robot hardware/PWM/ADC/controller is initialized.")
-    print(
-        f"Config: SR={args.sr} Hz, GYRO_DPS={args.gyro_dps}, GAIN={args.gain}, "
-        f"ACC_REJ={args.accel_rejection}, RECOV_S={args.recovery_s}"
-    )
+    print("Firmware config: SR=200Hz, AHRS settings hardcoded in Pico firmware.")
 
     reader = USBSerialReader(
         baud_rate=args.baud,
         port=args.port,
-        simulation_mode=args.sim,
         debug=args.debug,
     )
 
@@ -175,17 +161,6 @@ def main() -> int:
     plot_state = _setup_plot(args, args.max_imus)
 
     try:
-        if not args.sim:
-            reader.send_config(
-                sample_rate=args.sr,
-                gyro_dps=args.gyro_dps,
-                gain=args.gain,
-                accel_rejection=args.accel_rejection,
-                recovery_s=args.recovery_s,
-            )
-            if not args.no_wait:
-                reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0)
-
         print("Reading IMU stream. Tap the robot/IMUs and watch |gyro| spikes. Ctrl+C to stop.")
         started = time.monotonic()
         next_tick = started

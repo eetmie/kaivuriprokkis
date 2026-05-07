@@ -8,6 +8,7 @@
 //   m<rpm>    = set cruise/max RPM cap
 //   a<rate>   = set acceleration in output RPM/s
 
+//tare -command
 
 #define PIN_STP  D10
 #define PIN_DIR  D9

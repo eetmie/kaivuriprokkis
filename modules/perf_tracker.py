@@ -23,6 +23,7 @@ Usage:
 
 import threading
 import time
+from collections import deque
 from typing import Dict, Any, Optional
 
 __all__ = ['LoopPerfTracker', 'IntervalTracker', 'ControlLoopPerfTracker']
@@ -434,11 +435,11 @@ class ControlLoopPerfTracker:
         self._lock = threading.Lock()
 
         # Ring buffers for percentile support
-        self._loop_times: list = []
-        self._compute_times: list = []
+        self._loop_times: deque = deque(maxlen=self._buffer_size)
+        self._compute_times: deque = deque(maxlen=self._buffer_size)
 
-        # Stage timing (dict of stage_name -> list of durations)
-        self._stage_times: Dict[str, list] = {}
+        # Stage timing (dict of stage_name -> deque of durations)
+        self._stage_times: Dict[str, deque] = {}
         self._stage_starts: Dict[str, float] = {}
 
         # Counters
@@ -518,8 +519,6 @@ class ControlLoopPerfTracker:
             if interval > 0:
                 with self._lock:
                     self._loop_times.append(interval)
-                    if len(self._loop_times) > self._buffer_size:
-                        self._loop_times.pop(0)
                     if interval > self._target_period:
                         self._deadline_miss_count += 1
                     if interval > (self._target_period * 1.01):
@@ -538,9 +537,6 @@ class ControlLoopPerfTracker:
 
         with self._lock:
             self._compute_times.append(compute_time)
-            if len(self._compute_times) > self._buffer_size:
-                self._compute_times.pop(0)
-
             self._loop_count += 1
             if compute_time > self._target_period:
                 self._violation_count += 1
@@ -566,10 +562,8 @@ class ControlLoopPerfTracker:
         duration = time.perf_counter() - start
         with self._lock:
             if stage_name not in self._stage_times:
-                self._stage_times[stage_name] = []
+                self._stage_times[stage_name] = deque(maxlen=self._buffer_size)
             self._stage_times[stage_name].append(duration)
-            if len(self._stage_times[stage_name]) > self._buffer_size:
-                self._stage_times[stage_name].pop(0)
 
         del self._stage_starts[stage_name]
 
@@ -580,10 +574,8 @@ class ControlLoopPerfTracker:
 
         with self._lock:
             if stage_name not in self._stage_times:
-                self._stage_times[stage_name] = []
+                self._stage_times[stage_name] = deque(maxlen=self._buffer_size)
             self._stage_times[stage_name].append(duration_s)
-            if len(self._stage_times[stage_name]) > self._buffer_size:
-                self._stage_times[stage_name].pop(0)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics.

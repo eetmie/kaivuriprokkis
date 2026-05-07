@@ -306,8 +306,7 @@ class PWMConstants:
     NORMALIZED_COMMAND_MAX = 1.0
 
     # Safety parameters
-    DEFAULT_TIME_WINDOW = 1.0  # seconds
-    SAFE_STATE_THRESHOLD = 0.25
+    DEFAULT_TIME_WINDOW = 0.5  # seconds; short enough to catch a stalled loop quickly
 
 
 class PWMController:
@@ -345,6 +344,7 @@ class PWMController:
             self.logger.addHandler(handler)
 
         self._lock = threading.RLock()
+        self._io_lock = threading.Lock()
         self.pump_auto_mode = bool(pump_auto_mode)
         self.toggle_channels = toggle_channels
         self.pump_enabled = True
@@ -362,7 +362,6 @@ class PWMController:
 
         # Threads/monitoring
         self.running = False
-        self.input_event = threading.Event()
         self.monitor_thread = None
         self.last_input_time = time.time()
 
@@ -378,15 +377,16 @@ class PWMController:
         # Current normalized values per channel
         self.values = [0.0] * PWMConstants.MAX_CHANNELS
 
-        # Monitoring counters
-        self.input_counter = 0
+        # Rate monitoring counter — incremented in update_named() under _lock,
+        # read and reset by _monitor_loop each window. Avoids event coalescing.
+        self._cmd_counter = 0
         self.rate_window_start = time.time()
 
         # Register simple cleanup and start monitoring
         atexit.register(self._simple_cleanup)
         self.reset()
 
-        if not self.skip_rate_checking:
+        if not self.skip_rate_checking or self._stale_timeout_s > 0.0:
             self._start_monitoring()
 
         # Behavior defaults
@@ -732,7 +732,7 @@ class PWMController:
         )
 
     def _start_monitoring(self):
-        if self.skip_rate_checking or (self.monitor_thread and self.monitor_thread.is_alive()):
+        if (self.skip_rate_checking and self._stale_timeout_s <= 0.0) or (self.monitor_thread and self.monitor_thread.is_alive()):
             return
         self.running = True
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -742,52 +742,51 @@ class PWMController:
         if not self.running:
             return
         self.running = False
-        self.input_event.set()
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=2.0)
         self.monitor_thread = None
 
     def _monitor_loop(self):
+        _stale_reset_sent = False
         while self.running:
-            wait_timeout = 0.2 if self.input_rate_threshold <= 0 else min(0.2, 1.0 / self.input_rate_threshold)
-            if self.input_event.wait(timeout=wait_timeout):
-                self.input_event.clear()
-                current_time = time.time()
-                self.last_input_time = current_time
-                self.input_counter += 1
-            else:
-                current_time = time.time()
+            time.sleep(0.05)
+            current_time = time.time()
 
-            # Rolling window safety rate check (less jitter-sensitive)
-            elapsed = current_time - self.rate_window_start
-            if elapsed >= self.time_window:
-                rate = self.input_counter / elapsed if elapsed > 0 else 0.0
-                required_rate = self.input_rate_threshold * PWMConstants.SAFE_STATE_THRESHOLD
-                with self._lock:
-                    self.is_safe_state = (rate >= required_rate)
-                self.input_counter = 0
-                self.rate_window_start = current_time
+            # Rate check: count actual update_named() calls per window.
+            # _cmd_counter is incremented under _lock in update_named(), so read
+            # and reset it atomically here to get an accurate rate regardless of
+            # how many commands arrived between monitor wakeups.
+            if not self.skip_rate_checking:
+                elapsed = current_time - self.rate_window_start
+                if elapsed >= self.time_window:
+                    with self._lock:
+                        count = self._cmd_counter
+                        self._cmd_counter = 0
+                    rate = count / elapsed if elapsed > 0 else 0.0
+                    with self._lock:
+                        self.is_safe_state = (rate >= self.input_rate_threshold)
+                    self.rate_window_start = current_time
 
-            # Stale command timeout: if no updates for too long, reset outputs
+            # Stale command timeout: reset outputs if update_named() stops being called.
+            # Uses its own flag so it fires exactly once per stale period.
             if self._stale_timeout_s > 0.0:
                 if (time.monotonic() - self._last_command_ts) > self._stale_timeout_s:
-                    with self._lock:
-                        if self.is_safe_state:
+                    if not _stale_reset_sent:
+                        with self._lock:
                             self.reset(reset_pump=False)
                             self.is_safe_state = False
+                        _stale_reset_sent = True
                     continue
-
-            if (current_time - self.last_input_time) > self.time_window:
-                with self._lock:
-                    if self.is_safe_state:
-                        self.reset(reset_pump=False)
-                        self.is_safe_state = False
+                else:
+                    _stale_reset_sent = False
 
     def update_named(self, commands: Dict[str, float], *, unset_to_zero: Optional[bool] = None,
                      command_ts: Optional[float] = None):
         # Performance tracking (before lock to capture full update time)
         self._perf_tracker.tick_start()
 
+        duty_updates = []
+        io_locked = False
         with self._lock:
             now_mono = time.monotonic()
             if command_ts is not None and self._stale_timeout_s > 0.0:
@@ -796,7 +795,7 @@ class PWMController:
             self._last_command_ts = now_mono
 
             if not self.skip_rate_checking:
-                self.input_event.set()
+                self._cmd_counter += 1
                 if not self.is_safe_state:
                     return
 
@@ -822,12 +821,42 @@ class PWMController:
                 self.pump_activity_sum += abs(self.values[cfg.output_channel])
                 self.pump_activity_count += 1
 
-            self._update_channels()
-            self._update_pump()
-            self._direct_writer.flush()  # Single I2C transaction for all channels + pump
+            now = time.monotonic()
+            duty_updates = self._collect_channel_duties(now)
+            pump_update = self._pump_duty_update()
+            if pump_update is not None:
+                duty_updates.append(pump_update)
+
+            # Preserve write ordering but do not hold the PWM state lock during I2C.
+            self._io_lock.acquire()
+            io_locked = True
+
+        try:
+            self._flush_duty_updates(duty_updates)
+        finally:
+            if io_locked:
+                self._io_lock.release()
 
         # Performance tracking (after lock released, captures full update cycle)
         self._perf_tracker.tick_end()
+
+    def _collect_channel_duties(self, now: float) -> List[tuple[int, int]]:
+        updates: List[tuple[int, int]] = []
+        for name, config in self.channel_configs.items():
+            if not self.toggle_channels and config.toggleable:
+                continue
+
+            value = self.values[config.output_channel]
+            pulse = self._pulse_from_value(config, value, now, apply_ramp=True)
+            duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
+            duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
+            updates.append((config.output_channel, duty_cycle))
+        return updates
+
+    def _flush_duty_updates(self, updates: List[tuple[int, int]]) -> None:
+        for channel, duty_cycle in updates:
+            self._direct_writer.set_channel(channel, duty_cycle)
+        self._direct_writer.flush()
 
     def _update_channels(self):
         with self._lock:
@@ -1052,35 +1081,46 @@ class PWMController:
     def _update_pump(self, flush: bool = False):
         """Update pump channel. Set flush=True for standalone calls outside update_named."""
         with self._lock:
-            if not self.pump_config:
+            update = self._pump_duty_update()
+            if update is None:
                 return
-            if not self.pump_enabled:
-                pulse = float(self.pump_config.pulse_min)
-            elif self._pump_direct_us is not None:
-                # Direct control: caller owns the pulse, no auto logic applied
-                pulse = max(float(self.pump_config.pulse_min),
-                            min(float(self.pump_config.pulse_max), self._pump_direct_us))
-            elif self.pump_auto_mode:
-                # Auto mode: scale between base_pulse_us and base+activity_gain based on valve activity
-                denom = max(1, self.pump_activity_count)
-                avg_activity = self.pump_activity_sum / denom  # 0.0 – 1.0
-                pulse = self.pump_config.base_pulse_us + (
-                    self.pump_config.activity_gain_us * avg_activity
-                )
-                pulse = max(float(self.pump_config.pulse_min),
-                            min(float(self.pump_config.pulse_max), pulse))
-            else:
-                # Static mode: fixed speed from config
-                pulse = max(float(self.pump_config.pulse_min),
-                            min(float(self.pump_config.pulse_max), self.pump_config.static_pulse_us))
+            if not flush:
+                self._direct_writer.set_channel(update[0], update[1])
+                return
 
-            duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
-            duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
-            self._direct_writer.set_channel(self.pump_config.output_channel, duty_cycle)
-            if flush:
-                self._direct_writer.flush()
+        with self._io_lock:
+            self._flush_duty_updates([update])
+
+    def _pump_duty_update(self) -> Optional[tuple[int, int]]:
+        if not self.pump_config:
+            return None
+        if not self.pump_enabled:
+            pulse = float(self.pump_config.pulse_min)
+        elif self._pump_direct_us is not None:
+            # Direct control: caller owns the pulse, no auto logic applied
+            pulse = max(float(self.pump_config.pulse_min),
+                        min(float(self.pump_config.pulse_max), self._pump_direct_us))
+        elif self.pump_auto_mode:
+            # Auto mode: scale between base_pulse_us and base+activity_gain based on valve activity
+            denom = max(1, self.pump_activity_count)
+            avg_activity = self.pump_activity_sum / denom  # 0.0 - 1.0
+            pulse = self.pump_config.base_pulse_us + (
+                self.pump_config.activity_gain_us * avg_activity
+            )
+            pulse = max(float(self.pump_config.pulse_min),
+                        min(float(self.pump_config.pulse_max), pulse))
+        else:
+            # Static mode: fixed speed from config
+            pulse = max(float(self.pump_config.pulse_min),
+                        min(float(self.pump_config.pulse_max), self.pump_config.static_pulse_us))
+
+        duty_cycle = int((pulse / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
+        duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
+        return self.pump_config.output_channel, duty_cycle
 
     def reset(self, reset_pump: bool = True):
+        duty_updates = []
+        io_locked = False
         with self._lock:
             self.values = [0.0] * PWMConstants.MAX_CHANNELS
             self.pump_activity_sum = 0.0
@@ -1089,15 +1129,22 @@ class PWMController:
             for name, config in self.channel_configs.items():
                 duty_cycle = int((config.center / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
                 duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
-                self._direct_writer.set_channel(config.output_channel, duty_cycle)
+                duty_updates.append((config.output_channel, duty_cycle))
             self._init_ramp_state()
             if reset_pump and self.pump_config:
                 duty_cycle = int((self.pump_config.pulse_min / self._pwm_period_us) * PWMConstants.DUTY_CYCLE_MAX)
                 duty_cycle = max(0, min(PWMConstants.DUTY_CYCLE_MAX, duty_cycle))
-                self._direct_writer.set_channel(self.pump_config.output_channel, duty_cycle)
-            self._direct_writer.flush()
+                duty_updates.append((self.pump_config.output_channel, duty_cycle))
             self.is_safe_state = False
             self.input_counter = 0
+            self._io_lock.acquire()
+            io_locked = True
+
+        try:
+            self._flush_duty_updates(duty_updates)
+        finally:
+            if io_locked:
+                self._io_lock.release()
 
     def get_average_input_rate(self) -> float:
         current_time = time.time()
@@ -1137,8 +1184,8 @@ class PWMController:
     def set_pump_enabled(self, enabled: bool, flush: bool = True):
         with self._lock:
             self.pump_enabled = bool(enabled)
-            if flush:
-                self._update_pump(flush=True)
+        if flush:
+            self._update_pump(flush=True)
 
     def set_pump_auto(self, auto: bool):
         """Enable (True) or disable (False) valve-activity-based auto speed scaling."""
@@ -1174,8 +1221,8 @@ class PWMController:
                                                min(float(self.pump_config.pulse_max), float(pulse_us)))
                 else:
                     self._pump_direct_us = float(pulse_us)
-            if flush:
-                self._update_pump(flush=True)
+        if flush:
+            self._update_pump(flush=True)
 
     def disable_channels(self, disabled: bool):
         self.toggle_channels = not disabled

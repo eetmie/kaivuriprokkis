@@ -182,7 +182,7 @@ def get_thread_info(target_id: Optional[int] = None) -> Dict[str, Any]:
 def apply_rt_to_thread(
     priority: Optional[int] = PRIORITY_DEFAULT,
     policy: int = SCHED_FIFO,
-    lock_memory: bool = False,
+    lock_memory: bool = True,
     cpu_affinity: Optional[Set[int]] = None,
     quiet: bool = False,
     target_id: Optional[int] = None,

@@ -23,7 +23,7 @@ class PathExecutionConfig:
     """Unified configuration for path execution in both sim and real systems."""
 
     # Motion parameters ------------------------------
-    speed_mps: float = 0.030  #(0.02...70worked good) Target constant speed for standardized execution (m/s)
+    speed_mps: float = 0.070  #(0.02...70worked good) Target constant speed for standardized execution (m/s)
     # Jerk-limited controller smoothing settings.
     # NOTE: This jerk system is not hardware-tested yet and probably does not
     # work reliably; keep these values conservative until it is validated.
@@ -32,7 +32,7 @@ class PathExecutionConfig:
     max_jerk_mps3: float = 2.0
     enable_jerk: bool = False
     update_frequency: float = 100.0  # Hz - target harware loop frequency / simulation update rate
-    dt: float = 1 / 60        # Pathing waypoint sample period — matches sim physics dt (60 Hz).
+    dt: float = 1 / 100        # Pathing waypoint sample period — matches sim physics dt (headless).
 
 
     # Normalization / trajectory representation options
@@ -44,7 +44,7 @@ class PathExecutionConfig:
 
     # Path planning general parameters (apply to all algorithms)
     grid_resolution: float = 0.020  # 20mm. Grid cell size used for A* (and bounds for others)
-    safety_margin: float = 0.06    # Obstacle safety margin in meters.
+    safety_margin: float = 0.05    # Obstacle safety margin in meters.
 
     # Algorithm dimensionality
     # Use full 3D planning vs X-Z plane only

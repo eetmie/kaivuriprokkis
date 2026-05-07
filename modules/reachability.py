@@ -14,8 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from .differential_ik import (
-    joint_angles_to_absolute_quaternions, get_pose_from_joint_angles,
-    compute_jacobian_from_joint_angles, compute_condition_number,
+    joint_angles_to_absolute_quaternions,
+    forward_kinematics_with_ee_offset_core,
 )
 from .excavator_ik_utils import compute_relative_joint_angles
 from .quaternion_math import quat_from_axis_angle, quat_multiply, quat_normalize
@@ -106,9 +106,15 @@ def check_reachability(
     for i in range(max_iters):
         iters_used = i + 1
         quats = joint_angles_to_absolute_quaternions(angles, robot_config)
-        ee_pos, ee_quat = get_pose_from_joint_angles(angles, robot_config)
+        _, ee_pos = forward_kinematics_with_ee_offset_core(
+            quats,
+            robot_config.link_lengths,
+            robot_config.link_directions,
+            robot_config.origin_offset,
+            robot_config.ee_offset,
+        )
         ee_pos = np.asarray(ee_pos, dtype=np.float32)
-        ee_quat = np.asarray(ee_quat, dtype=np.float32)
+        ee_quat = quats[-1].copy()
         # Live IK composes tool pitch with the current slew every control tick
         # so yaw error stays zero while slew remains free to chase position.
         slew_quat = quat_from_axis_angle(
@@ -116,12 +122,6 @@ def check_reachability(
             np.float32(angles[0]),
         )
         sim_ik.ee_quat_des = quat_normalize(quat_multiply(slew_quat, pitch_quat))
-        if cond_threshold > 0.0:
-            sim_ik.last_condition_number = float(
-                compute_condition_number(
-                    compute_jacobian_from_joint_angles(angles, robot_config)
-                )
-            )
 
         err = float(np.linalg.norm(target_pos - ee_pos))
         err_history.append(err)
@@ -154,22 +154,3 @@ def check_reachability(
         iters=iters_used,
         final_cond_number=final_cond,
     )
-
-
-def _absolute_quaternions_from_angles(joint_angles: np.ndarray, robot_config) -> np.ndarray:
-    """Compose absolute joint quaternions from relative angles.
-
-    Mirrors ``tests/common_kinematics.build_absolute_quaternions`` so the
-    rollout can advance state without going through the hardware IMU path.
-    """
-    from .quaternion_math import quat_multiply, quat_normalize
-
-    joint_angles = np.asarray(joint_angles, dtype=np.float32)
-    axes = robot_config.rotation_axes
-    absolute = np.zeros((len(joint_angles), 4), dtype=np.float32)
-
-    absolute[0] = quat_from_axis_angle(axes[0], np.float32(joint_angles[0]))
-    for i in range(1, len(joint_angles)):
-        local = quat_from_axis_angle(axes[i], np.float32(joint_angles[i]))
-        absolute[i] = quat_normalize(quat_multiply(absolute[i - 1], local))
-    return absolute

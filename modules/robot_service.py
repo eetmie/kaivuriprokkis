@@ -1,4 +1,5 @@
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -32,25 +33,36 @@ class RobotService:
         self.controller = controller
         self.hardware = hardware
         self.robot_config = load_excavator_robot_config()
+        self._state_lock = threading.Lock()
         self.state = RobotServiceState()
         self._telemetry_sequence = 0
 
         try:
             measured_pos, measured_rot = self.controller.get_pose()
-            self.state.target_pose = PoseTarget(
-                float(measured_pos[0]),
-                float(measured_pos[1]),
-                float(measured_pos[2]),
-                float(measured_rot),
-            )
+            with self._state_lock:
+                self.state.target_pose = PoseTarget(
+                    float(measured_pos[0]),
+                    float(measured_pos[1]),
+                    float(measured_pos[2]),
+                    float(measured_rot),
+                )
         except Exception:
             pass
+
+    def _log_service_warning(self, message: str, *args) -> None:
+        logger = getattr(self.controller, "logger", None)
+        if logger is not None and hasattr(logger, "warning"):
+            try:
+                logger.warning(message, *args)
+            except Exception:
+                pass
 
     def _set_pump_enabled(self, enabled: bool) -> None:
         try:
             if hasattr(self.hardware, "set_pump_enabled"):
                 self.hardware.set_pump_enabled(enabled)
-        except Exception:
+        except Exception as exc:
+            self._log_service_warning("Pump enable sync failed: %s", exc)
             pass
 
     def submit_command(self, command: ControlCommand) -> Optional[ReachabilityResult]:
@@ -60,70 +72,72 @@ class RobotService:
         was submitted (None for direct mode, paused commands, or when the
         reachability check is disabled).
         """
-        self.state.last_command_sequence = int(command.sequence)
+        with self._state_lock:
+            self.state.last_command_sequence = int(command.sequence)
 
-        if command.reload_config:
-            self.hardware.reload_config()
+            if command.reload_config:
+                self.hardware.reload_config()
 
-        if command.pause and not self.state.paused:
-            self.controller.pause()
-            self._set_pump_enabled(False)
-            self.state.paused = True
+            if command.pause and not self.state.paused:
+                self.controller.pause()
+                self._set_pump_enabled(False)
+                self.state.paused = True
 
-        if command.resume and self.state.paused:
-            self.controller.resume()
-            self._set_pump_enabled(True)
-            self.state.paused = False
+            if command.resume and self.state.paused:
+                self.controller.resume()
+                self._set_pump_enabled(True)
+                self.state.paused = False
 
-        if command.mode == ControlMode.DIRECT and self.state.mode != ControlMode.DIRECT:
-            self.controller.enter_direct_mode()
-            self.state.mode = ControlMode.DIRECT
-        elif command.mode == ControlMode.IK and self.state.mode != ControlMode.IK:
-            self.controller.exit_direct_mode()
-            self.state.mode = ControlMode.IK
-            try:
-                measured_pos, measured_rot = self.controller.get_pose()
-                self.state.target_pose = PoseTarget(
-                    float(measured_pos[0]),
-                    float(measured_pos[1]),
-                    float(measured_pos[2]),
-                    float(measured_rot),
+            if command.mode == ControlMode.DIRECT and self.state.mode != ControlMode.DIRECT:
+                self.controller.enter_direct_mode()
+                self.state.mode = ControlMode.DIRECT
+            elif command.mode == ControlMode.IK and self.state.mode != ControlMode.IK:
+                self.controller.exit_direct_mode()
+                self.state.mode = ControlMode.IK
+                try:
+                    measured_pos, measured_rot = self.controller.get_pose()
+                    self.state.target_pose = PoseTarget(
+                        float(measured_pos[0]),
+                        float(measured_pos[1]),
+                        float(measured_pos[2]),
+                        float(measured_rot),
+                    )
+                except Exception as exc:
+                    self._log_service_warning("Failed to sync IK target pose after mode switch: %s", exc)
+                    pass
+
+            if self.state.mode == ControlMode.DIRECT:
+                self.state.direct_command = DirectCommand(
+                    float(command.direct.slew),
+                    float(command.direct.boom),
+                    float(command.direct.arm),
+                    float(command.direct.bucket),
                 )
-            except Exception:
-                pass
-
-        if self.state.mode == ControlMode.DIRECT:
-            self.state.direct_command = DirectCommand(
-                float(command.direct.slew),
-                float(command.direct.boom),
-                float(command.direct.arm),
-                float(command.direct.bucket),
-            )
-            if not self.state.paused:
-                self.controller.give_direct_commands({
-                    "rotate": self.state.direct_command.slew,
-                    "lift_boom": self.state.direct_command.boom,
-                    "tilt_boom": self.state.direct_command.arm,
-                    "scoop": self.state.direct_command.bucket,
-                })
-        else:
-            requested_pose = PoseTarget(
-                float(command.pose.x),
-                float(command.pose.y),
-                float(command.pose.z),
-                float(command.pose.rot_y_deg),
-            )
-            if not self.state.paused:
-                result = self.controller.give_pose(
-                    np.array([requested_pose.x, requested_pose.y, requested_pose.z], dtype=np.float32),
-                    float(requested_pose.rot_y_deg),
+                if not self.state.paused:
+                    self.controller.give_direct_commands({
+                        "rotate": self.state.direct_command.slew,
+                        "lift_boom": self.state.direct_command.boom,
+                        "tilt_boom": self.state.direct_command.arm,
+                        "scoop": self.state.direct_command.bucket,
+                    })
+            else:
+                requested_pose = PoseTarget(
+                    float(command.pose.x),
+                    float(command.pose.y),
+                    float(command.pose.z),
+                    float(command.pose.rot_y_deg),
                 )
-                if result is not None and not result.reachable:
+                if not self.state.paused:
+                    result = self.controller.give_pose(
+                        np.array([requested_pose.x, requested_pose.y, requested_pose.z], dtype=np.float32),
+                        float(requested_pose.rot_y_deg),
+                    )
+                    if result is not None and not result.reachable:
+                        return result
+                    self.state.target_pose = requested_pose
                     return result
                 self.state.target_pose = requested_pose
-                return result
-            self.state.target_pose = requested_pose
-        return None
+            return None
 
     # ---- Lifecycle wrappers ----
 
@@ -140,12 +154,14 @@ class RobotService:
         """Reset performance statistics on controller and hardware."""
         try:
             self.controller.reset_performance_stats()
-        except Exception:
+        except Exception as exc:
+            self._log_service_warning("Controller perf reset failed: %s", exc)
             pass
         try:
             if hasattr(self.hardware, "reset_perf_stats"):
                 self.hardware.reset_perf_stats()
-        except Exception:
+        except Exception as exc:
+            self._log_service_warning("Hardware perf reset failed: %s", exc)
             pass
 
     def get_debug_state(self) -> dict:
@@ -183,20 +199,33 @@ class RobotService:
         perf_stats = {}
         try:
             perf_stats = self.controller.get_performance_stats() or {}
-        except Exception:
+        except Exception as exc:
+            self._log_service_warning("Controller perf stats unavailable: %s", exc)
             perf_stats = {}
 
         try:
             hardware_ready = bool(self.hardware.is_hardware_ready())
-        except Exception:
+        except Exception as exc:
+            self._log_service_warning("Hardware readiness check failed: %s", exc)
             hardware_ready = False
 
-        self._telemetry_sequence += 1
+        with self._state_lock:
+            self._telemetry_sequence += 1
+            telemetry_sequence = self._telemetry_sequence
+            mode = self.state.mode
+            paused = self.state.paused
+            target_pose = PoseTarget(
+                float(self.state.target_pose.x),
+                float(self.state.target_pose.y),
+                float(self.state.target_pose.z),
+                float(self.state.target_pose.rot_y_deg),
+            )
+
         return RobotTelemetry(
-            sequence=self._telemetry_sequence,
+            sequence=telemetry_sequence,
             timestamp_ms=int(time.time() * 1000) & 0xFFFFFFFF,
-            mode=self.state.mode,
-            paused=self.state.paused,
+            mode=mode,
+            paused=paused,
             hardware_ready=hardware_ready,
             slew_fusion_enabled=bool(perf_stats.get("slew_fusion_enabled", False)),
             slew_fusion_active=bool(perf_stats.get("slew_fusion_active", False)),
@@ -206,12 +235,7 @@ class RobotService:
                 float(measured_pos[2]),
                 float(measured_rot),
             ),
-            target_pose=PoseTarget(
-                float(self.state.target_pose.x),
-                float(self.state.target_pose.y),
-                float(self.state.target_pose.z),
-                float(self.state.target_pose.rot_y_deg),
-            ),
+            target_pose=target_pose,
             joint_angles_deg=tuple(float(v) for v in np.asarray(joint_angles, dtype=np.float32).tolist()),
             joint_positions=joint_positions,
             slew_fusion_gyro_z_degps=float(perf_stats.get("slew_fusion_gyro_z_degps", 0.0)),

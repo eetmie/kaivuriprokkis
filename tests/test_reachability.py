@@ -235,6 +235,16 @@ class ControllerIntegrationTests(unittest.TestCase):
             ctrl.give_pose(target + np.array([0.005, 0.0, 0.0], dtype=np.float32))
             self.assertEqual(spy.call_count, 2)
 
+    def test_reachability_warns_when_current_state_missing(self):
+        ctrl = self._make_controller()
+        ctrl._current_fk_quats = None
+        ctrl._current_joint_angles = None
+
+        result = ctrl._evaluate_reachability(np.array([0.5, 0.0, -0.1], dtype=np.float32), 0.0)
+
+        self.assertTrue(result.reachable)
+        ctrl.logger.warning.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()

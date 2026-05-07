@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""USB IMU reader throughput stress test."""
+"""USB IMU reader throughput stress test.
+
+MANUAL HARDWARE TEST — requires a Pico IMU connected via USB. Not a unit test.
+"""
 
 import argparse
 import os
@@ -32,7 +35,8 @@ def _cpu_affinity(core):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stress-test the Pico USB IMU reader")
-    parser.add_argument("--target-hz", type=int, default=200)
+    parser.add_argument("--target-hz", type=int, default=200,
+                        help="Display-only expected rate; firmware streams at a fixed 200 Hz")
     parser.add_argument("--duration-s", type=float, default=20.0)
     parser.add_argument("--fifo-priority", type=int, default=75)
     parser.add_argument("--lock-memory", action="store_true", help="Call mlockall() for RT threads")
@@ -51,15 +55,21 @@ def main() -> int:
         reader = USBSerialReader(
             baud_rate=115200,
             timeout=1.0,
-            simulation_mode=False,
             log_level=args.log_level.upper(),
             rt_priority=args.fifo_priority,
             rt_lock_memory=args.lock_memory,
             rt_cpu_core=args.cpu_core,
         )
-        reader.send_config(sample_rate=args.target_hz)
-        reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=120.0)
         reader.start_background_reader()
+
+        # Firmware self-calibrates for ~30 s after power-on before streaming starts.
+        print("[stress] waiting for first IMU frame (Pico self-calibrates ~30 s after power-on)...")
+        wait_start = time.perf_counter()
+        while reader.get_latest_imus(only_new=False) is None:
+            if (time.perf_counter() - wait_start) > 120.0:
+                raise TimeoutError("No IMU frame received within 120 s")
+            time.sleep(0.2)
+        print(f"[stress] IMU streaming — starting test (waited {time.perf_counter() - wait_start:.1f} s)")
 
         apply_rt_to_thread(
             priority=args.fifo_priority,

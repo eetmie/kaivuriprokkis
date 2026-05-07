@@ -61,6 +61,32 @@ class ReadyState:
     FAULT = "fault"      # Failed permanently, unrecoverable
 
 
+class _ImuSnapshot:
+    """Immutable IMU data bundle published atomically by the IMU thread.
+
+    The control-loop hot path reads this with a single attribute load (no lock).
+    All fields are set once at construction; the snapshot is never mutated.
+    CPython guarantees that a single STORE_ATTR / LOAD_ATTR is atomic under the
+    GIL, so replacing self._imu_snapshot with a new instance is safe without an
+    explicit lock on the read side.
+    """
+    __slots__ = (
+        'imu_data', 'imu_by_role', 'base_imu_quat', 'base_imu_gyro',
+        'imu_gyro', 'raw_quat', 'corrected_quat', 'device_ts',
+    )
+
+    def __init__(self, *, imu_data, imu_by_role, base_imu_quat, base_imu_gyro,
+                 imu_gyro, raw_quat, corrected_quat, device_ts):
+        self.imu_data = imu_data
+        self.imu_by_role = imu_by_role
+        self.base_imu_quat = base_imu_quat
+        self.base_imu_gyro = base_imu_gyro
+        self.imu_gyro = imu_gyro
+        self.raw_quat = raw_quat
+        self.corrected_quat = corrected_quat
+        self.device_ts = device_ts
+
+
 class HardwareFaultError(Exception):
     """Raised when a hardware subsystem has faulted."""
     def __init__(self, subsystem: str, reason: str):
@@ -99,23 +125,17 @@ class HardwareInterface:
                  config_file: str = "configuration_files/servo_config_200.yaml",
                  pump_auto_mode: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
-                 # Defaults to disabled input gate checking for IK usage! Remember to enable if internal safety stop is desired.
-                 input_rate_threshold: int = 0,
-                 stale_timeout_s: float = 0.0,
+                 input_rate_threshold: int = 20,
+                 stale_timeout_s: float = 0.5,
                  default_unset_to_zero: bool = True,
                  cleanup_disable_osc: bool = True,
                  perf_enabled: bool = False,
-                 imu_expected_hz: Optional[float] = None,
-                 imu_gyro_dps: Optional[int] = None,
-                 imu_ahrs_gain: Optional[float] = None,
-                 imu_accel_rejection: Optional[float] = None,
-                 imu_recovery_s: Optional[float] = None,
-                 adc_sample_hz: float = 200.0,
+                 adc_sample_hz: float = 20.0,
                  adc_channels: Optional[List[Any]] = None,
                  log_level: str = "INFO",
                  enable_pwm: bool = True,
                  enable_imu: bool = True,
-                 enable_adc: bool = True,
+                 enable_adc: bool = False,
                  start_imu_reader: bool = True,
                  start_adc_reader: bool = True,
                  rt_lock_memory: bool = False,
@@ -133,14 +153,14 @@ class HardwareInterface:
             config_file: Path to PWM controller configuration
             pump_auto_mode: Whether to use valve-activity-based auto pump speed (True) or static speed (False)
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
-            input_rate_threshold: Input rate threshold for PWM controller safety monitoring.
-                                  If > 0, enables rate checking and resets PWM if rate drops below threshold.
-            stale_timeout_s: If > 0, reject commands older than this (requires command_ts in send_named_pwm_commands).
-                             Also triggers PWM reset if no commands received within this timeout.
+            input_rate_threshold: Minimum required PWM command rate (Hz). Resets valves to center
+                                  if the control loop drops below this rate. Default 20 Hz.
+            stale_timeout_s: Centers all valves if no PWM command arrives within this window (last-resort watchdog).
+                             Default 0.5 s — fires if the control thread dies without calling stop().
             log_level: Logging level - "DEBUG", "INFO", "WARNING", "ERROR"
             enable_pwm: If False, skip PWM controller initialization (sensor-only mode)
             enable_imu: If False, skip IMU initialization and threads
-            enable_adc: If False, skip ADC/encoder initialization and threads
+            enable_adc: If False, skip pressure ADC initialization and threads
             start_imu_reader: Auto-start IMU background thread when IMU is enabled
             start_adc_reader: Auto-start ADC background thread when ADC is enabled
             rt_lock_memory: Whether to call mlockall() for RT worker threads.
@@ -150,7 +170,7 @@ class HardwareInterface:
             usb_cpu_core: CPU core to pin USB serial background reader thread to.
             imu_cpu_core: CPU core to pin IMU thread to (None = no pinning, 0-3 on Pi 5).
             adc_cpu_core: CPU core to pin ADC thread to (None = no pinning, 0-3 on Pi 5).
-            adc_sample_hz: Target ADC sampling frequency for the background thread
+            adc_sample_hz: Target pressure ADC sampling frequency for the background thread
             adc_channels: List of ADC channels to sample in the background thread.
                            Accepts sensor names from ADCConfig or (board, channel) tuples.
             pwm_frequency: PCA9685 PWM signal frequency in Hz (None = use default 50Hz).
@@ -159,8 +179,9 @@ class HardwareInterface:
         self.logger = logging.getLogger(f"{__name__}.HardwareInterface")
         self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-        # Add console handler if no handlers exist
-        if not self.logger.handlers:
+        # Only add a fallback handler when no root handler exists (standalone use).
+        # When run under run_hw_v2 / basicConfig, propagation to root is sufficient.
+        if not logging.root.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('[%(levelname)s] %(name)s: %(message)s')
             handler.setFormatter(formatter)
@@ -182,13 +203,9 @@ class HardwareInterface:
         self._adc_channel_requests = list(adc_channels) if adc_channels is not None else None
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name}
 
-        # IMU AHRS settings - load from config file, with constructor overrides
+        # IMU mapping and chain — AHRS params are hardcoded in Pico firmware.
         _cfg = _load_control_config()
         _imu_cfg = _cfg.get('imu', {})
-        self._imu_gyro_dps = int(imu_gyro_dps if imu_gyro_dps is not None else _imu_cfg.get('gyro_dps', 500))
-        self._imu_ahrs_gain = float(imu_ahrs_gain if imu_ahrs_gain is not None else _imu_cfg.get('ahrs_gain', 0.5))
-        self._imu_accel_rejection = float(imu_accel_rejection if imu_accel_rejection is not None else _imu_cfg.get('accel_rejection', 10.0))
-        self._imu_recovery_s = float(imu_recovery_s if imu_recovery_s is not None else _imu_cfg.get('recovery_s', 1.0))
         # Named IMU mapping: logical role -> physical sensor index
         _imu_mapping = _imu_cfg.get('imu_mapping')
         if _imu_mapping is None or not isinstance(_imu_mapping, dict):
@@ -317,18 +334,17 @@ class HardwareInterface:
         self.latest_imu_by_role = None
         self.latest_imu_raw_quat = None
         self.latest_imu_corrected_quat = None
-        self.latest_imu_pitch = None  # radians, if available from stream
         self.latest_base_imu_quat = None   # Base/slew IMU quaternion used by IK yaw extraction
         self.latest_base_imu_gyro = None   # Base IMU gyro [gx, gy, gz] deg/s
         self._imu_lock = threading.Lock()
-        self._imu_expected_hz = None
+        # Lock-free snapshot for control-loop hot path (read_imu_data / read_base_imu).
+        # Written by the IMU thread via a single atomic assignment; read without any lock.
+        self._imu_snapshot: Optional[_ImuSnapshot] = None
         self.usb_reader = None
-        # IMU target sample rate (from config or constructor override)
-        if self._enable_imu:
-            _cfg = _load_control_config()
-            _imu_cfg = _cfg.get('imu', {})
-        # imu_expected_hz / sample_rate no longer sent to Pico — output is fixed 200 Hz in firmware.
-        # Debug telemetry (gated): when enabled, keep latest IMU gyro data for logging
+        # IMU streams at a fixed 200 Hz from firmware; no rate negotiation needed.
+        # Corrected gyro is always retained because it arrives in every IMU packet and
+        # is used by controllers/loggers. Only the heavier raw debug quaternion copies
+        # are gated by _debug_telemetry_enabled.
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
         self._imu_last_device_ts = None
@@ -336,7 +352,7 @@ class HardwareInterface:
         if self._enable_imu and self._auto_start_imu:
             self._start_imu_reader()
 
-        # Initialize ADC and encoder
+        # Initialize pressure ADC
         # Use tri-state: PENDING -> READY or FAULT
         # If disabled, mark as READY (not needed = OK)
         self._adc_state = ReadyState.PENDING if self._enable_adc else ReadyState.READY
@@ -347,7 +363,7 @@ class HardwareInterface:
         self._latest_adc_timestamp = None
         self.adc_thread = None
         self.adc = None
-        # ADC/encoder expected rate (constructor arg, no config fallback)
+        # Pressure ADC expected rate (constructor arg, no config fallback)
         if self._enable_adc:
             self._adc_expected_hz = float(adc_sample_hz)
             # Initialize ADC hardware even if the thread is not started so callers can read synchronously.
@@ -357,36 +373,6 @@ class HardwareInterface:
                 else:
                     self._adc_state = ReadyState.READY
     
-    def _check_imu_streaming(self, timeout: float = 2.0) -> bool:
-        """Check if IMUs are already streaming valid data."""
-        if self.usb_reader is None:
-            return False
-
-        start_time = time.time()
-        valid_count = 0
-
-        count_checked = False
-        while (time.time() - start_time) < timeout:
-            imu_data = self.usb_reader.read_imus()
-            if imu_data is not None and len(imu_data) >= self._expected_imu_count:
-                # On first valid frame, enforce sensor count
-                if not count_checked:
-                    num_sensors = getattr(self.usb_reader, 'num_sensors', len(imu_data))
-                    if num_sensors != self._expected_imu_count:
-                        self._imu_state = ReadyState.FAULT
-                        self._imu_fault_reason = (
-                            f"Expected {self._expected_imu_count} IMUs, "
-                            f"firmware reports {num_sensors}"
-                        )
-                        return False
-                    count_checked = True
-                valid_count += 1
-                if valid_count >= 3:  # Got multiple valid readings
-                    return True
-            time.sleep(0.1)
-
-        return False
-
     def _check_faults(self) -> None:
         """Check for hardware faults and raise HardwareFaultError if any subsystem has faulted.
 
@@ -418,30 +404,17 @@ class HardwareInterface:
             return
         if USBSerialReader is not None:
             try:
-                # Initialize USBSerialReader with basic parameters
-                # Data format: CSV with [w,x,y,z,gx,gy,gz] per IMU
+                # Data format: binary frames with [w,x,y,z,gx,gy,gz] per IMU
                 self.usb_reader = USBSerialReader(
                     baud_rate=115200,
                     timeout=1.0,
-                    simulation_mode=False,
                     rt_priority=self._usb_rt_priority,
                     rt_lock_memory=self._rt_lock_memory,
                     rt_cpu_core=self._usb_cpu_core,
                 )
-
-                # Send config and wait for acknowledgment
-                self.usb_reader.send_config(
-                    gyro_dps=self._imu_gyro_dps,
-                    gain=self._imu_ahrs_gain,
-                    accel_rejection=self._imu_accel_rejection,
-                    recovery_s=self._imu_recovery_s,
-                )
-                self.logger.info(
-                    "Waiting for IMU startup; Pico spends ~30s doing stationary gyro calibration"
-                )
-                if not self.usb_reader.wait_for_cfg_ok(timeout_s=3.0, calibration_timeout_s=120.0):
-                    self.logger.warning("IMU config acknowledgment not received")
-
+                # Firmware self-calibrates on power-on (~30 s stationary), then streams
+                # at 200 Hz autonomously. No config handshake needed.
+                self.logger.info("IMU connected; Pico firmware will self-calibrate (~30 s) then stream at 200 Hz")
                 self.usb_reader.start_background_reader()
 
                 # Start background thread for IMU reading
@@ -490,10 +463,26 @@ class HardwareInterface:
             else:
                 self.logger.warning("IMU thread: Failed to apply requested RT settings")
 
+        # Pico streams at 200 Hz; declare data stale if nothing arrives within this window.
+        _IMU_STALE_TIMEOUT_S = 0.5
+        _last_valid_packet_t = time.monotonic()
+
         while not self._stop_event.is_set():
             try:
-                # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] arrays
+                # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] packets
                 imu_packets = self.usb_reader.get_latest_imus(only_new=True)
+
+                # Silent-disconnect guard: if no packets arrive for too long, mark PENDING.
+                if imu_packets is None or len(imu_packets) < self._expected_imu_count:
+                    if time.monotonic() - _last_valid_packet_t > _IMU_STALE_TIMEOUT_S:
+                        with self._imu_lock:
+                            if self._imu_state == ReadyState.READY:
+                                self._imu_state = ReadyState.PENDING
+                                self.logger.warning(
+                                    "IMU data stale (no packets for >%.1f s); marking PENDING",
+                                    _IMU_STALE_TIMEOUT_S,
+                                )
+
                 if imu_packets is not None and len(imu_packets) >= self._expected_imu_count:
                     # Extract only the quaternion portion [w,x,y,z] from each IMU packet
                     # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
@@ -505,18 +494,25 @@ class HardwareInterface:
                         self._correct_imu_quaternion(raw_quat_only[i], i)
                         for i in range(self._expected_imu_count)
                     ]
+                    capture_debug = self._debug_telemetry_enabled
                     gyro_only = [
                         self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
                         for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
                     ]
-                    with self._imu_lock:
-                        self.latest_imu_gyro = [gyro_only[i] for i in self._imu_joint_indices]
-                        self._imu_last_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
-                        # Extract base IMU gyro if configured
-                        if self._base_imu_index is not None:
-                            self.latest_base_imu_gyro = gyro_only[self._base_imu_index].copy()
+                    # Build all derived values before acquiring the lock so the
+                    # lock hold time is just a burst of reference assignments.
+                    new_imu_gyro = [gyro_only[i] for i in self._imu_joint_indices] if gyro_only is not None else None
+                    new_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
+                    new_base_imu_gyro = (
+                        gyro_only[self._base_imu_index].copy()
+                        if gyro_only is not None and self._base_imu_index is not None else None
+                    )
 
-                    # Validate quaternion magnitudes for all configured IMUs (should be ~1.0)
+                    # Validate quaternion magnitudes for all configured IMUs (should be ~1.0).
+                    # During the ~33 s power-on calibration phase (3 s settle + 30 s sampling)
+                    # the Pico sends MSG_TYPE_CAL_WAIT every 200 ms and emits no data frames,
+                    # so _imu_state stays PENDING and this block is never reached. Magnitude
+                    # validation only runs once streaming begins post-calibration.
                     valid_data = True
                     for i in self._imu_all_indices:
                         mag = np.linalg.norm(quat_only[i])
@@ -524,25 +520,64 @@ class HardwareInterface:
                             valid_data = False
                             break
 
+                    new_imu_by_role = None
+                    new_raw_quat = None
+                    new_corrected_quat = None
+                    new_imu_data = None
+                    new_base_imu_quat = None
+                    became_ready = False
                     if valid_data:
-                        # Atomically update latest data
-                        with self._imu_lock:
-                            self.latest_imu_by_role = {
-                                role: quat_only[idx].copy()
-                                for role, idx in self._imu_mapping.items()
-                            }
-                            self.latest_imu_raw_quat = [q.copy() for q in raw_quat_only]
-                            self.latest_imu_corrected_quat = [q.copy() for q in quat_only]
-                            self.latest_imu_data = [quat_only[i] for i in self._imu_joint_indices]
-                            # Extract base IMU quaternion if configured
-                            if self._base_imu_index is not None:
-                                self.latest_base_imu_quat = quat_only[self._base_imu_index].copy()
-                            # Note: pitch can be computed from quaternion if needed
-                            # pitch = arcsin(2*(w*y - z*x))
+                        new_imu_by_role = {
+                            role: quat_only[idx].copy()
+                            for role, idx in self._imu_mapping.items()
+                        }
+                        if capture_debug:
+                            new_raw_quat = [q.copy() for q in raw_quat_only]
+                            new_corrected_quat = [q.copy() for q in quat_only]
+                        new_imu_data = [quat_only[i] for i in self._imu_joint_indices]
+                        if self._base_imu_index is not None:
+                            new_base_imu_quat = quat_only[self._base_imu_index].copy()
+
+                    if valid_data:
+                        _last_valid_packet_t = time.monotonic()
+
+                    # Publish lock-free snapshot for hot-path readers first.
+                    # Single STORE_ATTR is atomic under the GIL — no lock needed.
+                    if valid_data:
+                        self._imu_snapshot = _ImuSnapshot(
+                            imu_data=new_imu_data,
+                            imu_by_role=new_imu_by_role,
+                            base_imu_quat=new_base_imu_quat,
+                            base_imu_gyro=new_base_imu_gyro,
+                            imu_gyro=new_imu_gyro,
+                            raw_quat=new_raw_quat if capture_debug else None,
+                            corrected_quat=new_corrected_quat if capture_debug else None,
+                            device_ts=new_device_ts,
+                        )
+
+                    # Lock section: keep legacy fields alive for non-hot-path callers
+                    # and manage _imu_state transitions.
+                    with self._imu_lock:
+                        self.latest_imu_gyro = new_imu_gyro
+                        self._imu_last_device_ts = new_device_ts
+                        if new_base_imu_gyro is not None:
+                            self.latest_base_imu_gyro = new_base_imu_gyro
+                        else:
+                            self.latest_base_imu_gyro = None
+                        if valid_data:
+                            self.latest_imu_by_role = new_imu_by_role
+                            self.latest_imu_raw_quat = new_raw_quat if capture_debug else None
+                            self.latest_imu_corrected_quat = new_corrected_quat if capture_debug else None
+                            self.latest_imu_data = new_imu_data
+                            if new_base_imu_quat is not None:
+                                self.latest_base_imu_quat = new_base_imu_quat
                             if self._imu_state != ReadyState.READY:
                                 self._imu_state = ReadyState.READY
-                                self.logger.info("IMU data streaming (CSV)")
+                                became_ready = True
+                    if became_ready:
+                        self.logger.info("IMU data streaming")
 
+                    if valid_data:
                         # Perf: record sample for interval/rate tracking (uses IntervalTracker)
                         self._imu_tracker.record_sample()
 
@@ -678,14 +713,18 @@ class HardwareInterface:
         while not self._stop_event.is_set():
             try:
                 # Sample configured channels
+                new_readings = {}
                 for ch in self._adc_channel_plan:
                     voltage = self.adc.read_channel(ch['board'], ch['channel'])
-                    with self._adc_lock:
-                        self._latest_adc_readings[ch['name']] = voltage
-                        self._latest_adc_timestamp = time.time()
-                        if self._adc_state != ReadyState.READY:
-                            self._adc_state = ReadyState.READY
-                            self.logger.info("ADC sampling ready")
+                    new_readings[ch['name']] = voltage
+
+                sample_timestamp = time.time()
+                with self._adc_lock:
+                    self._latest_adc_readings = new_readings
+                    self._latest_adc_timestamp = sample_timestamp
+                    if self._adc_state != ReadyState.READY:
+                        self._adc_state = ReadyState.READY
+                        self.logger.info("ADC sampling ready")
 
                 # Perf: record sample for interval/rate tracking (uses IntervalTracker)
                 self._adc_tracker.record_sample()
@@ -714,18 +753,16 @@ class HardwareInterface:
         Mounting offsets are already removed in the hardware layer.
 
         Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
-        """
-        # Get latest data atomically - check ready flag inside lock
-        with self._imu_lock:
-            if self._imu_state != ReadyState.READY:
-                raise RuntimeError("IMU not ready - cannot read IMU data")
 
-            if self.latest_imu_data is not None:
-                # Return copy to avoid race conditions
-                corrected_data = [q.copy() for q in self.latest_imu_data]
-                return corrected_data
-            else:
-                raise RuntimeError("IMU data is None despite ready flag being set")
+        Hot path — lock-free. Reads _imu_snapshot via a single atomic attribute
+        load; _imu_state is checked bare (single-word read, safe under CPython GIL).
+        """
+        if self._imu_state != ReadyState.READY:
+            raise RuntimeError("IMU not ready - cannot read IMU data")
+        snapshot = self._imu_snapshot
+        if snapshot is None or snapshot.imu_data is None:
+            raise RuntimeError("IMU data unavailable")
+        return [q.copy() for q in snapshot.imu_data]
 
     @_safe_hardware_operation
     def read_imu_gyro(self) -> Optional[List[np.ndarray]]:
@@ -759,16 +796,20 @@ class HardwareInterface:
 
         Returns {'quat': ndarray[4], 'gyro': ndarray[3]} or None if base IMU
         is not configured or no data has arrived yet.
+
+        Hot path — lock-free via _imu_snapshot.
         """
         if self._base_imu_index is None:
             return None
-        with self._imu_lock:
-            if self.latest_base_imu_quat is None:
-                return None
-            result = {'quat': self.latest_base_imu_quat.copy()}
-            if self.latest_base_imu_gyro is not None:
-                result['gyro'] = self.latest_base_imu_gyro.copy()
-            return result
+        if self._imu_state != ReadyState.READY:
+            return None
+        snapshot = self._imu_snapshot
+        if snapshot is None or snapshot.base_imu_quat is None:
+            return None
+        result = {'quat': snapshot.base_imu_quat.copy()}
+        if snapshot.base_imu_gyro is not None:
+            result['gyro'] = snapshot.base_imu_gyro.copy()
+        return result
 
     @_safe_hardware_operation
     def read_all_imu_quaternions(self) -> Optional[List[np.ndarray]]:
@@ -806,19 +847,6 @@ class HardwareInterface:
                 'descriptors': list(descriptors),
                 'device_timestamp_us': self._imu_last_device_ts,
             }
-
-    @_safe_hardware_operation
-    def read_imu_pitch(self) -> Optional[List[float]]:
-        """Read latest IMU pitch angles (radians) if provided by the serial stream.
-
-        Raises on error instead of returning None (SAFETY: PWM reset + pump stopped before raising)
-        """
-        with self._imu_lock:
-            if self._imu_state != ReadyState.READY:
-                raise RuntimeError("IMU not ready - cannot read pitch data")
-            if self.latest_imu_pitch is None:
-                raise RuntimeError("IMU pitch data is None (may not be streamed by device)")
-            return list(self.latest_imu_pitch)
 
     def get_latest_adc_readings(self) -> Dict[str, float]:
         """Get a copy of the latest ADC readings sampled by the background thread."""
@@ -868,6 +896,12 @@ class HardwareInterface:
         except Exception:
             pass
 
+        try:
+            if getattr(self, 'usb_reader', None) is not None:
+                self.usb_reader.stop_background_reader()
+        except Exception:
+            pass
+
         # Join IMU/ADC threads if they were started
         try:
             if getattr(self, 'imu_thread', None) is not None:
@@ -890,8 +924,19 @@ class HardwareInterface:
         # Mark sensors not ready
         with self._imu_lock:
             self._imu_state = ReadyState.PENDING
+            self.latest_imu_data = None
+            self.latest_imu_by_role = None
+            self.latest_imu_raw_quat = None
+            self.latest_imu_corrected_quat = None
+            self.latest_base_imu_quat = None
+            self.latest_base_imu_gyro = None
+            self.latest_imu_gyro = None
+            self._imu_last_device_ts = None
+            self._imu_snapshot = None
         with self._adc_lock:
             self._adc_state = ReadyState.PENDING
+            self._latest_adc_readings = {}
+            self._latest_adc_timestamp = None
 
     def __del__(self):
         try:

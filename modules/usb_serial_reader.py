@@ -23,29 +23,14 @@ class USBSerialReader:
     FRAME_VERSION_DATA = 1
     FRAME_VERSION_CTRL = 2
     FRAME_VERSION_DESC = 3
-    FRAME_VERSION_STATUS = 4  # legacy firmware only
     FRAME_VERSION_CAL_REPORT = 5
 
     # Control frame message types (version=2)
-    MSG_TYPE_CFG_OK = 0x01
-    MSG_TYPE_CFG_WAIT = 0x02
-    MSG_TYPE_ERROR = 0x04
     MSG_TYPE_ERR_I2C = 0x05
     MSG_TYPE_ERR_IMU = 0x06
     MSG_TYPE_CAL_WAIT = 0x07
     MSG_TYPE_ERR_CAL = 0x08
 
-    STATUS_FLAG_USB_CONNECTED = 0x01
-    STATUS_FLAG_HOST_ALIVE = 0x02
-
-    # Tuned AHRS defaults (tested)
-    # TODO: once wait_for_settings() is removed from Pico firmware, gyro_dps/gain/
-    # accel_rejection/recovery_s below can also be hardcoded in firmware and send_config()
-    # removed entirely along with the CFG_WAIT/CFG_OK handshake.
-    DEFAULT_GYRO_DPS = 250
-    DEFAULT_GAIN = 5.0
-    DEFAULT_ACCEL_REJ = 20.0
-    DEFAULT_RECOVERY_S = 0.5
     STARTUP_CALIBRATION_DURATION_S = 30.0
 
     CAL_REPORT_ACCEPTED = 0x01
@@ -54,10 +39,10 @@ class USBSerialReader:
     CAL_FAIL_ACCEL_STD = 0x0004
     CAL_FAIL_ACCEL_NORM = 0x0008
 
-    def __init__(self, baud_rate=115200, timeout=1.0, simulation_mode=False,
+    def __init__(self, baud_rate=115200, timeout=1.0,
                  log_level: str = "INFO", port: str | None = None, debug: bool = False,
                  verify_checksum: bool = True, heartbeat_timeout: float = 3.0,
-                 status_telemetry: bool | None = None, rt_priority: int = 0,
+                 rt_priority: int = 0,
                  rt_lock_memory: bool = False, rt_cpu_core: int | None = None):
         self.logger = logging.getLogger(f"{__name__}.USBSerialReader")
         self.logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
@@ -74,13 +59,11 @@ class USBSerialReader:
         self.ser = None
         self.port = port
         self._requested_port = port  # remember original for reconnect
-        self.simulation_mode = simulation_mode
         self.debug = debug
         self.verify_checksum = verify_checksum
         self.heartbeat_timeout = heartbeat_timeout
         self._blocking_reads = os.name != "nt"
         self._read_timeout = min(max(timeout, 0.001), 0.02) if self._blocking_reads else 0
-        self.sim_time = 0.0
         self.num_sensors = 0  # discovered at runtime from first frame
         self.last_timestamp_us = None
         self._imu_descriptors = []  # list of {"bus": int, "addr": int}
@@ -89,29 +72,14 @@ class USBSerialReader:
         self._last_data_time = time.time()
         self._connect_time = time.time()
         self._bin_buf = bytearray()
-        self._text_buf = bytearray()
-        self._last_config = None
         self._checksum_failures = 0
         self._header_failures = 0
         self._reconnect_count = 0
         self._timestamp_sps = 0.0
         self._host_sps = 0.0
-        self._status_enabled = False
         self._rt_priority = int(rt_priority)
         self._rt_lock_memory = bool(rt_lock_memory)
         self._rt_cpu_core = rt_cpu_core
-        self._stream_status = {
-            "target_hz": 0,
-            "sensor_count": 0,
-            "flags": 0,
-            "tx_drop_count": 0,
-            "tx_short_write_count": 0,
-            "usb_disconnect_count": 0,
-            "loop_overrun_count": 0,
-            "max_loop_lag_us": 0,
-            "last_loop_us": 0,
-            "host_age_ms": 0,
-        }
         self._startup_phase = "disconnected"
         self._calibration_wait_start_time = None
         self._last_calibration_log_time = 0.0
@@ -127,20 +95,7 @@ class USBSerialReader:
         # SPS (samples per second) tracking
         self._reset_sps_tracking()
 
-        if status_telemetry:
-            self.logger.debug("Status telemetry is not used by stream-only firmware")
-
-        if not simulation_mode:
-            self.connect()
-        else:
-            self.num_sensors = 3
-            self._target_sps = self.DEFAULT_SAMPLE_RATE
-            self._imu_descriptors = [
-                {"bus": 0, "addr": 0x6A, "label": "I2C0:0x6A"},
-                {"bus": 0, "addr": 0x6B, "label": "I2C0:0x6B"},
-                {"bus": 1, "addr": 0x6A, "label": "I2C1:0x6A"},
-            ]
-            self.logger.info("Simulation mode: generating synthetic IMU data")
+        self.connect()
 
     # ------------------------------------------------------------------
     # Status API
@@ -173,12 +128,8 @@ class USBSerialReader:
             header_failures (int): Cumulative invalid header count.
             reconnect_count (int): Number of automatic reconnections.
             uptime_s (float): Seconds since initial connection.
-            simulation_mode (bool): Whether running in simulation mode.
         """
-        if self.simulation_mode:
-            connected = True
-        else:
-            connected = self.ser is not None and self.ser.is_open
+        connected = self.ser is not None and self.ser.is_open
         with self._lock:
             return {
             "connected": connected,
@@ -190,7 +141,6 @@ class USBSerialReader:
             "host_sps": self._host_sps,
             "timestamp_sps": self._timestamp_sps,
             "last_timestamp_us": self.last_timestamp_us,
-            "stream_status": dict(self._stream_status),
             "startup_phase": self._startup_phase,
             "calibration_wait_s": (
                 time.time() - self._calibration_wait_start_time
@@ -201,14 +151,11 @@ class USBSerialReader:
             "header_failures": self._header_failures,
             "reconnect_count": self._reconnect_count,
             "uptime_s": time.time() - self._connect_time,
-            "simulation_mode": self.simulation_mode,
             }
 
     @property
     def connected(self):
-        """True if the serial port is open (or in simulation mode)."""
-        if self.simulation_mode:
-            return True
+        """True if the serial port is open."""
         return self.ser is not None and self.ser.is_open
 
     @property
@@ -319,7 +266,6 @@ class USBSerialReader:
                 pass
         self.ser.reset_input_buffer()
         self._bin_buf.clear()
-        self._text_buf.clear()
         self._descriptor_signature = None
         self._imu_descriptors = []
         self.num_sensors = 0
@@ -339,7 +285,7 @@ class USBSerialReader:
         time.sleep(0.1)
 
     def reconnect(self):
-        """Close and re-open connection, then resend config after a reset."""
+        """Close and re-open connection after a reset or timeout."""
         self._reconnect_count += 1
         self.logger.info(f"Reconnecting (attempt #{self._reconnect_count})...")
 
@@ -357,15 +303,7 @@ class USBSerialReader:
 
         try:
             self.connect()
-            if self._last_config:
-                ser = self.ser
-                try:
-                    if ser is not None:
-                        ser.write(self._last_config.encode("utf-8"))
-                except serial.SerialTimeoutException:
-                    self.logger.warning("Timed out resending config after reconnect")
-                self.wait_for_cfg_ok(timeout_s=1.0, resend_s=0.3)
-            self.logger.info("Reconnected — config resent, waiting for stream")
+            self.logger.info("Reconnected — waiting for stream")
             return True
         except serial.SerialException as e:
             self.logger.warning(f"Reconnect failed: {e}")
@@ -380,59 +318,15 @@ class USBSerialReader:
     # Configuration
     # ------------------------------------------------------------------
 
-    def send_config(
-        self,
-        gyro_dps=None,
-        gain=None,
-        accel_rejection=None,
-        recovery_s=None,
-    ):
-        """Send configuration to Pico. Uses tuned defaults for omitted values.
-
-        SR is fixed at 200 Hz in firmware and not configurable here.
-        """
-        if not self.ser or not self.ser.is_open:
-            self.logger.warning("Not connected - cannot send config")
-            return False
-
-        gyro = gyro_dps if gyro_dps is not None else self.DEFAULT_GYRO_DPS
-        g = gain if gain is not None else self.DEFAULT_GAIN
-        ar = accel_rejection if accel_rejection is not None else self.DEFAULT_ACCEL_REJ
-        rs = recovery_s if recovery_s is not None else self.DEFAULT_RECOVERY_S
-
-        config = (
-            f"SR=200|"
-            f"GYRO_DPS={gyro}|"
-            f"GAIN={g}|"
-            f"ACC_REJ={ar}|"
-            f"RECOV_S={rs}|\n"
-        )
-        self._last_config = config
-        try:
-            self.ser.write(config.encode("utf-8"))
-        except serial.SerialTimeoutException:
-            self.logger.warning("Timed out sending config over CDC; proceeding to reads")
-            return False
-        self.logger.info(f"Sent config: {config.strip()}")
-        self._startup_phase = "config_sent"
-        return True
-
     def _handle_control_msg(self, msg_type):
-        """Handle Pico control frames. Returns True when startup may continue."""
+        """Handle Pico control frames."""
         now = time.time()
-        if msg_type == self.MSG_TYPE_CFG_OK:
-            self._startup_phase = "ready"
-            self._calibration_wait_start_time = None
-            return True
-        if msg_type == self.MSG_TYPE_CFG_WAIT:
-            self._startup_phase = "waiting_for_config"
-            return False
         if msg_type == self.MSG_TYPE_CAL_WAIT:
             if self._calibration_wait_start_time is None:
                 self._calibration_wait_start_time = now
                 self.logger.info(
                     "Pico startup calibration in progress; keep IMUs stationary "
-                    "(~%.0fs total after config)",
+                    "(~%.0fs after power-on)",
                     self.STARTUP_CALIBRATION_DURATION_S,
                 )
             elif (now - self._last_calibration_log_time) >= 5.0:
@@ -466,204 +360,7 @@ class USBSerialReader:
                 self.logger.error("Pico startup calibration failed; keep robot/IMUs still and power-cycle or reset Pico")
                 self._last_error_msg_type = msg_type
             return False
-        if msg_type == self.MSG_TYPE_ERROR:
-            self._startup_phase = "error"
-            if self._last_error_msg_type != msg_type:
-                self.logger.error("Pico reported a generic firmware error")
-                self._last_error_msg_type = msg_type
-            return False
         return False
-
-    def wait_for_cfg_ok(self, timeout_s=1.0, resend_s=None, calibration_timeout_s=120.0):
-        """Wait for binary CFG_OK from Pico, or infer success from streaming.
-
-        If CFG_OK is not received within ``timeout_s``, return False and let the
-        caller proceed directly to streaming reads using the bytes already buffered.
-        When the Pico reports startup calibration in progress, wait up to
-        ``calibration_timeout_s`` instead of applying the short config timeout.
-        """
-        if not self.ser or not self.ser.is_open:
-            self.logger.warning("Not connected - cannot wait for CFG_OK")
-            return False
-
-        start = time.time()
-        last_send = start
-        calibration_seen = False
-
-        while True:
-            now = time.time()
-            if calibration_seen:
-                cal_elapsed = now - (self._calibration_wait_start_time or now)
-                if calibration_timeout_s is not None and cal_elapsed >= calibration_timeout_s:
-                    self.logger.warning(
-                        "Pico startup calibration did not finish within %.1fs; proceeding to streaming reads",
-                        calibration_timeout_s,
-                    )
-                    return False
-            elif timeout_s is not None and (now - start) >= timeout_s:
-                self.logger.warning(
-                    "CFG_OK not received within %.1fs; proceeding to streaming reads",
-                    timeout_s,
-                )
-                return False
-
-            if resend_s is not None and not calibration_seen and (now - last_send) >= resend_s:
-                # Resend last config if available
-                if self._last_config:
-                    try:
-                        self.ser.write(self._last_config.encode("utf-8"))
-                    except serial.SerialTimeoutException:
-                        self.logger.warning("Timed out resending config; proceeding to reads")
-                        return False
-                last_send = now
-
-            if self.ser.in_waiting > 0:
-                chunk = self.ser.read(self.ser.in_waiting)
-                if self.debug and chunk:
-                    self.logger.info("RX(wait): %r", chunk)
-                self._bin_buf.extend(chunk)
-
-                # Scan buffer for CFG_OK, descriptor frames, or first data frame.
-                found_cfg_ok = False
-                found_stream = False
-                idx = 0
-                while idx <= len(self._bin_buf) - 6:
-                    if self._bin_buf[idx] == 0xAA and self._bin_buf[idx + 1] == 0x55:
-                        version = self._bin_buf[idx + 2]
-                        if version == self.FRAME_VERSION_CTRL:
-                            msg_type = self._bin_buf[idx + 3]
-                            expected_cs = struct.unpack_from("<H", self._bin_buf, idx + 4)[0]
-                            calc_cs = (version + msg_type) & 0xFFFF
-                            if calc_cs == expected_cs:
-                                if msg_type == self.MSG_TYPE_CFG_OK:
-                                    self._handle_control_msg(msg_type)
-                                    found_cfg_ok = True
-                                    self._bin_buf = bytearray(self._bin_buf[idx + 6:])
-                                    break
-                                if msg_type == self.MSG_TYPE_CFG_WAIT:
-                                    self._handle_control_msg(msg_type)
-                                    del self._bin_buf[idx:idx + 6]
-                                    continue
-                                if msg_type == self.MSG_TYPE_CAL_WAIT:
-                                    self._handle_control_msg(msg_type)
-                                    calibration_seen = True
-                                    del self._bin_buf[idx:idx + 6]
-                                    continue
-                                if msg_type == self.MSG_TYPE_ERR_I2C:
-                                    self._handle_control_msg(msg_type)
-                                    return False
-                                if msg_type == self.MSG_TYPE_ERR_IMU:
-                                    self._handle_control_msg(msg_type)
-                                    return False
-                                if msg_type == self.MSG_TYPE_ERR_CAL:
-                                    self._handle_control_msg(msg_type)
-                                    return False
-                            idx += 6
-                        elif version == self.FRAME_VERSION_DESC:
-                            # Parse descriptor if complete
-                            dc = self._bin_buf[idx + 3]
-                            df_len = 4 + 2 + dc * 2 + 2
-                            if idx + df_len <= len(self._bin_buf) and 1 <= dc <= self.MAX_SENSORS:
-                                cs_off = idx + df_len - 2
-                                exp_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
-                                cal_cs = sum(self._bin_buf[idx + 2:cs_off]) & 0xFFFF
-                                if cal_cs == exp_cs:
-                                    target_sps, descriptors = self._parse_descriptor_payload(idx, dc)
-                                    self._apply_descriptor(dc, target_sps, descriptors)
-                                    found_stream = True
-                                del self._bin_buf[idx:idx + df_len]
-                                continue
-                            else:
-                                idx += 1
-                        elif version == self.FRAME_VERSION_CAL_REPORT:
-                            sensor_count = self._bin_buf[idx + 3]
-                            if 1 <= sensor_count <= self.MAX_SENSORS:
-                                frame_len = self._calibration_report_frame_len(sensor_count)
-                                if idx + frame_len <= len(self._bin_buf):
-                                    cs_off = idx + frame_len - 2
-                                    exp_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
-                                    cal_cs = sum(self._bin_buf[idx + 2:cs_off]) & 0xFFFF
-                                    if cal_cs == exp_cs:
-                                        report = self._parse_calibration_report_payload(idx, sensor_count)
-                                        self._apply_calibration_report(report)
-                                    del self._bin_buf[idx:idx + frame_len]
-                                    continue
-                                break
-                            idx += 1
-                        elif version == self.FRAME_VERSION_DATA:
-                            sensor_count = self._bin_buf[idx + 3]
-                            if 1 <= sensor_count <= self.MAX_SENSORS:
-                                payload_len = 4 + sensor_count * self.FLOATS_PER_SENSOR * 4
-                                frame_len = 2 + 1 + 1 + payload_len + 2
-                                if idx + frame_len <= len(self._bin_buf):
-                                    checksum_offset = idx + 2 + 1 + 1 + payload_len
-                                    expected = struct.unpack_from("<H", self._bin_buf, checksum_offset)[0]
-                                    calc = sum(self._bin_buf[idx + 2:checksum_offset]) & 0xFFFF
-                                    if calc == expected:
-                                        found_stream = True
-                                        break
-                                else:
-                                    idx += 1
-                            else:
-                                idx += 1
-                        else:
-                            idx += 1
-                    else:
-                        idx += 1
-
-                if found_cfg_ok:
-                    self._last_data_time = time.time()
-                    return True
-                if found_stream:
-                    self._last_data_time = time.time()
-                    self._startup_phase = "streaming"
-                    self.logger.info("Streaming started before CFG_OK was observed")
-                    return True
-
-                # Keep buffer bounded
-                if len(self._bin_buf) > 4096:
-                    del self._bin_buf[:-1024]
-
-            time.sleep(0.01)
-
-    def set_status_enabled(self, enabled: bool):
-        """Legacy no-op retained for compatibility."""
-        self._status_enabled = bool(enabled)
-        self.logger.warning("Firmware status telemetry is unavailable in stream-only mode")
-        return False
-
-    def _send_heartbeat_if_due(self):
-        return
-
-    def _parse_status_payload(self):
-        if len(self._bin_buf) < 37:
-            return None
-        frame_len = 37
-        checksum_offset = frame_len - 2
-        expected = struct.unpack_from("<H", self._bin_buf, checksum_offset)[0]
-        calc = sum(self._bin_buf[2:checksum_offset]) & 0xFFFF
-        if calc != expected:
-            self._checksum_failures += 1
-            del self._bin_buf[0:1]
-            return None
-
-        target_hz, sensor_count, flags = struct.unpack_from("<HBB", self._bin_buf, 3)
-        fields = struct.unpack_from("<IIIIIII", self._bin_buf, 7)
-        with self._lock:
-            self._stream_status = {
-                "target_hz": target_hz,
-                "sensor_count": sensor_count,
-                "flags": flags,
-                "tx_drop_count": fields[0],
-                "tx_short_write_count": fields[1],
-                "usb_disconnect_count": fields[2],
-                "loop_overrun_count": fields[3],
-                "max_loop_lag_us": fields[4],
-                "last_loop_us": fields[5],
-                "host_age_ms": fields[6],
-            }
-        del self._bin_buf[:frame_len]
-        return True
 
     def _fill_binary_buffer(self, min_bytes=1):
         """Pull bytes from serial, preferring low-latency reads on POSIX."""
@@ -693,27 +390,6 @@ class USBSerialReader:
     # ------------------------------------------------------------------
     # Data reading
     # ------------------------------------------------------------------
-
-    def generate_simulation_data(self):
-        """Generate synthetic IMU data for testing."""
-        self.sim_time += 0.0083  # ~120Hz
-        sim_count = self.num_sensors or 3
-
-        # Simulate rotation from 0 to 45 degrees over 5 seconds
-        angle = min(45.0, (self.sim_time / 5.0) * 45.0) * math.pi / 180.0
-        angular_velocity = (45.0 * math.pi / 180.0) / 5.0 if self.sim_time < 5.0 else 0.0
-
-        data = []
-        for i in range(sim_count):
-            # Each IMU at slightly different angle
-            offset = i * 30.0 * math.pi / 180.0
-            a = angle + offset
-            w = math.cos(a / 2)
-            y = math.sin(a / 2)
-            data.append([w, 0.0, y, 0.0, 0.0, angular_velocity * 180.0 / math.pi, 0.0])
-
-        self.last_timestamp_us = int(self.sim_time * 1e6)
-        return data
 
     def _check_heartbeat(self):
         """Check if data stream is alive. Returns True if OK, False if timed out."""
@@ -958,23 +634,8 @@ class USBSerialReader:
                 expected_cs = struct.unpack_from("<H", self._bin_buf, 4)[0]
                 calc_cs = (version + msg_type) & 0xFFFF
                 if calc_cs == expected_cs:
-                    if msg_type == self.MSG_TYPE_ERR_I2C:
-                        self._handle_control_msg(msg_type)
-                    elif msg_type == self.MSG_TYPE_ERR_IMU:
-                        self._handle_control_msg(msg_type)
-                    elif msg_type in (self.MSG_TYPE_CFG_OK, self.MSG_TYPE_CFG_WAIT,
-                                      self.MSG_TYPE_CAL_WAIT, self.MSG_TYPE_ERR_CAL,
-                                      self.MSG_TYPE_ERROR):
-                        self._handle_control_msg(msg_type)
+                    self._handle_control_msg(msg_type)
                 del self._bin_buf[:6]
-                continue
-
-            if version == self.FRAME_VERSION_STATUS:
-                if refill:
-                    self._fill_binary_buffer(min_bytes=37)
-                parsed = self._parse_status_payload()
-                if parsed is None:
-                    return None
                 continue
 
             if version == self.FRAME_VERSION_CAL_REPORT:
@@ -1128,8 +789,6 @@ class USBSerialReader:
 
     def start_background_reader(self):
         """Start a latest-only background drain thread."""
-        if self.simulation_mode:
-            return True
         if self._reader_thread is not None and self._reader_thread.is_alive():
             return True
         self._reader_stop.clear()
@@ -1147,15 +806,14 @@ class USBSerialReader:
 
     def get_latest_imus(self, only_new=True):
         """Return the newest frame captured by the background reader."""
-        if self.simulation_mode:
-            return self.generate_simulation_data()
         with self._lock:
             if self._latest_frame is None:
                 return None
             if only_new and self._latest_frame_seq == self._last_returned_seq:
                 return None
             self._last_returned_seq = self._latest_frame_seq
-            return [list(pkt) for pkt in self._latest_frame]
+            frame = self._latest_frame  # grab reference; copy happens outside lock
+        return [list(pkt) for pkt in frame]
 
     def read_imus(self, auto_reconnect=True):
         """
@@ -1168,9 +826,6 @@ class USBSerialReader:
             List of N arrays, each containing [w, x, y, z, gx, gy, gz]
             (quaternion + gyro in dps), or None if no data available.
         """
-        if self.simulation_mode:
-            return self.generate_simulation_data()
-
         if self.debug and self.ser and self.ser.in_waiting > 0:
             peek = self.ser.read(self.ser.in_waiting)
             if peek:
@@ -1220,6 +875,10 @@ class USBSerialReader:
 
     def close(self):
         """Close serial connection."""
+        try:
+            self.stop_background_reader()
+        except Exception:
+            pass
         if self.ser and self.ser.is_open:
             self.ser.close()
             self.logger.info("Connection closed")
@@ -1234,16 +893,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Read 1-4 IMU quaternions over USB serial")
     parser.add_argument("--port", help="Serial port (auto-detect if not specified)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
-    parser.add_argument("--gyro-dps", type=int, default=USBSerialReader.DEFAULT_GYRO_DPS,
-                        help="Gyro range (125/250/500/1000/2000)")
-    parser.add_argument("--sim", action="store_true", help="Simulation mode")
     parser.add_argument("--debug", action="store_true", help="Print raw serial data")
-    parser.add_argument("--status", action="store_true",
-                        help="Legacy option; ignored by stream-only firmware")
     parser.add_argument("--no-checksum", action="store_true",
                         help="Skip checksum verification (debug only)")
-    parser.add_argument("--no-wait", action="store_true",
-                        help="Skip waiting for CFG_OK (useful if Pico is already streaming)")
     parser.add_argument("--heartbeat", type=float, default=3.0,
                         help="Reconnect if no data for this many seconds (0=disable)")
     parser.add_argument("--poll-sleep-ms", type=float,
@@ -1254,19 +906,10 @@ if __name__ == "__main__":
     reader = USBSerialReader(
         baud_rate=args.baud,
         port=args.port,
-        simulation_mode=args.sim,
         debug=args.debug,
         verify_checksum=not args.no_checksum,
         heartbeat_timeout=args.heartbeat,
     )
-
-    if not args.sim:
-        reader.send_config(
-            gyro_dps=args.gyro_dps,
-        )
-        if not args.no_wait:
-            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0):
-                reader.logger.warning("CFG_OK not received; continuing anyway")
 
     # Wait briefly for descriptor frame to arrive with first data
     print(f"Connecting... (Ctrl+C to stop)")

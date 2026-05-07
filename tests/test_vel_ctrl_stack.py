@@ -1,7 +1,8 @@
 """Tests for velocity-control additions to ExcavatorController and JointVelocityController.
 
 ExcavatorController methods are tested via a thin proxy (avoiding full hardware/numba init).
-JointVelocityController is imported from simple_drive with hardware deps pre-mocked.
+JointVelocityController is imported from simple_drive (the older velocity controller there,
+not the root test_vel_ctrl.py hardware prototype) with hardware deps pre-mocked.
 """
 
 import math
@@ -30,6 +31,11 @@ class _ControllerProxy:
     _gyro_velocity_mode: str = 'fd_only'
     _last_joint_vel_radps = None
     _last_joint_vel_time = None
+    _last_gyro_device_ts_us = 123
+    _last_gyro_wall_t = 456.0
+    _gyro_fallback_counter = 7
+    _gyro_bias_radps = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    logger = MagicMock()
 
     set_velocity_mode        = ExcavatorController.set_velocity_mode
     get_joint_velocities_with_age = ExcavatorController.get_joint_velocities_with_age
@@ -78,6 +84,35 @@ class TestSetVelocityMode(unittest.TestCase):
         except ValueError:
             pass
         self.assertEqual(self.ctrl._gyro_velocity_mode, 'fused')
+
+    def test_switching_modes_resets_gyro_state(self):
+        self.ctrl._gyro_velocity_mode = 'fd_only'
+        self.ctrl._last_gyro_device_ts_us = 123
+        self.ctrl._last_gyro_wall_t = 456.0
+        self.ctrl._gyro_fallback_counter = 7
+        self.ctrl._gyro_bias_radps = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+        self.ctrl.set_velocity_mode('gyro_only')
+
+        self.assertIsNone(self.ctrl._last_gyro_device_ts_us)
+        self.assertIsNone(self.ctrl._last_gyro_wall_t)
+        self.assertEqual(self.ctrl._gyro_fallback_counter, 0)
+        self.assertTrue(np.array_equal(self.ctrl._gyro_bias_radps, np.zeros(3, dtype=np.float32)))
+
+    def test_same_mode_is_noop(self):
+        bias = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        self.ctrl._gyro_velocity_mode = 'fd_only'
+        self.ctrl._last_gyro_device_ts_us = 123
+        self.ctrl._last_gyro_wall_t = 456.0
+        self.ctrl._gyro_fallback_counter = 7
+        self.ctrl._gyro_bias_radps = bias.copy()
+
+        self.ctrl.set_velocity_mode('fd_only')
+
+        self.assertEqual(self.ctrl._last_gyro_device_ts_us, 123)
+        self.assertEqual(self.ctrl._last_gyro_wall_t, 456.0)
+        self.assertEqual(self.ctrl._gyro_fallback_counter, 7)
+        self.assertTrue(np.array_equal(self.ctrl._gyro_bias_radps, bias))
 
 
 # ---------------------------------------------------------------------------

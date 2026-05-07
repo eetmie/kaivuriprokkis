@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Direct-drive / joint velocity-PI prototype test.
 
+MANUAL HARDWARE TEST — requires real hardware and gamepad. Not a unit test.
+
 Uses the same UDP/gamepad mapping as simple_drive.py. Button 3 cycles between
 raw valve control, closed-loop velocity control, and velocity-assisted raw
 control for gyro-backed joints. Slew and tracks remain raw in all modes.

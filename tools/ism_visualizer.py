@@ -105,14 +105,6 @@ def main():
     parser.add_argument('--imu', type=int, default=0,
                         help='Which IMU index to visualize (default: 0)')
 
-    # Firmware config
-    parser.add_argument('--sr', type=int, default=USBSerialReader.DEFAULT_SAMPLE_RATE,
-                        help='Sample rate Hz')
-    parser.add_argument('--gyro-dps', type=int, default=USBSerialReader.DEFAULT_GYRO_DPS,
-                        help='Gyro range (125/250/500/1000/2000)')
-
-    # Sim / debug
-    parser.add_argument('--sim', action='store_true', help='Simulation mode (no hardware)')
     parser.add_argument('--debug', action='store_true', help='Print raw serial data')
 
     args = parser.parse_args()
@@ -129,14 +121,8 @@ def main():
     reader = USBSerialReader(
         baud_rate=args.baud,
         port=args.port,
-        simulation_mode=args.sim,
         debug=args.debug,
     )
-
-    if not args.sim:
-        reader.send_config(sample_rate=args.sr, gyro_dps=args.gyro_dps)
-        if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0):
-            print("Warning: CFG_OK not received; continuing anyway", file=sys.stderr)
 
     zero_q_inv = None
     prev_q = None

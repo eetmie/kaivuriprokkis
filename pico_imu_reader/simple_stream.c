@@ -163,7 +163,7 @@ int main(void) {
         error_forever(MSG_TYPE_ERR_I2C);
     }
 
-    if (!initialize_sensors()) {
+    if (!initialize_sensors(416)) {
         error_forever(MSG_TYPE_ERR_IMU);
     }
 

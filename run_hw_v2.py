@@ -39,7 +39,7 @@ from configuration_files.pathing_config import (
     PathExecutionConfig,
 )
 from modules.excavator_controller import ExcavatorController
-from modules.hardware_interface import HardwareInterface
+from modules.hardware_interface import HardwareFaultError, HardwareInterface
 from modules.quaternion_math import quat_from_axis_angle
 from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread, reset_to_normal
 from pathing import path_planning_algorithms as planner_algos
@@ -530,6 +530,8 @@ class HardwareTrajectoryLogger:
         self.at_threshold_time: Optional[float] = None
         self.prev_joint_vel: Optional[np.ndarray] = None
         self.prev_joint_vel_t: Optional[float] = None
+        self.first_step_perf: Optional[float] = None
+        self.last_step_perf: Optional[float] = None
 
     def start_trajectory(
         self,
@@ -565,6 +567,9 @@ class HardwareTrajectoryLogger:
     ) -> None:
         # Acceleration: finite-diff over loop dt of joint velocity samples.
         now_t = time.perf_counter()
+        if self.first_step_perf is None:
+            self.first_step_perf = now_t
+        self.last_step_perf = now_t
         if self.prev_joint_vel is not None and self.prev_joint_vel_t is not None:
             dt_acc = max(now_t - self.prev_joint_vel_t, 1e-6)
             joint_acc = (joint_vel_rad - self.prev_joint_vel) / dt_acc
@@ -622,18 +627,31 @@ class HardwareTrajectoryLogger:
         env_config: EnvironmentConfig,
         obstacles: Optional[List[Dict[str, Any]]] = None,
         obstacles_source: str = "wall",
+        controller_perf_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self.trajectory_log:
             return
 
         self.trajectory_counter += 1
+        # Wall-clock execution time: start set inside _execute_on_hardware, so
+        # calculation_time has already elapsed before it — do NOT subtract it.
         execution_time = (
-            time.time() - self.execution_start_time - self.calculation_time
+            time.time() - self.execution_start_time
             if self.execution_start_time is not None
             else 0.0
         )
         sim_steps = len(self.trajectory_log)
-        sim_hz = sim_steps / execution_time if execution_time > 0 else None
+        # Derive Hz from first/last step perf_counter timestamps — immune to
+        # gaps between the final loop iteration and the save() call.
+        if (
+            self.first_step_perf is not None
+            and self.last_step_perf is not None
+            and sim_steps > 1
+            and self.last_step_perf > self.first_step_perf
+        ):
+            sim_hz = (sim_steps - 1) / (self.last_step_perf - self.first_step_perf)
+        else:
+            sim_hz = None
         errors = [
             float(np.linalg.norm(np.array(row[3:6]) - np.array(row[0:3])))
             for row in self.trajectory_log
@@ -712,6 +730,14 @@ class HardwareTrajectoryLogger:
             "ik_use_rotational_velocity": ik_cfg.get("use_rotational_velocity"),
             "ik_use_relative_mode": ik_cfg.get("use_relative_mode"),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            # Controller-reported loop timing (authoritative, from RT thread).
+            "controller_avg_loop_ms": (controller_perf_stats or {}).get("avg_loop_time_ms"),
+            "controller_max_loop_ms": (controller_perf_stats or {}).get("max_loop_time_ms"),
+            "controller_hz": (
+                1000.0 / (controller_perf_stats or {})["avg_loop_time_ms"]
+                if (controller_perf_stats or {}).get("avg_loop_time_ms")
+                else None
+            ),
         }
 
         metrics_path = os.path.join(self.log_dir, "metrics.csv")
@@ -828,11 +854,11 @@ def _execute_on_hardware(
     path_config: PathExecutionConfig,
     data_logger: Optional[HardwareTrajectoryLogger],
     enable_debug: bool,
-) -> None:
+) -> Dict[str, Any]:
     path = trajectory.positions
     if path.shape[0] < 2:
         logger.warning("Planned path has fewer than 2 waypoints; skipping.")
-        return
+        return {}
 
     speed_mps = float(path_config.speed_mps)
     if speed_mps <= 0.0:
@@ -953,6 +979,20 @@ def _execute_on_hardware(
         else:
             next_run_time = time.perf_counter()
 
+    try:
+        perf_stats = controller.get_performance_stats() or {}
+    except Exception:
+        perf_stats = {}
+    avg_ms = (perf_stats or {}).get("avg_loop_time_ms") or 0.0
+    if avg_ms > 0.0:
+        logger.info(
+            "[Execute] Controller loop: avg=%.2fms, max=%.2fms (%.1fHz)",
+            avg_ms,
+            perf_stats.get("max_loop_time_ms", 0.0),
+            1000.0 / avg_ms,
+        )
+    return perf_stats
+
 
 def _run_direct_target_test(
     controller: ExcavatorController,
@@ -1069,9 +1109,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         hardware_interface=hardware,
         enable_perf_tracking=bool(args.debug),
         log_level="DEBUG" if args.debug else "INFO",
+        rt_priority=args.rt_priority,
     )
     controller.start()
-    logger.info("Control loop started.")
 
     logger.info("Waiting 5.0s for IK/numba warmup...")
     time.sleep(5.0)
@@ -1080,6 +1120,43 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info("Applying SCHED_FIFO-%d to main thread...", args.rt_priority)
         if not apply_rt_to_thread(priority=args.rt_priority, policy=SCHED_FIFO, quiet=True):
             logger.warning("Failed to apply RT priority (run as root for RT scheduling).")
+
+    logger.info("Waiting for IMU to become ready (Pico self-calibrates ~30 s stationary)...")
+    _hw_wait_start = time.time()
+    _hw_wait_timeout = 90.0
+    _hw_last_status_log = -999.0
+    while True:
+        try:
+            if hardware.is_hardware_ready():
+                logger.info("Hardware ready after %.1f s.", time.time() - _hw_wait_start)
+                break
+        except HardwareFaultError as exc:
+            logger.critical("Hardware fault during startup — cannot continue: %s", exc)
+            try:
+                hardware.shutdown()
+            except Exception:
+                pass
+            return 1
+        elapsed = time.time() - _hw_wait_start
+        if elapsed >= _hw_wait_timeout:
+            logger.critical(
+                "Timed out waiting for hardware readiness after %.0f s. "
+                "Check IMU connection and ensure robot is stationary during calibration.",
+                elapsed,
+            )
+            try:
+                hardware.shutdown()
+            except Exception:
+                pass
+            return 1
+        if elapsed - _hw_last_status_log >= 5.0:
+            status = hardware.get_status()
+            logger.info(
+                "  IMU state: %s | %.0f s elapsed (timeout %.0f s)",
+                status.get("imu_state", "unknown"), elapsed, _hw_wait_timeout,
+            )
+            _hw_last_status_log = elapsed
+        time.sleep(0.5)
 
     controller.pause()
 
@@ -1169,17 +1246,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logger.error("[FATAL] Path planning error: %s", e)
                 break
 
-            logger.info("Resuming controller for execution...")
             controller.resume()
 
             # Hold start pose briefly to avoid PID windup on first command after resume.
-            logger.info("Holding start position for 5.0s before execution...")
-            hold_end = time.time() + 5.0
+            hold_end = time.time() + 1.0
             while time.time() < hold_end:
                 controller.give_pose(start_pos, current_rot_y)
                 time.sleep(0.05)
 
-            _execute_on_hardware(
+            ctrl_perf = _execute_on_hardware(
                 controller=controller,
                 trajectory=trajectory,
                 target_y_rotation_deg=goal_rot_y,
@@ -1196,9 +1271,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     env_config=env_config,
                     obstacles=obstacles,
                     obstacles_source=obstacles_source,
+                    controller_perf_stats=ctrl_perf,
                 )
 
-            logger.info("Pausing controller after execution...")
             controller.pause()
 
             final_pos, final_rot = controller.get_pose()

@@ -1,5 +1,7 @@
 """pump_ramp_test.py — Interactive pump ramp-up tool for finding safe pulse_max.
 
+MANUAL HARDWARE TEST — requires real pump hardware. Not a unit test.
+
 Usage:
     python tests/pump_ramp_test.py [--config PATH] [--start US] [--end US]
                                    [--step US] [--interval SEC]

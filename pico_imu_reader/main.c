@@ -168,21 +168,6 @@ static inline void write_sensor_output(float output[FLOATS_PER_SENSOR], FusionQu
     output[6] = gyroscope.axis.z;
 }
 
-static void send_cfg_ok_window(void) {
-    const uint64_t start_us = time_us_64();
-    uint64_t last_ok_us = start_us;
-
-    while ((time_us_64() - start_us) < 500000u) {
-        tud_task();
-        const uint64_t now_us = time_us_64();
-        if ((now_us - last_ok_us) >= 100000u) {
-            send_control_msg(MSG_TYPE_CFG_OK);
-            last_ok_us = now_us;
-        }
-        sleep_ms(10);
-    }
-}
-
 static void calibration_service_until(uint64_t deadline_us) {
     static uint64_t next_cal_wait_us = 0;
     static uint64_t next_led_toggle_us = 0;
@@ -594,9 +579,6 @@ int main() {
         while (1) { tud_task(); sleep_ms(100); }
     }
 
-    status_led_set(STATUS_CFG_WAIT);
-    wait_for_settings();
-
     status_led_set(STATUS_INIT);
 
     if (!initialize_sensors(SENSOR_INTERNAL_ODR_HZ)) {
@@ -624,7 +606,6 @@ int main() {
     initialize_calibrations(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_algos(g_sensor_runtime.sensors, MAX_SENSORS);
 
-    send_cfg_ok_window();
     stream_publish_descriptor(SENSOR_OUTPUT_HZ, sensor_count, sensor_bus_ids, sensor_addrs);
     status_led_set(STATUS_STREAM);
     multicore_launch_core1(sensor_core1_main);

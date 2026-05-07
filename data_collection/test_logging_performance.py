@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Performance stress test for the data logging pipeline.
 
+MANUAL HARDWARE TEST — requires real hardware. Not a unit test.
+
 Verifies that 100Hz logging + sine computation can keep up alongside the
 controller's background loop (200Hz PWM by default). Follows the pattern
 from tests/stress_full_stack.py — reads control_config.yaml for default
@@ -159,7 +161,6 @@ def main():
                 "Scoop extend ps", "Scoop retract ps", "Pump ps",
             ],
             adc_sample_hz=adc_hz,
-            imu_expected_hz=imu_hz,
             enable_pwm=True,
             enable_imu=True,
             enable_adc=True,

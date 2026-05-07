@@ -106,22 +106,16 @@ def main() -> int:
     parser.add_argument("--gravity", type=_parse_vec3, default=_parse_vec3("0,0,-1"),
                         help="World gravity direction, formatted x,y,z")
     parser.add_argument("--port", type=str, default=None, help="Serial port override")
-    parser.add_argument("--sim", action="store_true", help="Use simulation mode")
     args = parser.parse_args()
 
     reader = USBSerialReader(
         baud_rate=args.baud,
         timeout=1.0,
-        simulation_mode=args.sim,
         port=args.port,
     )
 
     try:
-        if not args.sim:
-            reader.send_config()
-            if not reader.wait_for_cfg_ok(timeout_s=3.0, resend_s=0.3, calibration_timeout_s=120.0):
-                print("Warning: CFG_OK not received; continuing anyway", file=sys.stderr)
-        reader.start_background_reader()
+        reader.start_background_reader()  # Firmware self-calibrates on power-on; no handshake needed.
         print(f"Capturing IMU {args.imu} with tool-axis {args.tool_axis.tolist()} and gravity {args.gravity.tolist()}")
 
         warmup_remaining = int(max(0, args.warmup))

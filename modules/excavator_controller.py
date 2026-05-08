@@ -489,8 +489,8 @@ class ExcavatorController:
             _ik_use_rot_vel = bool(ik_cfg.get('use_rotational_velocity', True))
             # Adaptive damping settings (DLS method)
             _enable_adaptive_damping = bool(ik_cfg.get('enable_adaptive_damping', True))
-            _adaptive_damping_scaling = float(ik_cfg.get('adaptive_damping_scaling', 0.5))
-            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 10.0))
+            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 2.0))
+            _cond_threshold = float(ik_cfg.get('condition_number_threshold', 40.0))
         except KeyError as e:
             raise RuntimeError(f"Missing required IK configuration in control_config.yaml: {e}")
 
@@ -560,8 +560,8 @@ class ExcavatorController:
             use_rotational_velocity=_ik_use_rot_vel,
             # Adaptive damping (DLS)
             enable_adaptive_damping=_enable_adaptive_damping,
-            adaptive_damping_scaling=_adaptive_damping_scaling,
             adaptive_damping_max_multiplier=_adaptive_damping_max_mult,
+            condition_number_threshold=_cond_threshold,
         )
         # Pass verbose flag if IK controller supports it, else use DEBUG level check
         ik_verbose = self.logger.level <= logging.DEBUG
@@ -577,8 +577,8 @@ class ExcavatorController:
         self._ik_velocity_mode_enabled: bool = bool(getattr(self.ik_config, "velocity_mode", False))
         self._ik_use_rotational_velocity: bool = bool(getattr(self.ik_config, "use_rotational_velocity", True))
 
-        # Condition number threshold gating (0 = disabled)
-        self._cond_threshold = float(ik_cfg.get('condition_number_threshold', 0.0))
+        # Condition number threshold gating — read from ik_config (shared with adaptive damping).
+        self._cond_threshold = self.ik_config.condition_number_threshold
         self._cond_reject_count = 0
 
         # Pre-flight reachability check
@@ -957,6 +957,14 @@ class ExcavatorController:
     def get_condition_number(self) -> float:
         """Get the Jacobian condition number from the last IK solve."""
         return float(self.ik_controller.last_condition_number)
+
+    def get_yoshikawa_index(self) -> float:
+        """Yoshikawa manipulability index from the last IK solve."""
+        return float(self.ik_controller.last_yoshikawa_index)
+
+    def get_singular_values(self) -> np.ndarray:
+        """Jacobian singular values (4-element float32) from the last IK solve."""
+        return self.ik_controller.last_singular_values.copy()
 
     def get_hardware_status(self) -> dict:
         """Get hardware status including all ADC channels for logging."""

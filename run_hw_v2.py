@@ -394,9 +394,7 @@ def _plan_trajectory(
 
     astar_params = AStarParams() if base_algorithm == "a_star" else None
     rrt_params = RRTParams(max_acceptable_cost=0.768) if base_algorithm == "rrt" else None
-    rrt_star_params = (
-        RRTStarParams(max_acceptable_cost=0.768) if base_algorithm == "rrt_star" else None
-    )
+    rrt_star_params = RRTStarParams() if base_algorithm == "rrt_star" else None
     prm_params = PRMParams() if base_algorithm == "prm" else None
 
     calc_start = time.time()
@@ -526,6 +524,8 @@ class HardwareTrajectoryLogger:
         self.peak_torque: float = 0.0
         self.sum_condition_number: float = 0.0
         self.max_condition_number: float = 0.0
+        self.sum_yoshikawa_index: float = 0.0
+        self.min_yoshikawa_index: float = float("inf")
         self.ik_diagnostic_steps: int = 0
         self.at_threshold_time: Optional[float] = None
         self.prev_joint_vel: Optional[np.ndarray] = None
@@ -561,6 +561,8 @@ class HardwareTrajectoryLogger:
         joint_vel_rad: np.ndarray,
         joint_pos_des_rad: np.ndarray,
         condition_number: float,
+        yoshikawa_index: float,
+        sv: np.ndarray,
         waypoint_idx: int,
         progress: float,
         sim_dt: float,
@@ -577,10 +579,6 @@ class HardwareTrajectoryLogger:
             joint_acc = np.zeros(4, dtype=np.float32)
         self.prev_joint_vel = joint_vel_rad.copy()
         self.prev_joint_vel_t = now_t
-
-        # Yoshikawa & singular values are not exposed by the hardware IK stack yet.
-        yoshikawa_index = float("nan")
-        sv = np.full(4, float("nan"), dtype=np.float32)
 
         self.trajectory_log.append([
             float(planned_pos[0]), float(planned_pos[1]), float(planned_pos[2]),
@@ -617,6 +615,9 @@ class HardwareTrajectoryLogger:
             self.sum_condition_number += condition_number
             self.max_condition_number = max(self.max_condition_number, condition_number)
             self.ik_diagnostic_steps += 1
+        if not math.isnan(yoshikawa_index) and yoshikawa_index > 0.0:
+            self.sum_yoshikawa_index += yoshikawa_index
+            self.min_yoshikawa_index = min(self.min_yoshikawa_index, yoshikawa_index)
 
     def save(
         self,
@@ -721,8 +722,8 @@ class HardwareTrajectoryLogger:
             "peak_torque_Nm": self.peak_torque,
             "avg_condition_number": self.sum_condition_number / n,
             "max_condition_number": self.max_condition_number,
-            "avg_yoshikawa_index": float("nan"),
-            "min_yoshikawa_index": float("nan"),
+            "avg_yoshikawa_index": self.sum_yoshikawa_index / n if self.ik_diagnostic_steps > 0 else float("nan"),
+            "min_yoshikawa_index": self.min_yoshikawa_index if self.min_yoshikawa_index < float("inf") else float("nan"),
             "ik_method": ik_cfg.get("method"),
             "ik_command_type": ik_cfg.get("command_type"),
             "ik_velocity_mode": ik_cfg.get("velocity_mode"),
@@ -758,10 +759,11 @@ class HardwareTrajectoryLogger:
 
 def _read_controller_step(
     controller: ExcavatorController,
-) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, float]:
+) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, float, float, np.ndarray]:
     """Snapshot controller state for the logger.
 
-    Returns: (ee_pos, ee_rot_y_deg, joint_pos_rad, joint_vel_rad, condition_number)
+    Returns: (ee_pos, ee_rot_y_deg, joint_pos_rad, joint_vel_rad,
+              condition_number, yoshikawa_index, singular_values)
     """
     pos, rot_y_deg = controller.get_pose()
     pos = np.asarray(pos, dtype=np.float32)
@@ -780,10 +782,14 @@ def _read_controller_step(
 
     try:
         cond = float(controller.get_condition_number())
+        yoshikawa = float(controller.get_yoshikawa_index())
+        sv = controller.get_singular_values()
     except Exception:
         cond = float("nan")
+        yoshikawa = float("nan")
+        sv = np.full(4, float("nan"), dtype=np.float32)
 
-    return pos, float(rot_y_deg), joint_pos_rad, joint_vel_rad, cond
+    return pos, float(rot_y_deg), joint_pos_rad, joint_vel_rad, cond, yoshikawa, sv
 
 
 def _blind_move_to_start(
@@ -894,7 +900,7 @@ def _execute_on_hardware(
         loop_start = time.perf_counter()
         elapsed = loop_start - t0
 
-        ee_pos, ee_rot_y, joint_pos_rad, joint_vel_rad, cond = _read_controller_step(controller)
+        ee_pos, ee_rot_y, joint_pos_rad, joint_vel_rad, cond, yoshikawa, sv = _read_controller_step(controller)
 
         if total_time > 1e-9:
             progress = min(elapsed / total_time, 1.0)
@@ -920,6 +926,8 @@ def _execute_on_hardware(
                 joint_vel_rad=joint_vel_rad,
                 joint_pos_des_rad=joint_pos_des_rad,
                 condition_number=cond,
+                yoshikawa_index=yoshikawa,
+                sv=sv,
                 waypoint_idx=waypoint_idx,
                 progress=progress,
                 sim_dt=sim_dt,
@@ -1107,7 +1115,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Initializing excavator controller...")
     controller = ExcavatorController(
         hardware_interface=hardware,
-        enable_perf_tracking=bool(args.debug),
+        enable_perf_tracking=True,
         log_level="DEBUG" if args.debug else "INFO",
         rt_priority=args.rt_priority,
     )

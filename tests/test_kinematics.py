@@ -17,7 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from modules.differential_ik import (  # noqa: E402
     compute_jacobian, compute_jacobian_from_joint_angles,
-    compute_condition_number, project_to_rotation_axes, propagate_base_rotation,
+    compute_jacobian_metrics, project_to_rotation_axes, propagate_base_rotation,
     extract_axis_rotation,
 )
 from modules.differential_ik_cfg import RobotConfig  # noqa: E402
@@ -373,7 +373,7 @@ class JacobianSanityTests(unittest.TestCase):
         angles = np.array([0.1, -0.4, 0.3, -0.1], dtype=np.float32)
         quats = build_absolute_quaternions(angles, self.rc)
         J = np.asarray(compute_jacobian(quats, self.rc))
-        cond = compute_condition_number(J)
+        cond, _, _ = compute_jacobian_metrics(J)
         self.assertTrue(np.isfinite(cond))
         self.assertGreater(cond, 1.0)
 
@@ -382,7 +382,7 @@ class JacobianSanityTests(unittest.TestCase):
         angles = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         quats = build_absolute_quaternions(angles, self.rc)
         J = np.asarray(compute_jacobian(quats, self.rc))
-        cond = compute_condition_number(J)
+        cond, _, _ = compute_jacobian_metrics(J)
         self.assertTrue(np.isfinite(cond))
         # A configuration where the boom/arm/bucket pitch axes are all collinear
         # collapses one Jacobian column — cond should be many orders of magnitude
@@ -398,7 +398,7 @@ class JacobianSanityTests(unittest.TestCase):
                           dtype=np.float32)
         quats = build_absolute_quaternions(angles, self.rc)
         J = np.asarray(compute_jacobian(quats, self.rc))
-        cond = compute_condition_number(J)
+        cond, _, _ = compute_jacobian_metrics(J)
         self.assertLess(cond, 200.0,
                         msg=f"generic mid-workspace cond unexpectedly large: {cond}")
 

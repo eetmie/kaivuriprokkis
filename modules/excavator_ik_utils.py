@@ -20,7 +20,7 @@ from .differential_ik import (
     forward_kinematics_core,
     forward_kinematics_with_ee_offset_core,
     compute_jacobian_core,
-    compute_condition_number,
+    compute_jacobian_metrics,
     ik_method_pinv,
     ik_method_svd,
     ik_method_transpose,
@@ -387,6 +387,6 @@ def warmup_numba_functions():
             _ = ik_method_svd(dummy_jacobian, dummy_delta_pose, np.float32(1.0), np.float32(1e-5))
             _ = ik_method_transpose(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
             _ = ik_method_damped_least_squares(dummy_jacobian, dummy_delta_pose, np.float32(0.1))
-            _ = compute_condition_number(dummy_jacobian)
+            _ = compute_jacobian_metrics(dummy_jacobian)
     except Exception as e:
         print(f"Numba warmup failed: {e}")

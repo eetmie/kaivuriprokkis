@@ -325,6 +325,12 @@ class RRTStarParams(RRTParams):
     rewire_radius: float = 0.08
     minimum_iterations: int = 1000
     cost_improvement_patience: int = 5000
+    # Relative-tolerance convergence: exit once the goal cost has improved by
+    # less than `relative_improvement_tol` (fraction of current cost) over the
+    # last `relative_improvement_window` iterations. Set tol to None to disable
+    # and fall back to the absolute `cost_improvement_patience` check only.
+    relative_improvement_tol: Optional[float] = 0.01
+    relative_improvement_window: int = 500
 
 
 @dataclass
@@ -853,6 +859,8 @@ class RRTStar(RRTBase):
                  rewire_radius: float = 0.08,
                  minimum_iterations: int = 1000,
                  cost_improvement_patience: int = 5000,
+                 relative_improvement_tol: Optional[float] = 0.01,
+                 relative_improvement_window: int = 500,
                  verbose: bool = False):
         """
         Initialize RRT* planner with rewiring optimization.
@@ -876,11 +884,25 @@ class RRTStar(RRTBase):
         self.rewire_radius = rewire_radius
         self.minimum_iterations = minimum_iterations
         self.cost_improvement_patience = cost_improvement_patience
+        self.relative_improvement_tol = relative_improvement_tol
+        self.relative_improvement_window = max(1, int(relative_improvement_window))
         self.max_acceptable_cost = None  # Set during plan_path call
 
     def should_terminate_early(self, goal_node: Optional[RRTNode], iteration: int,
-                              last_improvement_iteration: int) -> bool:
-        """Check if we should terminate early based on cost threshold."""
+                              last_improvement_iteration: int,
+                              goal_cost_history: List[Optional[float]]) -> bool:
+        """Decide whether to stop RRT* optimization early.
+
+        Three independent exit conditions, evaluated only after `minimum_iterations`:
+          1. Absolute cost gate: `goal_node.cost <= max_acceptable_cost` (workspace-specific
+             shortcut; default disabled — sized correctly only when the caller knows the
+             expected straight-line distance).
+          2. Relative-improvement gate: cost improved by < `relative_improvement_tol` (fraction
+             of current cost) over the last `relative_improvement_window` iterations. Scale-
+             invariant convergence test — primary stop signal for normal use.
+          3. Patience floor: no improvement at all for `cost_improvement_patience` iterations.
+             Backstop for the case where (2) is disabled, and a hard upper bound on wasted work.
+        """
         if iteration < self.minimum_iterations:
             return False
 
@@ -891,6 +913,21 @@ class RRTStar(RRTBase):
             goal_node.cost <= self.max_acceptable_cost):
             logger.info(f"RRT* early termination: cost {goal_node.cost:.3f}m <= {self.max_acceptable_cost:.3f}m")
             return True
+
+        if self.relative_improvement_tol is not None:
+            window = self.relative_improvement_window
+            if iteration >= window:
+                cost_then = goal_cost_history[iteration - window]
+                cost_now = goal_node.cost
+                if cost_then is not None and cost_now > 0.0:
+                    rel_gain = (cost_then - cost_now) / cost_then
+                    if rel_gain < self.relative_improvement_tol:
+                        logger.info(
+                            f"RRT* early termination: relative improvement {rel_gain*100:.3f}% "
+                            f"< {self.relative_improvement_tol*100:.3f}% over last {window} iters "
+                            f"(cost {cost_then:.3f}m -> {cost_now:.3f}m)"
+                        )
+                        return True
 
         if iteration - last_improvement_iteration > self.cost_improvement_patience:
             logger.info(f"RRT* early termination: no improvement for {self.cost_improvement_patience} iterations")
@@ -983,6 +1020,7 @@ class RRTStar(RRTBase):
         goal_node = None
 
         last_improvement_iteration = 0
+        goal_cost_history: List[Optional[float]] = []
 
         logger.info(f"RRT* starting planning from {start} to {goal}")
         logger.debug(f"Straight-line distance: {straight_line_distance:.3f}m")
@@ -1038,8 +1076,14 @@ class RRTStar(RRTBase):
                     last_improvement_iteration = iteration
                     logger.info(f"RRT* goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m (improved from {old_cost:.3f}m)")
 
+            # Record goal cost (or None if no goal yet) so the relative-improvement
+            # check has a `window`-iter old reference point to compare against.
+            # Rewiring can lower goal_node.cost without retriggering the goal-reached
+            # branch above, so we sample here every iteration.
+            goal_cost_history.append(goal_node.cost if goal_node is not None else None)
+
             # Check for early termination
-            if self.should_terminate_early(goal_node, iteration, last_improvement_iteration):
+            if self.should_terminate_early(goal_node, iteration, last_improvement_iteration, goal_cost_history):
                 logger.info(f"RRT* early termination at iteration {iteration}")
                 break
 
@@ -1733,6 +1777,8 @@ def create_rrt_star_plane_trajectory(
     goal_tolerance: float = 0.02,
     minimum_iterations: int = 1000,
     cost_improvement_patience: int = 5000,
+    relative_improvement_tol: Optional[float] = 0.01,
+    relative_improvement_window: int = 500,
 ) -> np.ndarray:
     """Plan RRT* path on the vertical plane containing start-goal and return world-frame waypoints."""
     grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
@@ -1760,6 +1806,8 @@ def create_rrt_star_plane_trajectory(
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
         cost_improvement_patience=cost_improvement_patience,
+        relative_improvement_tol=relative_improvement_tol,
+        relative_improvement_window=relative_improvement_window,
     )
 
     try:
@@ -1856,7 +1904,9 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
                               rewire_radius: float = 0.08,
                               goal_tolerance: float = 0.02,
                               minimum_iterations: int = 1000,
-                              cost_improvement_patience: int = 5000) -> np.ndarray:
+                              cost_improvement_patience: int = 5000,
+                              relative_improvement_tol: Optional[float] = 0.01,
+                              relative_improvement_window: int = 500) -> np.ndarray:
     """
     High-level interface to create RRT* trajectory with obstacle avoidance.
 
@@ -1906,7 +1956,9 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
         rewire_radius=rewire_radius,
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
-        cost_improvement_patience=cost_improvement_patience
+        cost_improvement_patience=cost_improvement_patience,
+        relative_improvement_tol=relative_improvement_tol,
+        relative_improvement_window=relative_improvement_window,
     )
 
     # Plan path

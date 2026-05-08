@@ -188,9 +188,9 @@ ik:
   # Formula: lambda_adaptive = lambda_val * (1 + scaling * log(1 + condition_number))
   # Clamped to: lambda_val <= lambda_adaptive <= lambda_val * max_multiplier
 
-  enable_adaptive_damping: False
-  adaptive_damping_scaling: 0.10        # How aggressively lambda increases near singularities
-  adaptive_damping_max_multiplier: 2.0  # Maximum lambda = lambda_val * max_multiplier
+  enable_adaptive_damping: True
+  adaptive_damping_max_multiplier: 2.0  # Peak lambda = lambda_val * multiplier, reached at condition_number_threshold
+  # NOTE: multiplier of 2.0 gives lambda 0.001→0.002 — likely needs increasing for real hardware
 
   # Orientation axes that cannot be physically produced are auto-detected from
   # joint rotation axes and always excluded from IK solving. No manual ignore_axes

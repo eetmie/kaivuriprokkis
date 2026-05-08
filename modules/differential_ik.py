@@ -240,10 +240,19 @@ def compute_jacobian_from_joint_angles(joint_angles: np.ndarray, robot_config: R
 # ----------------------------
 
 @numba.njit(fastmath=True, nogil=True)
-def compute_condition_number(jacobian):
-    """Condition number: ratio of largest to smallest singular value."""
+def compute_jacobian_metrics(jacobian):
+    """Return (condition_number, singular_values_f32, yoshikawa_index) from one SVD.
+
+    Single-pass replacement for compute_condition_number — all three values are
+    byproducts of the same factorisation, so computing them together avoids a
+    redundant SVD and gives a clean extension point for future Jacobian telemetry.
+    """
     _, S, _ = np.linalg.svd(jacobian.astype(np.float64), full_matrices=False)
-    return S[0] / (S[-1] + 1e-12)
+    cond = S[0] / (S[-1] + 1e-12)
+    yoshikawa = np.float32(1.0)
+    for s in S:
+        yoshikawa *= np.float32(s)
+    return float(cond), S.astype(np.float32), float(yoshikawa)
 
 
 @numba.njit(fastmath=True, nogil=True)
@@ -421,6 +430,8 @@ class IKController:
         # Debug/telemetry values (for external logging when enabled)
         self.last_adaptive_lambda: float = 0.0
         self.last_condition_number: float = 0.0
+        self.last_yoshikawa_index: float = 0.0
+        self.last_singular_values: np.ndarray = np.zeros(4, dtype=np.float32)
         # Always compute controllable DOFs (auto-detect + ignore_axes)
         self.controllable_dofs = self._compute_controllable_dofs()
         self.n_controllable = len(self.controllable_dofs)
@@ -786,7 +797,11 @@ class IKController:
         cond = self.last_condition_number
 
         base_lambda = self.cfg.ik_params.get("lambda_val", 0.01)
-        adaptive_lambda = base_lambda * (1.0 + self.cfg.adaptive_damping_scaling * np.log(1.0 + cond))
+        # Derive scaling so lambda peaks at base * max_multiplier exactly when
+        # cond == condition_number_threshold (where the IK gate also fires).
+        # This ties the two knobs together and makes max_multiplier meaningful.
+        scaling = (self.cfg.adaptive_damping_max_multiplier - 1.0) / np.log(1.0 + self.cfg.condition_number_threshold)
+        adaptive_lambda = base_lambda * (1.0 + scaling * np.log(1.0 + cond))
         lam = float(np.clip(adaptive_lambda, base_lambda, base_lambda * self.cfg.adaptive_damping_max_multiplier))
         self.last_adaptive_lambda = float(lam)
         return lam
@@ -865,8 +880,15 @@ class IKController:
         else:
             w_sqrt = None
 
-        # Keep this telemetry: adaptive damping and reachability both consume it.
-        self.last_condition_number = float(compute_condition_number(jacobian))
+        # Condition number is always needed (adaptive damping + gating).
+        # Yoshikawa index and singular values are optional diagnostics.
+        _cond, _sv, _yosh = compute_jacobian_metrics(jacobian)
+        self.last_condition_number = _cond
+        if self.cfg.enable_jacobian_metrics:
+            _sv_out = np.zeros(4, dtype=np.float32)
+            _sv_out[:min(4, len(_sv))] = _sv[:min(4, len(_sv))]
+            self.last_singular_values = _sv_out
+            self.last_yoshikawa_index = _yosh
 
         # Compute adaptive damping (uses self.last_condition_number)
         adaptive_lambda = self._compute_adaptive_damping()

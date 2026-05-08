@@ -56,14 +56,22 @@ class IKControllerConfig:
     enable_adaptive_damping: bool = True
     """Enable adaptive damping based on Jacobian conditioning."""
 
-    adaptive_damping_scaling: float = 0.5
-    """Scaling factor for adaptive damping: lambda = base * (1 + scaling * log(1 + cond))."""
+    adaptive_damping_max_multiplier: float = 2.0
+    """Peak lambda = base_lambda * max_multiplier, reached at condition_number_threshold.
+    Tune this to control how much extra damping is applied near singularities.
+    NOTE: 2.0 gives lambda 0.001 → 0.002 — likely needs increasing for real hardware."""
 
-    adaptive_damping_max_multiplier: float = 10.0
-    """Maximum multiplier for adaptive damping (lambda_max = base * max_multiplier)."""
+    condition_number_threshold: float = 40.0
+    """Condition number at which adaptive damping peaks and IK commands are gated (0 = no gating).
+    Adaptive scaling is derived so lambda reaches base * max_multiplier exactly at this value."""
 
     enable_joint_limit_avoidance: bool = True
     """Enable repulsion forces near joint limits."""
+
+    enable_jacobian_metrics: bool = True
+    """Compute and store Yoshikawa manipulability index and singular values each step.
+    Condition number is always computed (needed for adaptive damping and gating).
+    Disable for high-rate or minimal-overhead use cases where full diagnostics are not needed."""
 
     def __post_init__(self):
         # Validate inputs

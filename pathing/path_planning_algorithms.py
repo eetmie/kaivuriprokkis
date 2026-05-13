@@ -57,6 +57,22 @@ ObstacleData: TypeAlias = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
+_LAST_PLAN_STATS: Dict[str, Any] = {}
+
+
+def clear_last_plan_stats() -> None:
+    _LAST_PLAN_STATS.clear()
+
+
+def get_last_plan_stats() -> Dict[str, Any]:
+    return dict(_LAST_PLAN_STATS)
+
+
+def _set_last_plan_stats(**stats: Any) -> None:
+    _LAST_PLAN_STATS.clear()
+    _LAST_PLAN_STATS.update(stats)
+
+
 PLANAR_OBSTACLE_THICKNESS_EPS_M = 1e-3
 BOX_EDGE_CORNER_INDICES = (
     (0, 1), (0, 2), (0, 4),
@@ -287,6 +303,13 @@ ASTAR_PROGRESS_LOG_INTERVAL = 5000
 LINE_CHECK_SPACING_M = 0.01
 LINE_CHECK_MIN_SAMPLES = 2
 
+# A* per-edge oversampling — short A* edges (1 grid cell) need a higher minimum
+# sample count than the shared line-check default (2) to avoid skipping through
+# thin geometry. Restored from Oleg's tuning, which performed well in practice.
+# Effective spacing per A* edge: min(LINE_CHECK_SPACING_M, resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)
+ASTAR_EDGE_SAMPLES_MIN = 5
+ASTAR_EDGE_SAMPLE_RESOLUTION = 0.5  # fraction of grid resolution = ~2 samples per cell along the edge
+
 # RRT Constants
 RRT_DEFAULT_GOAL_SAMPLE_OFFSET = 0.05
 RRT_PROGRESS_LOG_INTERVAL = 500
@@ -314,7 +337,6 @@ AStarPlanarParams = AStarParams
 @dataclass
 class RRTParams:
     max_iterations: int = 10000
-    max_acceptable_cost: Optional[float] = None
     max_step_size: float = 0.05
     goal_bias: float = 0.1
     goal_tolerance: float = 0.02
@@ -324,13 +346,8 @@ class RRTParams:
 class RRTStarParams(RRTParams):
     rewire_radius: float = 0.08
     minimum_iterations: int = 1000
-    cost_improvement_patience: int = 5000
-    # Relative-tolerance convergence: exit once the goal cost has improved by
-    # less than `relative_improvement_tol` (fraction of current cost) over the
-    # last `relative_improvement_window` iterations. Set tol to None to disable
-    # and fall back to the absolute `cost_improvement_patience` check only.
-    relative_improvement_tol: Optional[float] = 0.01
-    relative_improvement_window: int = 500
+    cost_improvement_patience: int = 2000
+    min_improvement_fraction: float = 0.05  # Oleg logic: improvements smaller than this do not reset patience
 
 
 @dataclass
@@ -457,7 +474,15 @@ class AStar3D:
             if not self.obstacle_checker.is_point_collision_free(world_pos):
                 continue
 
-            if not self.obstacle_checker.is_line_collision_free(world_curr, world_pos):
+            # --- Edge collision sampling to prevent skipping through thin geometry ---
+            # Sample ~every ASTAR_EDGE_SAMPLE_RESOLUTION * resolution along the edge,
+            # with a floor of ASTAR_EDGE_SAMPLES_MIN. Short cardinal steps still get
+            # enough samples to catch thin walls that the default 2-sample line check
+            # would slip through.
+            seg_len = math.sqrt(dx*dx + dy*dy + dz*dz) * self.grid_config.resolution
+            num_samples = max(ASTAR_EDGE_SAMPLES_MIN,
+                              int(seg_len / (self.grid_config.resolution * ASTAR_EDGE_SAMPLE_RESOLUTION)))
+            if not self.obstacle_checker.is_line_collision_free(world_curr, world_pos, num_samples=num_samples):
                 continue
 
             # Calculate cost (Euclidean distance)
@@ -487,6 +512,8 @@ class AStar3D:
         # Convert to grid coordinates
         start_grid = self.world_to_grid(start)
         goal_grid = self.world_to_grid(goal)
+
+        clear_last_plan_stats()
 
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
@@ -768,8 +795,7 @@ class RRT(RRTBase):
         pass
 
     def plan_path(self, start: Point3D, goal: Point3D,
-                  max_iterations: int = 10000,
-                  max_acceptable_cost: Optional[float] = None) -> PathType:
+                  max_iterations: int = 10000) -> PathType:
         """
         Plan a path from start to goal using basic RRT.
 
@@ -777,7 +803,6 @@ class RRT(RRTBase):
             start: Start position in world coordinates
             goal: Goal position in world coordinates
             max_iterations: Maximum planning iterations
-            max_acceptable_cost: Unused in basic RRT (kept for API compatibility)
 
         Returns:
             List of waypoints in world coordinates
@@ -786,6 +811,8 @@ class RRT(RRTBase):
             CollisionError: If start or goal is in collision
             NoPathFoundError: If no valid path exists
         """
+        clear_last_plan_stats()
+
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
             raise CollisionError(f"Start position {start} is in collision")
@@ -836,6 +863,7 @@ class RRT(RRTBase):
             if self.calculate_distance(new_position, goal) <= self.goal_tolerance:
                 goal_node = new_node
                 logger.info(f"RRT goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m")
+                print(f"[RRT] Path found at iteration {iteration}/{max_iterations}, cost={goal_node.cost:.3f}m")
                 break
 
         if goal_node is None:
@@ -844,6 +872,15 @@ class RRT(RRTBase):
         # Extract and return path
         path = self.extract_path(goal_node)
         logger.info(f"RRT path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+        _set_last_plan_stats(
+            algorithm="rrt",
+            first_solution_iteration=iteration,
+            final_iteration=iteration,
+            max_iterations=max_iterations,
+            final_cost_m=goal_node.cost,
+            waypoints=len(path),
+            tree_size=len(tree),
+        )
 
         return path
 
@@ -858,9 +895,8 @@ class RRTStar(RRTBase):
                  goal_tolerance: float = 0.02,
                  rewire_radius: float = 0.08,
                  minimum_iterations: int = 1000,
-                 cost_improvement_patience: int = 5000,
-                 relative_improvement_tol: Optional[float] = 0.01,
-                 relative_improvement_window: int = 500,
+                 cost_improvement_patience: int = 2000,
+                 min_improvement_fraction: float = 0.05,
                  verbose: bool = False):
         """
         Initialize RRT* planner with rewiring optimization.
@@ -874,7 +910,8 @@ class RRTStar(RRTBase):
             goal_tolerance: Distance to consider goal reached
             rewire_radius: Radius for rewiring optimization
             minimum_iterations: Minimum iterations before early termination
-            cost_improvement_patience: Iterations to wait for cost improvement
+            cost_improvement_patience: Iterations to wait for meaningful cost improvement
+            min_improvement_fraction: Minimum relative improvement to reset patience (0.05 = 5%)
             verbose: If True, log detailed progress information
         """
         super().__init__(grid_config, obstacle_checker, use_3d, max_step_size,
@@ -884,53 +921,23 @@ class RRTStar(RRTBase):
         self.rewire_radius = rewire_radius
         self.minimum_iterations = minimum_iterations
         self.cost_improvement_patience = cost_improvement_patience
-        self.relative_improvement_tol = relative_improvement_tol
-        self.relative_improvement_window = max(1, int(relative_improvement_window))
-        self.max_acceptable_cost = None  # Set during plan_path call
+        self.min_improvement_fraction = min_improvement_fraction
 
     def should_terminate_early(self, goal_node: Optional[RRTNode], iteration: int,
-                              last_improvement_iteration: int,
-                              goal_cost_history: List[Optional[float]]) -> bool:
-        """Decide whether to stop RRT* optimization early.
-
-        Three independent exit conditions, evaluated only after `minimum_iterations`:
-          1. Absolute cost gate: `goal_node.cost <= max_acceptable_cost` (workspace-specific
-             shortcut; default disabled — sized correctly only when the caller knows the
-             expected straight-line distance).
-          2. Relative-improvement gate: cost improved by < `relative_improvement_tol` (fraction
-             of current cost) over the last `relative_improvement_window` iterations. Scale-
-             invariant convergence test — primary stop signal for normal use.
-          3. Patience floor: no improvement at all for `cost_improvement_patience` iterations.
-             Backstop for the case where (2) is disabled, and a hard upper bound on wasted work.
-        """
+                              last_improvement_iteration: int) -> bool:
+        """Oleg-style early stop: wait for meaningful goal-cost improvements."""
         if iteration < self.minimum_iterations:
             return False
 
         if goal_node is None:
             return False
 
-        if (self.max_acceptable_cost is not None and
-            goal_node.cost <= self.max_acceptable_cost):
-            logger.info(f"RRT* early termination: cost {goal_node.cost:.3f}m <= {self.max_acceptable_cost:.3f}m")
-            return True
-
-        if self.relative_improvement_tol is not None:
-            window = self.relative_improvement_window
-            if iteration >= window:
-                cost_then = goal_cost_history[iteration - window]
-                cost_now = goal_node.cost
-                if cost_then is not None and cost_now > 0.0:
-                    rel_gain = (cost_then - cost_now) / cost_then
-                    if rel_gain < self.relative_improvement_tol:
-                        logger.info(
-                            f"RRT* early termination: relative improvement {rel_gain*100:.3f}% "
-                            f"< {self.relative_improvement_tol*100:.3f}% over last {window} iters "
-                            f"(cost {cost_then:.3f}m -> {cost_now:.3f}m)"
-                        )
-                        return True
-
         if iteration - last_improvement_iteration > self.cost_improvement_patience:
-            logger.info(f"RRT* early termination: no improvement for {self.cost_improvement_patience} iterations")
+            logger.info(
+                f"RRT* early termination: no meaningful improvement for "
+                f"{self.cost_improvement_patience} iterations "
+                f"(threshold: {self.min_improvement_fraction:.0%})"
+            )
             return True
 
         return False
@@ -983,8 +990,7 @@ class RRTStar(RRTBase):
             self._propagate_cost_update(child, cost_delta)
 
     def plan_path(self, start: Point3D, goal: Point3D,
-                  max_iterations: int = 10000,
-                  max_acceptable_cost: Optional[float] = None) -> PathType:
+                  max_iterations: int = 10000) -> PathType:
         """
         Plan a path from start to goal using RRT*.
 
@@ -992,7 +998,6 @@ class RRTStar(RRTBase):
             start: Start position in world coordinates
             goal: Goal position in world coordinates
             max_iterations: Maximum planning iterations
-            max_acceptable_cost: Early termination cost threshold (meters)
 
         Returns:
             List of waypoints in world coordinates
@@ -1001,15 +1006,14 @@ class RRTStar(RRTBase):
             CollisionError: If start or goal is in collision
             NoPathFoundError: If no valid path exists
         """
+        clear_last_plan_stats()
+
         # Check if start and goal are valid
         if not self.obstacle_checker.is_point_collision_free(start):
             raise CollisionError(f"Start position {start} is in collision")
 
         if not self.obstacle_checker.is_point_collision_free(goal):
             raise CollisionError(f"Goal position {goal} is in collision")
-
-        # Set cost threshold
-        self.max_acceptable_cost = max_acceptable_cost
 
         # Calculate straight-line distance for reference
         straight_line_distance = self.calculate_distance(start, goal)
@@ -1020,15 +1024,18 @@ class RRTStar(RRTBase):
         goal_node = None
 
         last_improvement_iteration = 0
-        goal_cost_history: List[Optional[float]] = []
+        last_significant_cost = float('inf')
+        first_goal_iteration: Optional[int] = None
+        final_iteration = 0
 
         logger.info(f"RRT* starting planning from {start} to {goal}")
         logger.debug(f"Straight-line distance: {straight_line_distance:.3f}m")
-        logger.debug(f"Max acceptable cost: {max_acceptable_cost}m" if max_acceptable_cost else "No cost limit set")
         logger.debug(f"Max iterations: {max_iterations}, 3D mode: {self.use_3d}")
         logger.debug(f"Parameters: step={self.max_step_size}, bias={self.goal_bias}, rewire={self.rewire_radius}")
+        logger.debug(f"Early stop: min_iters={self.minimum_iterations}, patience={self.cost_improvement_patience}, min_improv={self.min_improvement_fraction:.1%}")
 
         for iteration in range(max_iterations):
+            final_iteration = iteration
             if self.verbose and iteration % RRT_PROGRESS_LOG_INTERVAL == 0 and iteration > 0:
                 logger.info(f"RRT* iteration {iteration}, tree size: {len(tree)}")
 
@@ -1073,18 +1080,29 @@ class RRTStar(RRTBase):
                 if goal_node is None or new_node.cost < goal_node.cost:
                     old_cost = goal_node.cost if goal_node else float('inf')
                     goal_node = new_node
-                    last_improvement_iteration = iteration
-                    logger.info(f"RRT* goal reached at iteration {iteration}, cost: {goal_node.cost:.3f}m (improved from {old_cost:.3f}m)")
+                    if first_goal_iteration is None:
+                        first_goal_iteration = iteration
+                        print(f"[RRT*] First path found at iteration {iteration}/{max_iterations}, cost={goal_node.cost:.3f}m")
 
-            # Record goal cost (or None if no goal yet) so the relative-improvement
-            # check has a `window`-iter old reference point to compare against.
-            # Rewiring can lower goal_node.cost without retriggering the goal-reached
-            # branch above, so we sample here every iteration.
-            goal_cost_history.append(goal_node.cost if goal_node is not None else None)
+                    # Oleg logic: only reset patience for meaningful improvements.
+                    if old_cost == float('inf') or (old_cost - goal_node.cost) / old_cost >= self.min_improvement_fraction:
+                        last_improvement_iteration = iteration
+                        last_significant_cost = goal_node.cost
+                        logger.info(
+                            f"RRT* significant improvement at iteration {iteration}: "
+                            f"{old_cost:.3f}m -> {goal_node.cost:.3f}m"
+                        )
+                    else:
+                        logger.debug(
+                            f"RRT* minor improvement at iteration {iteration}: "
+                            f"{old_cost:.4f}m -> {goal_node.cost:.4f}m "
+                            f"(< {self.min_improvement_fraction:.0%} threshold)"
+                        )
 
             # Check for early termination
-            if self.should_terminate_early(goal_node, iteration, last_improvement_iteration, goal_cost_history):
-                logger.info(f"RRT* early termination at iteration {iteration}")
+            if self.should_terminate_early(goal_node, iteration, last_improvement_iteration):
+                logger.info(f"RRT* early termination at iteration {iteration}, final cost: {goal_node.cost:.3f}m")
+                print(f"[RRT*] Stopped at iteration {iteration}/{max_iterations}, final cost={goal_node.cost:.3f}m")
                 break
 
         if goal_node is None:
@@ -1093,6 +1111,23 @@ class RRTStar(RRTBase):
         # Extract and return path
         path = self.extract_path(goal_node)
         logger.info(f"RRT* path found with {len(path)} waypoints, total cost: {goal_node.cost:.3f}m")
+        if first_goal_iteration is not None:
+            print(
+                f"[RRT*] Path found iteration={first_goal_iteration}, returned after iteration={final_iteration}, "
+                f"waypoints={len(path)}, cost={goal_node.cost:.3f}m"
+            )
+        _set_last_plan_stats(
+            algorithm="rrt_star",
+            first_solution_iteration=first_goal_iteration,
+            final_iteration=final_iteration,
+            max_iterations=max_iterations,
+            final_cost_m=goal_node.cost,
+            waypoints=len(path),
+            tree_size=len(tree),
+            last_significant_cost_m=last_significant_cost,
+            min_improvement_fraction=self.min_improvement_fraction,
+            cost_improvement_patience=self.cost_improvement_patience,
+        )
 
         return path
 
@@ -1707,7 +1742,6 @@ def create_rrt_plane_trajectory(
     grid_resolution: float = 0.01,
     safety_margin: float = 0.02,
     max_iterations: int = 10000,
-    max_acceptable_cost: Optional[float] = None,
     max_step_size: float = 0.05,
     goal_bias: float = 0.1,
     goal_tolerance: float = 0.02,
@@ -1743,7 +1777,6 @@ def create_rrt_plane_trajectory(
             tuple(s_p.tolist()),
             tuple(g_p.tolist()),
             max_iterations=max_iterations,
-            max_acceptable_cost=max_acceptable_cost,
         )
     except CollisionError as err:
         _rethrow_planar_collision_error(
@@ -1770,15 +1803,13 @@ def create_rrt_star_plane_trajectory(
     grid_resolution: float = 0.01,
     safety_margin: float = 0.02,
     max_iterations: int = 10000,
-    max_acceptable_cost: Optional[float] = None,
     max_step_size: float = 0.05,
     goal_bias: float = 0.1,
     rewire_radius: float = 0.08,
     goal_tolerance: float = 0.02,
     minimum_iterations: int = 1000,
-    cost_improvement_patience: int = 5000,
-    relative_improvement_tol: Optional[float] = 0.01,
-    relative_improvement_window: int = 500,
+    cost_improvement_patience: int = 2000,
+    min_improvement_fraction: float = 0.05,
 ) -> np.ndarray:
     """Plan RRT* path on the vertical plane containing start-goal and return world-frame waypoints."""
     grid_cfg, _, s_p, g_p, _, plane_to_world = _build_planar_environment(
@@ -1806,8 +1837,7 @@ def create_rrt_star_plane_trajectory(
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
         cost_improvement_patience=cost_improvement_patience,
-        relative_improvement_tol=relative_improvement_tol,
-        relative_improvement_window=relative_improvement_window,
+        min_improvement_fraction=min_improvement_fraction,
     )
 
     try:
@@ -1815,7 +1845,6 @@ def create_rrt_star_plane_trajectory(
             tuple(s_p.tolist()),
             tuple(g_p.tolist()),
             max_iterations=max_iterations,
-            max_acceptable_cost=max_acceptable_cost,
         )
     except CollisionError as err:
         _rethrow_planar_collision_error(
@@ -1898,15 +1927,13 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
                               safety_margin: float = 0.02,
                               use_3d: bool = True,
                               max_iterations: int = 10000,
-                              max_acceptable_cost: Optional[float] = None,
                               max_step_size: float = 0.05,
                               goal_bias: float = 0.1,
                               rewire_radius: float = 0.08,
                               goal_tolerance: float = 0.02,
                               minimum_iterations: int = 1000,
-                              cost_improvement_patience: int = 5000,
-                              relative_improvement_tol: Optional[float] = 0.01,
-                              relative_improvement_window: int = 500) -> np.ndarray:
+                              cost_improvement_patience: int = 2000,
+                              min_improvement_fraction: float = 0.05) -> np.ndarray:
     """
     High-level interface to create RRT* trajectory with obstacle avoidance.
 
@@ -1918,7 +1945,6 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
         safety_margin: Additional clearance around obstacles
         use_3d: Use full 3D planning or just X-Z plane
         max_iterations: Maximum RRT* iterations
-        max_acceptable_cost: Early termination cost threshold (meters)
         max_step_size: Maximum tree extension distance
         goal_bias: Probability of sampling toward goal (0.0-1.0)
         rewire_radius: Radius for tree rewiring
@@ -1957,14 +1983,12 @@ def create_rrt_star_trajectory(start_pos: Tuple[float, float, float],
         goal_tolerance=goal_tolerance,
         minimum_iterations=minimum_iterations,
         cost_improvement_patience=cost_improvement_patience,
-        relative_improvement_tol=relative_improvement_tol,
-        relative_improvement_window=relative_improvement_window,
+        min_improvement_fraction=min_improvement_fraction,
     )
 
     # Plan path
     path = planner.plan_path(start_pos, goal_pos,
-                             max_iterations=max_iterations,
-                             max_acceptable_cost=max_acceptable_cost)
+                             max_iterations=max_iterations)
 
     if not path:
         raise RuntimeError("RRT* failed to find a path")
@@ -1987,7 +2011,6 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
                          safety_margin: float = 0.02,
                          use_3d: bool = True,
                          max_iterations: int = 10000,
-                         max_acceptable_cost: Optional[float] = None,
                          max_step_size: float = 0.05,
                          goal_bias: float = 0.1,
                          goal_tolerance: float = 0.02) -> np.ndarray:
@@ -2002,7 +2025,6 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
         safety_margin: Additional clearance around obstacles
         use_3d: Use full 3D planning or just X-Z plane
         max_iterations: Maximum RRT iterations
-        max_acceptable_cost: Early termination cost threshold (meters)
         max_step_size: Maximum tree extension distance
         goal_bias: Probability of sampling toward goal (0.0-1.0)
         goal_tolerance: Distance threshold to reach goal
@@ -2040,8 +2062,7 @@ def create_rrt_trajectory(start_pos: Tuple[float, float, float],
 
     # Plan path
     path = planner.plan_path(start_pos, goal_pos,
-                             max_iterations=max_iterations,
-                             max_acceptable_cost=max_acceptable_cost)
+                             max_iterations=max_iterations)
 
     if not path:
         raise RuntimeError("RRT failed to find a path")

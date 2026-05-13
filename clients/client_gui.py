@@ -9,6 +9,7 @@ Controls:
     Direct: A/D=Slew, W/S=Boom, Q/E=Arm, R/F=Bucket | Shift=full
 """
 
+import argparse
 import sys
 from pathlib import Path
 import tkinter as tk
@@ -51,9 +52,10 @@ class ExcavatorGUI3D:
     KEY_STEP_POS = 0.001
     KEY_STEP_ROT = 0.1
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, disable_limits: bool = False):
         self.root = root
         self.root.title("Excavator 3D Position Control GUI - UDP Streaming")
+        self.disable_limits = disable_limits
 
         # IK target state stays local to the GUI and always composes back into
         # Cartesian commands before the network boundary.
@@ -129,7 +131,8 @@ class ExcavatorGUI3D:
             (self.measured_x, self.measured_y, self.measured_z),
             self.measured_rot_y,
         )
-        self.target_state.clamp_cartesian(self.WORKSPACE_LIMITS)
+        if not self.disable_limits:
+            self.target_state.clamp_cartesian(self.WORKSPACE_LIMITS)
         return True
 
     def _toggle_ik_space(self):
@@ -362,6 +365,8 @@ class ExcavatorGUI3D:
         self._update_labels()
 
     def _clamp_pose(self):
+        if self.disable_limits:
+            return
         self.target_state.clamp_cartesian(self.WORKSPACE_LIMITS)
 
     def _update_labels(self):
@@ -576,8 +581,15 @@ class ExcavatorGUI3D:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Excavator GUI client")
+    parser.add_argument("--no-limits", action="store_true",
+                        help="Disable client-side workspace XYZ/rotation clamping")
+    args, _ = parser.parse_known_args()
+
     root = tk.Tk()
-    app = ExcavatorGUI3D(root)
+    app = ExcavatorGUI3D(root, disable_limits=args.no_limits)
+    if args.no_limits:
+        print("[GUI] Workspace limits DISABLED — target pose will not be clamped.")
     root.mainloop()
 
 

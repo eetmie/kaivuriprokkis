@@ -298,7 +298,7 @@ def _plan_raw_suffix(
     prm_params=None,
     use_3d: bool = True,
     verbose: bool = False,
-) -> Optional[np.ndarray]:
+) -> Optional[Dict[str, Any]]:
     from .normalized_planners import plan_to_target
 
     start = np.asarray(start_pos, dtype=np.float32)
@@ -329,7 +329,10 @@ def _plan_raw_suffix(
             )
             exec_positions = result.get("exec_positions")
             if exec_positions is not None and len(exec_positions) > 0:
-                return np.asarray(exec_positions, dtype=np.float32)
+                return {
+                    "positions": np.asarray(exec_positions, dtype=np.float32),
+                    "planning_stats": result.get("planning_stats"),
+                }
         except Exception as err:  # noqa: BLE001
             logger.info("[RadialPlanner] Raw suffix planner %s failed: %s: %s", algorithm, type(err).__name__, err)
     return None
@@ -347,6 +350,7 @@ def _compose_result(
     raw_suffix: np.ndarray | None = None,
     radial_suffix: np.ndarray | None = None,
     chosen_variant: str = "seed",
+    planning_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     result = standardize_path(
         exec_path,
@@ -363,6 +367,8 @@ def _compose_result(
     if radial_suffix is not None:
         result["radial_suffix_positions"] = np.asarray(radial_suffix, dtype=np.float32)
     result["chosen_variant"] = chosen_variant
+    if planning_stats:
+        result["planning_stats"] = planning_stats
     return result
 
 
@@ -440,7 +446,7 @@ def plan_radial(
         prefix = radial_seed[: handoff_idx + 1]
         handoff = tuple(prefix[-1].tolist())
 
-        raw_suffix = _plan_raw_suffix(
+        raw_suffix_result = _plan_raw_suffix(
             handoff,
             goal_pos,
             obstacle_data=obstacle_data,
@@ -455,9 +461,11 @@ def plan_radial(
             use_3d=use_3d,
             verbose=verbose,
         )
-        if raw_suffix is None:
+        if raw_suffix_result is None:
             continue
 
+        raw_suffix = raw_suffix_result["positions"]
+        planning_stats = raw_suffix_result.get("planning_stats")
         raw_path = _merge_prefix_and_suffix(prefix, raw_suffix)
         if not _path_is_collision_free(raw_path, checker):
             continue
@@ -478,6 +486,7 @@ def plan_radial(
                 handoff_point=handoff_arr,
                 raw_suffix=raw_suffix,
                 chosen_variant=chosen,
+                planning_stats=planning_stats,
             )
 
         radial_suffix = radial_compensate(
@@ -509,10 +518,11 @@ def plan_radial(
             raw_suffix=raw_suffix,
             radial_suffix=radial_suffix,
             chosen_variant=chosen,
+            planning_stats=planning_stats,
         )
 
     logger.warning("[RadialPlanner] No handoff produced a collision-free raw path; falling back to direct raw from start")
-    raw_from_start = _plan_raw_suffix(
+    raw_from_start_result = _plan_raw_suffix(
         start_pos,
         goal_pos,
         obstacle_data=obstacle_data,
@@ -527,13 +537,15 @@ def plan_radial(
         use_3d=use_3d,
         verbose=verbose,
     )
-    if raw_from_start is None:
+    if raw_from_start_result is None:
         raise RuntimeError("Radial planner could not produce a fallback raw path")
 
+    raw_from_start = raw_from_start_result["positions"]
     return _compose_result(
         exec_path=raw_from_start,
         normalizer_params=normalizer_params,
         radial_seed=radial_seed,
         raw_suffix=raw_from_start,
         chosen_variant="red",
+        planning_stats=raw_from_start_result.get("planning_stats"),
     )

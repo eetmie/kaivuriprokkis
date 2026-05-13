@@ -192,7 +192,13 @@ def main():
     parser.add_argument("--lock-memory", action="store_true", help="Call mlockall() for RT threads")
     parser.add_argument("--control-core", type=int, default=None, help="CPU core for main loop and control loop")
     parser.add_argument("--io-core", type=int, default=None, help="CPU core for USB reader, IMU, and ADC threads")
+    parser.add_argument("--no-limits", action="store_true",
+                        help="Disable workspace limits (note: enforced client-side, server has none to disable)")
     args, _ = parser.parse_known_args()
+
+    if args.no_limits:
+        print("[excv_gui] --no-limits: workspace XYZ limits are enforced client-side only; "
+              "pass --no-limits to client_gui.py to actually disable them.")
 
     quiet = args.perf
     jac_state = {}  # mutable state for Jacobian delta tracking

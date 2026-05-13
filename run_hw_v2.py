@@ -66,18 +66,19 @@ from pathing.path_utils import (
 )
 
 
-def _wide_workspace_bounds(
+def _configured_workspace_bounds(
     obstacle_data,
     start_pos,
     goal_pos,
-    padding: float = 0.1,
-    min_bounds: Tuple[float, float, float] = (-1.0, -1.0, -0.3),
-    max_bounds: Tuple[float, float, float] = (1.0, 1.0, 0.6),
+    padding: float = DEFAULT_CONFIG.workspace_padding,
+    min_bounds: Tuple[float, float, float] = DEFAULT_CONFIG.workspace_min_bounds,
+    max_bounds: Tuple[float, float, float] = DEFAULT_CONFIG.workspace_max_bounds,
 ):
-    """Workspace bounds wide enough to contain points below the slew plane (z<0).
+    """Workspace bounds sourced from PathExecutionConfig (shared sim/IRL).
 
-    Mirrors run_sim_v2.py:_wide_workspace_bounds — the planner's default min_bounds
-    of (0.34, -0.36, 0.0) clips the negative-z task points used by all presets.
+    Mirrors run_sim_v2.py:_configured_workspace_bounds. Bounds stretch to
+    enclose start/goal/obstacles + padding, then clamp to be at least as
+    wide as [min_bounds, max_bounds]. Tune in pathing_config.py.
     """
     points = [list(start_pos), list(goal_pos)]
     if obstacle_data:
@@ -91,8 +92,8 @@ def _wide_workspace_bounds(
     return tuple(bounds_min_calc.tolist()), tuple(bounds_max_calc.tolist())
 
 
-planner_algos.calculate_workspace_bounds = _wide_workspace_bounds
-path_utils_mod.calculate_workspace_bounds = _wide_workspace_bounds
+planner_algos.calculate_workspace_bounds = _configured_workspace_bounds
+path_utils_mod.calculate_workspace_bounds = _configured_workspace_bounds
 
 
 logger = logging.getLogger("run_hw_v2")
@@ -143,10 +144,11 @@ class TaskPreset:
 
 def make_task_preset(task_name: str) -> TaskPreset:
     if task_name == "in-and-out":
+        env = DEFAULT_ENV_CONFIG
         return TaskPreset(
             name="in-and-out",
-            goals=((0.55, 0.25, -0.15), (0.55, -0.25, -0.2)),
-            rotations_deg=(0.0, 0.0),
+            goals=(tuple(env.point_a_pos), tuple(env.point_b_pos)),
+            rotations_deg=(env.point_a_rotation_deg, env.point_b_rotation_deg),
             labels=("A_INSIDE", "B_OUTSIDE"),
         )
     if task_name == "rotation":
@@ -392,10 +394,39 @@ def _plan_trajectory(
     use_3d = not planar
     normalizer = _make_normalizer(path_config)
 
-    astar_params = AStarParams() if base_algorithm == "a_star" else None
-    rrt_params = RRTParams(max_acceptable_cost=0.768) if base_algorithm == "rrt" else None
-    rrt_star_params = RRTStarParams() if base_algorithm == "rrt_star" else None
-    prm_params = PRMParams() if base_algorithm == "prm" else None
+    astar_params = (
+        AStarParams(max_iterations=path_config.astar_max_iterations)
+        if base_algorithm == "a_star" else None
+    )
+    rrt_params = (
+        RRTParams(
+            max_iterations=path_config.rrt_max_iterations,
+            max_step_size=path_config.rrt_max_step_size,
+            goal_bias=path_config.rrt_goal_bias,
+            goal_tolerance=path_config.rrt_goal_tolerance,
+        )
+        if base_algorithm == "rrt" else None
+    )
+    rrt_star_params = (
+        RRTStarParams(
+            max_iterations=path_config.rrt_max_iterations,
+            max_step_size=path_config.rrt_max_step_size,
+            goal_bias=path_config.rrt_goal_bias,
+            goal_tolerance=path_config.rrt_goal_tolerance,
+            rewire_radius=path_config.rrt_star_rewire_radius,
+            minimum_iterations=path_config.rrt_star_min_iterations,
+            cost_improvement_patience=path_config.rrt_star_cost_patience,
+        )
+        if base_algorithm == "rrt_star" else None
+    )
+    prm_params = (
+        PRMParams(
+            num_samples=path_config.prm_num_samples,
+            connection_radius=path_config.prm_connection_radius,
+            max_connections_per_node=path_config.prm_max_connections,
+        )
+        if base_algorithm == "prm" else None
+    )
 
     calc_start = time.time()
 
@@ -415,6 +446,9 @@ def _plan_trajectory(
             use_3d=use_3d,
             verbose=enable_verbose,
             execute_raw=(radial_mode == "raw"),
+            rdp_epsilon=path_config.radial_rdp_epsilon,
+            radial_compensation_alpha=path_config.radial_compensation_alpha,
+            smoothing_samples=path_config.radial_smoothing_samples,
         )
     else:
         result = plan_to_target(
@@ -434,6 +468,16 @@ def _plan_trajectory(
         )
 
     calculation_time = time.time() - calc_start
+
+    planning_stats = result.get("planning_stats") or {}
+    if planning_stats:
+        first_iter = planning_stats.get("first_solution_iteration")
+        final_iter = planning_stats.get("final_iteration")
+        max_iter = planning_stats.get("max_iterations")
+        print(
+            f"[Planner] {planning_stats.get('algorithm', fallback)} iterations: "
+            f"first_path={first_iter}, returned_after={final_iter}/{max_iter}"
+        )
 
     exec_positions = np.asarray(result["exec_positions"], dtype=np.float32)
     if exec_positions.ndim == 2 and exec_positions.shape[1] >= 7:

@@ -34,6 +34,7 @@ from .path_planning_algorithms import (
     create_rrt_trajectory,
     create_prm_trajectory,
     create_prm_plane_trajectory,
+    get_last_plan_stats,
 )
 
 
@@ -130,13 +131,17 @@ def _plan_and_normalize(
 ) -> Dict[str, np.ndarray]:
     """Run a raw planner, append goal if requested, then normalize to constant speed."""
     raw = raw_fn(**raw_kwargs)
+    planning_stats = get_last_plan_stats()
     raw = force_goal_as_final_waypoint(raw, goal_pos, obstacle_data, safety_margin, normalizer_params.force_goal)
-    return standardize_path(
+    result = standardize_path(
         raw,
         speed_mps=normalizer_params.speed_mps,
         dt=normalizer_params.dt,
         return_poses=normalizer_params.return_poses,
     )
+    if planning_stats:
+        result["planning_stats"] = planning_stats
+    return result
 
 
 def plan_to_target(

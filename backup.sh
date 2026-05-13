@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dated backup script - excludes pycache and temp files
+# Dated backup script - excludes pycache, temp files, and large runtime data dirs
 
 BACKUP_DIR="$HOME/backups"
 DATE=$(date +%Y-%m-%d_%H%M)
@@ -12,6 +12,8 @@ rsync -a \
     --exclude='*.pyc' \
     --exclude='.lgd*' \
     --exclude='.pytest_cache' \
+    --exclude='data_collection/hydraulic_data/' \
+    --exclude='logs_hw/' \
     "$(pwd)/" "$DEST/"
 
 echo "Backup created: $DEST"

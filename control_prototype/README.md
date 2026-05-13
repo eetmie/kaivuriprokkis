@@ -112,6 +112,54 @@ See the TODO block at the bottom of `relative_command_processor.py`:
 directional scaling, predictive safety, input shaping, per-axis caps,
 table-floor, config loader, telemetry channel, anti-windup vs measured.
 
+## Likely next architecture: rubber-band model
+
+The current integrator approach may be replaced with a simpler rubber-band
+model. The full intended stack would be:
+
+```
+client (raw, fast-switching commands)
+        |
+        v
+  server slew limiter       ramps v_cmd per-axis to suit robot dynamics.
+                            lives on the server so any client is safe —
+                            gamepad, ROS node, web UI, all get the same
+                            smooth behaviour for free.
+        |
+        v
+  directional reachability  per-axis smoothstep scale derived from
+  scaling                   joint-limit distance, Yoshikawa, condition
+                            number. Only damps axes pointing INTO a
+                            constraint; tangential axes stay at full scale.
+        |
+        v
+  rubber-band offset        target = meas_pos + v_scaled * lookahead_m
+                            target is re-derived from measured EE every
+                            tick. zero velocity → target = EE → arm holds
+                            naturally. windup impossible by construction.
+                            no lead-window clamp or zero-snap needed.
+        |
+        v
+  controller.give_pose(...)
+```
+
+Key properties:
+- Smooth start/stop falls out of the slew limiter. No special stop logic.
+- Zero velocity holds the arm where it physically is, not where the
+  integrator drifted to.
+- Boundary sliding falls out of directional scaling. Motion tangent to a
+  limit keeps full lookahead; motion into it gets a shortened band.
+- `reachability_limiter.py` is reused unchanged — it already computes
+  the per-margin scalars needed for directional scaling.
+- The only new pieces are the server slew limiter and the rubber-band
+  offset (both trivial); `RelativeCommandProcessor` is replaced or
+  simplified to a one-liner.
+
+The `lookahead_m` tunable (e.g. 30-50 mm) controls how hard the
+controller pulls. The open question for hardware testing is whether a
+fixed lookahead gives the PID enough authority to drive the hydraulics
+smoothly across the full commanded speed range.
+
 ## Boundary with production code
 
 This folder reads `modules/*` (IK kernel, controller, hardware, UDP)

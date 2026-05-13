@@ -10,6 +10,16 @@ Usage examples:
     sudo python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
     sudo python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
     sudo python run_hw_v2.py --test --once          # direct A/B, no planner
+
+NOTE — yaw/rotation error wrapping:
+    The IMUs have no magnetometer or gyroscope, so yaw drifts freely. The
+    Y-rotation angle extracted from the quaternion can wrap at ±180°, causing
+    a bare abs(a - b) check to report ~360° error instead of ~0°. All rotation
+    error comparisons in this file must use wrapped angular difference:
+        abs(((a - b) + 180) % 360 - 180)
+    Affected: _blind_move_to_start (line ~855), _execute_on_hardware (line ~1000),
+    _run_direct_target_test (line ~1085). Observed failure mode: robot oscillates
+    between +180° and -180° target for the full dwell period (~700-run occurrence).
 """
 
 from __future__ import annotations

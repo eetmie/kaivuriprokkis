@@ -207,3 +207,25 @@ def _wrap_deg(deg: float, half_range: float) -> float:
 #   integration so |target - measured| does not exceed a "lead window" --
 #   prevents wind-up similar to what relative-mode was supposed to solve at
 #   the IK level but applied at this layer too.
+#   See excv_gui_relative.py for the current lead-window + zero-snap approach.
+#
+# TODO(rubber-band-model): Consider replacing the integrator entirely with a
+#   pure rubber-band: target = meas_pos + normalize(v_cmd) * lookahead_m.
+#   The target is re-derived from the measured EE every tick, so windup is
+#   impossible by construction and zero velocity naturally holds the arm in
+#   place — no snap, no clamp, no accumulated state.
+#
+#   Slew-rate limiting belongs on the SERVER, not the client. The client
+#   sends raw fast-switching commands; the server ramps them to suit the
+#   robot's dynamics. This way any client (gamepad, ROS node, web UI) gets
+#   safe smooth behaviour for free without knowing anything about the machine.
+#   A simple per-axis rate limiter (max delta per tick) applied to v_cmd
+#   before the rubber-band offset is computed is all that is needed:
+#
+#       v_cmd_slewed = slew(v_cmd_raw, v_prev, max_delta_per_tick)
+#       target = meas_pos + normalize(v_cmd_slewed) * lookahead_m
+#
+#   Smooth start/stop then falls out naturally from the ramp.
+#   The reachability smoothstep scaling of v_cmd is unchanged.
+#   Only open question: does a fixed lookahead_m (e.g. 30-50 mm) give the
+#   PID enough authority to drive the hydraulics across the full speed range?

@@ -198,3 +198,23 @@ cython_debug/
 /pico_imu_reader/*.hex
 /pico_imu_reader/*.uf2
 .claude/settings.local.json
+
+# Local/public-release cleanup artifacts
+backups/
+logs_stress/
+data_collection/nn/dataset_split_*/
+
+# Hardware logs, datasets, and generated model artifacts
+logs*/
+*_logs/
+*.log
+*.csv
+*.npy
+*.npz
+*.pt
+*.pth
+*.bag
+*.db3
+*.mcap
+data_collection/hydraulic_data/
+data_collection/test_results/

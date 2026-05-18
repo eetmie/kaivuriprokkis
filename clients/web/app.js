@@ -85,10 +85,10 @@ function makeTargetMarker() {
 // ----- URDF load -----------------------------------------------------------
 let robot = null;
 const JOINT_MAP = {
-    slew: 'revolute_cabin',
+    slew: 'revolute_carriage',
     boom: 'revolute_lift',
     arm: 'revolute_tilt',
-    bucket: 'revolute_scoop',
+    bucket: 'revolute_tool',
 };
 
 const loadingOverlay = document.createElement('div');
@@ -99,6 +99,7 @@ viewport.appendChild(loadingOverlay);
 async function loadRobot() {
     const res = await fetch('/robot/robot.urdf');
     let xml = await res.text();
+    const initialJointPositions = parseInitialJointPositions(xml);
     // URDF references meshes as `file:./meshes/X.obj` — strip the scheme so
     // the browser can fetch them relative to workingPath.
     xml = xml.replace(/filename="file:/g, 'filename="');
@@ -112,6 +113,8 @@ async function loadRobot() {
         manager.onLoad = resolve;
         manager.onError = reject;
     });
+
+    applyInitialJointPositions(parsed, initialJointPositions);
 
     parsed.traverse(c => {
         if (c.isMesh) {
@@ -127,6 +130,30 @@ async function loadRobot() {
     });
 
     return parsed;
+}
+
+function parseInitialJointPositions(xml) {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const values = {};
+    doc.querySelectorAll('ros2_control joint').forEach((joint) => {
+        const name = joint.getAttribute('name');
+        const param = joint.querySelector('state_interface[name="position"] param[name="initial_value"]');
+        if (!name || !param) return;
+        const value = Number.parseFloat(param.textContent || '');
+        if (Number.isFinite(value)) {
+            values[name] = value;
+        }
+    });
+    return values;
+}
+
+function applyInitialJointPositions(loadedRobot, initialJointPositions) {
+    Object.entries(initialJointPositions).forEach(([jointName, value]) => {
+        const joint = loadedRobot.joints?.[jointName];
+        if (joint) {
+            joint.setJointValue(value);
+        }
+    });
 }
 
 function loadObjMesh(path, manager, done) {

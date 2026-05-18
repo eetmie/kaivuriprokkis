@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="excavator_urdf_ros2_ready">
+  <joint name="gripper_to_tool" type="fixed">
+    <origin xyz="0.047 -0. -0.019" rpy="0. 0. 0."/>
+    <parent link="tool_body"/>
+    <child link="gripper_mount"/>
+  </joint>
+  <joint name="revolute_carriage" type="revolute">
+    <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+    <parent link="excavator"/>
+    <child link="upper_carriage"/>
+    <axis xyz="0. 0. 1."/>
+    <limit lower="-8.0285146" upper="8.0285146" effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <joint name="revolute_claw_1" type="revolute">
+    <origin xyz="0. 0.025 -0.038" rpy="0. 0. -0."/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_1"/>
+    <axis xyz="1. 0. 0."/>
+    <limit lower="0." upper="0.8726646" effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <joint name="revolute_claw_2" type="revolute">
+    <origin xyz="0. -0.025 -0.038" rpy="-0.0000005 0.0000001 0.0000001"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_2"/>
+    <axis xyz="1. 0. 0."/>
+    <limit lower="-0.8726646" upper="0." effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <joint name="revolute_gripper" type="continuous">
+    <origin xyz="-0.0105 0. -0.025 " rpy="0.0000004 -0. -1.5707964"/>
+    <parent link="gripper_mount"/>
+    <child link="gripper_frame"/>
+    <axis xyz="0. 0. 1."/>
+  </joint>
+  <joint name="revolute_lift" type="revolute">
+    <origin xyz="0.0165 0. 0.0785" rpy="0. 0. 0."/>
+    <parent link="upper_carriage"/>
+    <child link="lift_boom"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="-0.8726646" upper="0.5235988" effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <joint name="revolute_tilt" type="revolute">
+    <origin xyz="0.42008 0. -0.20564" rpy="0. 0. 0."/>
+    <parent link="lift_boom"/>
+    <child link="tilt_boom"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="0.4886922" upper="2.5132741" effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <joint name="revolute_tool" type="revolute">
+    <origin xyz="0.2499999 0. -0.0025 " rpy="0. 0. 0."/>
+    <parent link="tilt_boom"/>
+    <child link="tool_body"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="-1.4835299" upper="1.2217305" effort="10000000." velocity="17453.2925199"/>
+  </joint>
+  <link name="excavator">
+    <inertial>
+      <origin xyz="0.0045939 -0.0001728 -0.0382546" rpy="0. 0. 0."/>
+      <mass value="6.5"/>
+      <inertia ixx="0.049442" ixy="0.0005321" ixz="0.0005431" iyy="0.0529756" iyz="-0.0000344" izz="0.0970931"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_claw_1">
+    <inertial>
+      <origin xyz="-0.00019 0.0062462 -0.0327046" rpy="0. 0. 0."/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736" ixy="-0.0000001" ixz="0.0000012" iyy="0.0003253" iyz="-0.0000481" izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_claw_2">
+    <inertial>
+      <origin xyz="0.00019 -0.0062462 -0.0327046" rpy="0. 0. 0."/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736" ixy="-0.0000001" ixz="-0.0000012" iyy="0.0003253" iyz="0.0000481" izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_frame">
+    <inertial>
+      <origin xyz="0. 0. -0.02261" rpy="0. 0. 0."/>
+      <mass value="0.07586"/>
+      <inertia ixx="0.0000321" ixy="0." ixz="0." iyy="0.0000572" iyz="0." izz="0.0000607"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_mount">
+    <inertial>
+      <origin xyz="-0.01131 0. -0.01542" rpy="0. 0. 0."/>
+      <mass value="0.06983"/>
+      <inertia ixx="0.0000177" ixy="0." ixz="0.0000006" iyy="0.0000127" iyz="0." izz="0.0000198"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="lift_boom">
+    <inertial>
+      <origin xyz="0.199811 -0.000094 -0.044468" rpy="0. 0. 0."/>
+      <mass value="1.15299"/>
+      <inertia ixx="0.0049344" ixy="0.0000021" ixz="0.0072827" iyy="0.021352" iyz="0.0000036" izz="0.0167196"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="tilt_boom">
+    <inertial>
+      <origin xyz="0.06505 -0.00005 0.01784" rpy="0. 0. 0."/>
+      <mass value="0.77626"/>
+      <inertia ixx="0.00036" ixy="0." ixz="0.000676" iyy="0.0060442" iyz="0." izz="0.005863"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="tool_body">
+    <inertial>
+      <origin xyz="0.0265998 0. -0.0101976" rpy="0. 0. 0."/>
+      <mass value="0.137"/>
+      <inertia ixx="0.0000403" ixy="0." ixz="0.0000048" iyy="0.0000601" iyz="0." izz="0.0000815"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_carriage">
+    <inertial>
+      <origin xyz="-0.0821657 0.0013232 0.0460171" rpy="0. 0. 0."/>
+      <mass value="8.1000004"/>
+      <inertia ixx="0.0446463" ixy="-0.0058658" ixz="0.0002102" iyy="0.0700401" iyz="-0.0020342" izz="0.095637"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_visuals_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
+      <geometry>
+        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

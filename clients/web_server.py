@@ -66,9 +66,24 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 8000
 
 _HERE = Path(__file__).resolve().parent
+
+
+def _robot_static_root() -> Path:
+    """Find the robot folder, preferring the current/generated model location."""
+    candidates = [
+        Path.cwd() / "robot",
+        _ROOT_DIR / "models" / "robot",
+        _HERE / "robot",
+    ]
+    for candidate in candidates:
+        if (candidate / "robot.urdf").is_file():
+            return candidate
+    return _HERE / "robot"
+
+
 STATIC_ROOTS = {
     # URL prefix -> directory on disk. Longest prefix wins.
-    "/robot/": _HERE / "robot",
+    "/robot/": _robot_static_root(),
     "/vendor/urdf-loader/": _HERE / "urdf-loaders-master" / "javascript" / "src",
     "/": _HERE / "web",
 }

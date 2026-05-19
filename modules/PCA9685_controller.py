@@ -316,7 +316,8 @@ class PWMController:
                  toggle_channels: bool = True, input_rate_threshold: float = 0,
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
                  stale_timeout_s: float = 0.0, perf_enabled: bool = False,
-                 cleanup_disable_osc: bool = True, pwm_frequency: Optional[int] = None):
+                 cleanup_disable_osc: bool = True, pwm_frequency: Optional[int] = None,
+                 bus: int = 1):  # 1 for Pi, 7 for Orin Nano.
         """Initialize PWM controller.
 
         Args:
@@ -331,6 +332,7 @@ class PWMController:
             cleanup_disable_osc: If True, stop PCA9685 oscillator on cleanup (outputs go LOW).
                                  If False, keep oscillator running (outputs stay at center).
             pwm_frequency: PWM frequency in Hz (default: from PWMConstants.PWM_FREQUENCY_DEFAULT)
+            bus: I2C bus number for PCA9685.
         """
         # Setup logger
         self.logger = logging.getLogger(f"{__name__}.PWMController")
@@ -369,7 +371,7 @@ class PWMController:
         self._load_config(config_file)
 
         # Hardware init - direct SMBus I2C, no Adafruit dependency
-        self._i2c = _open_smbus(PCA9685_I2C_BUS)
+        self._i2c = _open_smbus(bus)
         self._direct_writer = None
         self._pwm_period_us = 0.0
         self._rebuild_writer(pwm_frequency=pwm_frequency)

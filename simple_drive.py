@@ -8,8 +8,8 @@ Usage:
     sudo python simple_drive.py --linkage-rate-correction
     sudo python simple_drive.py --robot jetson
 
-Jetson mode is PCA9685-only by default: no IMUs, no ExcavatorController stack,
-just direct named PWM commands for valve config tuning.
+Jetson mode is PCA9685-only by default: HardwareInterface is used with IMU
+disabled and direct named PWM commands for valve config tuning.
 
 Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
@@ -301,46 +301,10 @@ def map_pwm_commands(canonical_commands: dict, command_names: dict) -> dict:
     }
 
 
-class PWMOnlyHardware:
-    """Minimal HardwareInterface-compatible wrapper for PCA9685-only driving."""
-
-    def __init__(self, *, config_file: str, pump_auto_mode: bool, toggle_channels: bool,
-                 stale_timeout_s: float, cleanup_disable_osc: bool,
-                 pwm_i2c_bus: int, pwm_i2c_addr: int):
-        from modules.PCA9685_controller import PWMController
-
-        self.config_file = config_file
-        self.pwm_controller = PWMController(
-            config_file=config_file,
-            pump_auto_mode=pump_auto_mode,
-            toggle_channels=toggle_channels,
-            stale_timeout_s=stale_timeout_s,
-            cleanup_disable_osc=cleanup_disable_osc,
-            bus=pwm_i2c_bus,
-            i2c_addr=pwm_i2c_addr,
-        )
-
-    def is_hardware_ready(self) -> bool:
-        return True
-
-    def reload_config(self) -> bool:
-        return self.pwm_controller.reload_config(self.config_file)
-
-    def send_named_pwm_commands(self, commands: dict) -> bool:
-        self.pwm_controller.update_named(commands)
-        return True
-
-    def reset(self, reset_pump: bool = False) -> None:
-        self.pwm_controller.reset(reset_pump=reset_pump)
-
-    def shutdown(self) -> None:
-        self.pwm_controller._simple_cleanup()
-
-
 class PWMOnlyController:
     """Small direct-mode controller facade used when IMUs are disabled."""
 
-    def __init__(self, hardware: PWMOnlyHardware):
+    def __init__(self, hardware):
         self.hardware = hardware
 
     def start(self) -> None:
@@ -384,41 +348,29 @@ def main():
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
         f"IMU={'on' if imu_enabled else 'off'}"
     )
-    if imu_enabled:
-        from modules.hardware_interface import HardwareInterface, HardwareFaultError
+    from modules.hardware_interface import HardwareFaultError, HardwareInterface
 
-        hardware = HardwareInterface(
-            config_file=robot_profile['config_file'],
-            pump_auto_mode=True,
-            toggle_channels=True,
-            stale_timeout_s=0.5,
-            enable_pwm=True,
-            enable_imu=True,
-            enable_adc=False,           # not needed for plain driving
-            start_imu_reader=True,
-            cleanup_disable_osc=False,
-            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
-            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
-        )
-        hardware_fault_error = HardwareFaultError
-    else:
-        hardware = PWMOnlyHardware(
-            config_file=robot_profile['config_file'],
-            pump_auto_mode=True,
-            toggle_channels=True,
-            stale_timeout_s=0.5,
-            cleanup_disable_osc=False,
-            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
-            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
-        )
-        hardware_fault_error = RuntimeError
+    hardware = HardwareInterface(
+        config_file=robot_profile['config_file'],
+        pump_auto_mode=True,
+        toggle_channels=True,
+        stale_timeout_s=0.5,
+        enable_pwm=True,
+        enable_imu=imu_enabled,
+        enable_adc=False,           # not needed for plain driving
+        start_imu_reader=imu_enabled,
+        start_adc_reader=False,
+        cleanup_disable_osc=False,
+        pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
+        pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
+    )
 
     print("Waiting for hardware to be ready...")
     try:
         while not hardware.is_hardware_ready():
             time.sleep(0.1)
         print("Hardware ready.")
-    except hardware_fault_error as e:
+    except HardwareFaultError as e:
         subsystem = getattr(e, 'subsystem', 'hardware')
         reason = getattr(e, 'reason', str(e))
         print(f"\n*** HARDWARE FAULT ({subsystem}): {reason} ***")

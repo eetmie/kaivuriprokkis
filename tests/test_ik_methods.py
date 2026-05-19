@@ -331,6 +331,9 @@ class IKFeatureTests(unittest.TestCase):
         delta_b = np.asarray(new_b) - angles
         # Doubling dt should double the integrated joint delta to leading order.
         for i in range(4):
+            if abs(float(delta_a[i])) < 1e-8:
+                self.assertAlmostEqual(float(delta_b[i]), 0.0, delta=1e-8)
+                continue
             self.assertAlmostEqual(float(delta_b[i]) / (float(delta_a[i]) + 1e-12),
                                    2.0, delta=0.05,
                                    msg=f"joint {i}: dt scaling broken {delta_a[i]} -> {delta_b[i]}")

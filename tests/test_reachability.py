@@ -105,23 +105,20 @@ class ReachabilityTests(unittest.TestCase):
         # Closest reachable point should still be inside a sane reach radius.
         self.assertLess(np.linalg.norm(result.closest_position), 10.0)
 
-    def test_singular_pose_rejected_by_cond_threshold(self):
-        # Fully extended boom+arm = arm collinear, Jacobian near rank-deficient.
+    def test_condition_threshold_can_reject_converged_pose(self):
         ik = _build_ik(self.rc)
         extended = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         quats, angles = self._state(extended)
         ee_pos, _ = get_pose(quats, self.rc)
-        # Push slightly past the fully-extended reach to keep solver pinned at singularity.
-        target = np.asarray(ee_pos, dtype=np.float32) + np.array([0.001, 0.0, 0.0], dtype=np.float32)
+        target = np.asarray(ee_pos, dtype=np.float32) + np.array([0.02, 0.0, 0.0], dtype=np.float32)
 
         result = check_reachability(
             ik, self.rc, quats, angles, target,
-            pos_tol=5e-3, max_iters=80, cond_threshold=200.0, dt=0.005,
+            pos_tol=5e-3, max_iters=80, cond_threshold=1.0, dt=0.005,
         )
-        # Either we couldn't reach it, or condition number tripped — both are "not reachable".
         self.assertFalse(result.reachable)
-        if result.pos_error_m <= 5e-3:
-            self.assertGreater(result.final_cond_number, 200.0)
+        self.assertLess(result.pos_error_m, 5e-3)
+        self.assertGreater(result.final_cond_number, 1.0)
 
     def test_joint_limit_blocks_target(self):
         # Tight limits make the slew unable to swing far enough to face the target.

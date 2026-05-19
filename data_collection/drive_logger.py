@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#only rpi support atm!
 """
 Data logger for hydraulic actuator model training.
 

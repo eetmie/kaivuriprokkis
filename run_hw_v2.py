@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#only rpi support atm!
 """Hardware pathing + logging demo.
 
 Mirrors the structure of ``Isaac-Pathing/scripts/masi/pathing/run_sim_v2.py`` so

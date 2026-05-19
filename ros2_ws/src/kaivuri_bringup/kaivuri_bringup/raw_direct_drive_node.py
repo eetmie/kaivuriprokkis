@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -10,6 +9,8 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
+
+from kaivuri_bringup.project_paths import add_project_import_path, resolve_project_root
 
 
 JOINT_NAMES = [
@@ -50,8 +51,8 @@ class RawDirectDriveNode(Node):
         self.declare_parameter("stale_timeout_s", 0.5)
         self.declare_parameter("publish_tool_pose", True)
 
-        self._project_root = Path(str(self.get_parameter("project_root").value)).resolve()
-        self._add_project_import_path(self._project_root)
+        self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
+        add_project_import_path(self._project_root)
 
         from modules.differential_ik import get_pose_from_joint_angles
         from modules.differential_ik_cfg import load_excavator_robot_config
@@ -100,11 +101,6 @@ class RawDirectDriveNode(Node):
         self.get_logger().info(
             f"Raw direct drive ready on {command_topic}; order={COMMAND_NAMES}"
         )
-
-    def _add_project_import_path(self, project_root: Path) -> None:
-        root = str(project_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
 
     def _resolve_project_path(self, path_value: str) -> Path:
         path = Path(path_value)

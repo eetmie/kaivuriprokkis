@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="model2_simple">
+  <joint name="gripper_claw_1_FixedJoint" type="fixed">
+    <origin xyz="0.0261671 0. -0.0385303" rpy="-0.3665192 0. 1.5707964"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_1"/>
+  </joint>
+  <joint name="gripper_claw_2_FixedJoint" type="fixed">
+    <origin xyz="-0.0238304 0. -0.0385303" rpy="0. -0.3316125 -3.1415927"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_2"/>
+  </joint>
+  <joint name="gripper_frame_FixedJoint" type="fixed">
+    <origin xyz="0.0363731 -0. -0.0450618" rpy="0. 0. 0."/>
+    <parent link="tool_body"/>
+    <child link="gripper_frame"/>
+  </joint>
+  <joint name="lower_carriage_FixedJoint" type="fixed">
+    <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+    <parent link="excavator"/>
+    <child link="lower_carriage"/>
+  </joint>
+  <joint name="revolute_cabin" type="revolute">
+    <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+    <parent link="lower_carriage"/>
+    <child link="upper_carriage"/>
+    <axis xyz="0. 0. 1."/>
+    <limit lower="-8.0285146" upper="8.0285146" effort="100." velocity="1.0471976"/>
+  </joint>
+  <joint name="revolute_lift" type="revolute">
+    <origin xyz="0.0171573 0. 0.0629643" rpy="0. 0. 0."/>
+    <parent link="upper_carriage"/>
+    <child link="lift_boom"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="0." upper="1.3962634" effort="500." velocity="2.0943951"/>
+  </joint>
+  <joint name="revolute_scoop" type="revolute">
+    <origin xyz="0.2496772 0. -0.0024304" rpy="0. 0. 0."/>
+    <parent link="tilt_boom"/>
+    <child link="tool_body"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="-2.0943951" upper="0." effort="500." velocity="2.0943951"/>
+  </joint>
+  <joint name="revolute_tilt" type="revolute">
+    <origin xyz="0.20564 0. 0.420085" rpy="0. 0. 0."/>
+    <parent link="lift_boom"/>
+    <child link="tilt_boom"/>
+    <axis xyz="0. 1. 0."/>
+    <limit lower="-0.5235988" upper="1.3962634" effort="500." velocity="2.0943951"/>
+  </joint>
+  <link name="excavator"/>
+  <link name="gripper_claw_1">
+    <inertial>
+      <origin xyz="0. -0. -0." rpy="0. 0. 0."/>
+      <mass value="0.215"/>
+      <inertia ixx="0.001" ixy="0." ixz="-0." iyy="0.001" iyz="-0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. -0. -0." rpy="0. 0. -0."/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_claw_1_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. -0. -0." rpy="0. 0. -0."/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_claw_1_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_claw_2">
+    <inertial>
+      <origin xyz="0. 0. -0." rpy="0. 0. 0."/>
+      <mass value="0.215"/>
+      <inertia ixx="0.001" ixy="-0." ixz="-0." iyy="0.001" iyz="-0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. -0." rpy="0. 0. 1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_claw_2_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. -0." rpy="0. 0. 1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_claw_2_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_frame">
+    <inertial>
+      <origin xyz="-0. 0. -0." rpy="0. 0. 0."/>
+      <mass value="0.07"/>
+      <inertia ixx="0.001" ixy="0." ixz="0." iyy="0.001" iyz="0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0. 0. -0." rpy="0. 0. 1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_frame_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="-0. 0. -0." rpy="0. 0. 1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/gripper_frame_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="lift_boom">
+    <inertial>
+      <origin xyz="0. 0.00005 0. " rpy="0. 0. 0."/>
+      <mass value="1.14"/>
+      <inertia ixx="0.001" ixy="-0." ixz="0." iyy="0.001" iyz="-0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0.00005 0. " rpy="1.5710484 0. -1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/lift_boom_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0.00005 0. " rpy="1.5710484 0. -1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/lift_boom_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="lower_carriage">
+    <inertial>
+      <origin xyz="0.0032417 -0.000002 -0.0433429" rpy="0. 0. 0."/>
+      <mass value="10."/>
+      <inertia ixx="0.0476341" ixy="-0.0000258" ixz="0.0001417" iyy="0.0847687" iyz="-0.000145" izz="0.1238072"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/lower_carriage_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/lower_carriage_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="tilt_boom">
+    <inertial>
+      <origin xyz="-0. 0. 0." rpy="0. 0. 0."/>
+      <mass value="0.78"/>
+      <inertia ixx="0.001" ixy="0." ixz="0." iyy="0.001" iyz="0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/tilt_boom_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="-0. 0. 0." rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/tilt_boom_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="tool_body">
+    <inertial>
+      <origin xyz="0.0001261 -0. -0.0000618" rpy="0. 0. 0."/>
+      <mass value="0.11"/>
+      <inertia ixx="0.001" ixy="0." ixz="0." iyy="0.001" iyz="0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0001261 -0. -0.0000618" rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/tool_body_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0.0001261 -0. -0.0000618" rpy="0. 0. 0."/>
+      <geometry>
+        <mesh filename="file:./meshes/tool_body_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_carriage">
+    <inertial>
+      <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
+      <mass value="15."/>
+      <inertia ixx="0.001" ixy="0." ixz="0." iyy="0.001" iyz="0." izz="0.001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0. 0. 0." rpy="0. 0. -1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/upper_carriage_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0. 0. 0." rpy="0. 0. -1.5707964"/>
+      <geometry>
+        <mesh filename="file:./meshes/upper_carriage_Mesh.obj" scale="1. 1. 1."/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

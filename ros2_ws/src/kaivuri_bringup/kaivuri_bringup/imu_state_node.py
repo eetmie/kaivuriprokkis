@@ -1,5 +1,4 @@
 import os
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +7,8 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+
+from kaivuri_bringup.project_paths import add_project_import_path, resolve_project_root
 
 
 JOINT_NAMES = [
@@ -26,8 +27,8 @@ class ImuStateNode(Node):
         self.declare_parameter("config_file", "configuration_files/servo_config_200.yaml")
         self.declare_parameter("publish_tool_pose", True)
 
-        self._project_root = Path(str(self.get_parameter("project_root").value)).resolve()
-        self._add_project_import_path(self._project_root)
+        self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
+        add_project_import_path(self._project_root)
 
         from modules.differential_ik import get_pose_from_joint_angles
         from modules.differential_ik_cfg import load_excavator_robot_config
@@ -55,11 +56,6 @@ class ImuStateNode(Node):
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self.create_timer(1.0 / rate_hz, self._publish)
         self.get_logger().info(f"Publishing IMU-derived joint_states from {self._project_root}")
-
-    def _add_project_import_path(self, project_root: Path) -> None:
-        root = str(project_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
 
     def _resolve_project_path(self, path_value: str) -> Path:
         path = Path(path_value)

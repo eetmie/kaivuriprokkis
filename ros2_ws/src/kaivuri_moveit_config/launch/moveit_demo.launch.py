@@ -58,8 +58,15 @@ def generate_launch_description():
         planning_pipelines,
         trajectory_execution,
         planning_scene_monitor,
-        _load_yaml(moveit_dir / "config" / "moveit_controllers.yaml"),
     ]
+    controller_parameters = _load_yaml(moveit_dir / "config" / "moveit_controllers.yaml")
+    controller_names = (
+        controller_parameters
+        .get("moveit_simple_controller_manager", {})
+        .get("controller_names", [])
+    )
+    if controller_names:
+        common_parameters.append(controller_parameters)
 
     return LaunchDescription([
         DeclareLaunchArgument("launch_rviz", default_value="true"),

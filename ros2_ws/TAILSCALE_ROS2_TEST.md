@@ -1,7 +1,7 @@
 # ROS 2 Jazzy over Tailscale
 
-This guide sets up the Kaivuri ROS 2 test publisher on this machine and a main
-subscriber node on another machine over Tailscale.
+This guide sets up the Kaivuri ROS 2 IMU state publisher on `pikkukaivuri-dev`
+and a subscriber on this machine over Tailscale.
 
 Plain ROS 2 discovery usually does not work across Tailscale because ROS 2 DDS
 discovery expects LAN multicast, and Tailscale does not forward multicast. Use a
@@ -9,7 +9,7 @@ Fast DDS discovery server so the ROS 2 nodes discover each other over unicast.
 
 ## Subscriber Machine
 
-Run the discovery server on the main subscriber side.
+Run the discovery server on this subscriber side.
 
 Get the subscriber machine's Tailscale IPv4 address:
 
@@ -17,7 +17,8 @@ Get the subscriber machine's Tailscale IPv4 address:
 tailscale ip -4
 ```
 
-Start the discovery server, replacing `100.x.y.z` with that Tailscale IP:
+Start the discovery server, replacing `100.x.y.z` with this machine's Tailscale
+IP:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -26,7 +27,7 @@ fastdds discovery -i 0 -l 100.x.y.z -p 11811
 
 Keep that terminal running.
 
-In another terminal on the same subscriber machine:
+In another terminal on this same subscriber machine:
 
 ```bash
 export ROS_DOMAIN_ID=23
@@ -40,23 +41,19 @@ ros2 topic list
 ros2 topic echo /joint_states
 ```
 
-## Publisher Machine
+## Publisher Machine: pikkukaivuri-dev
 
-On this machine, run the ROS 2 Jazzy container with host networking so DDS can
-use the host Tailscale interface:
+On `pikkukaivuri-dev`, run the ROS 2 Jazzy environment with host networking so
+DDS can use the host Tailscale interface.
 
 ```bash
 cd /home/joel/kaivuriprokkis
-
-docker run --rm -it \
-  --network host \
-  -v /home/joel/kaivuriprokkis:/work \
-  -w /work/ros2_ws \
-  ros:jazzy-ros-base \
-  bash
+ros2-jazzy
+cd /work/ros2_ws
 ```
 
-Inside the container, point ROS 2 at the subscriber machine's discovery server:
+Inside that ROS 2 environment, point ROS 2 at the subscriber machine's discovery
+server:
 
 ```bash
 export ROS_DOMAIN_ID=23
@@ -67,13 +64,7 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 ```
 
-Launch the demo publisher:
-
-```bash
-ros2 launch kaivuri_bringup bringup_demo.launch.py
-```
-
-For the hardware state publisher, use:
+Launch the hardware IMU state publisher:
 
 ```bash
 ros2 launch kaivuri_bringup bringup_hardware.launch.py

@@ -60,7 +60,7 @@ From the repo root, enter the Jazzy container and build:
 cd /home/joel/kaivuriprokkis
 ros2-jazzy
 cd /work/ros2_ws
-colcon build --symlink-install
+colcon build
 source install/setup.bash
 ```
 
@@ -68,7 +68,16 @@ One-shot build from the host:
 
 ```bash
 cd /home/joel/kaivuriprokkis/ros2_ws
-ros2-jazzy colcon build --symlink-install
+ros2-jazzy colcon build
+```
+
+Avoid `--symlink-install` when building in Docker and running from a different
+host path. It can leave installed URDF/mesh assets pointing at the container
+path instead of real files. Quick check:
+
+```bash
+test -e install/kaivuri_description/share/kaivuri_description/urdf/kaivuri.urdf
+test -e install/kaivuri_description/share/kaivuri_description/meshes/upper_carriage_Mesh.obj
 ```
 
 ## Demo State Bringup
@@ -92,6 +101,15 @@ Disable animation:
 ```bash
 ros2 launch kaivuri_bringup bringup_demo.launch.py animate:=false
 ```
+
+To view the model in RViz, source the same install in another terminal and run:
+
+```bash
+ros2 launch kaivuri_description display.launch.py
+```
+
+Use fixed frame `excavator`. Do not run `joint_state_publisher_gui` at the same
+time as the demo node, because both publish `/joint_states`.
 
 ## Hardware State Bringup
 

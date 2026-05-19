@@ -20,7 +20,10 @@ import threading
 import yaml
 
 from .PCA9685_controller import PWMController
-from .usb_serial_reader import USBSerialReader
+try:
+    from .usb_serial_reader import USBSerialReader
+except Exception:
+    USBSerialReader = None  # type: ignore
 from .quaternion_math import (
     quat_normalize,
     quat_multiply,
@@ -145,7 +148,9 @@ class HardwareInterface:
                  usb_cpu_core: Optional[int] = None,
                  imu_cpu_core: Optional[int] = None,
                  adc_cpu_core: Optional[int] = None,
-                 pwm_frequency: Optional[int] = None):
+                 pwm_frequency: Optional[int] = None,
+                 pwm_i2c_bus: int = 1,
+                 pwm_i2c_addr: int = 0x40):
         """
         Initialize real hardware interface.
 
@@ -174,6 +179,8 @@ class HardwareInterface:
             adc_channels: List of ADC channels to sample in the background thread.
                            Accepts sensor names from ADCConfig or (board, channel) tuples.
             pwm_frequency: PCA9685 PWM signal frequency in Hz (None = use default 50Hz).
+            pwm_i2c_bus: Linux I2C bus number for the PCA9685.
+            pwm_i2c_addr: I2C address for the PCA9685.
         """
         # Setup logger first
         self.logger = logging.getLogger(f"{__name__}.HardwareInterface")
@@ -293,6 +300,8 @@ class HardwareInterface:
                     cleanup_disable_osc=cleanup_disable_osc,
                     perf_enabled=perf_enabled,
                     pwm_frequency=pwm_frequency,
+                    bus=pwm_i2c_bus,
+                    i2c_addr=pwm_i2c_addr,
                 )
                 self._pwm_state = ReadyState.READY
                 self.logger.info("PWM controller initialized")

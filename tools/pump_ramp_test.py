@@ -3,7 +3,7 @@
 MANUAL HARDWARE TEST — requires real pump hardware. Not a unit test.
 
 Usage:
-    python tests/pump_ramp_test.py [--config PATH] [--start US] [--end US]
+    python tools/pump_ramp_test.py [--config PATH] [--start US] [--end US]
                                    [--step US] [--interval SEC]
 
 The pump starts at --start (default: pulse_min from config) and increases by

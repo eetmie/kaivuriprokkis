@@ -36,7 +36,7 @@ CHANNEL_CONFIGS:
         affects_pump: False
         toggleable: True
         center: 1500
-        direction: 1
+        direction: -1
         pulse_min: 1000
         pulse_max: 2000
         deadzone: 0.0
@@ -54,12 +54,12 @@ CHANNEL_CONFIGS:
 
     slew:
         output_channel: 2
-        affects_pump: True
-        toggleable: False
-        center: 1500
+        affects_pump: False
+        toggleable: True
+        center: None #1637,5. "none" calculates center to in-between
         direction: 1
-        pulse_min: 1000
-        pulse_max: 2000
+        pulse_min: 1550
+        pulse_max: 1725
         deadzone: 0.0
         deadband_us_pos: 0.0
         deadband_us_neg: 0.0
@@ -78,7 +78,7 @@ CHANNEL_CONFIGS:
         affects_pump: True
         toggleable: False
         center: 1500
-        direction: 1
+        direction: -1
         pulse_min: 1000
         pulse_max: 2000
         deadzone: 0.0
@@ -99,7 +99,7 @@ CHANNEL_CONFIGS:
         affects_pump: True
         toggleable: False
         center: 1500
-        direction: 1
+        direction: -1
         pulse_min: 1000
         pulse_max: 2000
         deadzone: 0.0
@@ -120,7 +120,7 @@ CHANNEL_CONFIGS:
         affects_pump: True
         toggleable: False
         center: 1500
-        direction: 1
+        direction: -1
         pulse_min: 1000
         pulse_max: 2000
         deadzone: 0.0
@@ -140,7 +140,7 @@ CHANNEL_CONFIGS:
         output_channel: 6
         affects_pump: False
         toggleable: False
-        center: 1500
+        center: 1600
         direction: 1
         pulse_min: 1000
         pulse_max: 2000
@@ -182,6 +182,6 @@ CHANNEL_CONFIGS:
         output_channel: 8
         pulse_min: 1000
         pulse_max: 1650
-        static_pulse_us: 1530
-        base_pulse_us: 1480
-        activity_gain_us: 150
+        static_pulse_us: 1550
+        base_pulse_us: 1540
+        activity_gain_us: 120

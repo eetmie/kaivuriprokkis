@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Bench driving helper — same UDP/gamepad input as drive_logger.py, no recording.
+"""VERY MESSY TEST SCRIPT, unify the usage some day!!!!
+
+Bench driving helper — same UDP/gamepad input as drive_logger.py, no recording.
 
 Usage:
     sudo python simple_drive.py
     sudo python simple_drive.py --linkage-rate-correction
+    sudo python simple_drive.py --robot jetson
+
+Jetson mode is PCA9685-only by default: no IMUs, no ExcavatorController stack,
+just direct named PWM commands for valve config tuning.
 
 Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
@@ -36,8 +42,6 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from modules.udp_socket import UDPSocket
-from modules.hardware_interface import HardwareInterface, HardwareFaultError
-from modules.excavator_controller import ExcavatorController
 from tools.linkage_rate_compensation import (
     DEFAULT_TABLE,
     DEFAULT_UNIVERSAL_TABLE,
@@ -52,6 +56,37 @@ PUMP_GAIN_ADJUST_RATE = 80.0         # µs/s per unit of paddle input for bench 
 PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
+
+ROBOT_PROFILES = {
+    'rpi': {
+        'config_file': 'configuration_files/servo_config_200.yaml',
+        'pwm_i2c_bus': 1,
+        'pwm_i2c_addr': 0x40,
+        'enable_imu': True,
+        'command_names': {
+            'rotate': 'rotate',
+            'lift_boom': 'lift_boom',
+            'tilt_boom': 'tilt_boom',
+            'scoop': 'scoop',
+            'trackL': 'trackL',
+            'trackR': 'trackR',
+        },
+    },
+    'jetson': {
+        'config_file': 'configuration_files/servo_config_jetson.yaml',
+        'pwm_i2c_bus': 7,
+        'pwm_i2c_addr': 0x40,
+        'enable_imu': False,
+        'command_names': {
+            'rotate': 'slew',
+            'lift_boom': 'lift',
+            'tilt_boom': 'tilt',
+            'scoop': 'scoop',
+            'trackL': 'trackL',
+            'trackR': 'trackR',
+        },
+    },
+}
 
 # Velocity PID: joystick command → desired deg/s → PI → valve command.
 # Slew (rotate) has no gyro so it stays open-loop; only boom/arm/bucket are controlled.
@@ -181,6 +216,39 @@ def format_imu_debug_line(payload, joint_angles_deg=None, joint_names=None, imu_
 def parse_args():
     parser = argparse.ArgumentParser(description="Bench driving helper with optional linkage-rate correction")
     parser.add_argument(
+        "--robot",
+        choices=sorted(ROBOT_PROFILES),
+        default="rpi",
+        help="Robot profile. 'rpi' keeps the current defaults; 'jetson' uses bus 7 and servo_config_jetson.yaml.",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Override PWM servo config path selected by --robot.",
+    )
+    parser.add_argument(
+        "--pwm-i2c-bus",
+        type=int,
+        default=None,
+        help="Override PCA9685 Linux I2C bus selected by --robot.",
+    )
+    parser.add_argument(
+        "--pwm-i2c-addr",
+        type=lambda value: int(value, 0),
+        default=None,
+        help="Override PCA9685 I2C address selected by --robot, e.g. 0x40.",
+    )
+    parser.add_argument(
+        "--enable-imu",
+        action="store_true",
+        help="Force IMU startup even if the selected robot profile disables it.",
+    )
+    parser.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Disable IMU startup even if the selected robot profile enables it.",
+    )
+    parser.add_argument(
         "--linkage-rate-correction",
         action="store_true",
         help="Start with prototype linkage-rate command correction enabled",
@@ -202,47 +270,180 @@ def parse_args():
     parser.add_argument("--vel-ki-max",    type=float, default=0.4,   help="Velocity PI — I-term anti-windup clamp")
     parser.add_argument("--vel-deadband",  type=float, default=2.0,   help="Velocity PI — error deadband (deg/s)")
     parser.add_argument("--vel-max-degps", type=float, default=30.0,  help="Velocity PI — joystick full deflection = this many deg/s")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.enable_imu and args.no_imu:
+        parser.error("--enable-imu and --no-imu are mutually exclusive")
+    return args
+
+
+def resolve_robot_profile(args) -> dict:
+    profile = dict(ROBOT_PROFILES[args.robot])
+    profile['command_names'] = dict(profile['command_names'])
+
+    if args.config_file is not None:
+        profile['config_file'] = args.config_file
+    if args.pwm_i2c_bus is not None:
+        profile['pwm_i2c_bus'] = args.pwm_i2c_bus
+    if args.pwm_i2c_addr is not None:
+        profile['pwm_i2c_addr'] = args.pwm_i2c_addr
+    if args.enable_imu:
+        profile['enable_imu'] = True
+    if args.no_imu:
+        profile['enable_imu'] = False
+    return profile
+
+
+def map_pwm_commands(canonical_commands: dict, command_names: dict) -> dict:
+    """Map canonical simple_drive command names to the selected robot config names."""
+    return {
+        command_names.get(name, name): value
+        for name, value in canonical_commands.items()
+    }
+
+
+class PWMOnlyHardware:
+    """Minimal HardwareInterface-compatible wrapper for PCA9685-only driving."""
+
+    def __init__(self, *, config_file: str, pump_auto_mode: bool, toggle_channels: bool,
+                 stale_timeout_s: float, cleanup_disable_osc: bool,
+                 pwm_i2c_bus: int, pwm_i2c_addr: int):
+        from modules.PCA9685_controller import PWMController
+
+        self.config_file = config_file
+        self.pwm_controller = PWMController(
+            config_file=config_file,
+            pump_auto_mode=pump_auto_mode,
+            toggle_channels=toggle_channels,
+            stale_timeout_s=stale_timeout_s,
+            cleanup_disable_osc=cleanup_disable_osc,
+            bus=pwm_i2c_bus,
+            i2c_addr=pwm_i2c_addr,
+        )
+
+    def is_hardware_ready(self) -> bool:
+        return True
+
+    def reload_config(self) -> bool:
+        return self.pwm_controller.reload_config(self.config_file)
+
+    def send_named_pwm_commands(self, commands: dict) -> bool:
+        self.pwm_controller.update_named(commands)
+        return True
+
+    def reset(self, reset_pump: bool = False) -> None:
+        self.pwm_controller.reset(reset_pump=reset_pump)
+
+    def shutdown(self) -> None:
+        self.pwm_controller._simple_cleanup()
+
+
+class PWMOnlyController:
+    """Small direct-mode controller facade used when IMUs are disabled."""
+
+    def __init__(self, hardware: PWMOnlyHardware):
+        self.hardware = hardware
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def enter_direct_mode(self) -> None:
+        return
+
+    def exit_direct_mode(self) -> None:
+        return
+
+    def set_velocity_mode(self, _mode: str) -> None:
+        return
+
+    def get_joint_angles(self):
+        return np.zeros(4, dtype=np.float32)
+
+    def get_joint_velocities_with_age(self) -> tuple:
+        return None, float('inf')
+
+    def give_direct_commands(self, commands: dict) -> None:
+        self.hardware.send_named_pwm_commands(commands)
 
 
 def main():
     args = parse_args()
+    robot_profile = resolve_robot_profile(args)
+    imu_enabled = bool(robot_profile['enable_imu'])
+
     # ---- UDP (mirror drive_logger.py wire format exactly) ----
     server = UDPSocket(local_id=2)
     server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
 
     # ---- Hardware ----
     print("Initializing hardware...")
-    hardware = HardwareInterface(
-        pump_auto_mode=True,
-        toggle_channels=True,
-        stale_timeout_s=0.5,
-        enable_pwm=True,
-        enable_imu=True,
-        enable_adc=False,           # not needed for plain driving
-        cleanup_disable_osc=False,
+    print(
+        f"Robot profile: {args.robot} | config={robot_profile['config_file']} | "
+        f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
+        f"IMU={'on' if imu_enabled else 'off'}"
     )
+    if imu_enabled:
+        from modules.hardware_interface import HardwareInterface, HardwareFaultError
+
+        hardware = HardwareInterface(
+            config_file=robot_profile['config_file'],
+            pump_auto_mode=True,
+            toggle_channels=True,
+            stale_timeout_s=0.5,
+            enable_pwm=True,
+            enable_imu=True,
+            enable_adc=False,           # not needed for plain driving
+            start_imu_reader=True,
+            cleanup_disable_osc=False,
+            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
+            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
+        )
+        hardware_fault_error = HardwareFaultError
+    else:
+        hardware = PWMOnlyHardware(
+            config_file=robot_profile['config_file'],
+            pump_auto_mode=True,
+            toggle_channels=True,
+            stale_timeout_s=0.5,
+            cleanup_disable_osc=False,
+            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
+            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
+        )
+        hardware_fault_error = RuntimeError
 
     print("Waiting for hardware to be ready...")
     try:
         while not hardware.is_hardware_ready():
             time.sleep(0.1)
         print("Hardware ready.")
-    except HardwareFaultError as e:
-        print(f"\n*** HARDWARE FAULT ({e.subsystem}): {e.reason} ***")
+    except hardware_fault_error as e:
+        subsystem = getattr(e, 'subsystem', 'hardware')
+        reason = getattr(e, 'reason', str(e))
+        print(f"\n*** HARDWARE FAULT ({subsystem}): {reason} ***")
         hardware.shutdown()
         raise SystemExit(1)
 
     # ---- Controller (direct mode, IK/PID bypassed) ----
     print("Starting controller...")
-    controller = ExcavatorController(hardware, config=None, enable_perf_tracking=False)
+    if imu_enabled:
+        from modules.excavator_controller import ExcavatorController
+
+        controller = ExcavatorController(hardware, config=None, enable_perf_tracking=False)
+    else:
+        controller = PWMOnlyController(hardware)
     controller.start()
-    time.sleep(2.0)                 # numba JIT warmup
+    if imu_enabled:
+        time.sleep(2.0)             # numba JIT warmup
     controller.enter_direct_mode()
     controller.set_velocity_mode('gyro_only')
     control_joint_names = get_control_joint_names(controller)
     imu_role_order = get_imu_role_order(controller)
-    print("Controller in DIRECT mode (velocity feedback: gyro_only).")
+    print(
+        "Controller in DIRECT mode "
+        f"(velocity feedback: {'gyro_only' if imu_enabled else 'disabled, no IMU'})."
+    )
 
     linkage_compensator = None
     universal_compensator = None
@@ -335,9 +536,12 @@ def main():
 
                 # Button 0: toggle mounting-corrected IMU + relative joint angle printing.
                 if buttons[0] > button_threshold and button_prev[0] <= button_threshold:
-                    print_angles = not print_angles
-                    state = "ON" if print_angles else "OFF"
-                    print(f"\n[Button 0] IMU/joint angle print {state}")
+                    if imu_enabled:
+                        print_angles = not print_angles
+                        state = "ON" if print_angles else "OFF"
+                        print(f"\n[Button 0] IMU/joint angle print {state}")
+                    else:
+                        print("\n[Button 0] IMU/joint angle print unavailable (--robot jetson disables IMU)")
 
                 # Button 1: reload PWM/servo config for live valve tuning.
                 if buttons[1] > button_threshold and button_prev[1] <= button_threshold:
@@ -360,6 +564,8 @@ def main():
                         comp_mode = (comp_mode + 1) % 4
                     if comp_mode == 2 and universal_compensator is None:
                         comp_mode = (comp_mode + 1) % 4
+                    if comp_mode == 3 and not imu_enabled:
+                        comp_mode = (comp_mode + 1) % 4
                     # reset integrator when leaving velocity PID mode
                     if old_comp_mode == 3 and comp_mode != 3:
                         vel_controller.reset()
@@ -368,7 +574,7 @@ def main():
                 button_prev = buttons
 
             # Direct-mode commands straight from the joystick.
-            commands = {
+            canonical_commands = {
                 'rotate':    left_rl,
                 'lift_boom': right_ud,
                 'tilt_boom': left_ud,
@@ -382,17 +588,18 @@ def main():
             # Mode 2: valve commands untouched — correction goes to pump gain only.
             # Mode 3: closed-loop velocity PI — joystick sets desired deg/s, gyro is feedback.
             if comp_mode == 1 and linkage_compensator is not None:
-                commands = linkage_compensator.apply(commands, joint_angles)
-            elif comp_mode == 3:
+                canonical_commands = linkage_compensator.apply(canonical_commands, joint_angles)
+            elif comp_mode == 3 and imu_enabled:
                 # TODO: add linkage feed-forward — apply linkage_compensator to commands first,
                 # then run vel_controller on top. Reduces initial tracking error at positions
                 # where valve effectiveness drops (e.g. full arm extension), without relying
                 # solely on the integrator to catch up.
                 joint_vels, vel_age = controller.get_joint_velocities_with_age()
                 if vel_age < 0.05:
-                    commands = vel_controller.apply(commands, joint_vels, actual_dt)
+                    canonical_commands = vel_controller.apply(canonical_commands, joint_vels, actual_dt)
                 else:
                     vel_controller.reset()
+            commands = map_pwm_commands(canonical_commands, robot_profile['command_names'])
             controller.give_direct_commands(commands)
 
             # Left paddle: trim the pump activity_gain_us base level.
@@ -407,7 +614,7 @@ def main():
             # Apply pump gain: base level, optionally modulated by linkage shape (mode 2).
             if pump_gain_available:
                 if comp_mode == 2 and universal_compensator is not None:
-                    factor = universal_compensator.pump_correction_factor(commands, joint_angles)
+                    factor = universal_compensator.pump_correction_factor(canonical_commands, joint_angles)
                 else:
                     factor = 1.0
                 pwm.set_pump_activity_gain_us(pump_gain_us * factor)

@@ -52,7 +52,7 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    slew:
+    rotate:
         output_channel: 2
         affects_pump: False
         toggleable: True
@@ -73,7 +73,7 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    lift:
+    lift_boom:
         output_channel: 3
         affects_pump: True
         toggleable: False
@@ -94,7 +94,7 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    tilt:
+    tilt_boom:
         output_channel: 4
         affects_pump: True
         toggleable: False

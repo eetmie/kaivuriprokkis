@@ -68,7 +68,7 @@ echo "  OK: Virtual I2C bus 4 (GPIO 20/21, 100kHz) - OLED"
 echo ""
 echo "[2/5] Installing system packages..."
 apt-get update -qq
-apt-get install -y python3-pip python3-pil python3-smbus i2c-tools git > /dev/null 2>&1
+apt-get install -y python3-pip python3-pil i2c-tools git > /dev/null 2>&1
 echo "  OK: System packages installed"
 
 # --- Python packages ---
@@ -82,13 +82,14 @@ pip3 install --break-system-packages --quiet \
     numba \
     pyyaml \
     pyserial \
+    smbus2 \
     adafruit-blinka \
     adafruit-circuitpython-ssd1306 \
     adafruit-extended-bus \
     2>/dev/null
 
 echo "  OK: Python packages installed"
-echo "      numpy, scipy, pandas, numba, pyyaml, pyserial"
+echo "      numpy, scipy, pandas, numba, pyyaml, pyserial, smbus2"
 echo "      adafruit-blinka, ssd1306"
 
 # --- OLED systemd service ---

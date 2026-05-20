@@ -172,6 +172,40 @@ If running outside the repo-mounted Docker layout, set:
 export KAIVURI_PROJECT_ROOT=/home/joel/kaivuriprokkis
 ```
 
+## Intel RealSense D435i
+
+Use this when the D435i is connected to the Jetson through USB 3:
+
+```bash
+cd /home/joel/kaivuriprokkis
+ros2-jazzy bash -lc 'cd /work/ros2_ws && source install/setup.bash && ros2 launch kaivuri_bringup realsense_d435i.launch.py'
+```
+
+The launch file starts Intel's `realsense2_camera` driver with color, depth,
+aligned depth, gyro, accel, sync, and fused IMU enabled. Default profiles are
+`640x480x30` for RGB and depth. It publishes the standard RealSense ROS topics,
+including:
+
+- `/camera/camera/color/image_raw`
+- `/camera/camera/depth/image_rect_raw`
+- `/camera/camera/aligned_depth_to_color/image_raw`
+- `/camera/camera/imu`
+- `/camera/camera/color/camera_info`
+- `/camera/camera/depth/camera_info`
+
+Optional point cloud:
+
+```bash
+ros2 launch kaivuri_bringup realsense_d435i.launch.py pointcloud_enable:=true
+```
+
+Useful checks:
+
+```bash
+ros2 topic list | grep camera
+ros2 topic hz /camera/camera/imu
+```
+
 ## RViz and MoveIt on a Laptop
 
 The current Pi image is headless and does not include RViz/MoveIt. Run RViz and

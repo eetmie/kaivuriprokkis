@@ -13,6 +13,7 @@ setup(
             "launch/bringup_demo.launch.py",
             "launch/bringup_hardware.launch.py",
             "launch/raw_direct_drive.launch.py",
+            "launch/realsense_d435i.launch.py",
         ]),
     ],
     install_requires=["setuptools"],

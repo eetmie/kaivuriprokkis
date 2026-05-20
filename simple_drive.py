@@ -5,6 +5,7 @@ Bench driving helper — same UDP/gamepad input as drive_logger.py, no recording
 
 Usage:
     sudo python simple_drive.py
+    sudo python simple_drive.py --disable
     sudo python simple_drive.py --linkage-rate-correction
     sudo python simple_drive.py --robot jetson
 
@@ -249,6 +250,11 @@ def parse_args():
         help="Disable IMU startup even if the selected robot profile enables it.",
     )
     parser.add_argument(
+        "--disable",
+        action="store_true",
+        help="Disable toggleable PWM channels so they are left out of control.",
+    )
+    parser.add_argument(
         "--linkage-rate-correction",
         action="store_true",
         help="Start with prototype linkage-rate command correction enabled",
@@ -339,21 +345,22 @@ def main():
 
     # ---- UDP (mirror drive_logger.py wire format exactly) ----
     server = UDPSocket(local_id=2)
-    server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup("192.168.0.134", 8080, num_inputs=10, num_outputs=0, is_server=True)
 
     # ---- Hardware ----
     print("Initializing hardware...")
     print(
         f"Robot profile: {args.robot} | config={robot_profile['config_file']} | "
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
-        f"IMU={'on' if imu_enabled else 'off'}"
+        f"IMU={'on' if imu_enabled else 'off'} | "
+        f"toggleable channels={'disabled' if args.disable else 'enabled'}"
     )
     from modules.hardware_interface import HardwareFaultError, HardwareInterface
 
     hardware = HardwareInterface(
         config_file=robot_profile['config_file'],
         pump_auto_mode=True,
-        toggle_channels=True,
+        toggle_channels=not args.disable,
         stale_timeout_s=0.5,
         enable_pwm=True,
         enable_imu=imu_enabled,

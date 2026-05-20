@@ -18,6 +18,7 @@ class _Args:
     pwm_i2c_addr = None
     enable_imu = False
     no_imu = False
+    disable = False
 
 
 class _FakeHardware:
@@ -97,6 +98,34 @@ class SimpleDriveProfileTests(unittest.TestCase):
         self.assertFalse(kwargs["start_imu_reader"])
         self.assertFalse(kwargs["start_adc_reader"])
         self.assertGreaterEqual(_FakeHardware.instances[0].shutdown_calls, 1)
+
+    def test_disable_arg_disables_toggleable_channels_for_jetson(self):
+        _FakeHardware.instances = []
+
+        with patch.object(sys, "argv", ["simple_drive.py", "--robot", "jetson", "--disable"]), \
+                patch.object(simple_drive, "UDPSocket", _FakeSocket), \
+                patch("modules.hardware_interface.HardwareInterface", _FakeHardware):
+            with self.assertRaises(SystemExit):
+                simple_drive.main()
+
+        self.assertEqual(len(_FakeHardware.instances), 1)
+        self.assertFalse(_FakeHardware.instances[0].kwargs["toggle_channels"])
+
+    def test_disable_arg_disables_toggleable_channels_for_rpi(self):
+        _FakeHardware.instances = []
+
+        with patch.object(sys, "argv", ["simple_drive.py", "--robot", "rpi", "--no-imu", "--disable"]), \
+                patch.object(simple_drive, "UDPSocket", _FakeSocket), \
+                patch("modules.hardware_interface.HardwareInterface", _FakeHardware):
+            with self.assertRaises(SystemExit):
+                simple_drive.main()
+
+        self.assertEqual(len(_FakeHardware.instances), 1)
+        kwargs = _FakeHardware.instances[0].kwargs
+        self.assertEqual(kwargs["config_file"], "configuration_files/servo_config_200.yaml")
+        self.assertEqual(kwargs["pwm_i2c_bus"], 1)
+        self.assertFalse(kwargs["enable_imu"])
+        self.assertFalse(kwargs["toggle_channels"])
 
 
 if __name__ == "__main__":

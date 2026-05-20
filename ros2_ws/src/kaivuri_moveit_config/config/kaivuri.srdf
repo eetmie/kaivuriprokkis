@@ -3,21 +3,22 @@
   <virtual_joint name="world_joint" type="fixed" parent_frame="world" child_link="excavator"/>
 
   <group name="excavator_arm">
-    <chain base_link="lower_carriage" tip_link="tool_body"/>
+    <chain base_link="excavator" tip_link="tool_body"/>
   </group>
 
   <group_state name="home" group="excavator_arm">
-    <joint name="revolute_cabin" value="0.0"/>
-    <joint name="revolute_lift" value="0.45"/>
-    <joint name="revolute_tilt" value="0.25"/>
-    <joint name="revolute_scoop" value="-0.8"/>
+    <joint name="revolute_carriage" value="0.0"/>
+    <joint name="revolute_lift" value="-0.2"/>
+    <joint name="revolute_tilt" value="1.4"/>
+    <joint name="revolute_tool" value="-0.2"/>
   </group_state>
 
-  <disable_collisions link1="lower_carriage" link2="upper_carriage" reason="Adjacent"/>
+  <disable_collisions link1="excavator" link2="upper_carriage" reason="Adjacent"/>
   <disable_collisions link1="upper_carriage" link2="lift_boom" reason="Adjacent"/>
   <disable_collisions link1="lift_boom" link2="tilt_boom" reason="Adjacent"/>
   <disable_collisions link1="tilt_boom" link2="tool_body" reason="Adjacent"/>
-  <disable_collisions link1="tool_body" link2="gripper_frame" reason="Adjacent"/>
+  <disable_collisions link1="tool_body" link2="gripper_mount" reason="Adjacent"/>
+  <disable_collisions link1="gripper_mount" link2="gripper_frame" reason="Adjacent"/>
   <disable_collisions link1="gripper_frame" link2="gripper_claw_1" reason="Adjacent"/>
   <disable_collisions link1="gripper_frame" link2="gripper_claw_2" reason="Adjacent"/>
 </robot>

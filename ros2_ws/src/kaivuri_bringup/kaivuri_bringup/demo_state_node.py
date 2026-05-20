@@ -7,10 +7,13 @@ from sensor_msgs.msg import JointState
 
 
 JOINT_NAMES = [
-    "revolute_cabin",
+    "revolute_carriage",
     "revolute_lift",
     "revolute_tilt",
-    "revolute_scoop",
+    "revolute_tool",
+    "revolute_gripper",
+    "revolute_claw_1",
+    "revolute_claw_2",
 ]
 
 
@@ -20,8 +23,8 @@ class DemoStateNode(Node):
         self.declare_parameter("rate_hz", 30.0)
         self.declare_parameter("animate", True)
         self.declare_parameter("joint_names", JOINT_NAMES)
-        self.declare_parameter("base_positions", [0.0, 0.45, 0.25, -0.8])
-        self.declare_parameter("amplitudes", [0.35, 0.25, 0.25, 0.35])
+        self.declare_parameter("base_positions", [0.0, -0.2, 1.4, -0.2, 0.0, 0.0, 0.0])
+        self.declare_parameter("amplitudes", [0.35, 0.2, 0.3, 0.25, 0.0, 0.0, 0.0])
 
         self._joint_names = list(self.get_parameter("joint_names").value)
         self._base_positions = self._float_list("base_positions", len(self._joint_names))

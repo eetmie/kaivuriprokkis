@@ -14,10 +14,13 @@ from kaivuri_bringup.project_paths import add_project_import_path, resolve_proje
 
 
 JOINT_NAMES = [
-    "revolute_cabin",
+    "revolute_carriage",
     "revolute_lift",
     "revolute_tilt",
-    "revolute_scoop",
+    "revolute_tool",
+    "revolute_gripper",
+    "revolute_claw_1",
+    "revolute_claw_2",
 ]
 
 COMMAND_NAMES = [
@@ -164,7 +167,7 @@ class RawDirectDriveNode(Node):
         joint_msg = JointState()
         joint_msg.header.stamp = now
         joint_msg.name = JOINT_NAMES
-        joint_msg.position = [float(v) for v in joint_angles_rad[:len(JOINT_NAMES)]]
+        joint_msg.position = [float(v) for v in joint_angles_rad[:4]] + [0.0, 0.0, 0.0]
         self._joint_pub.publish(joint_msg)
 
         if bool(self.get_parameter("publish_tool_pose").value):

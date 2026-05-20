@@ -1,0 +1,481 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  excavator_urdf_ros2_ready.urdf
+  Mini excavator robot description for ROS 2 / ros2_control.
+
+  Unit conventions (URDF standard):
+    Length  : metres
+    Angle   : radians
+    Mass    : kilograms
+    Inertia : kg·m²
+    Force   : N  |  Torque : N·m  |  Velocity : rad/s
+
+  Kinematic chain (parent → child):
+    excavator (base)
+      └─ revolute_carriage  → upper_carriage   [continuous, Z-axis yaw]
+           └─ revolute_lift → lift_boom         [revolute,   Y-axis pitch]
+                └─ revolute_tilt → tilt_boom    [revolute,   Y-axis pitch]
+                     └─ revolute_tool → tool_body [revolute, Y-axis pitch]
+                          └─ gripper_to_tool (fixed) → gripper_mount
+                               └─ revolute_gripper → gripper_frame [continuous, Z-axis spin]
+                                    ├─ revolute_claw_1 → gripper_claw_1
+                                    └─ revolute_claw_2 → gripper_claw_2
+
+  Collision meshes:
+    Currently pointing at the visual OBJ files (Isaac Sim export).
+    Replace with dedicated convex-hull meshes once exported — see notes
+    at the bottom of this file.
+
+  ros2_control:
+    Hardware plugin : mock_components/GenericSystem  (swap for real hw plugin)
+    Interfaces      : position command + position/velocity state on all joints
+-->
+<robot name="excavator_urdf_ros2_ready">
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       JOINTS
+       All revolute velocity limits set to 10 RPM = 1.0472 rad/s.
+       Effort limits are nominal placeholders; tune per actuator spec.
+       ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Fixed wrist bracket: attaches gripper_mount rigidly to tool_body -->
+  <joint name="gripper_to_tool" type="fixed">
+    <origin xyz="0.047 0.0 -0.019" rpy="0.0 0.0 0.0"/>
+    <parent link="tool_body"/>
+    <child link="gripper_mount"/>
+  </joint>
+
+  <!-- Slewing ring: full continuous rotation of upper carriage on base (Z) -->
+  <joint name="revolute_carriage" type="continuous">
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+    <parent link="excavator"/>
+    <child link="upper_carriage"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <!-- continuous joints have no position limits; velocity = 10 RPM -->
+    <limit effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Gripper claw 1: opens from 0 to ~50 deg (positive direction) -->
+  <joint name="revolute_claw_1" type="revolute">
+    <origin xyz="0.0 0.025 -0.038" rpy="0.0 0.0 0.0"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_1"/>
+    <axis xyz="1.0 0.0 0.0"/>
+    <limit lower="0.0" upper="0.8726646" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Gripper claw 2: mirrors claw 1 (negative direction) -->
+  <joint name="revolute_claw_2" type="revolute">
+    <origin xyz="0.0 -0.025 -0.038" rpy="0.0 0.0 0.0"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_2"/>
+    <axis xyz="1.0 0.0 0.0"/>
+    <limit lower="-0.8726646" upper="0.0" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Gripper spin: continuous rotation of gripper frame around tool Z-axis -->
+  <joint name="revolute_gripper" type="continuous">
+    <origin xyz="-0.0105 0.0 -0.025" rpy="0.0 0.0 -1.5707964"/>
+    <parent link="gripper_mount"/>
+    <child link="gripper_frame"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <!-- continuous joints have no position limits; velocity = 10 RPM -->
+    <limit effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Lift boom: main shoulder pitch joint; initial pose ~ -0.7 rad -->
+  <joint name="revolute_lift" type="revolute">
+    <origin xyz="0.0165 0.0 0.0785" rpy="0.0 -0.455181869 0.0"/>
+    <parent link="upper_carriage"/>
+    <child link="lift_boom"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="-0.8726646" upper="0.5235988" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Tilt boom: elbow pitch joint; initial pose ~ 2.2 rad -->
+  <joint name="revolute_tilt" type="revolute">
+    <origin xyz="0.42008 0.0 -0.20564" rpy="0.0 0.455181869 0.0"/>
+    <parent link="lift_boom"/>
+    <child link="tilt_boom"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="0.4886922" upper="2.5132741" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Tool pitch: wrist pitch joint; initial pose ~ -0.7 rad -->
+  <joint name="revolute_tool" type="revolute">
+    <origin xyz="0.2499999 0.0 -0.0025" rpy="0.0 0.0 0.0"/>
+    <parent link="tilt_boom"/>
+    <child link="tool_body"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="-1.4835299" upper="1.2217305" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       LINKS
+       Each link carries: inertial, visual (OBJ), and collision (OBJ).
+       NOTE: collision meshes currently reuse visual OBJs — see notes
+       at the bottom for the recommended replacement workflow.
+       ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Base link: lower chassis / tracks; treated as world-fixed in simulation -->
+  <link name="excavator">
+    <inertial>
+      <origin xyz="0.0045939 -0.0001728 -0.0382546" rpy="0.0 0.0 0.0"/>
+      <mass value="6.5"/>
+      <inertia ixx="0.049442"  ixy="0.0005321"  ixz="0.0005431"
+               iyy="0.0529756" iyz="-0.0000344"
+               izz="0.0970931"/>
+    </inertial>
+    <visual>
+      <!-- Isaac Sim exports Y-up OBJs; -90 deg roll corrects to Z-up URDF convention -->
+      <origin xyz="0.0 0.0 0.0" rpy="-1.5707964 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/excavator_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="-1.5707964 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/excavator_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper claw 1 (opens in +X direction) -->
+  <link name="gripper_claw_1">
+    <inertial>
+      <origin xyz="-0.00019 0.0062462 -0.0327046" rpy="0.0 0.0 0.0"/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736"  ixy="-0.0000001" ixz="0.0000012"
+               iyy="0.0003253"  iyz="-0.0000481"
+               izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.6283185 -1.5707964"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_claw_1_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.6283185 -1.5707964"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_claw_1_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper claw 2 (opens in -X direction, symmetric to claw 1) -->
+  <link name="gripper_claw_2">
+    <inertial>
+      <origin xyz="0.00019 -0.0062462 -0.0327046" rpy="0.0 0.0 0.0"/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736"  ixy="-0.0000001" ixz="-0.0000012"
+               iyy="0.0003253"  iyz="0.0000481"
+               izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.6283185 1.5707964"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_claw_2_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.6283185 1.5707964"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_claw_2_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper frame: structural ring connecting the two claws -->
+  <link name="gripper_frame">
+    <inertial>
+      <origin xyz="0.0 0.0 -0.02261" rpy="0.0 0.0 0.0"/>
+      <mass value="0.07586"/>
+      <inertia ixx="0.0000321" ixy="0.0" ixz="0.0"
+               iyy="0.0000572" iyz="0.0"
+               izz="0.0000607"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_frame_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_frame_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper mount: bracket that interfaces tool_body to gripper_frame -->
+  <link name="gripper_mount">
+    <inertial>
+      <origin xyz="-0.01131 0.0 -0.01542" rpy="0.0 0.0 0.0"/>
+      <mass value="0.06983"/>
+      <inertia ixx="0.0000177" ixy="0.0"       ixz="0.0000006"
+               iyy="0.0000127" iyz="0.0"
+               izz="0.0000198"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_mount_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/gripper_mount_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Lift boom: main arm segment from shoulder to elbow (~0.42 m long) -->
+  <link name="lift_boom">
+    <inertial>
+      <origin xyz="0.199811 -0.000094 -0.044468" rpy="0.0 0.0 0.0"/>
+      <mass value="1.15299"/>
+      <inertia ixx="0.0049344" ixy="0.0000021" ixz="0.0072827"
+               iyy="0.021352"  iyz="0.0000036"
+               izz="0.0167196"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/lift_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/lift_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Tilt boom: forearm segment from elbow to wrist (~0.25 m long) -->
+  <link name="tilt_boom">
+    <inertial>
+      <origin xyz="0.06505 -0.00005 0.01784" rpy="0.0 0.0 0.0"/>
+      <mass value="0.77626"/>
+      <inertia ixx="0.00036"   ixy="0.0"  ixz="0.000676"
+               iyy="0.0060442" iyz="0.0"
+               izz="0.005863"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/tilt_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/tilt_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Tool body: quick-coupler / tool interface plate -->
+  <link name="tool_body">
+    <inertial>
+      <origin xyz="0.0265998 0.0 -0.0101976" rpy="0.0 0.0 0.0"/>
+      <mass value="0.137"/>
+      <inertia ixx="0.0000403" ixy="0.0"       ixz="0.0000048"
+               iyy="0.0000601" iyz="0.0"
+               izz="0.0000815"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/tool_body_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/tool_body_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Upper carriage: rotating superstructure (cabin, engine, arm base) -->
+  <link name="upper_carriage">
+    <inertial>
+      <origin xyz="-0.0821657 0.0013232 0.0460171" rpy="0.0 0.0 0.0"/>
+      <mass value="8.1"/>
+      <inertia ixx="0.0446463"  ixy="-0.0058658" ixz="0.0002102"
+               iyy="0.0700401"  iyz="-0.0020342"
+               izz="0.095637"/>
+    </inertial>
+    <visual>
+      <!-- Isaac Sim Y-up correction: -90 deg roll -->
+      <origin xyz="0.0 0.0 0.0" rpy="-1.5707964 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/upper_carriage_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- TODO: replace with dedicated convex-hull mesh (see file notes) -->
+      <origin xyz="0.0 0.0 0.0" rpy="-1.5707964 0.0 0.0"/>
+      <geometry>
+        <mesh filename="package://kaivuri_description/robot/meshes/upper_carriage_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       ROS 2 CONTROL
+       Plugin : mock_components/GenericSystem  (for testing / sim)
+       Replace with your real hardware plugin before deployment.
+
+       All joints expose:
+         - command interface : position
+         - state interfaces  : position, velocity
+
+       Initial positions reflect a compact "parked" pose:
+         lift  : -0.7 rad  (arm lowered)
+         tilt  :  2.2 rad  (elbow folded)
+         tool  : -0.7 rad  (wrist tucked)
+         rest  :  0.0 rad
+       ═══════════════════════════════════════════════════════════════ -->
+  <ros2_control name="initial_positions" type="system">
+    <hardware>
+      <plugin>mock_components/GenericSystem</plugin>
+    </hardware>
+
+    <!-- Slewing ring — starts at home (0 rad) -->
+    <joint name="revolute_carriage">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper claw 1 — starts closed (0 rad) -->
+    <joint name="revolute_claw_1">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper claw 2 — starts closed (0 rad) -->
+    <joint name="revolute_claw_2">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper spin — starts at home (0 rad) -->
+    <joint name="revolute_gripper">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Lift boom — starts lowered (-0.7 rad) -->
+    <joint name="revolute_lift">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">-0.7</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Tilt boom — starts folded (2.2 rad) -->
+    <joint name="revolute_tilt">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">2.2</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Tool pitch — starts tucked (-0.7 rad) -->
+    <joint name="revolute_tool">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">-0.7</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+  </ros2_control>
+
+</robot>
+
+<!--
+  ═══════════════════════════════════════════════════════════════════════
+  COLLISION MESH NOTES — Isaac Sim → URDF workflow
+  ═══════════════════════════════════════════════════════════════════════
+
+  CURRENT STATE
+  ─────────────
+  Every <collision> element points at the same OBJ as the <visual>.
+  This works but means the physics engine is colliding against the full
+  high-poly visual mesh, which is slow and can cause tunnelling on thin
+  parts (boom arms, claws).
+
+  WHY YOUR CONVEX-HULL MESHES DIDN'T APPEAR
+  ──────────────────────────────────────────
+  Isaac Sim's URDF exporter (as of Isaac Sim 4.x / USD Asset Structure 3.0)
+  exports collision geometry only when the USD prim has:
+    - Purpose = "guide"  AND  collision API applied
+      OR
+    - A dedicated PhysicsCollisionAPI + ConvexHullMeshCollisionAPI prim
+      that is a *separate* child of the rigid body prim.
+
+  If your collision prims are children of the visual mesh prim instead of
+  the rigid body prim, the exporter silently drops them.
+
+  RECOMMENDED WORKFLOW
+  ─────────────────────
+  Option A — Re-export from Isaac Sim (cleanest)
+    1. In the USD stage, for each rigid body, create a separate child prim
+       of type "Mesh" with Purpose="guide".
+    2. Apply PhysicsCollisionAPI and PhysicsMeshCollisionAPI (set to
+       "convexHull") to that prim.
+    3. Make it a child of the XForm/rigid-body prim, NOT of the visual mesh.
+    4. Re-run the URDF exporter — it should now emit separate collision
+       filenames (e.g. excavator_collision_Mesh.obj).
+
+  Option B — Post-process the OBJs with V-HACD (recommended for complex shapes)
+    pip install coacd   # or use standalone v-hacd binary
+    For each visual OBJ run:
+      coacd -i meshes/lift_boom_visuals_Mesh.obj \
+            -o meshes/lift_boom_collision.obj
+    Then update each <collision> filename in this URDF.
+
+  Option C — Use primitive shapes (fastest simulation, lowest fidelity)
+    Replace <mesh> tags in <collision> with URDF primitives:
+      <box size="0.42 0.05 0.06"/>        ← for lift_boom
+      <cylinder radius="0.02" length="0.25"/>  ← for tilt_boom
+      etc.
+    Adjust <origin> to centre each primitive on the link's CoM.
+
+  FOR NOW
+  ───────
+  The TODO comments above each <collision> block mark every mesh that
+  needs replacing. Search "TODO" to find them all.
+  ═══════════════════════════════════════════════════════════════════════
+-->

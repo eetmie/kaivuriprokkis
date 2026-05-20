@@ -19,7 +19,7 @@ def generate_launch_description():
     moveit_dir = Path(get_package_share_directory("kaivuri_moveit_config"))
 
     robot_description = {
-        "robot_description": (description_dir / "urdf" / "kaivuri.urdf").read_text(encoding="utf-8")
+        "robot_description": (description_dir / "robot" / "robot.urdf").read_text(encoding="utf-8")
     }
     robot_description_semantic = {
         "robot_description_semantic": (moveit_dir / "config" / "kaivuri.srdf").read_text(encoding="utf-8")

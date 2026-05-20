@@ -17,5 +17,5 @@ excavator_arm:
   default_planner_config: RRTConnectkConfigDefault
   planner_configs:
     - RRTConnectkConfigDefault
-  projection_evaluator: joints(revolute_cabin,revolute_lift)
+  projection_evaluator: joints(revolute_carriage,revolute_lift)
   longest_valid_segment_fraction: 0.01

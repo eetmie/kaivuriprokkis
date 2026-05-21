@@ -3,7 +3,7 @@
 MANUAL HARDWARE TEST — requires real pump hardware. Not a unit test.
 
 Usage:
-    python tests/pump_ramp_test.py [--config PATH] [--start US] [--end US]
+    python tools/pump_ramp_test.py [--config PATH] [--start US] [--end US]
                                    [--step US] [--interval SEC]
 
 The pump starts at --start (default: pulse_min from config) and increases by
@@ -95,12 +95,8 @@ def main():
     # ---- low-level PWM writer (bypass full stack for simplicity) ----
     from modules.PCA9685_controller import DirectPWMWriter  # type: ignore
 
-    try:
-        import smbus2
-        i2c = smbus2.SMBus(1)
-    except Exception:
-        import smbus as smbus2  # type: ignore
-        i2c = smbus2.SMBus(1)
+    import smbus2
+    i2c = smbus2.SMBus(1)
 
     # Read actual frequency from config to compute duty cycles correctly
     import yaml

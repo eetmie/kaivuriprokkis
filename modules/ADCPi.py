@@ -43,16 +43,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ================================================
 
-Requires smbus2 or python smbus to be installed
+Requires smbus2 to be installed
 """
 
-try:
-    from smbus2 import SMBus
-except ImportError:
-    try:
-        from smbus import SMBus
-    except ImportError:
-        raise ImportError("python3-smbus or smbus2 not found")
+from smbus2 import SMBus
 import re
 import platform
 import time

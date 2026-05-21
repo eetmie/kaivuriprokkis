@@ -226,14 +226,14 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
             self.assertEqual(hw.get_status()["adc_state"], ReadyState.READY)
             self.assertEqual(
                 hw.get_pwm_channel_names(include_pump=True),
-                ["trackL", "trackR", "slew", "lift", "tilt", "scoop", "extra1", "extra2", "pump"],
+                ["trackL", "trackR", "rotate", "lift_boom", "tilt_boom", "scoop", "extra1", "extra2", "pump"],
             )
             self.assertTrue(hw.send_named_pwm_commands({
                 "trackL": 0.0,
                 "trackR": 0.0,
-                "slew": 0.0,
-                "lift": 0.0,
-                "tilt": 0.0,
+                "rotate": 0.0,
+                "lift_boom": 0.0,
+                "tilt_boom": 0.0,
                 "scoop": 0.0,
             }))
             self.assertIn(("block", 0x40, 0x06, 32), calls)

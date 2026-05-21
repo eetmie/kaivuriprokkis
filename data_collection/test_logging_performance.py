@@ -5,7 +5,7 @@ MANUAL HARDWARE TEST — requires real hardware. Not a unit test.
 
 Verifies that 100Hz logging + sine computation can keep up alongside the
 controller's background loop (200Hz PWM by default). Follows the pattern
-from tests/stress_full_stack.py — reads control_config.yaml for default
+from tools/stress_full_stack.py — reads control_config.yaml for default
 rates, supports --rate-hz override, RT flags, and CPU pinning.
 
 Key constraints that are always fixed:
@@ -64,7 +64,7 @@ def _cpu_affinity(core):
 
 
 def _load_rate_config():
-    """Load default rates from control_config.yaml (same pattern as stress_full_stack.py)."""
+    """Load default rates from control_config.yaml (same pattern as tools/stress_full_stack.py)."""
     cfg_path = _ROOT / "configuration_files" / "control_config.yaml"
     with cfg_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -148,7 +148,7 @@ def main():
     total_cycles = 0
 
     try:
-        # ---- Hardware (same pattern as stress_full_stack.py) ----
+        # ---- Hardware (same pattern as tools/stress_full_stack.py) ----
         print(f"[test] Initializing hardware (ctrl={ctrl_hz}Hz imu={imu_hz}Hz adc={adc_hz}Hz)...")
         hardware = HardwareInterface(
             config_file=str(_ROOT / "configuration_files" / "servo_config_200.yaml"),

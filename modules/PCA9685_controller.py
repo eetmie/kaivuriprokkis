@@ -26,13 +26,9 @@ PCA9685_I2C_ADDRESS = 0x40
 
 
 def _open_smbus(bus_number: int = PCA9685_I2C_BUS):
-    """Open Raspberry Pi I2C via smbus2/smbus for low-overhead direct writes."""
-    try:
-        import smbus2
-        return smbus2.SMBus(bus_number)
-    except Exception:
-        import smbus as smbus2  # type: ignore
-        return smbus2.SMBus(bus_number)
+    """Open Raspberry Pi I2C via smbus2 for low-overhead direct writes."""
+    import smbus2
+    return smbus2.SMBus(bus_number)
 
 
 class PWMControllerError(Exception):

@@ -98,7 +98,7 @@ class PathExecutionConfig:
     radial_compensation_alpha: float = 0.8         # radial-error compensation blend
     radial_smoothing_samples: int = 120            # post-fit resample count
 
-    # NOTE: IK configuration has been moved to configuration_files/control_config.yaml
+    # NOTE: IK configuration has been moved to configuration_files/profiles/rpi/control_config.yaml
     # See the 'ik' section in that file for: command_type, method, velocity_mode,
     # params, relative gains, ignore_axes, joint_limits_relative
 

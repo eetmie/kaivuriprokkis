@@ -205,7 +205,7 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
 
         with patch("modules.PCA9685_controller._open_smbus", side_effect=open_bus):
             hw = HardwareInterface(
-                config_file=str(ROOT_DIR / "configuration_files" / "servo_config_jetson.yaml"),
+                config_file=str(ROOT_DIR / "configuration_files" / "profiles" / "jetson" / "servo_config.yaml"),
                 enable_pwm=True,
                 enable_imu=False,
                 enable_adc=False,

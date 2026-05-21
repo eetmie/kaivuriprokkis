@@ -39,7 +39,7 @@ Compensations to consider (each can be added independently)
 
 2. Asymmetric valve compensation
    - Hydraulic valves often have different flow on extend vs retract.
-   - Already partially handled in servo_config_200.yaml via
+   - Already partially handled in profiles/rpi/servo_config.yaml via
      deadband_us_pos / deadband_us_neg + dither. Anything beyond a
      constant deadband (e.g., gain asymmetry) can be modeled here as a
      per-channel piecewise gain on (pid_out + grav_ff) before the PWM map.

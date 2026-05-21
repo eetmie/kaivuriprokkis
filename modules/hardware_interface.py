@@ -34,7 +34,7 @@ from .perf_tracker import IntervalTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
 
 
-def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+def _load_control_config(path: str) -> Dict[str, Any]:
     """Load control configuration YAML file."""
     try:
         p = Path(path)
@@ -125,7 +125,8 @@ class HardwareInterface:
     """
     
     def __init__(self,
-                 config_file: str = "configuration_files/servo_config_200.yaml",
+                 config_file: Optional[str] = None,
+                 control_config_file: Optional[str] = None,
                  pump_auto_mode: bool = False,
                  toggle_channels: bool = False, # basically tracks disabled (no IK for them)
                  input_rate_threshold: int = 20,
@@ -155,7 +156,8 @@ class HardwareInterface:
         Initialize real hardware interface.
 
         Args:
-            config_file: Path to PWM controller configuration
+            config_file: Path to PWM controller configuration. Required when enable_pwm=True.
+            control_config_file: Path to controller/IMU configuration. Required when enable_imu=True.
             pump_auto_mode: Whether to use valve-activity-based auto pump speed (True) or static speed (False)
             toggle_channels: Whether to allow usage of "toggleable" channels (i.e. tracks + center rotation)
             input_rate_threshold: Minimum required PWM command rate (Hz). Resets valves to center
@@ -195,6 +197,7 @@ class HardwareInterface:
             self.logger.addHandler(handler)
 
         self.config_file = config_file
+        self.control_config_file = control_config_file
         self._enable_pwm = bool(enable_pwm)
         self._enable_imu = bool(enable_imu)
         self._enable_adc = bool(enable_adc)
@@ -211,6 +214,8 @@ class HardwareInterface:
         self._adc_channel_plan = None  # Resolved plan of dicts {board, channel, name}
 
         if self._enable_imu:
+            if not self.control_config_file:
+                raise ValueError("control_config_file is required when enable_imu=True")
             self._init_imu_config()
         else:
             self._init_disabled_imu_config()
@@ -221,6 +226,8 @@ class HardwareInterface:
         self._pwm_fault_reason: Optional[str] = None
 
         if PWMController is not None and self._enable_pwm:
+            if not self.config_file:
+                raise ValueError("config_file is required when enable_pwm=True")
             try:
                 self.pwm_controller = PWMController(
                     config_file=config_file,
@@ -328,7 +335,7 @@ class HardwareInterface:
 
     def _init_imu_config(self) -> None:
         """Load and validate IMU mapping only when IMU support is enabled."""
-        _cfg = _load_control_config()
+        _cfg = _load_control_config(self.control_config_file)
         _imu_cfg = _cfg.get('imu', {})
         # Named IMU mapping: logical role -> physical sensor index
         _imu_mapping = _imu_cfg.get('imu_mapping')

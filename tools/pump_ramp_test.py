@@ -33,7 +33,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-DEFAULT_CONFIG = ROOT_DIR / "configuration_files" / "servo_config_200.yaml"
+DEFAULT_CONFIG = ROOT_DIR / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"
 
 
 def _parse_args():

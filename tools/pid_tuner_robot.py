@@ -67,7 +67,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8090, help="UDP port; separate from excv_gui.py")
     parser.add_argument("--rate", type=float, default=50.0, help="Control loop rate Hz")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    parser.add_argument("--config-file", default="configuration_files/servo_config_200.yaml")
+    parser.add_argument("--config-file", default="configuration_files/profiles/rpi/servo_config.yaml")
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="[%(levelname)s] %(name)s: %(message)s")
@@ -90,13 +90,14 @@ def main() -> int:
 
     hardware = HardwareInterface(
         config_file=args.config_file,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         pump_auto_mode=False,
         cleanup_disable_osc=False,
         enable_adc=False,
         start_adc_reader=False,
         log_level=args.log_level,
     )
-    robot_config = load_excavator_robot_config()
+    robot_config = load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")
 
     log.info("Waiting for hardware")
     while not hardware.is_hardware_ready():

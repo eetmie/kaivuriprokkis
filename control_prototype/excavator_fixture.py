@@ -1,6 +1,6 @@
 """Real-robot test fixture for the smooth reachability prototype.
 
-Hardcoded to match configuration_files/control_config.yaml as of 2026-05-13.
+Hardcoded to match configuration_files/profiles/rpi/control_config.yaml as of 2026-05-13.
 Kept hardcoded (instead of YAML-loading) so the prototype stays self-contained
 and the tests are not sensitive to future config edits.
 
@@ -84,4 +84,4 @@ def load_real_robot_config():
     """
     from modules.differential_ik_cfg import load_excavator_robot_config
 
-    return load_excavator_robot_config()
+    return load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")

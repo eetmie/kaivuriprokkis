@@ -280,6 +280,8 @@ def run_hardware_test(args) -> list[str]:
     try:
         print("[hw] Initializing hardware...")
         hardware = HardwareInterface(
+            config_file="configuration_files/profiles/rpi/servo_config.yaml",
+            control_config_file="configuration_files/profiles/rpi/control_config.yaml",
             pump_auto_mode=False,
             toggle_channels=True,
             stale_timeout_s=0.5,
@@ -303,6 +305,7 @@ def run_hardware_test(args) -> list[str]:
             config=None,
             enable_perf_tracking=False,
             log_level="WARNING",
+            control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         )
         controller.start()
         time.sleep(2.0)

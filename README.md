@@ -69,11 +69,12 @@ PCA9685 bus with:
 i2cdetect -y 7
 ```
 
-Runtime platform defaults live in `modules/board.py`. The Raspberry Pi profile
-uses `configuration_files/servo_config_rpi.yaml`; the Jetson profile uses
-`configuration_files/servo_config_jetson.yaml`. Both currently share
-`configuration_files/control_config.yaml` for robot geometry, IMU mapping, IK,
-PID, and controller settings.
+Runtime profile defaults live in `configuration_files/profiles/<name>/profile.yaml`.
+The profile selects a `board` (`rpi` or `jetson`) for compute-platform defaults
+such as I2C bus numbers, then points at profile-local `servo_config.yaml` and
+`control_config.yaml` files for robot-specific valve, geometry, IMU, IK, PID,
+and controller settings. `--robot auto` only auto-detects the board profile;
+robot-specific profiles must be selected explicitly.
 
 USB serial should not require running the robot process with `sudo`. If
 `modules/usb_serial_reader.py` cannot import `serial`, check that you are

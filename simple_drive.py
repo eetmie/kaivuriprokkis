@@ -9,8 +9,8 @@ Usage:
     sudo python simple_drive.py --linkage-rate-correction
     sudo python simple_drive.py --robot jetson
 
-Jetson mode is PCA9685-only by default: HardwareInterface is used with IMU
-disabled and direct named PWM commands for valve config tuning.
+Jetson mode uses the Jetson PCA9685 profile and the same USB IMU stack as the
+Raspberry Pi profile. Use --disable-imu for PCA9685-only valve config tuning.
 
 Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
@@ -191,7 +191,7 @@ def parse_args():
         "--robot",
         choices=[*sorted(ROBOT_PROFILES), "auto"],
         default="auto",
-        help="Robot profile. 'auto' detects the board at startup (default). 'rpi'/'jetson' are explicit overrides.",
+        help="Robot profile. 'auto' detects only the board profile at startup (default).",
     )
     parser.add_argument(
         "--ip",
@@ -203,6 +203,11 @@ def parse_args():
         "--config-file",
         default=None,
         help="Override PWM servo config path selected by --robot.",
+    )
+    parser.add_argument(
+        "--control-config-file",
+        default=None,
+        help="Override controller/IK/IMU config path selected by --robot.",
     )
     parser.add_argument(
         "--pwm-i2c-bus",
@@ -254,7 +259,10 @@ def parse_args():
 def resolve_robot_profile(args) -> dict:
     profile = _resolve_board_profile(args.robot)   # handles 'auto' detection
     if args.config_file is not None:
+        profile['servo_config_file'] = args.config_file
         profile['config_file'] = args.config_file
+    if args.control_config_file is not None:
+        profile['control_config_file'] = args.control_config_file
     if args.pwm_i2c_bus is not None:
         profile['pwm_i2c_bus'] = args.pwm_i2c_bus
     if args.pwm_i2c_addr is not None:
@@ -321,7 +329,8 @@ def main():
     _auto_note = f" (auto-detected as '{_resolved}')" if _selected == "auto" else ""
     print("Initializing hardware...")
     print(
-        f"Robot: {_selected}{_auto_note} | config={robot_profile['config_file']} | "
+        f"Robot: {_selected}{_auto_note} | servo_config={robot_profile['servo_config_file']} | "
+        f"control_config={robot_profile['control_config_file']} | "
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
         f"IMU={'on' if imu_enabled else 'off'} | "
         f"UDP={_host}:{_port} | "
@@ -330,7 +339,8 @@ def main():
     from modules.hardware_interface import HardwareFaultError, HardwareInterface
 
     hardware = HardwareInterface(
-        config_file=robot_profile['config_file'],
+        config_file=robot_profile['servo_config_file'],
+        control_config_file=robot_profile['control_config_file'],
         pump_auto_mode=True,
         toggle_channels=not args.disable,
         stale_timeout_s=0.5,
@@ -361,7 +371,12 @@ def main():
     if imu_enabled:
         from modules.excavator_controller import ExcavatorController
 
-        controller = ExcavatorController(hardware, config=None, enable_perf_tracking=False)
+        controller = ExcavatorController(
+            hardware,
+            config=None,
+            enable_perf_tracking=False,
+            control_config_file=robot_profile['control_config_file'],
+        )
     else:
         controller = PWMOnlyController(hardware)
     controller.start()

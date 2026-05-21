@@ -13,27 +13,38 @@ Typical hardware run:
 
 ```bash
 source .venv/bin/activate
-python run_hw_v2.py --algorithm a_star -r --task in-and-out --log --once
+sudo .venv/bin/python run_hw_v2.py --algorithm a_star -r --task in-and-out --log --once
 ```
 
 Useful examples:
 
 ```bash
-python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
-python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
-python run_hw_v2.py --algorithm prm -r -p --task empty --log --once
-python run_hw_v2.py --test --once
+sudo .venv/bin/python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
+sudo .venv/bin/python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
+sudo .venv/bin/python run_hw_v2.py --algorithm prm -r -p --task empty --log --once
+sudo .venv/bin/python run_hw_v2.py --test --once
 ```
 
 `--test` sends direct A/B pose commands without the planner. It is useful for
 checking basic control behavior, but normal pathing work should use planner
 mode.
 
+On Raspberry Pi, run `run_hw_v2.py` with `sudo` as shown above. This lets the
+realtime helpers in `rt_utils` apply the requested scheduling settings while
+still using the project virtual environment.
+
 ## Platform Setup And Privileges
 
 `setup.sh` is Raspberry Pi-specific. It edits Raspberry Pi boot config, creates
 virtual I2C buses for the ADC/OLED wiring, and installs an OLED service. Do not
 use it on Jetson Nano.
+
+The Raspberry Pi main I2C bus runs well at 1 MHz in this project.
+
+## Jetson Nano WIP Notes
+
+Jetson Nano support is still work in progress and is separate from the main
+Raspberry Pi usage above.
 
 For Jetson Nano, use:
 
@@ -49,10 +60,10 @@ profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
 service, OLED/display Python packages, and analysis-only `scipy`/`pandas`
 packages are not part of the Jetson setup.
 
-The Raspberry Pi main I2C bus runs well at 1 MHz in this project. Jetson bus 7
-has not yet been tested at 1 MHz, and it needs a Jetson-specific device-tree or
-kernel configuration path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`.
-Before changing bus speed, check the current PCA9685 bus with:
+Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz, and it needs a Jetson-specific
+device-tree or kernel configuration path rather than Raspberry Pi
+`dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
+PCA9685 bus with:
 
 ```bash
 i2cdetect -y 7
@@ -98,7 +109,7 @@ To compare sim and IRL against the same obstacle layout:
 3. Run hardware with:
 
    ```bash
-   python run_hw_v2.py --algorithm a_star -r --obstacles-json obstacles.json --log --once
+   sudo .venv/bin/python run_hw_v2.py --algorithm a_star -r --obstacles-json obstacles.json --log --once
    ```
 
 ## Layout

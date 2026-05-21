@@ -2,11 +2,17 @@
 # MASI Robot Setup Script
 # Configures I2C, installs dependencies, sets up OLED service
 #
-# TODO: add a minimal mode (e.g. --minimal flag) that only installs Python
-#       deps and optionally bumps the main I2C speed — skips I2C GPIO
-#       mapping, OLED service setup, and shell aliases. Useful for Jetson
-#       and other non-RPi boards where the overlay names, GPIO pins, and
-#       service paths all differ.
+# Raspberry Pi setup only.
+#
+# NOTE(jetson): do not run this on Jetson Nano. This script edits Raspberry Pi
+#               boot config, creates RPi i2c-gpio overlay buses, and installs
+#               an OLED service with RPi-specific assumptions. Use
+#               setup_jetson.sh instead.
+#
+# Privilege note: USB serial should not require running the robot process with
+#                 sudo. Add the operator user to the serial device group
+#                 (usually dialout) and run Python from the project .venv.
+#                 Running "sudo python ..." often bypasses .venv packages.
 
 set -e
 

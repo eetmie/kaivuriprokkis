@@ -12,21 +12,58 @@ The shared planner package lives in `pathing/` and matches the sim package.
 Typical hardware run:
 
 ```bash
-sudo python run_hw_v2.py --algorithm a_star -r --task in-and-out --log --once
+source .venv/bin/activate
+python run_hw_v2.py --algorithm a_star -r --task in-and-out --log --once
 ```
 
 Useful examples:
 
 ```bash
-sudo python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
-sudo python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
-sudo python run_hw_v2.py --algorithm prm -r -p --task empty --log --once
-sudo python run_hw_v2.py --test --once
+python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
+python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
+python run_hw_v2.py --algorithm prm -r -p --task empty --log --once
+python run_hw_v2.py --test --once
 ```
 
 `--test` sends direct A/B pose commands without the planner. It is useful for
 checking basic control behavior, but normal pathing work should use planner
 mode.
+
+## Platform Setup And Privileges
+
+`setup.sh` is Raspberry Pi-specific. It edits Raspberry Pi boot config, creates
+virtual I2C buses for the ADC/OLED wiring, and installs an OLED service. Do not
+use it on Jetson Nano.
+
+For Jetson Nano, use:
+
+```bash
+sudo ./setup_jetson.sh
+```
+
+Jetson setup is intentionally minimal: it installs OS packages, updates a
+lightweight project `.venv`, and adds the user to device groups such as
+`dialout`, `i2c`, and `gpio` when those groups exist. This robot's Jetson
+profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
+7, plus USB serial for IMU reading. The Raspberry Pi virtual I2C channels, OLED
+service, OLED/display Python packages, and analysis-only `scipy`/`pandas`
+packages are not part of the Jetson setup.
+
+The Raspberry Pi main I2C bus runs well at 1 MHz in this project. Jetson bus 7
+has not yet been tested at 1 MHz, and it needs a Jetson-specific device-tree or
+kernel configuration path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`.
+Before changing bus speed, check the current PCA9685 bus with:
+
+```bash
+i2cdetect -y 7
+```
+
+USB serial should not require running the robot process with `sudo`. If
+`modules/usb_serial_reader.py` cannot import `serial`, check that you are
+running `.venv/bin/python`; plain `sudo python ...` usually switches to
+system/root Python and bypasses `.venv`. If opening `/dev/ttyACM0` or
+`/dev/ttyUSB0` needs sudo, add the user to the device group shown by
+`ls -l /dev/ttyACM0`, usually `dialout`, then relogin or reboot.
 
 ## Main Flags
 
@@ -61,7 +98,7 @@ To compare sim and IRL against the same obstacle layout:
 3. Run hardware with:
 
    ```bash
-   sudo python run_hw_v2.py --algorithm a_star -r --obstacles-json obstacles.json --log --once
+   python run_hw_v2.py --algorithm a_star -r --obstacles-json obstacles.json --log --once
    ```
 
 ## Layout

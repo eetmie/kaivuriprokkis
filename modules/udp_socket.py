@@ -57,6 +57,7 @@ class UDPSocket:
         # Pre-computed format strings (filled after setup)
         self.send_format = None
         self.recv_format = None
+        self._nonblocking_send = False
 
         # HMAC authentication (optional)
         self._hmac_key = hmac_key.encode('utf-8') if isinstance(hmac_key, str) else hmac_key
@@ -99,7 +100,7 @@ class UDPSocket:
             self.socket.bind((host, port))
             print(f"UDP Server listening on {host}:{port}")
         else:
-            self.remote_addr = (host, port)
+            self.remote_addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
             print(f"UDP Client ready to send to {host}:{port}")
 
         # Format: endian + timestamp (uint32) + data elements
@@ -111,6 +112,10 @@ class UDPSocket:
     def set_nominal_rate_hz(self, nominal_rate_hz: Optional[float]):
         """Set local nominal application send/update rate advertised in handshake."""
         self.nominal_rate_hz = float(nominal_rate_hz) if nominal_rate_hz is not None else None
+
+    def set_nonblocking_send(self, enabled: bool = True):
+        """Drop a packet instead of blocking the caller if sendto would block."""
+        self._nonblocking_send = bool(enabled)
 
     def get_handshake_info(self) -> dict:
         """Return local/remote handshake metadata."""
@@ -221,7 +226,17 @@ class UDPSocket:
         data = struct.pack(self.send_format, timestamp_ms, *values)
         if self._hmac_key:
             data += hmac.new(self._hmac_key, data, hashlib.sha256).digest()
-        self.socket.sendto(data, self.remote_addr)
+        previous_timeout = None
+        try:
+            if self._nonblocking_send:
+                previous_timeout = self.socket.gettimeout()
+                self.socket.setblocking(False)
+            self.socket.sendto(data, self.remote_addr)
+        except (BlockingIOError, socket.timeout):
+            return True
+        finally:
+            if previous_timeout is not None:
+                self.socket.settimeout(previous_timeout)
         return True
 
     def get_latest(self) -> Optional[List]:

@@ -5,7 +5,6 @@ from typing import Optional
 
 import numpy as np
 
-from .differential_ik_cfg import load_excavator_robot_config
 from .excavator_ik_utils import get_joint_positions, get_pose
 from .control_protocol import (
     ControlCommand,
@@ -32,7 +31,9 @@ class RobotService:
     def __init__(self, controller, hardware):
         self.controller = controller
         self.hardware = hardware
-        self.robot_config = load_excavator_robot_config()
+        self.robot_config = getattr(controller, "robot_config", None)
+        if self.robot_config is None:
+            raise ValueError("RobotService requires controller.robot_config")
         self._state_lock = threading.Lock()
         self.state = RobotServiceState()
         self._telemetry_sequence = 0

@@ -201,9 +201,10 @@ class ValveTuner:
         self.udp: UDPSocket | None = None
         _write_yaml(self.output_path, self.candidate)
 
-        self.robot_config = load_excavator_robot_config()
+        self.robot_config = load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")
         self.hardware = HardwareInterface(
             config_file=str(self.output_path),
+            control_config_file="configuration_files/profiles/rpi/control_config.yaml",
             pump_auto_mode=False,
             cleanup_disable_osc=False,
             enable_adc=False,

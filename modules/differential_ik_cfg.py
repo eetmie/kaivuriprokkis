@@ -329,7 +329,7 @@ class CheckDOF:
         }
 
 
-def _load_control_config(path: str = "configuration_files/control_config.yaml") -> Dict[str, Any]:
+def _load_control_config(path: str) -> Dict[str, Any]:
     """Load control configuration YAML file."""
     try:
         p = Path(path)
@@ -350,8 +350,8 @@ def _require_xyz_vector(value: Any, field_name: str) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
-def load_excavator_robot_config(path: str = "configuration_files/control_config.yaml") -> RobotConfig:
-    """Build the excavator kinematic model from control_config.yaml."""
+def load_excavator_robot_config(path: str) -> RobotConfig:
+    """Build the excavator kinematic model from a profile-selected control YAML."""
     cfg = _load_control_config(path)
     robot_cfg = cfg.get('robot', {}) if isinstance(cfg, dict) else {}
     if not isinstance(robot_cfg, dict) or not robot_cfg:
@@ -415,6 +415,6 @@ def load_excavator_robot_config(path: str = "configuration_files/control_config.
     )
 
 
-def create_excavator_config() -> RobotConfig:
+def create_excavator_config(path: str) -> RobotConfig:
     """Compatibility wrapper for the config-backed excavator model."""
-    return load_excavator_robot_config()
+    return load_excavator_robot_config(path)

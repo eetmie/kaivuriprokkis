@@ -49,6 +49,7 @@ from configuration_files.pathing_config import (
     EnvironmentConfig,
     PathExecutionConfig,
 )
+from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
 from modules.excavator_controller import ExcavatorController
 from modules.hardware_interface import HardwareFaultError, HardwareInterface
 from modules.quaternion_math import quat_from_axis_angle
@@ -235,6 +236,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "Replaces the default wall obstacle for the chosen task.",
     )
     parser.add_argument("--log", action="store_true", help="Write trajectory CSV + metrics.csv under logs_hw/.")
+    parser.add_argument(
+        "--robot",
+        choices=[*sorted(ROBOT_PROFILES), "auto"],
+        default="auto",
+        help="Robot profile. 'auto' detects the board at startup.",
+    )
+    parser.add_argument("--servo-config", default=None, help="Override PWM servo config path selected by --robot.")
+    parser.add_argument("--control-config", default=None, help="Override controller/IK/IMU config path selected by --robot.")
+    parser.add_argument("--pwm-i2c-bus", type=int, default=None, help="Override PCA9685 Linux I2C bus selected by --robot.")
+    parser.add_argument(
+        "--pwm-i2c-addr",
+        type=lambda value: int(value, 0),
+        default=None,
+        help="Override PCA9685 I2C address selected by --robot, e.g. 0x40.",
+    )
+    parser.add_argument("--disable-imu", action="store_true", help="Disable IMU startup for PWM-only bring-up.")
     parser.add_argument("--debug", action="store_true", help="Verbose logging from controller, hardware, and planning internals.")
     parser.add_argument("--debug-planning", action="store_true", help="Verbose planning logs only.")
     parser.add_argument("--once", action="store_true", help="Run a single sweep through the task goals and stop.")
@@ -286,8 +303,10 @@ def _configure_logging(args: argparse.Namespace) -> None:
     logger.setLevel(logging.INFO)
 
 
-def _load_control_config() -> Dict[str, Any]:
-    config_path = _ROOT / "configuration_files" / "control_config.yaml"
+def _load_control_config(config_file: str) -> Dict[str, Any]:
+    config_path = Path(config_file)
+    if not config_path.is_absolute():
+        config_path = _ROOT / config_path
     if not config_path.exists():
         return {}
     try:
@@ -542,7 +561,12 @@ _PD_DAMPING = np.array([40.0, 40.0, 40.0, 40.0], dtype=np.float32)
 class HardwareTrajectoryLogger:
     """Per-trajectory CSV + cumulative metrics.csv, matching the sim layout."""
 
-    def __init__(self, algorithm_name: str, base_log_dir: str = "logs_hw") -> None:
+    def __init__(
+        self,
+        algorithm_name: str,
+        control_config_file: str,
+        base_log_dir: str = "logs_hw",
+    ) -> None:
         script_dir = _ROOT
         base_dir = script_dir / base_log_dir
         base_dir.mkdir(parents=True, exist_ok=True)
@@ -557,6 +581,7 @@ class HardwareTrajectoryLogger:
         folder_num = max(existing_nums) + 1 if existing_nums else 1
 
         self.algorithm_name = algorithm_name
+        self.control_config_file = control_config_file
         self.log_dir = str(base_dir / f"{algorithm_name}_{folder_num}")
         os.makedirs(self.log_dir, exist_ok=True)
         self.trajectory_counter = 0
@@ -728,7 +753,7 @@ class HardwareTrajectoryLogger:
             writer.writerows(self.trajectory_log)
 
         n = max(self.ik_diagnostic_steps, 1)
-        ctrl_cfg = _load_control_config()
+        ctrl_cfg = _load_control_config(self.control_config_file)
         ik_cfg = ctrl_cfg.get("ik", {}) if isinstance(ctrl_cfg.get("ik", {}), dict) else {}
 
         metrics = {
@@ -1126,6 +1151,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     _configure_logging(args)
 
+    robot_profile = _resolve_board_profile(args.robot)
+    if args.servo_config is not None:
+        robot_profile["servo_config_file"] = args.servo_config
+        robot_profile["config_file"] = args.servo_config
+    if args.control_config is not None:
+        robot_profile["control_config_file"] = args.control_config
+    if args.pwm_i2c_bus is not None:
+        robot_profile["pwm_i2c_bus"] = args.pwm_i2c_bus
+    if args.pwm_i2c_addr is not None:
+        robot_profile["pwm_i2c_addr"] = args.pwm_i2c_addr
+    if args.disable_imu:
+        robot_profile["enable_imu"] = False
+
     env_config = DEFAULT_ENV_CONFIG
     path_config = DEFAULT_CONFIG
     task = make_task_preset(args.task)
@@ -1135,6 +1173,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("=" * 60)
     logger.info("Task: %s | Algorithm: %s", args.task, args.algorithm_name)
     logger.info("Debug=%s, Log=%s, Once=%s", args.debug, args.log, args.once)
+    logger.info(
+        "Robot profile: %s | board=%s | servo=%s | control=%s | I2C bus=%s addr=0x%02X | IMU=%s",
+        args.robot,
+        robot_profile["board"],
+        robot_profile["servo_config_file"],
+        robot_profile["control_config_file"],
+        robot_profile["pwm_i2c_bus"],
+        robot_profile["pwm_i2c_addr"],
+        "on" if robot_profile["enable_imu"] else "off",
+    )
     logger.info("RT priorities: ctrl=%d, imu=%d", args.rt_priority, args.imu_priority)
 
     targets: List[Tuple[np.ndarray, float]] = [
@@ -1160,11 +1208,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logger.info("Initializing hardware interface...")
     hardware = HardwareInterface(
+        config_file=robot_profile["servo_config_file"],
+        control_config_file=robot_profile["control_config_file"],
         perf_enabled=bool(args.debug),
         cleanup_disable_osc=False,
         enable_adc=False,
+        enable_imu=bool(robot_profile["enable_imu"]),
         start_adc_reader=False,
         imu_rt_priority=args.imu_priority,
+        pwm_i2c_bus=robot_profile["pwm_i2c_bus"],
+        pwm_i2c_addr=robot_profile["pwm_i2c_addr"],
     )
 
     logger.info("Initializing excavator controller...")
@@ -1173,6 +1226,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         enable_perf_tracking=True,
         log_level="DEBUG" if args.debug else "INFO",
         rt_priority=args.rt_priority,
+        control_config_file=robot_profile["control_config_file"],
     )
     controller.start()
 
@@ -1235,7 +1289,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     algorithm_log_name = _logging_safe_name(args.algorithm_name)
     data_logger: Optional[HardwareTrajectoryLogger] = None
     if args.log and not args.test:
-        data_logger = HardwareTrajectoryLogger(algorithm_name=algorithm_log_name)
+        data_logger = HardwareTrajectoryLogger(
+            algorithm_name=algorithm_log_name,
+            control_config_file=robot_profile["control_config_file"],
+        )
         if args.obstacles_json:
             import shutil
             try:

@@ -213,4 +213,4 @@ def make_ik_config(
 def load_robot_config():
     """Ensure numba is warm and return the excavator robot config."""
     warmup_numba_functions()
-    return load_excavator_robot_config()
+    return load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")

@@ -177,6 +177,8 @@ def main() -> int:
     from modules.hardware_interface import HardwareInterface
 
     hardware = HardwareInterface(
+        config_file="configuration_files/profiles/rpi/servo_config.yaml",
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         log_level=args.log_level.upper(),
         pump_auto_mode=False, cleanup_disable_osc=False,
         enable_adc=False, start_adc_reader=False,
@@ -198,6 +200,7 @@ def main() -> int:
         rt_priority=args.fifo_priority,
         rt_lock_memory=args.lock_memory,
         rt_cpu_core=args.control_core,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
     )
 
     # *** The prototype's defining line ***

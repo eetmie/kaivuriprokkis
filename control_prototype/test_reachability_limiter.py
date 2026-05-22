@@ -31,7 +31,7 @@ from excavator_fixture import REAL_JOINT_LIMITS_RAD, SAFE_ANGLES_RAD
 
 
 # Joint limits and mid-pose come from the real robot config
-# (configuration_files/control_config.yaml, mirrored in excavator_fixture.py).
+# (configuration_files/profiles/rpi/control_config.yaml, mirrored in excavator_fixture.py).
 # Slew is unbounded (None); boom/arm/bucket carry the real ranges.
 JOINT_LIMITS_RAD = REAL_JOINT_LIMITS_RAD
 

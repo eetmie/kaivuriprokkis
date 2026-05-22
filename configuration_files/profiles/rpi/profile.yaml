@@ -1,0 +1,6 @@
+name: rpi
+board: rpi
+servo_config_file: servo_config.yaml
+control_config_file: control_config.yaml
+enable_imu: true
+enable_adc: false

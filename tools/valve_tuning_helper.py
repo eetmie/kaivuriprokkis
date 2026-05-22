@@ -213,7 +213,7 @@ class ValveTuner:
         )
         if args.udp_positioning:
             self.udp = UDPSocket(local_id=2, max_age_seconds=0.5, nominal_rate_hz=UDP_POSITION_HZ)
-            self.udp.setup(args.host, args.port, num_inputs=10, num_outputs=0, is_server=True)
+            self.udp.setup(args.host, args.port, inputs='10b', outputs='', is_server=True)
 
     def wait_ready(self) -> None:
         self.log.info("Waiting for hardware")
@@ -259,7 +259,7 @@ class ValveTuner:
         next_t = time.perf_counter()
 
         while True:
-            float_data = self.udp.get_latest_floats()
+            float_data = UDPSocket.ints_to_floats(self.udp.get_latest() or [])
             if float_data:
                 buttons = [float_data[0], float_data[1], float_data[2], float_data[3]]
                 if buttons[0] > BUTTON_THRESHOLD and button_prev[0] <= BUTTON_THRESHOLD:

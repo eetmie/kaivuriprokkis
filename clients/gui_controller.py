@@ -183,7 +183,7 @@ class ControllerGUI:
 
             rate_ms = max(1, int(self.rate_var.get()))
             self.client = UDPSocket(local_id=1, max_age_seconds=0.5, nominal_rate_hz=(1000.0 / rate_ms))
-            self.client.setup(host=host, port=port, num_inputs=0, num_outputs=10, is_server=False)
+            self.client.setup(host=host, port=port, inputs='', outputs='10b', is_server=False)
 
             self.status_label.config(text="Handshaking...", foreground="orange")
             self.root.update()

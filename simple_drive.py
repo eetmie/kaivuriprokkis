@@ -321,7 +321,7 @@ def main():
         _host, _port = _ip_arg, 8080
 
     server = UDPSocket(local_id=2)
-    server.setup(_host, _port, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup(_host, _port, inputs='10b', outputs='', is_server=True)
 
     # ---- Hardware ----
     _selected = args.robot
@@ -470,7 +470,7 @@ def main():
             actual_dt = now - prev_loop_time
             prev_loop_time = now
 
-            float_data = server.get_latest_floats()
+            float_data = UDPSocket.ints_to_floats(server.get_latest() or [])
             if float_data:
                 right_rl = float_data[9]   # scoop
                 right_ud = float_data[8]   # lift

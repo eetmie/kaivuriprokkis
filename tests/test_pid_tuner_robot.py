@@ -28,14 +28,13 @@ class _FakeUDPSocket:
         self.closed = False
         _FakeUDPSocket.instances.append(self)
 
-    def setup(self, host, port, num_inputs, num_outputs, is_server=False, data_format=None):
+    def setup(self, host, port, inputs='', outputs='', is_server=False):
         self.setup_kwargs = {
             "host": host,
             "port": port,
-            "num_inputs": num_inputs,
-            "num_outputs": num_outputs,
+            "inputs": inputs,
+            "outputs": outputs,
             "is_server": is_server,
-            "data_format": data_format,
         }
         return True
 
@@ -175,10 +174,9 @@ class PIDTunerRobotTests(unittest.TestCase):
         self.assertEqual(len(_FakeHardware.instances), 1)
 
         sock = _FakeUDPSocket.instances[0]
-        self.assertEqual(sock.setup_kwargs["num_inputs"], pid_tuner_robot.COMMAND_SIZE)
-        self.assertEqual(sock.setup_kwargs["num_outputs"], pid_tuner_robot.TELEMETRY_SIZE)
+        self.assertEqual(sock.setup_kwargs["inputs"], f'{pid_tuner_robot.COMMAND_SIZE}f')
+        self.assertEqual(sock.setup_kwargs["outputs"], f'{pid_tuner_robot.TELEMETRY_SIZE}f')
         self.assertTrue(sock.setup_kwargs["is_server"])
-        self.assertEqual(sock.setup_kwargs["data_format"], "f")
         self.assertTrue(sock.closed)
 
         hardware = _FakeHardware.instances[0]

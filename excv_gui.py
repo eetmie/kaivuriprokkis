@@ -218,8 +218,8 @@ def main():
     # ---- UDP setup ----
     server = UDPSocket(local_id=2, max_age_seconds=0.5)
     server.setup("192.168.0.132", 8080,
-                 num_inputs=COMMAND_PACKET_SIZE, num_outputs=TELEMETRY_PACKET_SIZE,
-                 is_server=True, data_format='b')
+                 inputs=f'{COMMAND_PACKET_SIZE}b', outputs=f'{TELEMETRY_PACKET_SIZE}b',
+                 is_server=True)
 
     if not quiet:
         app_logger.info("Waiting for GUI connection...")

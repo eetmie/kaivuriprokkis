@@ -4,9 +4,18 @@ import socket
 import struct
 import threading
 import time
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 HMAC_DIGEST_SIZE = 32  # SHA-256
+_HANDSHAKE_SIZE = 69   # BHH32s32s
+_ENDIAN_CHARS = frozenset('@=<>!')
+
+
+def _parse_fmt(fmt: str) -> tuple:
+    """Return (endian, data_part) from a struct format string. Default endian is '<'."""
+    if fmt and fmt[0] in _ENDIAN_CHARS:
+        return fmt[0], fmt[1:]
+    return '<', fmt
 
 
 class UDPSocket:
@@ -15,18 +24,21 @@ class UDPSocket:
     - Adds timestamp to each packet
     - Returns None if data is too old
     - Configurable timeout for safety
+
+    inputs/outputs are struct format strings, e.g. '10b', '<8b10?', '>12f'.
+    Endianness prefix is optional (defaults to '<'). Use '' for zero elements.
     """
 
-    def __init__(self, local_id=0, max_age_seconds=0.5, data_format: str = 'b', hmac_key: Optional[str] = None,
+    def __init__(self, local_id=0, max_age_seconds=0.5, hmac_key: Optional[str] = None,
                  nominal_rate_hz: Optional[float] = None):
         self.socket = None
         self.remote_addr = None
         self.local_id = local_id
-        self.num_inputs = 0
-        self.num_outputs = 0
+        self.inputs_fmt = ''
+        self.outputs_fmt = ''
+        self._num_inputs = 0
+        self._num_outputs = 0
         self.max_age_seconds = max_age_seconds
-        self.data_format = data_format
-        self._elem_size = 1
         self.nominal_rate_hz = float(nominal_rate_hz) if nominal_rate_hz is not None else None
         self.remote_nominal_rate_hz: Optional[float] = None
 
@@ -42,7 +54,7 @@ class UDPSocket:
         self.packets_expired = 0
         self.last_packet_time = 0.0
 
-        # Pre-computed format strings (filled after handshake)
+        # Pre-computed format strings (filled after setup)
         self.send_format = None
         self.recv_format = None
 
@@ -54,18 +66,31 @@ class UDPSocket:
         """Set HMAC key for packet authentication. Must be called on both sides with the same key."""
         self._hmac_key = key.encode('utf-8') if isinstance(key, str) else key
 
-    def setup(self, host, port, num_inputs, num_outputs, is_server=False, data_format: Optional[str] = None):
-        """Set up UDP socket with heartbeat protocol."""
-        self.num_inputs = num_inputs
-        self.num_outputs = num_outputs
-        if data_format is not None:
-            self.data_format = data_format
-        if not isinstance(self.data_format, str) or len(self.data_format) != 1:
-            raise ValueError("data_format must be a single struct format character (e.g., 'b', 'h', 'f')")
-        try:
-            self._elem_size = struct.calcsize('<' + self.data_format)
-        except struct.error as e:
-            raise ValueError(f"Invalid data_format '{self.data_format}': {e}") from e
+    def setup(self, host, port, inputs: str = '', outputs: str = '', is_server=False):
+        """Set up UDP socket.
+
+        inputs:  struct format for data received (e.g. '10b', '<8b10?'). '' = receive-nothing.
+        outputs: struct format for data sent     (e.g. '10b', '<12f').  '' = send-nothing.
+        Endianness prefix is optional — defaults to '<' if omitted.
+        """
+        for name, fmt in (('inputs', inputs), ('outputs', outputs)):
+            if len(fmt) > 32:
+                raise ValueError(f"{name} format exceeds 32-char handshake limit: '{fmt}'")
+            try:
+                endian, data = _parse_fmt(fmt)
+                struct.calcsize(endian + data)
+            except struct.error as e:
+                raise ValueError(f"Invalid {name} format '{fmt}': {e}") from e
+
+        in_endian, in_data = _parse_fmt(inputs)
+        out_endian, out_data = _parse_fmt(outputs)
+
+        # Normalize to always include endianness prefix (stored and transmitted)
+        self.inputs_fmt = (in_endian + in_data) if inputs else ''
+        self.outputs_fmt = (out_endian + out_data) if outputs else ''
+
+        self._num_inputs = len(struct.unpack(self.inputs_fmt, bytes(struct.calcsize(self.inputs_fmt)))) if inputs else 0
+        self._num_outputs = len(struct.unpack(self.outputs_fmt, bytes(struct.calcsize(self.outputs_fmt)))) if outputs else 0
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(1.0)
@@ -77,10 +102,9 @@ class UDPSocket:
             self.remote_addr = (host, port)
             print(f"UDP Client ready to send to {host}:{port}")
 
-        # Format: timestamp (4 bytes) + data (N * element size)
-        # Using 32-bit timestamp (milliseconds since epoch % 2^32)
-        self.send_format = f'<I{self.num_outputs}{self.data_format}'
-        self.recv_format = f'<I{self.num_inputs}{self.data_format}'
+        # Format: endian + timestamp (uint32) + data elements
+        self.recv_format = (in_endian + 'I' + in_data) if inputs else (in_endian + 'I')
+        self.send_format = (out_endian + 'I' + out_data) if outputs else (out_endian + 'I')
 
         return True
 
@@ -96,38 +120,29 @@ class UDPSocket:
             'remote_addr': self.remote_addr,
             'remote_nominal_rate_hz': self.remote_nominal_rate_hz,
             'max_age_seconds': self.max_age_seconds,
-            'data_format': self.data_format,
+            'inputs_fmt': self.inputs_fmt,
+            'outputs_fmt': self.outputs_fmt,
         }
 
     # ================================
-    # Conversion helpers (int <-> float)
+    # Conversion helpers (int8 <-> float)
     # ================================
     @staticmethod
     def ints_to_floats(values: List[int]) -> List[float]:
-        """Convert signed int8 [-128..127] to floats in [-1.0..1.0] with clamping.
-
-        Values outside int8 range are clamped. Uses symmetric scale with 127.
-        """
+        """Convert signed int8 [-128..127] to floats in [-1.0..1.0] with clamping."""
         floats: List[float] = []
         for v in values:
             try:
                 iv = int(v)
             except Exception:
                 iv = 0
-            if iv < -128:
-                iv = -128
-            if iv > 127:
-                iv = 127
-            # Map to [-1, 1]; prefer 127 for symmetry
+            iv = max(-128, min(127, iv))
             floats.append(max(-1.0, min(1.0, iv / 127.0)))
         return floats
 
     @staticmethod
     def floats_to_ints(values: List[float]) -> List[int]:
-        """Convert floats in [-1.0..1.0] to signed int8 [-128..127].
-
-        Uses 127 scale with rounding and clamps to [-128, 127].
-        """
+        """Convert floats in [-1.0..1.0] to signed int8 [-128..127]."""
         ints: List[int] = []
         for v in values:
             try:
@@ -136,57 +151,25 @@ class UDPSocket:
                 fv = 0.0
             fv = max(-1.0, min(1.0, fv))
             iv = int(round(fv * 127.0))
-            if iv < -128:
-                iv = -128
-            if iv > 127:
-                iv = 127
-            ints.append(iv)
+            ints.append(max(-128, min(127, iv)))
         return ints
 
-    def get_latest_floats(self) -> Optional[List[float]]:
-        """Return latest data converted to floats [-1..1] if fresh, else None."""
-        latest = self.get_latest()
-        if latest is None:
-            return None
-        return UDPSocket.ints_to_floats(latest)
-
-    def send_floats(self, values: List[float]) -> bool:
-        """Send float values in [-1..1] (converted to signed bytes)."""
-        return self.send(UDPSocket.floats_to_ints(values))
-
     def handshake(self, timeout=5.0):
-        """Enhanced handshake that includes max_age_seconds, format, and nominal rate."""
-        # Base pack: [id, num_outputs, num_inputs, format_code] + max_age_ms
-        # Optional extension: nominal_rate_cHz (uint16, rate * 100)
+        """Perform handshake exchanging format strings and rate info.
+
+        Packet layout (69 bytes): [local_id:B][max_age_ms:H][nominal_rate_cHz:H][out_fmt:32s][in_fmt:32s]
+        """
         max_age_ms = int(self.max_age_seconds * 1000)
-        fmt_code = ord(self.data_format)
-        if self.nominal_rate_hz is not None and self.nominal_rate_hz > 0:
-            nominal_rate_c_hz = max(0, min(65535, int(round(self.nominal_rate_hz * 100.0))))
-            our_info = struct.pack(
-                '<4BHH',
-                self.local_id,
-                self.num_outputs,
-                self.num_inputs,
-                fmt_code,
-                max_age_ms,
-                nominal_rate_c_hz,
-            )
-        else:
-            our_info = struct.pack(
-                '<4BH',
-                self.local_id,
-                self.num_outputs,
-                self.num_inputs,
-                fmt_code,
-                max_age_ms,
-            )
+        nominal_rate_c_hz = max(0, min(65535, int(round(self.nominal_rate_hz * 100.0)))) if self.nominal_rate_hz else 0
+        out_fmt_bytes = self.outputs_fmt.encode('ascii').ljust(32, b'\x00')
+        in_fmt_bytes = self.inputs_fmt.encode('ascii').ljust(32, b'\x00')
+        our_info = struct.pack('<BHH32s32s', self.local_id, max_age_ms, nominal_rate_c_hz, out_fmt_bytes, in_fmt_bytes)
 
         if self.remote_addr:  # Client mode
             self.socket.sendto(our_info, self.remote_addr)
-
             self.socket.settimeout(timeout)
             try:
-                data, addr = self.socket.recvfrom(8)
+                data, addr = self.socket.recvfrom(_HANDSHAKE_SIZE)
                 self.remote_addr = addr
             except socket.timeout:
                 print("Handshake timeout!")
@@ -195,90 +178,61 @@ class UDPSocket:
             print("Waiting for handshake...")
             self.socket.settimeout(timeout)
             try:
-                data, addr = self.socket.recvfrom(8)
+                data, addr = self.socket.recvfrom(_HANDSHAKE_SIZE)
                 self.remote_addr = addr
                 self.socket.sendto(our_info, self.remote_addr)
             except socket.timeout:
                 print("Handshake timeout!")
                 return False
 
-        # Verify match
-        if len(data) >= 8:
-            remote_id, remote_outputs, remote_inputs, remote_fmt_code, remote_max_age_ms, remote_rate_c_hz = struct.unpack('<4BHH', data[:8])
-            self.remote_nominal_rate_hz = remote_rate_c_hz / 100.0 if remote_rate_c_hz > 0 else None
-        elif len(data) >= 6:
-            remote_id, remote_outputs, remote_inputs, remote_fmt_code, remote_max_age_ms = struct.unpack('<4BH', data[:6])
-            self.remote_nominal_rate_hz = None
-        else:
-            print(f"Handshake packet too short: {len(data)} bytes")
+        if len(data) != _HANDSHAKE_SIZE:
+            print(f"Handshake packet wrong size: expected {_HANDSHAKE_SIZE}, got {len(data)}")
             return False
-        remote_format = chr(remote_fmt_code) if remote_fmt_code != 0 else 'b'
 
-        if remote_inputs != self.num_outputs:
-            print(f"Mismatch: They expect {remote_inputs} inputs, we send {self.num_outputs}")
+        remote_id, remote_max_age_ms, remote_rate_c_hz, raw_out, raw_in = struct.unpack('<BHH32s32s', data)
+        remote_out_fmt = raw_out.rstrip(b'\x00').decode('ascii')
+        remote_in_fmt = raw_in.rstrip(b'\x00').decode('ascii')
+        self.remote_nominal_rate_hz = remote_rate_c_hz / 100.0 if remote_rate_c_hz > 0 else None
+
+        if remote_in_fmt != self.outputs_fmt:
+            print(f"Mismatch: They expect inputs '{remote_in_fmt}', we send '{self.outputs_fmt}'")
             return False
-        if remote_outputs != self.num_inputs:
-            print(f"Mismatch: They send {remote_outputs} outputs, we expect {self.num_inputs}")
-            return False
-        if remote_format != self.data_format:
-            print(f"Mismatch: They use format '{remote_format}', we use '{self.data_format}'")
+        if remote_out_fmt != self.inputs_fmt:
+            print(f"Mismatch: They send outputs '{remote_out_fmt}', we expect '{self.inputs_fmt}'")
             return False
 
         rate_msg = f", rate: {self.remote_nominal_rate_hz:.2f}Hz" if self.remote_nominal_rate_hz is not None else ""
-        print(f"Handshake OK with device ID {remote_id} (max_age: {remote_max_age_ms}ms, format: {remote_format}{rate_msg})")
+        print(f"Handshake OK with device ID {remote_id} (max_age: {remote_max_age_ms}ms, "
+              f"in: '{self.inputs_fmt}', out: '{self.outputs_fmt}'{rate_msg})")
         self.socket.settimeout(1.0)
         return True
 
     def send(self, values):
-        """Send values with timestamp."""
+        """Send values with timestamp. Values must match the outputs format."""
         if not self.remote_addr:
             print("No remote address set!")
             return False
 
-        if len(values) != self.num_outputs:
-            print(f"Expected {self.num_outputs} values, got {len(values)}")
+        if len(values) != self._num_outputs:
+            print(f"Expected {self._num_outputs} values, got {len(values)}")
             return False
 
-        # Create timestamp (milliseconds since epoch, wrapped to 32-bit)
         timestamp_ms = int(time.time() * 1000) & 0xFFFFFFFF
-
-        # Clamp/cast values based on format
-        if self.data_format in ('b', 'B', 'h', 'H', 'i', 'I'):
-            limits = {
-                'b': (-128, 127),
-                'B': (0, 255),
-                'h': (-32768, 32767),
-                'H': (0, 65535),
-                'i': (-2147483648, 2147483647),
-                'I': (0, 4294967295),
-            }
-            lo, hi = limits[self.data_format]
-            clamped = [max(lo, min(hi, int(v))) for v in values]
-        else:
-            clamped = [float(v) for v in values]
-
-        # Pack timestamp + data and send
-        data = struct.pack(self.send_format, timestamp_ms, *clamped)
+        data = struct.pack(self.send_format, timestamp_ms, *values)
         if self._hmac_key:
             data += hmac.new(self._hmac_key, data, hashlib.sha256).digest()
         self.socket.sendto(data, self.remote_addr)
         return True
 
-    def get_latest(self) -> Optional[List[int]]:
-        """
-        Get latest data only if it's fresh enough.
-        Returns None if data is too old or no data received.
-        """
+    def get_latest(self) -> Optional[List]:
+        """Get latest received data if fresh, else None."""
         with self.data_lock:
             if self.latest_data is None:
                 return None
 
-            # Check if data is too old
             age = time.monotonic() - self.latest_timestamp
             if age > self.max_age_seconds:
                 self.packets_expired += 1
-                #if self.packets_expired % 10 == 1:  # Log every 10th expiration
-                    #print(f"WARNING: Data expired (age: {age:.3f}s > {self.max_age_seconds}s)")
                 return None
 
             return self.latest_data.copy()
@@ -337,13 +291,10 @@ class UDPSocket:
                             continue
                         data = payload
 
-                    # Unpack timestamp and values
                     unpacked = struct.unpack(self.recv_format, data)
-                    timestamp_ms = unpacked[0]
                     values = list(unpacked[1:])
 
-                    # Use arrival time as packet timestamp - much simpler and more reliable
-                    # than trying to handle 32-bit wraparound across network
+                    # Use arrival time — simpler and more reliable than handling 32-bit ms wraparound
                     arrival_time = time.monotonic()
 
                     with self.data_lock:
@@ -356,7 +307,7 @@ class UDPSocket:
                     print(f"Wrong packet size: expected {expected_size}, got {len(data)}")
 
             except socket.timeout:
-                continue  # Normal timeout, keep trying
+                continue
             except Exception as e:
                 if self.running:
                     print(f"Receive error: {e}")

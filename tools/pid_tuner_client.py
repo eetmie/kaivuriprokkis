@@ -216,8 +216,8 @@ class PIDTunerClient:
             self.status.set("Invalid port")
             return
         try:
-            sock = UDPSocket(local_id=11, max_age_seconds=0.5, data_format="f", nominal_rate_hz=1000.0 / self.period_ms)
-            sock.setup(host, port, num_inputs=TELEMETRY_SIZE, num_outputs=COMMAND_SIZE, is_server=False, data_format="f")
+            sock = UDPSocket(local_id=11, max_age_seconds=0.5, nominal_rate_hz=1000.0 / self.period_ms)
+            sock.setup(host, port, inputs=f'{TELEMETRY_SIZE}f', outputs=f'{COMMAND_SIZE}f', is_server=False)
             if not sock.handshake(timeout=10.0):
                 self.status.set("Handshake failed")
                 sock.close()

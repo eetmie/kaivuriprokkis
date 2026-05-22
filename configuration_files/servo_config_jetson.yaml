@@ -1,7 +1,12 @@
 # Jetson Orin Nano PCA9685 servo control
 #
-# Header I2C pins 3/5 map to Linux bus 7 on this robot. The bus/address are
-# selected by the caller via PWMController(bus=7, i2c_addr=0x40).
+# Header I2C pins 3/5 map to Linux bus 7 on this robot. The Jetson setup uses
+# only this main I2C bus for PCA9685 control; IMU data is read over USB serial.
+# The bus/address are selected by the caller via PWMController(bus=7,
+# i2c_addr=0x40).
+#
+# TODO(jetson): test 1 MHz operation on bus 7. The Raspberry Pi main I2C bus
+# runs well at 1 MHz, but Jetson needs a different device-tree/kernel setup.
 #
 # Keep output_channel values contiguous. The PWM driver writes one range from
 # min channel to max channel, so gaps waste I2C bandwidth.

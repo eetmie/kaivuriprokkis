@@ -33,14 +33,14 @@
     <axis xyz="0. 0. 1."/>
   </joint>
   <joint name="revolute_lift" type="revolute">
-    <origin xyz="0.0165 0. 0.0785" rpy="0. 0. 0."/>
+    <origin xyz="0.0165 0. 0.0785" rpy="0. -0.455181869 0."/>
     <parent link="upper_carriage"/>
     <child link="lift_boom"/>
     <axis xyz="0. 1. 0."/>
     <limit lower="-0.8726646" upper="0.5235988" effort="10000000." velocity="17453.2925199"/>
   </joint>
   <joint name="revolute_tilt" type="revolute">
-    <origin xyz="0.42008 0. -0.20564" rpy="0. 0. 0."/>
+    <origin xyz="0.42008 0. -0.20564" rpy="0. 0.455181869 0."/>
     <parent link="lift_boom"/>
     <child link="tilt_boom"/>
     <axis xyz="0. 1. 0."/>

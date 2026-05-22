@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 """Direct-drive / joint velocity-PI prototype test.
 
 MANUAL HARDWARE TEST — requires real hardware and gamepad. Not a unit test.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 """DOES NOT WORK ATM, VERY WIP!!!
 """
 

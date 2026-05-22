@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 #only rpi support atm!
 """
 Data logger for hydraulic actuator model training.

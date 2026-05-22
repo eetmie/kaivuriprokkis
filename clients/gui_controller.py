@@ -1,3 +1,4 @@
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading

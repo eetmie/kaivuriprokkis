@@ -19,7 +19,7 @@ def generate_launch_description():
             "project_root",
             default_value=EnvironmentVariable("KAIVURI_PROJECT_ROOT", default_value="/work"),
         ),
-        DeclareLaunchArgument("udp_host", default_value="0.0.0.0"),
+        DeclareLaunchArgument("udp_host", default_value="10.214.33.132"),
         DeclareLaunchArgument("udp_port", default_value="8080"),
         DeclareLaunchArgument("joystick_topic", default_value="joystick_values"),
         DeclareLaunchArgument("direct_pwm_topic", default_value="/kaivuri/direct_pwm"),

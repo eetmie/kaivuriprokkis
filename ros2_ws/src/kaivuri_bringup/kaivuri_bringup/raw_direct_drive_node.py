@@ -43,8 +43,11 @@ class RawDirectDriveNode(Node):
     def __init__(self) -> None:
         super().__init__("kaivuri_raw_direct_drive_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
-        self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
-        self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
+        self.declare_parameter("robot", "auto")
+        self.declare_parameter("config_file", "")
+        self.declare_parameter("control_config_file", "")
+        self.declare_parameter("pwm_i2c_bus", -1)
+        self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("command_topic", "/kaivuri/direct_pwm")
         self.declare_parameter("command_rate_hz", 50.0)
         self.declare_parameter("state_rate_hz", 30.0)
@@ -62,12 +65,25 @@ class RawDirectDriveNode(Node):
         from modules.differential_ik_cfg import load_excavator_robot_config
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
+        from modules.board import resolve_profile
 
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        control_config_path = self._resolve_project_path(str(self.get_parameter("control_config_file").value))
+        robot_profile = resolve_profile(str(self.get_parameter("robot").value))
+        config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
+        control_config_file = self._param_or_profile("control_config_file", robot_profile["control_config_file"])
+        pwm_i2c_bus = self._int_param_or_profile("pwm_i2c_bus", int(robot_profile["pwm_i2c_bus"]), unset=-1)
+        pwm_i2c_addr = self._int_param_or_profile("pwm_i2c_addr", int(robot_profile["pwm_i2c_addr"]), unset=-1)
+
+        control_config_path = self._resolve_project_path(control_config_file)
         self._robot_config = load_excavator_robot_config(str(control_config_path))
 
-        config_path = self._resolve_project_path(str(self.get_parameter("config_file").value))
+        config_path = self._resolve_project_path(config_file)
+        self.get_logger().info(
+            "Raw direct drive profile="
+            f"{robot_profile['profile_name']} board={robot_profile['board']} "
+            f"servo_config={config_path} control_config={control_config_path} "
+            f"I2C bus={pwm_i2c_bus} addr=0x{pwm_i2c_addr:02X}"
+        )
         self._hardware = HardwareInterface(
             config_file=str(config_path),
             control_config_file=str(control_config_path),
@@ -80,6 +96,8 @@ class RawDirectDriveNode(Node):
             start_imu_reader=True,
             start_adc_reader=False,
             cleanup_disable_osc=False,
+            pwm_i2c_bus=pwm_i2c_bus,
+            pwm_i2c_addr=pwm_i2c_addr,
         )
         self._wait_for_hardware(float(self.get_parameter("ready_timeout_s").value))
 
@@ -114,6 +132,16 @@ class RawDirectDriveNode(Node):
         if path.is_absolute():
             return path
         return self._project_root / path
+
+    def _param_or_profile(self, name: str, profile_value: str) -> str:
+        value = str(self.get_parameter(name).value).strip()
+        return value or profile_value
+
+    def _int_param_or_profile(self, name: str, profile_value: int, *, unset: int = None) -> int:
+        value = int(self.get_parameter(name).value)
+        if unset is not None and value == unset:
+            return profile_value
+        return value
 
     def _wait_for_hardware(self, timeout_s: float) -> None:
         deadline = time.time() + max(0.0, timeout_s)

@@ -2,12 +2,14 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     project_root = LaunchConfiguration("project_root")
     udp_host = LaunchConfiguration("udp_host")
     udp_port = LaunchConfiguration("udp_port")
+    robot = LaunchConfiguration("robot")
     joystick_topic = LaunchConfiguration("joystick_topic")
     direct_pwm_topic = LaunchConfiguration("direct_pwm_topic")
     raw_max = LaunchConfiguration("raw_max")
@@ -21,6 +23,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("udp_host", default_value="10.214.33.132"),
         DeclareLaunchArgument("udp_port", default_value="8080"),
+        DeclareLaunchArgument("robot", default_value="auto"),
         DeclareLaunchArgument("joystick_topic", default_value="joystick_values"),
         DeclareLaunchArgument("direct_pwm_topic", default_value="/kaivuri/direct_pwm"),
         DeclareLaunchArgument("raw_max", default_value="127.0"),
@@ -58,7 +61,8 @@ def generate_launch_description():
             parameters=[{
                 "project_root": project_root,
                 "command_topic": direct_pwm_topic,
-                "command_timeout_s": command_timeout_s,
+                "robot": robot,
+                "command_timeout_s": ParameterValue(command_timeout_s, value_type=float),
             }],
         ),
     ])

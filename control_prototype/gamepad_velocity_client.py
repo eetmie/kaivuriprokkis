@@ -116,9 +116,9 @@ def main() -> int:
 
     udp = UDPSocket(local_id=3, max_age_seconds=0.5, nominal_rate_hz=args.rate)
     udp.setup(args.host, args.port,
-              num_inputs=TELEMETRY_PACKET_SIZE,
-              num_outputs=COMMAND_PACKET_SIZE,
-              is_server=False, data_format='b')
+              inputs=f'{TELEMETRY_PACKET_SIZE}b',
+              outputs=f'{COMMAND_PACKET_SIZE}b',
+              is_server=False)
 
     print(f"[client] handshaking with {args.host}:{args.port} at {args.rate:.1f} Hz...")
     if not udp.handshake(timeout=10.0):

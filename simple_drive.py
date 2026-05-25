@@ -416,7 +416,7 @@ def main():
         _host, _port = _ip_arg, 8080
 
     server = UDPSocket(local_id=2)
-    server.setup(_host, _port, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
 
     # ---- Hardware ----
     _selected = args.robot
@@ -581,8 +581,7 @@ def main():
 
     right_rl = right_ud = left_rl = left_ud = 0.0
     right_paddle = left_paddle = 0.0
-    button_prev = [0.0, 0.0, 0.0, 0.0]
-    button_threshold = 0.5
+    mask_prev = 0
 
     print_angles = False
     iter_count = 0
@@ -593,40 +592,48 @@ def main():
             actual_dt = now - prev_loop_time
             prev_loop_time = now
 
-            float_data = server.get_latest_floats()
-            if float_data:
-                right_rl = float_data[9]   # scoop
-                right_ud = float_data[8]   # lift
-                left_rl = float_data[7]    # rotate (slew)
-                left_ud = float_data[6]    # tilt
-                right_paddle = float_data[5]
-                left_paddle = float_data[4]
-                buttons = [float_data[0], float_data[1], float_data[2], float_data[3]]
+            raw = server.get_latest() or []
+            if raw:
+                float_axes = UDPSocket.ints_to_floats(raw[:8])
+                mask = raw[8]
 
-                # Button 0: toggle mounting-corrected IMU + relative joint angle printing.
-                if buttons[0] > button_threshold and button_prev[0] <= button_threshold:
+                # Axes: <8bH wire format from MotionPlatform
+                right_rl    = float_axes[0]   # scoop
+                right_ud    = float_axes[1]   # lift
+                # float_axes[2] = right_rocker (unused)
+                left_rl     = float_axes[3]   # rotate (slew)
+                left_ud     = float_axes[4]   # tilt
+                # float_axes[5] = left_rocker (unused)
+                right_paddle = float_axes[6]  # trackR
+                left_paddle  = float_axes[7]  # trackL
+
+                def btn(bit):      return bool(mask & (1 << bit))
+                def btn_prev(bit): return bool(mask_prev & (1 << bit))
+
+                # Button A (bit 0): toggle mounting-corrected IMU + joint angle printing.
+                if btn(0) and not btn_prev(0):
                     if imu_enabled:
                         print_angles = not print_angles
                         state = "ON" if print_angles else "OFF"
-                        print(f"\n[Button 0] IMU/joint angle print {state}")
+                        print(f"\n[Button A] IMU/joint angle print {state}")
                     else:
-                        print("\n[Button 0] IMU/joint angle print unavailable (IMU is disabled)")
+                        print("\n[Button A] IMU/joint angle print unavailable (IMU is disabled)")
 
-                # Button 1: reload PWM/servo config for live valve tuning.
-                if buttons[1] > button_threshold and button_prev[1] <= button_threshold:
+                # Button B (bit 1): reload PWM/servo config for live valve tuning.
+                if btn(1) and not btn_prev(1):
                     ok = hardware.reload_config()
                     state = "OK" if ok else "FAILED"
-                    print(f"\n[Button 1] reload config {state}")
+                    print(f"\n[Button B] reload config {state}")
 
-                # Button 2: pump toggle (handy on the bench).
-                if buttons[2] > button_threshold and button_prev[2] <= button_threshold:
+                # Button X (bit 2): pump toggle (handy on the bench).
+                if btn(2) and not btn_prev(2):
                     if hardware.pwm_controller is not None:
                         new_state = not hardware.pwm_controller.pump_enabled
                         hardware.pwm_controller.set_pump_enabled(new_state)
-                        print(f"\n[Button 2] pump {'ON' if new_state else 'OFF'}")
+                        print(f"\n[Button X] pump {'ON' if new_state else 'OFF'}")
 
-                # Button 3: cycle compensation mode OFF → raw → universal smooth → velocity PID.
-                if buttons[3] > button_threshold and button_prev[3] <= button_threshold:
+                # Button Y (bit 3): cycle compensation mode OFF → raw → universal smooth → velocity PID.
+                if btn(3) and not btn_prev(3):
                     old_comp_mode = comp_mode
                     comp_mode = (comp_mode + 1) % 4
                     if comp_mode == 1 and linkage_compensator is None:
@@ -638,9 +645,9 @@ def main():
                     # reset integrator when leaving velocity PID mode
                     if old_comp_mode == 3 and comp_mode != 3:
                         vel_controller.reset()
-                    print(f"\n[Button 3] compensation mode: {COMP_LABELS[comp_mode]}")
+                    print(f"\n[Button Y] compensation mode: {COMP_LABELS[comp_mode]}")
 
-                button_prev = buttons
+                mask_prev = mask
 
             # Direct-mode commands straight from the joystick.
             canonical_commands = {

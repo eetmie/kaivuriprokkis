@@ -163,8 +163,8 @@ def main() -> int:
     # ---- UDP -------------------------------------------------------------
     server = UDPSocket(local_id=2, max_age_seconds=0.5)
     server.setup(args.host, args.port,
-                 num_inputs=COMMAND_PACKET_SIZE, num_outputs=TELEMETRY_PACKET_SIZE,
-                 is_server=True, data_format="b")
+                 inputs=f'{COMMAND_PACKET_SIZE}b', outputs=f'{TELEMETRY_PACKET_SIZE}b',
+                 is_server=True)
     logger.info(f"Waiting for prototype client on {args.host}:{args.port}...")
     if not server.handshake(timeout=60.0):
         logger.error("Handshake failed.")

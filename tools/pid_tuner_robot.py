@@ -73,14 +73,13 @@ def main() -> int:
     logging.basicConfig(level=getattr(logging, args.log_level), format="[%(levelname)s] %(name)s: %(message)s")
     log = logging.getLogger("pid_tuner_robot")
 
-    server = UDPSocket(local_id=12, max_age_seconds=0.5, data_format="f", nominal_rate_hz=args.rate)
+    server = UDPSocket(local_id=12, max_age_seconds=0.5, nominal_rate_hz=args.rate)
     server.setup(
         args.host,
         args.port,
-        num_inputs=COMMAND_SIZE,
-        num_outputs=TELEMETRY_SIZE,
+        inputs=f'{COMMAND_SIZE}f',
+        outputs=f'{TELEMETRY_SIZE}f',
         is_server=True,
-        data_format="f",
     )
     log.info("Waiting for tuner client on %s:%d", args.host, args.port)
     if not server.handshake(timeout=60.0):

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 """Direct-drive / joint velocity-PI prototype test.
 
 MANUAL HARDWARE TEST — requires real hardware and gamepad. Not a unit test.
@@ -170,7 +171,7 @@ def main():
     args = parse_args()
 
     server = UDPSocket(local_id=2)
-    server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup("192.168.0.132", 8080, inputs='10b', outputs='', is_server=True)
 
     print("Initializing hardware...")
     hardware = HardwareInterface(
@@ -240,7 +241,7 @@ def main():
             actual_dt = now - prev_loop_time
             prev_loop_time = now
 
-            float_data = server.get_latest_floats()
+            float_data = UDPSocket.ints_to_floats(server.get_latest() or [])
             if float_data:
                 right_rl = float_data[9]   # scoop
                 right_ud = float_data[8]   # lift

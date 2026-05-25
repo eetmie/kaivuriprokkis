@@ -70,9 +70,9 @@ class ExcavatorUDPClient:
                 nominal_rate_hz=rate_hz,
             )
             self._udp.setup(host, port,
-                            num_inputs=TELEMETRY_PACKET_SIZE,
-                            num_outputs=COMMAND_PACKET_SIZE,
-                            is_server=False, data_format='b')
+                            inputs=f'{TELEMETRY_PACKET_SIZE}b',
+                            outputs=f'{COMMAND_PACKET_SIZE}b',
+                            is_server=False)
             if not self._udp.handshake(timeout=10.0):
                 self._udp.close()
                 self._udp = None

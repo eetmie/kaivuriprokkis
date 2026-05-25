@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# TODO: NOT UPDATED YET TO CURRENT UDP USAGE
 #only rpi support atm!
 """
 Data logger for hydraulic actuator model training.
@@ -564,7 +565,7 @@ def main():
 
     # ---- UDP setup (raw float mode, same as old logger) ----
     server = UDPSocket(local_id=2)
-    server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup("192.168.0.132", 8080, inputs='10b', outputs='', is_server=True)
 
     # ---- Hardware ----
     print("Initializing hardware...")
@@ -680,7 +681,7 @@ def main():
             current_time = time.time()
 
             # --- 1. Receive joystick ---
-            float_data = server.get_latest_floats()
+            float_data = UDPSocket.ints_to_floats(server.get_latest() or [])
 
             if float_data:
                 right_rl = float_data[9]      # scoop

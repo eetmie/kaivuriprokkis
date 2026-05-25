@@ -253,102 +253,7 @@ def parse_args():
     parser.add_argument("--vel-ki-max",    type=float, default=0.4,   help="Velocity PI — I-term anti-windup clamp")
     parser.add_argument("--vel-deadband",  type=float, default=2.0,   help="Velocity PI — error deadband (deg/s)")
     parser.add_argument("--vel-max-degps", type=float, default=30.0,  help="Velocity PI — joystick full deflection = this many deg/s")
-    args = parser.parse_args()
-    if args.enable_imu and args.no_imu:
-        parser.error("--enable-imu and --no-imu are mutually exclusive")
-    return args
-
-
-def resolve_robot_profile(args) -> dict:
-    profile = dict(ROBOT_PROFILES[args.robot])
-    profile['command_names'] = dict(profile['command_names'])
-
-    if args.config_file is not None:
-        profile['config_file'] = args.config_file
-    if args.pwm_i2c_bus is not None:
-        profile['pwm_i2c_bus'] = args.pwm_i2c_bus
-    if args.pwm_i2c_addr is not None:
-        profile['pwm_i2c_addr'] = args.pwm_i2c_addr
-    if args.enable_imu:
-        profile['enable_imu'] = True
-    if args.no_imu:
-        profile['enable_imu'] = False
-    return profile
-
-
-def map_pwm_commands(canonical_commands: dict, command_names: dict) -> dict:
-    """Map canonical simple_drive command names to the selected robot config names."""
-    return {
-        command_names.get(name, name): value
-        for name, value in canonical_commands.items()
-    }
-
-
-class PWMOnlyHardware:
-    """Minimal HardwareInterface-compatible wrapper for PCA9685-only driving."""
-
-    def __init__(self, *, config_file: str, pump_auto_mode: bool, toggle_channels: bool,
-                 stale_timeout_s: float, cleanup_disable_osc: bool,
-                 pwm_i2c_bus: int, pwm_i2c_addr: int):
-        from modules.PCA9685_controller import PWMController
-
-        self.config_file = config_file
-        self.pwm_controller = PWMController(
-            config_file=config_file,
-            pump_auto_mode=pump_auto_mode,
-            toggle_channels=toggle_channels,
-            stale_timeout_s=stale_timeout_s,
-            cleanup_disable_osc=cleanup_disable_osc,
-            bus=pwm_i2c_bus,
-            i2c_addr=pwm_i2c_addr,
-        )
-
-    def is_hardware_ready(self) -> bool:
-        return True
-
-    def reload_config(self) -> bool:
-        return self.pwm_controller.reload_config(self.config_file)
-
-    def send_named_pwm_commands(self, commands: dict) -> bool:
-        self.pwm_controller.update_named(commands)
-        return True
-
-    def reset(self, reset_pump: bool = False) -> None:
-        self.pwm_controller.reset(reset_pump=reset_pump)
-
-    def shutdown(self) -> None:
-        self.pwm_controller._simple_cleanup()
-
-
-class PWMOnlyController:
-    """Small direct-mode controller facade used when IMUs are disabled."""
-
-    def __init__(self, hardware: PWMOnlyHardware):
-        self.hardware = hardware
-
-    def start(self) -> None:
-        return
-
-    def stop(self) -> None:
-        return
-
-    def enter_direct_mode(self) -> None:
-        return
-
-    def exit_direct_mode(self) -> None:
-        return
-
-    def set_velocity_mode(self, _mode: str) -> None:
-        return
-
-    def get_joint_angles(self):
-        return np.zeros(4, dtype=np.float32)
-
-    def get_joint_velocities_with_age(self) -> tuple:
-        return None, float('inf')
-
-    def give_direct_commands(self, commands: dict) -> None:
-        self.hardware.send_named_pwm_commands(commands)
+    return parser.parse_args()
 
 
 def resolve_robot_profile(args) -> dict:
@@ -448,34 +353,6 @@ def main():
         pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
         pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
     )
-    if imu_enabled:
-        from modules.hardware_interface import HardwareInterface, HardwareFaultError
-
-        hardware = HardwareInterface(
-            config_file=robot_profile['config_file'],
-            pump_auto_mode=True,
-            toggle_channels=True,
-            stale_timeout_s=0.5,
-            enable_pwm=True,
-            enable_imu=True,
-            enable_adc=False,           # not needed for plain driving
-            start_imu_reader=True,
-            cleanup_disable_osc=False,
-            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
-            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
-        )
-        hardware_fault_error = HardwareFaultError
-    else:
-        hardware = PWMOnlyHardware(
-            config_file=robot_profile['config_file'],
-            pump_auto_mode=True,
-            toggle_channels=True,
-            stale_timeout_s=0.5,
-            cleanup_disable_osc=False,
-            pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
-            pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
-        )
-        hardware_fault_error = RuntimeError
 
     print("Waiting for hardware to be ready...")
     try:

@@ -18,11 +18,7 @@ def _pwm_available() -> bool:
     try:
         import smbus2  # type: ignore
     except Exception:
-        try:
-            import smbus  # type: ignore  # noqa: F401
-            smbus2 = __import__("smbus")
-        except Exception:
-            return False
+        return False
     try:
         bus = smbus2.SMBus(1)
         try:

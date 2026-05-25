@@ -161,6 +161,33 @@ ros2 topic pub --once /kaivuri/direct_pwm std_msgs/msg/Float32MultiArray \
   "{data: [0.0, 0.15, 0.0, 0.0, 0.0, 0.0]}"
 ```
 
+For UDP joystick control, use the separate mapper node. The UDP receiver keeps
+publishing the MotionPlatform packet values on `/joystick_values`
+(`[axis0..axis7, button_mask]`), and `joystick_to_direct_pwm_node` converts
+the selected axis values from int8 range to normalized `[-1.0, 1.0]` commands
+on `/kaivuri/direct_pwm`.
+
+```bash
+ros2 launch kaivuri_bringup joystick_direct_drive.launch.py
+```
+
+From the operator machine, MotionPlatform sends to the robot UDP server:
+
+```bash
+python main.py --ip <robot-ip>:8080
+```
+
+Default mapper order:
+
+```text
+joystick_values[0] -> rotate
+joystick_values[1] -> lift_boom
+joystick_values[2] -> tilt_boom
+joystick_values[3] -> scoop
+joystick_values[4] -> trackL
+joystick_values[5] -> trackR
+```
+
 While driving, the same node publishes:
 
 - `/joint_states`

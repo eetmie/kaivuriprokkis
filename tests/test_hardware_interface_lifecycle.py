@@ -4,6 +4,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -53,6 +54,20 @@ class _FakeAdc:
             return 1.25
         self.hw._stop_event.set()
         return 2.5
+
+
+class _FakeSmbus:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def write_byte_data(self, addr, reg, val):
+        self.calls.append(("reg", addr, reg, val))
+
+    def write_i2c_block_data(self, addr, reg, data):
+        self.calls.append(("block", addr, reg, len(data)))
+
+    def close(self):
+        self.calls.append(("close",))
 
 
 class HardwareInterfaceLifecycleTests(unittest.TestCase):
@@ -158,6 +173,72 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload['device_timestamp_us'], 123)
         self.assertEqual(payload['gyro'], [[0.0, 0.0, 0.0]])
+
+    def test_all_disabled_hardware_does_not_load_imu_config(self):
+        with patch.object(_HW_MODULE, "_load_control_config", side_effect=AssertionError("IMU config loaded")):
+            hw = HardwareInterface(
+                enable_pwm=False,
+                enable_imu=False,
+                enable_adc=False,
+                start_imu_reader=False,
+                start_adc_reader=False,
+                log_level="CRITICAL",
+            )
+
+        try:
+            self.assertTrue(hw.is_hardware_ready())
+            self.assertEqual(hw.get_status()["pwm_state"], ReadyState.READY)
+            self.assertEqual(hw.get_status()["imu_state"], ReadyState.READY)
+            self.assertEqual(hw.get_status()["adc_state"], ReadyState.READY)
+            self.assertEqual(hw.get_pwm_channel_names(), [])
+            self.assertEqual(hw.get_latest_adc_snapshot(), {"readings": {}, "timestamp": None})
+            self.assertIsNone(hw.read_base_imu())
+        finally:
+            hw.shutdown()
+
+    def test_jetson_pwm_config_uses_selected_bus_with_imu_adc_disabled(self):
+        calls = []
+
+        def open_bus(bus_number):
+            calls.append(("bus", bus_number))
+            return _FakeSmbus(calls)
+
+        with patch("modules.PCA9685_controller._open_smbus", side_effect=open_bus):
+            hw = HardwareInterface(
+                config_file=str(ROOT_DIR / "configuration_files" / "profiles" / "jetson" / "servo_config.yaml"),
+                enable_pwm=True,
+                enable_imu=False,
+                enable_adc=False,
+                start_imu_reader=False,
+                start_adc_reader=False,
+                input_rate_threshold=0,
+                stale_timeout_s=0.0,
+                cleanup_disable_osc=False,
+                pwm_i2c_bus=7,
+                pwm_i2c_addr=0x40,
+                log_level="CRITICAL",
+            )
+
+        try:
+            self.assertTrue(hw.is_hardware_ready())
+            self.assertEqual(calls[0], ("bus", 7))
+            self.assertEqual(hw.get_status()["imu_state"], ReadyState.READY)
+            self.assertEqual(hw.get_status()["adc_state"], ReadyState.READY)
+            self.assertEqual(
+                hw.get_pwm_channel_names(include_pump=True),
+                ["trackL", "trackR", "rotate", "lift_boom", "tilt_boom", "scoop", "extra1", "extra2", "pump"],
+            )
+            self.assertTrue(hw.send_named_pwm_commands({
+                "trackL": 0.0,
+                "trackR": 0.0,
+                "rotate": 0.0,
+                "lift_boom": 0.0,
+                "tilt_boom": 0.0,
+                "scoop": 0.0,
+            }))
+            self.assertIn(("block", 0x40, 0x06, 32), calls)
+        finally:
+            hw.shutdown()
 
 
 if __name__ == "__main__":

@@ -27,7 +27,8 @@ class ImuStateNode(Node):
         super().__init__("kaivuri_imu_state_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
         self.declare_parameter("rate_hz", 50.0)
-        self.declare_parameter("config_file", "configuration_files/servo_config_200.yaml")
+        self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
+        self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
         self.declare_parameter("publish_tool_pose", True)
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
@@ -40,12 +41,14 @@ class ImuStateNode(Node):
 
         self._canonical_joint_angles_from_imus = canonical_joint_angles_from_imus
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        self._robot_config = load_excavator_robot_config()
+        control_config_path = self._resolve_project_path(str(self.get_parameter("control_config_file").value))
+        self._robot_config = load_excavator_robot_config(str(control_config_path))
 
         config_file = str(self.get_parameter("config_file").value)
         config_path = self._resolve_project_path(config_file)
         self._hardware = HardwareInterface(
             config_file=str(config_path),
+            control_config_file=str(control_config_path),
             enable_pwm=False,
             enable_imu=True,
             enable_adc=False,

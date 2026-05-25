@@ -5,11 +5,12 @@ Bench driving helper — same UDP/gamepad input as drive_logger.py, no recording
 
 Usage:
     sudo python simple_drive.py
+    sudo python simple_drive.py --disable
     sudo python simple_drive.py --linkage-rate-correction
     sudo python simple_drive.py --robot jetson
 
-Jetson mode is PCA9685-only by default: no IMUs, no ExcavatorController stack,
-just direct named PWM commands for valve config tuning.
+Jetson mode uses the Jetson PCA9685 profile and the same USB IMU stack as the
+Raspberry Pi profile. Use --disable-imu for PCA9685-only valve config tuning.
 
 Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 0: toggle live mounting-corrected IMU and joint angle print
@@ -41,6 +42,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
 from modules.udp_socket import UDPSocket
 from tools.linkage_rate_compensation import (
     DEFAULT_TABLE,
@@ -57,36 +59,6 @@ PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
 
-ROBOT_PROFILES = {
-    'rpi': {
-        'config_file': 'configuration_files/servo_config_200.yaml',
-        'pwm_i2c_bus': 1,
-        'pwm_i2c_addr': 0x40,
-        'enable_imu': True,
-        'command_names': {
-            'rotate': 'rotate',
-            'lift_boom': 'lift_boom',
-            'tilt_boom': 'tilt_boom',
-            'scoop': 'scoop',
-            'trackL': 'trackL',
-            'trackR': 'trackR',
-        },
-    },
-    'jetson': {
-        'config_file': 'configuration_files/servo_config_jetson.yaml',
-        'pwm_i2c_bus': 7,
-        'pwm_i2c_addr': 0x40,
-        'enable_imu': False,
-        'command_names': {
-            'rotate': 'slew',
-            'lift_boom': 'lift',
-            'tilt_boom': 'tilt',
-            'scoop': 'scoop',
-            'trackL': 'trackL',
-            'trackR': 'trackR',
-        },
-    },
-}
 
 # Velocity PID: joystick command → desired deg/s → PI → valve command.
 # Slew (rotate) has no gyro so it stays open-loop; only boom/arm/bucket are controlled.
@@ -217,14 +189,25 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Bench driving helper with optional linkage-rate correction")
     parser.add_argument(
         "--robot",
-        choices=sorted(ROBOT_PROFILES),
-        default="rpi",
-        help="Robot profile. 'rpi' keeps the current defaults; 'jetson' uses bus 7 and servo_config_jetson.yaml.",
+        choices=[*sorted(ROBOT_PROFILES), "auto"],
+        default="auto",
+        help="Robot profile. 'auto' detects only the board profile at startup (default).",
+    )
+    parser.add_argument(
+        "--ip",
+        default="192.168.0.132:8080",
+        metavar="HOST[:PORT]",
+        help="UDP remote IP and optional port (default: 192.168.0.132:8080).",
     )
     parser.add_argument(
         "--config-file",
         default=None,
         help="Override PWM servo config path selected by --robot.",
+    )
+    parser.add_argument(
+        "--control-config-file",
+        default=None,
+        help="Override controller/IK/IMU config path selected by --robot.",
     )
     parser.add_argument(
         "--pwm-i2c-bus",
@@ -239,14 +222,14 @@ def parse_args():
         help="Override PCA9685 I2C address selected by --robot, e.g. 0x40.",
     )
     parser.add_argument(
-        "--enable-imu",
+        "--disable-imu",
         action="store_true",
-        help="Force IMU startup even if the selected robot profile disables it.",
+        help="Disable IMU startup (both profiles enable IMU by default).",
     )
     parser.add_argument(
-        "--no-imu",
+        "--disable",
         action="store_true",
-        help="Disable IMU startup even if the selected robot profile enables it.",
+        help="Disable toggleable PWM channels so they are left out of control.",
     )
     parser.add_argument(
         "--linkage-rate-correction",
@@ -368,21 +351,102 @@ class PWMOnlyController:
         self.hardware.send_named_pwm_commands(commands)
 
 
+def resolve_robot_profile(args) -> dict:
+    profile = _resolve_board_profile(args.robot)   # handles 'auto' detection
+    if args.config_file is not None:
+        profile['servo_config_file'] = args.config_file
+        profile['config_file'] = args.config_file
+    if args.control_config_file is not None:
+        profile['control_config_file'] = args.control_config_file
+    if args.pwm_i2c_bus is not None:
+        profile['pwm_i2c_bus'] = args.pwm_i2c_bus
+    if args.pwm_i2c_addr is not None:
+        profile['pwm_i2c_addr'] = args.pwm_i2c_addr
+    if args.disable_imu:
+        profile['enable_imu'] = False
+    return profile
+
+
+class PWMOnlyController:
+    """Small direct-mode controller facade used when IMUs are disabled."""
+
+    def __init__(self, hardware):
+        self.hardware = hardware
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def enter_direct_mode(self) -> None:
+        return
+
+    def exit_direct_mode(self) -> None:
+        return
+
+    def set_velocity_mode(self, _mode: str) -> None:
+        return
+
+    def get_joint_angles(self):
+        return np.zeros(4, dtype=np.float32)
+
+    def get_joint_velocities_with_age(self) -> tuple:
+        return None, float('inf')
+
+    def give_direct_commands(self, commands: dict) -> None:
+        self.hardware.send_named_pwm_commands(commands)
+
+
 def main():
     args = parse_args()
     robot_profile = resolve_robot_profile(args)
     imu_enabled = bool(robot_profile['enable_imu'])
 
     # ---- UDP (mirror drive_logger.py wire format exactly) ----
+    _ip_arg = args.ip
+    if ":" in _ip_arg:
+        _host, _port_str = _ip_arg.rsplit(":", 1)
+        try:
+            _port = int(_port_str)
+        except ValueError:
+            print(f"Invalid port in --ip {_ip_arg!r}; using 8080", file=sys.stderr)
+            _host, _port = _ip_arg, 8080
+    else:
+        _host, _port = _ip_arg, 8080
+
     server = UDPSocket(local_id=2)
-    server.setup("192.168.0.132", 8080, num_inputs=10, num_outputs=0, is_server=True)
+    server.setup(_host, _port, num_inputs=10, num_outputs=0, is_server=True)
 
     # ---- Hardware ----
+    _selected = args.robot
+    _resolved = robot_profile.get('_resolved_board', _selected)
+    _auto_note = f" (auto-detected as '{_resolved}')" if _selected == "auto" else ""
     print("Initializing hardware...")
     print(
-        f"Robot profile: {args.robot} | config={robot_profile['config_file']} | "
+        f"Robot: {_selected}{_auto_note} | servo_config={robot_profile['servo_config_file']} | "
+        f"control_config={robot_profile['control_config_file']} | "
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
-        f"IMU={'on' if imu_enabled else 'off'}"
+        f"IMU={'on' if imu_enabled else 'off'} | "
+        f"UDP={_host}:{_port} | "
+        f"toggleable channels={'disabled' if args.disable else 'enabled'}"
+    )
+    from modules.hardware_interface import HardwareFaultError, HardwareInterface
+
+    hardware = HardwareInterface(
+        config_file=robot_profile['servo_config_file'],
+        control_config_file=robot_profile['control_config_file'],
+        pump_auto_mode=True,
+        toggle_channels=not args.disable,
+        stale_timeout_s=0.5,
+        enable_pwm=True,
+        enable_imu=imu_enabled,
+        enable_adc=False,           # not needed for plain driving
+        start_imu_reader=imu_enabled,
+        start_adc_reader=False,
+        cleanup_disable_osc=False,
+        pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
+        pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
     )
     if imu_enabled:
         from modules.hardware_interface import HardwareInterface, HardwareFaultError
@@ -418,7 +482,7 @@ def main():
         while not hardware.is_hardware_ready():
             time.sleep(0.1)
         print("Hardware ready.")
-    except hardware_fault_error as e:
+    except HardwareFaultError as e:
         subsystem = getattr(e, 'subsystem', 'hardware')
         reason = getattr(e, 'reason', str(e))
         print(f"\n*** HARDWARE FAULT ({subsystem}): {reason} ***")
@@ -430,7 +494,12 @@ def main():
     if imu_enabled:
         from modules.excavator_controller import ExcavatorController
 
-        controller = ExcavatorController(hardware, config=None, enable_perf_tracking=False)
+        controller = ExcavatorController(
+            hardware,
+            config=None,
+            enable_perf_tracking=False,
+            control_config_file=robot_profile['control_config_file'],
+        )
     else:
         controller = PWMOnlyController(hardware)
     controller.start()
@@ -541,7 +610,7 @@ def main():
                         state = "ON" if print_angles else "OFF"
                         print(f"\n[Button 0] IMU/joint angle print {state}")
                     else:
-                        print("\n[Button 0] IMU/joint angle print unavailable (--robot jetson disables IMU)")
+                        print("\n[Button 0] IMU/joint angle print unavailable (IMU is disabled)")
 
                 # Button 1: reload PWM/servo config for live valve tuning.
                 if buttons[1] > button_threshold and button_prev[1] <= button_threshold:
@@ -599,8 +668,7 @@ def main():
                     canonical_commands = vel_controller.apply(canonical_commands, joint_vels, actual_dt)
                 else:
                     vel_controller.reset()
-            commands = map_pwm_commands(canonical_commands, robot_profile['command_names'])
-            controller.give_direct_commands(commands)
+            controller.give_direct_commands(canonical_commands)
 
             # Left paddle: trim the pump activity_gain_us base level.
             # In mode 2 this base is then further modulated by linkage position below.

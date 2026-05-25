@@ -174,6 +174,8 @@ def main():
 
     print("Initializing hardware...")
     hardware = HardwareInterface(
+        config_file="configuration_files/profiles/rpi/servo_config.yaml",
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         pump_auto_mode=False,
         toggle_channels=True,
         stale_timeout_s=0.5,
@@ -194,7 +196,12 @@ def main():
         raise SystemExit(1)
 
     print("Starting controller...")
-    controller = ExcavatorController(hardware, config=None, enable_perf_tracking=False)
+    controller = ExcavatorController(
+        hardware,
+        config=None,
+        enable_perf_tracking=False,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
+    )
     controller.start()
     time.sleep(2.0)
     controller.enter_direct_mode()

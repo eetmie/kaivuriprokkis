@@ -56,7 +56,7 @@ Phases (mirrors `smooth_reachability_limiter_readme.md`):
 | `smooth_reachability_limiter_readme.md` | Design doc (the spec we are implementing) |
 | `reachability_limiter.py` | Pure-numpy smoothstep + margin math. **Lift target.** |
 | `relative_command_processor.py` | Velocity-to-pose integrator. **Lift target.** |
-| `excavator_fixture.py` | Real joint limits and link lengths mirrored from `configuration_files/control_config.yaml` |
+| `excavator_fixture.py` | Real joint limits and link lengths mirrored from `configuration_files/profiles/rpi/control_config.yaml` |
 | `test_reachability_limiter.py` | 24 unit tests (smoothstep, margins, NaN-safety) |
 | `test_relative_command_processor.py` | 14 unit tests (lifecycle, integration, wrap, caps) |
 | `bench_reachability_limiter.py` | Performance baseline at 3 cost levels |

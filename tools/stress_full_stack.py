@@ -181,7 +181,7 @@ def _read_sensor_snapshot(hardware, imu_roles: list[str], adc_names: list[str]) 
 
 
 def _load_rate_config():
-    cfg_path = ROOT / "configuration_files" / "control_config.yaml"
+    cfg_path = ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"
     with cfg_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
 
@@ -240,7 +240,8 @@ def main() -> int:
         target_hz = float(args.rate_hz) if args.rate_hz is not None else float(config_control_hz)
 
         hardware = HardwareInterface(
-            config_file=str(ROOT / "configuration_files" / "servo_config_200.yaml"),
+            config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"),
+            control_config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
             log_level=args.log_level.upper(),
             pump_auto_mode=True,
             cleanup_disable_osc=False,
@@ -278,6 +279,7 @@ def main() -> int:
             rt_priority=args.fifo_priority,
             rt_lock_memory=True,
             rt_cpu_core=args.control_core,
+            control_config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
         )
         service = RobotService(controller, hardware)
         service.start()

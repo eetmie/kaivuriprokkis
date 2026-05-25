@@ -77,8 +77,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Show PID gains as joint-error and geometry-scaled tool-motion numbers."
     )
-    parser.add_argument("--control-config", default="configuration_files/control_config.yaml")
-    parser.add_argument("--servo-config", default="configuration_files/servo_config_200.yaml")
+    parser.add_argument("--control-config", default="configuration_files/profiles/rpi/control_config.yaml")
+    parser.add_argument("--servo-config", default="configuration_files/profiles/rpi/servo_config.yaml")
     parser.add_argument(
         "--angles-deg",
         nargs=4,

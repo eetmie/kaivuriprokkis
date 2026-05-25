@@ -9,7 +9,6 @@ import sys
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 
@@ -41,6 +40,7 @@ class _FakeController:
         self.enter_direct_calls = 0
         self.exit_direct_calls = 0
         self.perf_resets = 0
+        self.robot_config = object()
 
     def get_pose(self):
         position, rotation = self.initial_pose
@@ -118,9 +118,7 @@ class ServiceSubmitCommandTests(unittest.TestCase):
     def _make_service(self, initial_pose=((0.5, 0.1, -0.05), 7.0)):
         controller = _FakeController(initial_pose=initial_pose)
         hardware = _FakeHardware()
-        with patch("modules.robot_service.load_excavator_robot_config",
-                   return_value=object()):
-            service = RobotService(controller, hardware)
+        service = RobotService(controller, hardware)
         return service, controller, hardware
 
     def test_initial_target_pose_seeded_from_controller(self):

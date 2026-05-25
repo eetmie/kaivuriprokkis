@@ -205,7 +205,6 @@ def make_ik_config(
         max_joint_velocities=max_joint_velocities,
         joint_limits=joint_limits,
         enable_adaptive_damping=enable_adaptive_damping,
-        adaptive_damping_scaling=0.5,
         adaptive_damping_max_multiplier=10.0,
         enable_joint_limit_avoidance=enable_joint_limit_avoidance,
     )
@@ -214,4 +213,4 @@ def make_ik_config(
 def load_robot_config():
     """Ensure numba is warm and return the excavator robot config."""
     warmup_numba_functions()
-    return load_excavator_robot_config()
+    return load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")

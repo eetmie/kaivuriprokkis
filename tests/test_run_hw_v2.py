@@ -29,6 +29,12 @@ class _FakeHardware:
         self.shutdown_calls = 0
         _FakeHardware.instances.append(self)
 
+    def is_hardware_ready(self):
+        return True
+
+    def get_status(self):
+        return {"imu_state": "ready"}
+
     def shutdown(self):
         self.shutdown_calls += 1
 
@@ -205,13 +211,21 @@ class RunHwV2Tests(unittest.TestCase):
             def get_condition_number(self):
                 return 42.0
 
-        pos, rot, joint_pos, joint_vel, cond = run_hw_v2._read_controller_step(Controller())
+            def get_yoshikawa_index(self):
+                return 0.25
+
+            def get_singular_values(self):
+                return [4.0, 3.0, 2.0, 1.0]
+
+        pos, rot, joint_pos, joint_vel, cond, yoshikawa, singular_values = run_hw_v2._read_controller_step(Controller())
 
         np.testing.assert_allclose(pos, [1.0, 2.0, 3.0])
         self.assertEqual(rot, 12.0)
         np.testing.assert_allclose(joint_pos, np.radians([0.0, 90.0, -90.0, 180.0]))
         np.testing.assert_allclose(joint_vel, np.radians([0.0, 10.0, -10.0, 20.0]))
         self.assertEqual(cond, 42.0)
+        self.assertEqual(yoshikawa, 0.25)
+        np.testing.assert_allclose(singular_values, [4.0, 3.0, 2.0, 1.0])
 
     def test_main_dry_run_wires_hardware_controller_and_planning_stack(self):
         _FakeHardware.instances = []
@@ -246,12 +260,16 @@ class RunHwV2Tests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(_FakeHardware.instances), 1)
         self.assertEqual(len(_FakeController.instances), 1)
+        self.assertEqual(_FakeHardware.instances[0].kwargs["config_file"], "configuration_files/profiles/rpi/servo_config.yaml")
+        self.assertEqual(_FakeHardware.instances[0].kwargs["control_config_file"], "configuration_files/profiles/rpi/control_config.yaml")
+        self.assertEqual(_FakeHardware.instances[0].kwargs["pwm_i2c_bus"], 1)
         self.assertFalse(_FakeHardware.instances[0].kwargs["enable_adc"])
         self.assertFalse(_FakeHardware.instances[0].kwargs["start_adc_reader"])
         self.assertNotIn("adc_channels", _FakeHardware.instances[0].kwargs)
         self.assertNotIn("adc_rt_priority", _FakeHardware.instances[0].kwargs)
         self.assertEqual(_FakeHardware.instances[0].kwargs["imu_rt_priority"], 0)
-        self.assertEqual(_FakeController.instances[0].kwargs["enable_perf_tracking"], False)
+        self.assertEqual(_FakeController.instances[0].kwargs["control_config_file"], "configuration_files/profiles/rpi/control_config.yaml")
+        self.assertEqual(_FakeController.instances[0].kwargs["enable_perf_tracking"], True)
         blind_mock.assert_called_once()
         plan_kwargs = plan_mock.call_args.kwargs
         self.assertTrue(plan_kwargs["radial"])

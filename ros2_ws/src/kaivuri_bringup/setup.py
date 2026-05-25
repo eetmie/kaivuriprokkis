@@ -10,8 +10,8 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
         (f"share/{package_name}/launch", [
-            "launch/bringup_demo.launch.py",
             "launch/bringup_hardware.launch.py",
+            "launch/joystick_direct_drive.launch.py",
             "launch/raw_direct_drive.launch.py",
             "launch/realsense_d435i.launch.py",
         ]),
@@ -26,7 +26,9 @@ setup(
         "console_scripts": [
             "demo_state_node = kaivuri_bringup.demo_state_node:main",
             "imu_state_node = kaivuri_bringup.imu_state_node:main",
+            "joystick_to_direct_pwm_node = kaivuri_bringup.joystick_to_direct_pwm_node:main",
             "raw_direct_drive_node = kaivuri_bringup.raw_direct_drive_node:main",
+            "udp_joystick_values_node = kaivuri_bringup.udp_joystick_values_node:main",
         ],
     },
 )

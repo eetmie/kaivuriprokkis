@@ -262,7 +262,9 @@ class SimpleADC:
             try:
                 addr1, addr2 = self.config.get_board_addresses(board_name)
 
-                # Create ADCPi instance with the original library
+                # TODO(jetson): make ADC bus/profile configurable before enabling
+                # pressure sensing on Jetson. The current virtual bus 3 wiring is
+                # Raspberry Pi-specific.
                 adc = ADCPi(address=addr1, address2=addr2, bus=3) # use virtual bus 3
 
                 # Configure the ADC with our settings

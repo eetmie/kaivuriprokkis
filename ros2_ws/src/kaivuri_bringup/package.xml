@@ -3,7 +3,7 @@
   <name>kaivuri_bringup</name>
   <version>0.1.0</version>
   <description>Bringup and state publisher nodes for the Kaivuri excavator.</description>
-  <maintainer email="joel@example.com">joel</maintainer>
+  <maintainer email="olli.kangasniemi1@proton.me">Olli</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

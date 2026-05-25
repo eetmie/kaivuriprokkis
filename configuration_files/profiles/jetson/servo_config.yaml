@@ -1,0 +1,192 @@
+# Jetson Orin Nano PCA9685 servo control
+#
+# Header I2C pins 3/5 map to Linux bus 7 on this robot. The Jetson setup uses
+# only this main I2C bus for PCA9685 control; IMU data is read over USB serial.
+# The bus/address are selected by the caller via PWMController(bus=7,
+# i2c_addr=0x40).
+#
+# TODO(jetson): test 1 MHz operation on bus 7. The Raspberry Pi main I2C bus
+# runs well at 1 MHz, but Jetson needs a different device-tree/kernel setup.
+#
+# Keep output_channel values contiguous. The PWM driver writes one range from
+# min channel to max channel, so gaps waste I2C bandwidth.
+
+pwm_frequency: 100
+
+CHANNEL_CONFIGS:
+
+    trackL:
+        output_channel: 0
+        affects_pump: False
+        toggleable: True
+        center: 1500
+        direction: 1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    trackR:
+        output_channel: 1
+        affects_pump: False
+        toggleable: True
+        center: 1500
+        direction: -1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    rotate:
+        output_channel: 2
+        affects_pump: False
+        toggleable: True
+        center: None #1637,5. "none" calculates center to in-between
+        direction: 1
+        pulse_min: 1550
+        pulse_max: 1725
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    lift_boom:
+        output_channel: 3
+        affects_pump: True
+        toggleable: False
+        center: 1500
+        direction: -1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    tilt_boom:
+        output_channel: 4
+        affects_pump: True
+        toggleable: False
+        center: 1500
+        direction: -1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    scoop:
+        output_channel: 5
+        affects_pump: True
+        toggleable: False
+        center: 1500
+        direction: -1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    extra1:
+        output_channel: 6
+        affects_pump: False
+        toggleable: False
+        center: 1600
+        direction: 1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    extra2:
+        output_channel: 7
+        affects_pump: False
+        toggleable: False
+        center: 1500
+        direction: 1
+        pulse_min: 1000
+        pulse_max: 2000
+        deadzone: 0.0
+        deadband_us_pos: 0.0
+        deadband_us_neg: 0.0
+        dither_enable: False
+        dither_amp_us: 25.0
+        dither_hz: 33.0
+        dither_taper: False
+        dither_taper_us: 20.0
+        ramp_enable: False
+        ramp_limit: 1500.0
+        ramp_skip_deadband: False
+        gamma: 1.0
+
+    pump:
+        output_channel: 8
+        pulse_min: 1000
+        pulse_max: 1650
+        static_pulse_us: 1550
+        base_pulse_us: 1540
+        activity_gain_us: 120

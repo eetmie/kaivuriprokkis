@@ -1,6 +1,18 @@
 #!/bin/bash
 # MASI Robot Setup Script
 # Configures I2C, installs dependencies, sets up OLED service
+#
+# Raspberry Pi setup only.
+#
+# NOTE(jetson): do not run this on Jetson Nano. This script edits Raspberry Pi
+#               boot config, creates RPi i2c-gpio overlay buses, and installs
+#               an OLED service with RPi-specific assumptions. Use
+#               setup_jetson.sh instead.
+#
+# Privilege note: USB serial should not require running the robot process with
+#                 sudo. Add the operator user to the serial device group
+#                 (usually dialout) and run Python from the project .venv.
+#                 Running "sudo python ..." often bypasses .venv packages.
 
 set -e
 
@@ -37,6 +49,9 @@ if ! grep -q "^dtparam=i2c_arm=on" "$CONFIG"; then
 fi
 
 # Set baudrate to 1MHz
+# TODO(jetson): 1MHz I2C for PCA9685 not tested on Jetson yet — running
+#               stock bus speed (unknown default). dtparam is RPi-specific;
+#               Jetson uses a different mechanism to set I2C clock rate.
 if grep -q "^dtparam=i2c_arm_baudrate=" "$CONFIG"; then
     sed -i 's/^dtparam=i2c_arm_baudrate=.*/dtparam=i2c_arm_baudrate=1000000/' "$CONFIG"
 else
@@ -50,6 +65,10 @@ sed -i '/dtoverlay=i2c-gpio,bus=4/d' "$CONFIG"
 sed -i '/# Virtual I2C buses/d' "$CONFIG"
 sed -i '/# Bus 3:/d' "$CONFIG"
 sed -i '/# Bus 4:/d' "$CONFIG"
+
+# TODO(jetson): virtual I2C channels via i2c-gpio overlay not tested on
+#               Jetson. GPIO numbers, overlay names, and bus numbering all
+#               differ — needs a separate Jetson-specific config block.
 
 # Add virtual I2C buses
 cat >> "$CONFIG" << 'EOF'
@@ -68,7 +87,7 @@ echo "  OK: Virtual I2C bus 4 (GPIO 20/21, 100kHz) - OLED"
 echo ""
 echo "[2/5] Installing system packages..."
 apt-get update -qq
-apt-get install -y python3-pip python3-pil python3-smbus i2c-tools git > /dev/null 2>&1
+apt-get install -y python3-pip python3-pil i2c-tools git > /dev/null 2>&1
 echo "  OK: System packages installed"
 
 # --- Python packages ---
@@ -82,13 +101,14 @@ pip3 install --break-system-packages --quiet \
     numba \
     pyyaml \
     pyserial \
+    smbus2 \
     adafruit-blinka \
     adafruit-circuitpython-ssd1306 \
     adafruit-extended-bus \
     2>/dev/null
 
 echo "  OK: Python packages installed"
-echo "      numpy, scipy, pandas, numba, pyyaml, pyserial"
+echo "      numpy, scipy, pandas, numba, pyyaml, pyserial, smbus2"
 echo "      adafruit-blinka, ssd1306"
 
 # --- OLED systemd service ---

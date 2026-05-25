@@ -28,7 +28,7 @@ PID_KEYS = ["joint0", "joint1", "joint2", "joint3"]
 
 
 def _load_initial_gains() -> list[tuple[float, float, float]]:
-    path = ROOT_DIR / "configuration_files" / "control_config.yaml"
+    path = ROOT_DIR / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"
     try:
         with path.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}

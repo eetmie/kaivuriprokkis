@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#only rpi support atm!
 """
 Data logger for hydraulic actuator model training.
 
@@ -54,7 +55,7 @@ COMMAND_STALE_TIMEOUT_S = 0.5
 PRESSURE_MAX_AGE_S = 0.2
 OUTPUT_DIR = Path(__file__).parent / "hydraulic_data"
 
-# Joint names matching servo_config_200.yaml
+# Joint names matching profiles/rpi/servo_config.yaml
 JOINT_NAMES = ['rotate', 'lift_boom', 'tilt_boom', 'scoop']
 
 # Sine amplitude presets (cycled by button 3)
@@ -568,6 +569,8 @@ def main():
     # ---- Hardware ----
     print("Initializing hardware...")
     hardware = HardwareInterface(
+        config_file="configuration_files/profiles/rpi/servo_config.yaml",
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         pump_auto_mode=args.auto_pump,
         toggle_channels=True,
         stale_timeout_s=0.5,
@@ -603,6 +606,7 @@ def main():
     controller = ExcavatorController(
         hardware, config=None,
         enable_perf_tracking=args.perf,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
     )
     controller.start()
     time.sleep(2.0)  # warmup (numba JIT)

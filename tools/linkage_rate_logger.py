@@ -71,9 +71,10 @@ class LinkageRateLogger:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.log = logging.getLogger("linkage_rate_logger")
-        self.robot_config = load_excavator_robot_config()
+        self.robot_config = load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")
         self.hardware = HardwareInterface(
             config_file=args.config_file,
+            control_config_file="configuration_files/profiles/rpi/control_config.yaml",
             pump_auto_mode=True,
             cleanup_disable_osc=False,
             enable_adc=False,
@@ -307,7 +308,7 @@ class LinkageRateLogger:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Auto linkage-rate logger using fixed full-range valve shuttles")
     parser.add_argument("--i-understand", action="store_true", help="Required safety acknowledgement")
-    parser.add_argument("--config-file", default="configuration_files/servo_config_200.yaml")
+    parser.add_argument("--config-file", default="configuration_files/profiles/rpi/servo_config.yaml")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--rate", type=float, default=50.0)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

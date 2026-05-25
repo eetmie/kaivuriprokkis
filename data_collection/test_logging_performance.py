@@ -5,7 +5,7 @@ MANUAL HARDWARE TEST — requires real hardware. Not a unit test.
 
 Verifies that 100Hz logging + sine computation can keep up alongside the
 controller's background loop (200Hz PWM by default). Follows the pattern
-from tests/stress_full_stack.py — reads control_config.yaml for default
+from tools/stress_full_stack.py — reads control_config.yaml for default
 rates, supports --rate-hz override, RT flags, and CPU pinning.
 
 Key constraints that are always fixed:
@@ -64,8 +64,8 @@ def _cpu_affinity(core):
 
 
 def _load_rate_config():
-    """Load default rates from control_config.yaml (same pattern as stress_full_stack.py)."""
-    cfg_path = _ROOT / "configuration_files" / "control_config.yaml"
+    """Load default rates from control_config.yaml (same pattern as tools/stress_full_stack.py)."""
+    cfg_path = _ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"
     with cfg_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
@@ -148,10 +148,11 @@ def main():
     total_cycles = 0
 
     try:
-        # ---- Hardware (same pattern as stress_full_stack.py) ----
+        # ---- Hardware (same pattern as tools/stress_full_stack.py) ----
         print(f"[test] Initializing hardware (ctrl={ctrl_hz}Hz imu={imu_hz}Hz adc={adc_hz}Hz)...")
         hardware = HardwareInterface(
-            config_file=str(_ROOT / "configuration_files" / "servo_config_200.yaml"),
+            config_file=str(_ROOT / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"),
+            control_config_file=str(_ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
             pump_auto_mode=False,
             toggle_channels=True,
             stale_timeout_s=0.5,
@@ -192,6 +193,7 @@ def main():
             rt_priority=args.fifo_priority,
             rt_lock_memory=args.lock_memory,
             rt_cpu_core=args.control_core,
+            control_config_file=str(_ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
         )
         controller.start()
         time.sleep(max(1.0, args.warmup_s))

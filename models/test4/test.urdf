@@ -33,14 +33,14 @@
     <axis xyz="0. 0. 1."/>
   </joint>
   <joint name="revolute_lift" type="revolute">
-    <origin xyz="0.0165 0. 0.0785" rpy="0. 0. 0."/>
+    <origin xyz="0.0165 0. 0.0785" rpy="0. -0.455181869 0."/>
     <parent link="upper_carriage"/>
     <child link="lift_boom"/>
     <axis xyz="0. 1. 0."/>
     <limit lower="-0.8726646" upper="0.5235988" effort="10000000." velocity="17453.2925199"/>
   </joint>
   <joint name="revolute_tilt" type="revolute">
-    <origin xyz="0.42008 0. -0.20564" rpy="0. 0. 0."/>
+    <origin xyz="0.42008 0. -0.20564" rpy="0. 0.455181869 0."/>
     <parent link="lift_boom"/>
     <child link="tilt_boom"/>
     <axis xyz="0. 1. 0."/>
@@ -62,19 +62,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/excavator_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/excavator_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -87,19 +87,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_1_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="-0. 0.6283185 -1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_1_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -112,19 +112,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_2_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="0. 0.6283185 1.5707964"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_claw_2_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -137,19 +137,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_frame_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="-0. -0. -0.0000001"/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_frame_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -162,19 +162,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_mount_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/gripper_mount_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -187,19 +187,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/lift_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/lift_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -212,19 +212,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tilt_boom_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tilt_boom_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -237,19 +237,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tool_body_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="0. 0. 0."/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/tool_body_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>
@@ -262,19 +262,19 @@
     <visual>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_visuals_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/upper_carriage_visuals_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <visual>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </visual>
     <collision>
       <origin xyz="0. 0. 0." rpy="-1.5707964 0. 0. "/>
       <geometry>
-        <mesh filename="file://C:/Users/sh23937/Documents/GitHub/kaivuriprokkis/models/test4/meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
+        <mesh filename="meshes/upper_carriage_colliders_Mesh.obj" scale="1. 1. 1."/>
       </geometry>
     </collision>
   </link>

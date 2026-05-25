@@ -238,6 +238,8 @@ def main():
 
     hw_log_level = "WARNING" if quiet else args.log_level.upper()
     hardware = HardwareInterface(
+        config_file="configuration_files/profiles/rpi/servo_config.yaml",
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
         log_level=hw_log_level, pump_auto_mode=False, cleanup_disable_osc=False,
         enable_adc=False, start_adc_reader=False,
         rt_lock_memory=args.lock_memory,
@@ -258,6 +260,7 @@ def main():
         rt_priority=args.fifo_priority,
         rt_lock_memory=args.lock_memory,
         rt_cpu_core=args.control_core,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
     )
     service = RobotService(controller, hardware)
     service.start()

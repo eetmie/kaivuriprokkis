@@ -43,7 +43,8 @@ class RawDirectDriveNode(Node):
     def __init__(self) -> None:
         super().__init__("kaivuri_raw_direct_drive_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
-        self.declare_parameter("config_file", "configuration_files/servo_config_200.yaml")
+        self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
+        self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
         self.declare_parameter("command_topic", "/kaivuri/direct_pwm")
         self.declare_parameter("command_rate_hz", 50.0)
         self.declare_parameter("state_rate_hz", 30.0)
@@ -63,11 +64,13 @@ class RawDirectDriveNode(Node):
         from modules.hardware_interface import HardwareInterface
 
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        self._robot_config = load_excavator_robot_config()
+        control_config_path = self._resolve_project_path(str(self.get_parameter("control_config_file").value))
+        self._robot_config = load_excavator_robot_config(str(control_config_path))
 
         config_path = self._resolve_project_path(str(self.get_parameter("config_file").value))
         self._hardware = HardwareInterface(
             config_file=str(config_path),
+            control_config_file=str(control_config_path),
             pump_auto_mode=bool(self.get_parameter("pump_auto_mode").value),
             toggle_channels=bool(self.get_parameter("toggle_channels").value),
             stale_timeout_s=float(self.get_parameter("stale_timeout_s").value),
@@ -84,6 +87,7 @@ class RawDirectDriveNode(Node):
             self._hardware,
             config=None,
             enable_perf_tracking=False,
+            control_config_file=str(control_config_path),
         )
         self._controller.start()
         self._controller.enter_direct_mode()

@@ -491,6 +491,7 @@ def main():
                 if btn(0) and not btn_prev(0):
                     if imu_enabled:
                         print_angles = not print_angles
+                        hardware.set_debug_telemetry_enabled(print_angles)
                         state = "ON" if print_angles else "OFF"
                         print(f"\n[Button A] IMU/joint angle print {state}")
                     else:

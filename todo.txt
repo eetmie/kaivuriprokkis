@@ -1,0 +1,8 @@
+IMU/API naming cleanup notes
+
+- Rename try_read_imu_gyro() to get_imu_gyro_snapshot() or read_imu_gyro_optional().
+  Current name means best-effort/non-throwing, but reads a bit wonky.
+- Rename read_imu_data() to read_joint_imu_quaternions(); it returns corrected joint IMU quats.
+- Rename read_all_imu_quaternions() to read_role_imu_quaternions(); it returns configured role-order quats, not arbitrary "all" IMUs.
+- Rename read_imu_debug_quaternions() to get_imu_debug_snapshot(); it returns quats plus role/descriptors/timestamp metadata.
+- Consider replacing get_joint_velocities_with_age() tuple return with a small velocity snapshot object/dict.

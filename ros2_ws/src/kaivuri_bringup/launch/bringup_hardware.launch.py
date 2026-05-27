@@ -9,7 +9,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     description_dir = Path(get_package_share_directory("kaivuri_description"))
-    urdf_path = description_dir / "urdf" / "kaivuri.urdf"
+    urdf_path = description_dir / "robot" / "robot.urdf"
     robot_description = urdf_path.read_text(encoding="utf-8")
 
     use_sim_time = LaunchConfiguration("use_sim_time")

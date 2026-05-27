@@ -19,7 +19,7 @@ def generate_launch_description():
     moveit_dir = Path(get_package_share_directory("kaivuri_moveit_config"))
 
     robot_description = {
-        "robot_description": (description_dir / "urdf" / "kaivuri.urdf").read_text(encoding="utf-8")
+        "robot_description": (description_dir / "robot" / "robot.urdf").read_text(encoding="utf-8")
     }
     robot_description_semantic = {
         "robot_description_semantic": (moveit_dir / "config" / "kaivuri.srdf").read_text(encoding="utf-8")
@@ -58,8 +58,15 @@ def generate_launch_description():
         planning_pipelines,
         trajectory_execution,
         planning_scene_monitor,
-        _load_yaml(moveit_dir / "config" / "moveit_controllers.yaml"),
     ]
+    controller_parameters = _load_yaml(moveit_dir / "config" / "moveit_controllers.yaml")
+    controller_names = (
+        controller_parameters
+        .get("moveit_simple_controller_manager", {})
+        .get("controller_names", [])
+    )
+    if controller_names:
+        common_parameters.append(controller_parameters)
 
     return LaunchDescription([
         DeclareLaunchArgument("launch_rviz", default_value="true"),

@@ -225,3 +225,17 @@ or with valve nonlinearity:
 3. Build an offline benchmark script that reads the current CSV format.
 4. Fit and compare the baseline linear, angle-scheduled, and Hammerstein-style models.
 5. Promote the best model into a feedforward block while keeping PID trim active.
+
+## Logging TODO (next data collection session)
+
+- [x] Drop pressure logging for now — pressure columns are all NaN or unreliable in current hardware setup. ADC disabled in HardwareInterface.
+- [x] Log joint velocities directly from the controller (already computed at control rate) — avoids finite-difference noise and ensures training targets match what the model will see at inference time.
+- [x] Train with `--no-pressures` until pressure hardware is confirmed working end-to-end.
+
+## Future logging direction
+
+- Consider migrating from CSV to **ROS 2 / rosbag2** for richer multi-topic recording once the system moves to a ROS 2 runtime. Benefits: timestamped topics per sensor, replay support, standard tooling (rqt, ros2 bag play). The current CSV format with `sanitize_drive_logs.py` is sufficient for offline blackbox training but becomes awkward if more sensors (IMU topics, pressure, camera) are added or if real-time replay is needed for RL policy rollout.
+
+## Pump speed note
+
+The logger runs static pump speed by default (no `--auto-pump` flag). Prefer static during excitation data collection so pump pressure is a stable, known background condition rather than a correlated input. Use `--auto-pump` only for driving sessions where range of motion matters more than data quality.

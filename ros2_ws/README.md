@@ -60,7 +60,7 @@ From the repo root, enter the Jazzy container and build:
 cd /home/joel/kaivuriprokkis
 ros2-jazzy
 cd /work/ros2_ws
-colcon build --symlink-install
+colcon build
 source install/setup.bash
 ```
 
@@ -68,7 +68,16 @@ One-shot build from the host:
 
 ```bash
 cd /home/joel/kaivuriprokkis/ros2_ws
-ros2-jazzy colcon build --symlink-install
+ros2-jazzy colcon build
+```
+
+Avoid `--symlink-install` when building in Docker and running from a different
+host path. It can leave installed URDF/mesh assets pointing at the container
+path instead of real files. Quick check:
+
+```bash
+test -e install/kaivuri_description/share/kaivuri_description/urdf/kaivuri.urdf
+test -e install/kaivuri_description/share/kaivuri_description/meshes/upper_carriage_Mesh.obj
 ```
 
 ## Demo State Bringup
@@ -92,6 +101,15 @@ Disable animation:
 ```bash
 ros2 launch kaivuri_bringup bringup_demo.launch.py animate:=false
 ```
+
+To view the model in RViz, source the same install in another terminal and run:
+
+```bash
+ros2 launch kaivuri_description display.launch.py
+```
+
+Use fixed frame `excavator`. Do not run `joint_state_publisher_gui` at the same
+time as the demo node, because both publish `/joint_states`.
 
 ## Hardware State Bringup
 
@@ -143,6 +161,33 @@ ros2 topic pub --once /kaivuri/direct_pwm std_msgs/msg/Float32MultiArray \
   "{data: [0.0, 0.15, 0.0, 0.0, 0.0, 0.0]}"
 ```
 
+For UDP joystick control, use the separate mapper node. The UDP receiver keeps
+publishing the MotionPlatform packet values on `/joystick_values`
+(`[axis0..axis7, button_mask]`), and `joystick_to_direct_pwm_node` converts
+the selected axis values from int8 range to normalized `[-1.0, 1.0]` commands
+on `/kaivuri/direct_pwm`.
+
+```bash
+ros2 launch kaivuri_bringup joystick_direct_drive.launch.py
+```
+
+From the operator machine, MotionPlatform sends to the robot UDP server:
+
+```bash
+python main.py --ip <robot-ip>:8080
+```
+
+Default mapper order:
+
+```text
+joystick_values[0] -> rotate
+joystick_values[1] -> lift_boom
+joystick_values[2] -> tilt_boom
+joystick_values[3] -> scoop
+joystick_values[4] -> trackL
+joystick_values[5] -> trackR
+```
+
 While driving, the same node publishes:
 
 - `/joint_states`
@@ -152,6 +197,40 @@ If running outside the repo-mounted Docker layout, set:
 
 ```bash
 export KAIVURI_PROJECT_ROOT=/home/joel/kaivuriprokkis
+```
+
+## Intel RealSense D435i
+
+Use this when the D435i is connected to the Jetson through USB 3:
+
+```bash
+cd /home/joel/kaivuriprokkis
+ros2-jazzy bash -lc 'cd /work/ros2_ws && source install/setup.bash && ros2 launch kaivuri_bringup realsense_d435i.launch.py'
+```
+
+The launch file starts Intel's `realsense2_camera` driver with color, depth,
+aligned depth, gyro, accel, sync, and fused IMU enabled. Default profiles are
+`640x480x30` for RGB and depth. It publishes the standard RealSense ROS topics,
+including:
+
+- `/camera/camera/color/image_raw`
+- `/camera/camera/depth/image_rect_raw`
+- `/camera/camera/aligned_depth_to_color/image_raw`
+- `/camera/camera/imu`
+- `/camera/camera/color/camera_info`
+- `/camera/camera/depth/camera_info`
+
+Optional point cloud:
+
+```bash
+ros2 launch kaivuri_bringup realsense_d435i.launch.py pointcloud_enable:=true
+```
+
+Useful checks:
+
+```bash
+ros2 topic list | grep camera
+ros2 topic hz /camera/camera/imu
 ```
 
 ## RViz and MoveIt on a Laptop

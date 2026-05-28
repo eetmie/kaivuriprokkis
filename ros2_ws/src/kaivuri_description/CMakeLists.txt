@@ -3,7 +3,7 @@ project(kaivuri_description)
 
 find_package(ament_cmake REQUIRED)
 
-install(DIRECTORY launch meshes rviz urdf
+install(DIRECTORY launch robot rviz
   DESTINATION share/${PROJECT_NAME}
 )
 

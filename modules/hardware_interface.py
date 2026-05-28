@@ -993,6 +993,7 @@ class HardwareInterface:
         if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
             return False
         try:
+            print(commands)
             self.pwm_controller.update_named(commands,
                                              unset_to_zero=unset_to_zero,
                                              command_ts=command_ts)

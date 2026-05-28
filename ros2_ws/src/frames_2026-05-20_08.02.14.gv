@@ -1,0 +1,9 @@
+digraph G {
+"upper_carriage" -> "lift_boom"[label=" Broadcaster: default_authority\nAverage rate: 16.863\nBuffer length: 5.041\nMost recent transform: 1779264134.51125\nOldest transform: 1779264129.470644\n"];
+"lift_boom" -> "tilt_boom"[label=" Broadcaster: default_authority\nAverage rate: 16.863\nBuffer length: 5.041\nMost recent transform: 1779264134.51125\nOldest transform: 1779264129.470644\n"];
+"tool_body" -> "gripper_mount"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1779264134.529113"[ shape=plaintext ] ;
+}->"tool_body";
+}

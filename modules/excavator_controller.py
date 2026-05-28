@@ -60,6 +60,11 @@ else:
 # Defining them here avoids per-tick allocation / nested-function overhead.
 _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
+# Joints that receive gyro-derived velocity feedback in velocity-command mode.
+# Maps joint name → index into the 4-element joint velocity array.
+# rotate (slew) has no boom-axis gyro; trackL/trackR are pass-through in all modes.
+_VEL_CMD_JOINTS: Dict[str, int] = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
+
 
 def _angle_error(target: float, current: float) -> float:
     """Wrap-aware angle difference in radians."""
@@ -532,6 +537,16 @@ class ExcavatorController:
             np.clip(float(bias_cfg.get('adaptation_rate', 0.01)), 0.0, 1.0)
         )
 
+        # Velocity-command mode PI gains (control_config.yaml → controller.velocity_command)
+        vel_cmd_cfg = ctrl_cfg.get('velocity_command', {}) if isinstance(ctrl_cfg, dict) else {}
+        self._vel_kp = float(vel_cmd_cfg.get('kp', 0.04))
+        self._vel_ki = float(vel_cmd_cfg.get('ki', 0.008))
+        self._vel_ki_max = float(vel_cmd_cfg.get('ki_max', 0.4))
+        self._vel_deadband_radps = float(
+            np.radians(max(0.0, float(vel_cmd_cfg.get('deadband_degps', 2.0))))
+        )
+        self._vel_stale_timeout_s = float(max(0.0, float(vel_cmd_cfg.get('stale_timeout_s', 0.15))))
+
         # Slew/yaw now comes from the configured IMU canonical state extractor.
         self._slew_fusion_enabled = False
 
@@ -680,6 +695,12 @@ class ExcavatorController:
         self._direct_mode = False
         self._direct_commands = {}  # joint name -> float [-1, 1]
         self._direct_lock = threading.Lock()
+
+        # Velocity command mode (joint velocity PI for boom/arm/bucket; slew/tracks pass-through)
+        self._vel_cmd_mode = False
+        self._vel_cmd_commands: Dict[str, float] = {}
+        self._vel_cmd_lock = threading.Lock()
+        self._vel_cmd_integrals: Dict[str, float] = {j: 0.0 for j in _VEL_CMD_JOINTS}
 
         # Debug telemetry (data capture for detailed logging/analysis)
         self._last_pi_outputs = None
@@ -1249,6 +1270,92 @@ class ExcavatorController:
         self.hardware.send_named_pwm_commands(cmds)
         self._outputs_zeroed = False
 
+    def enter_velocity_command_mode(self) -> None:
+        """Switch to velocity-command mode.
+
+        lift_boom / tilt_boom / scoop are PI-controlled to a desired rad/s target.
+        rotate / trackL / trackR pass through as normalized [-1, 1] direct commands.
+        Mutually exclusive with direct mode and IK mode.
+        """
+        with self._vel_cmd_lock:
+            self._vel_cmd_commands = {}
+            for k in self._vel_cmd_integrals:
+                self._vel_cmd_integrals[k] = 0.0
+        with self._lock:
+            self._direct_mode = False
+            self._vel_cmd_mode = True
+        self._outputs_zeroed = False
+        self.logger.info("Entered velocity command mode")
+
+    def exit_velocity_command_mode(self) -> None:
+        """Return to IK mode from velocity-command mode."""
+        with self._vel_cmd_lock:
+            self._vel_cmd_commands = {}
+            for k in self._vel_cmd_integrals:
+                self._vel_cmd_integrals[k] = 0.0
+        with self._lock:
+            self._vel_cmd_mode = False
+        self._outputs_zeroed = False
+        self.logger.info("Exited velocity command mode")
+
+    def give_velocity_commands(self, commands: Dict[str, float]) -> None:
+        """Set velocity targets for velocity-command mode.
+
+        Args:
+            commands: {joint_name: value} where:
+              - lift_boom, tilt_boom, scoop: desired velocity in rad/s (PI-controlled,
+                gyro feedback from boom/arm/bucket IMUs)
+              - rotate, trackL, trackR: normalized [-1, 1] pass-through (no feedback)
+        """
+        with self._vel_cmd_lock:
+            self._vel_cmd_commands = dict(commands)
+        self._outputs_zeroed = False
+
+    def _send_velocity_commands(self, dt: float) -> None:
+        """PI tick: compute PWM outputs from desired joint velocities and gyro feedback."""
+        with self._vel_cmd_lock:
+            cmds = dict(self._vel_cmd_commands)
+
+        if not cmds:
+            if not self._outputs_zeroed:
+                self.hardware.reset(reset_pump=False)
+                self._outputs_zeroed = True
+            return
+
+        vel_radps = self._last_joint_vel_radps
+        vel_age = (
+            time.perf_counter() - self._last_joint_vel_time
+            if self._last_joint_vel_time is not None else float('inf')
+        )
+        vel_fresh = vel_radps is not None and vel_age <= self._vel_stale_timeout_s
+
+        output: Dict[str, float] = {}
+        for joint_name, value in cmds.items():
+            if joint_name not in _VEL_CMD_JOINTS:
+                output[joint_name] = float(np.clip(float(value), -1.0, 1.0))
+                continue
+
+            desired_radps = float(value)
+
+            if not vel_fresh or abs(desired_radps) < self._vel_deadband_radps:
+                self._vel_cmd_integrals[joint_name] = 0.0
+                output[joint_name] = 0.0
+                continue
+
+            vel_idx = _VEL_CMD_JOINTS[joint_name]
+            actual_radps = float(vel_radps[vel_idx]) if vel_idx < len(vel_radps) else 0.0
+            error = desired_radps - actual_radps
+
+            self._vel_cmd_integrals[joint_name] = float(np.clip(
+                self._vel_cmd_integrals[joint_name] + error * dt,
+                -self._vel_ki_max, self._vel_ki_max,
+            ))
+            cmd = self._vel_kp * error + self._vel_ki * self._vel_cmd_integrals[joint_name]
+            output[joint_name] = float(np.clip(cmd, -1.0, 1.0))
+
+        self.hardware.send_named_pwm_commands(output)
+        self._outputs_zeroed = False
+
     def get_ik_debug_info(self) -> dict:
         """Return IK telemetry such as adaptive damping and condition number."""
         return {
@@ -1455,11 +1562,17 @@ class ExcavatorController:
 
                 with self._lock:
                     direct_mode = self._direct_mode
+                    vel_cmd_mode = self._vel_cmd_mode
 
                 if direct_mode:
                     # Direct mode: bypass smoothing, IK, and PID
                     self._perf_tracker.stage_start('pwm')
                     self._send_direct_commands()
+                    self._perf_tracker.stage_end('pwm')
+                elif vel_cmd_mode:
+                    # Velocity command mode: PI tracks desired joint velocities
+                    self._perf_tracker.stage_start('pwm')
+                    self._send_velocity_commands(loop_dt)
                     self._perf_tracker.stage_end('pwm')
                 else:
                     # IK mode: smooth -> IK -> PID -> PWM

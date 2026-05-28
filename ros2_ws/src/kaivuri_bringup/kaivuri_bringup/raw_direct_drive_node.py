@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -11,12 +10,17 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
 
+from kaivuri_bringup.project_paths import add_project_import_path, resolve_project_root
+
 
 JOINT_NAMES = [
-    "revolute_cabin",
+    "revolute_carriage",
     "revolute_lift",
     "revolute_tilt",
-    "revolute_scoop",
+    "revolute_tool",
+    "revolute_gripper",
+    "revolute_claw_1",
+    "revolute_claw_2",
 ]
 
 COMMAND_NAMES = [
@@ -39,8 +43,11 @@ class RawDirectDriveNode(Node):
     def __init__(self) -> None:
         super().__init__("kaivuri_raw_direct_drive_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
-        self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
-        self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
+        self.declare_parameter("robot", "auto")
+        self.declare_parameter("config_file", "")
+        self.declare_parameter("control_config_file", "")
+        self.declare_parameter("pwm_i2c_bus", -1)
+        self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("command_topic", "/kaivuri/direct_pwm")
         self.declare_parameter("command_rate_hz", 50.0)
         self.declare_parameter("state_rate_hz", 30.0)
@@ -51,19 +58,32 @@ class RawDirectDriveNode(Node):
         self.declare_parameter("stale_timeout_s", 0.5)
         self.declare_parameter("publish_tool_pose", True)
 
-        self._project_root = Path(str(self.get_parameter("project_root").value)).resolve()
-        self._add_project_import_path(self._project_root)
+        self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
+        add_project_import_path(self._project_root)
 
         from modules.differential_ik import get_pose_from_joint_angles
         from modules.differential_ik_cfg import load_excavator_robot_config
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
+        from modules.board import resolve_profile
 
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        control_config_path = self._resolve_project_path(str(self.get_parameter("control_config_file").value))
+        robot_profile = resolve_profile(str(self.get_parameter("robot").value))
+        config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
+        control_config_file = self._param_or_profile("control_config_file", robot_profile["control_config_file"])
+        pwm_i2c_bus = self._int_param_or_profile("pwm_i2c_bus", int(robot_profile["pwm_i2c_bus"]), unset=-1)
+        pwm_i2c_addr = self._int_param_or_profile("pwm_i2c_addr", int(robot_profile["pwm_i2c_addr"]), unset=-1)
+
+        control_config_path = self._resolve_project_path(control_config_file)
         self._robot_config = load_excavator_robot_config(str(control_config_path))
 
-        config_path = self._resolve_project_path(str(self.get_parameter("config_file").value))
+        config_path = self._resolve_project_path(config_file)
+        self.get_logger().info(
+            "Raw direct drive profile="
+            f"{robot_profile['profile_name']} board={robot_profile['board']} "
+            f"servo_config={config_path} control_config={control_config_path} "
+            f"I2C bus={pwm_i2c_bus} addr=0x{pwm_i2c_addr:02X}"
+        )
         self._hardware = HardwareInterface(
             config_file=str(config_path),
             control_config_file=str(control_config_path),
@@ -76,6 +96,8 @@ class RawDirectDriveNode(Node):
             start_imu_reader=True,
             start_adc_reader=False,
             cleanup_disable_osc=False,
+            pwm_i2c_bus=pwm_i2c_bus,
+            pwm_i2c_addr=pwm_i2c_addr,
         )
         self._wait_for_hardware(float(self.get_parameter("ready_timeout_s").value))
 
@@ -105,16 +127,21 @@ class RawDirectDriveNode(Node):
             f"Raw direct drive ready on {command_topic}; order={COMMAND_NAMES}"
         )
 
-    def _add_project_import_path(self, project_root: Path) -> None:
-        root = str(project_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-
     def _resolve_project_path(self, path_value: str) -> Path:
         path = Path(path_value)
         if path.is_absolute():
             return path
         return self._project_root / path
+
+    def _param_or_profile(self, name: str, profile_value: str) -> str:
+        value = str(self.get_parameter(name).value).strip()
+        return value or profile_value
+
+    def _int_param_or_profile(self, name: str, profile_value: int, *, unset: int = None) -> int:
+        value = int(self.get_parameter(name).value)
+        if unset is not None and value == unset:
+            return profile_value
+        return value
 
     def _wait_for_hardware(self, timeout_s: float) -> None:
         deadline = time.time() + max(0.0, timeout_s)
@@ -168,11 +195,18 @@ class RawDirectDriveNode(Node):
             self.get_logger().warn(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
             return
 
+        joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()
+        if joint_vel_degps is not None and vel_age < 0.2:
+            joint_vel_radps = [float(np.radians(v)) for v in joint_vel_degps[:4]]
+        else:
+            joint_vel_radps = [0.0, 0.0, 0.0, 0.0]
+
         now = self.get_clock().now().to_msg()
         joint_msg = JointState()
         joint_msg.header.stamp = now
         joint_msg.name = JOINT_NAMES
-        joint_msg.position = [float(v) for v in joint_angles_rad[:len(JOINT_NAMES)]]
+        joint_msg.position = [float(v) for v in joint_angles_rad[:4]] + [0.0, 0.0, 0.0]
+        joint_msg.velocity = joint_vel_radps + [0.0, 0.0, 0.0]
         self._joint_pub.publish(joint_msg)
 
         if bool(self.get_parameter("publish_tool_pose").value):

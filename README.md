@@ -41,12 +41,14 @@ use it on Jetson Nano.
 
 The Raspberry Pi main I2C bus runs well at 1 MHz in this project.
 
-## Jetson Nano WIP Notes
+## Jetson Orin Nano Super WIP Notes
 
-Jetson Nano support is still work in progress and is separate from the main
-Raspberry Pi usage above.
+Jetson support targets the **Jetson Orin Nano Super (8 GB)** and is still work
+in progress, separate from the main Raspberry Pi usage above. The original
+Maxwell-era Jetson Nano is not supported — Reflex/TensorRT FP16 and the VLA
+runner (`run_vla_v0.py`) need Ampere or newer.
 
-For Jetson Nano, use:
+For the Orin Nano Super, use:
 
 ```bash
 sudo ./setup_jetson.sh
@@ -60,9 +62,9 @@ profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
 service, OLED/display Python packages, and analysis-only `scipy`/`pandas`
 packages are not part of the Jetson setup.
 
-Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz, and it needs a Jetson-specific
-device-tree or kernel configuration path rather than Raspberry Pi
-`dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
+Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz on the Orin
+Nano Super, and it needs a Jetson-specific device-tree or kernel configuration
+path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
 PCA9685 bus with:
 
 ```bash

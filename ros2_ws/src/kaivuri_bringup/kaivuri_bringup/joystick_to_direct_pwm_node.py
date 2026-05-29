@@ -23,7 +23,6 @@ class JoystickToDirectPwmNode(Node):
         self.declare_parameter("input_topic", "joystick_values")
         self.declare_parameter("output_topic", "/kaivuri/direct_pwm")
         self.declare_parameter("raw_max", 127.0)
-        self.declare_parameter("deadband", 0.05)
         self.declare_parameter("axis_indices", [0, 1, 2, 3, 4, 5])
         self.declare_parameter("axis_signs", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
@@ -87,8 +86,7 @@ class JoystickToDirectPwmNode(Node):
 
             normalized = float(raw_values[axis_index]) / self._raw_max
             normalized = max(-1.0, min(1.0, normalized * axis_sign))
-            if abs(normalized) < self._deadband:
-                normalized = 0.0
+
             direct_pwm.append(normalized)
 
         out = Float32MultiArray()

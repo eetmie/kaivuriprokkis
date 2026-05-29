@@ -54,7 +54,7 @@ class MotionPlatformUdpReceiver:
             inputs_fmt.ljust(32, b"\x00"),
         )
 
-        print("Waiting for MotionPlatform handshake...")
+        print("Waiting for handshake from client...")
         self.socket.settimeout(timeout)
         try:
             data, addr = self.socket.recvfrom(_HANDSHAKE_SIZE)
@@ -142,9 +142,9 @@ class UdpJoystickValuesNode(Node):
     def __init__(self) -> None:
         super().__init__("udp_joystick_values_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "~/kaivuriprokkis"))
-        self.declare_parameter("host", "0.0.0.0")
+        self.declare_parameter("host", "10.214.33.132")
         self.declare_parameter("port", 8080)
-        self.declare_parameter("rate_hz", 100.0)
+        self.declare_parameter("joystick_publish_rate", 100.0)
         self.declare_parameter("max_age_seconds", 0.5)
         self.declare_parameter("topic", "joystick_values")
         self.declare_parameter("local_id", 2)
@@ -161,7 +161,7 @@ class UdpJoystickValuesNode(Node):
 
         host = str(self.get_parameter("host").value)
         port = int(self.get_parameter("port").value)
-        rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
+        rate_hz = max(1.0, float(self.get_parameter("joystick_publish_rate").value))
         max_age_seconds = float(self.get_parameter("max_age_seconds").value)
         local_id = int(self.get_parameter("local_id").value)
 

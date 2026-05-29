@@ -41,12 +41,14 @@ use it on Jetson Nano.
 
 The Raspberry Pi main I2C bus runs well at 1 MHz in this project.
 
-## Jetson Nano WIP Notes
+## Jetson Orin Nano Super WIP Notes
 
-Jetson Nano support is still work in progress and is separate from the main
-Raspberry Pi usage above.
+Jetson support targets the **Jetson Orin Nano Super (8 GB)** and is still work
+in progress, separate from the main Raspberry Pi usage above. The original
+Maxwell-era Jetson Nano is not supported — Reflex/TensorRT FP16 and the VLA
+runner (`run_vla_v0.py`) need Ampere or newer.
 
-For Jetson Nano, use:
+For the Orin Nano Super, use:
 
 ```bash
 sudo ./setup_jetson.sh
@@ -60,9 +62,9 @@ profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
 service, OLED/display Python packages, and analysis-only `scipy`/`pandas`
 packages are not part of the Jetson setup.
 
-Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz, and it needs a Jetson-specific
-device-tree or kernel configuration path rather than Raspberry Pi
-`dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
+Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz on the Orin
+Nano Super, and it needs a Jetson-specific device-tree or kernel configuration
+path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
 PCA9685 bus with:
 
 ```bash
@@ -101,6 +103,65 @@ system/root Python and bypasses `.venv`. If opening `/dev/ttyACM0` or
 | `--rt-priority` | Control-loop realtime priority. Use `0` to disable. |
 | `--imu-priority` | IMU thread realtime priority. Use `0` for normal scheduling. |
 
+## EE PID Tuner
+
+Tools for tuning the joint PIDs against an EE x-plane sweep. The host runs the
+full production control stack (`HardwareInterface` + `ExcavatorController`);
+a thin Tk client shows the ideal X line vs. the measured EE travel and the
+tracking-error stats per stroke.
+
+```bash
+# robot side (default binds 192.168.0.132:8091)
+sudo .venv/bin/python tools/pid_tuner_ee.py
+
+# operator laptop
+python tools/pid_tuner_ee_client.py 192.168.0.132 8091
+```
+
+What it does:
+
+* Drives the EE back and forth along a straight X line at fixed Y, Z, rot=0.
+  EE speed is configurable in the `20..70 mm/s` band; Z height is whatever you
+  set in the GUI.
+* Optionally swaps the chosen joint's PID for an in-script `DirectionalPID`
+  wrapper that holds **separate gain triples for out (+X) and in (-X)
+  strokes**. During a tuning run the wrapper is pinned to the current stroke
+  direction, so the +X strokes always use `pid_pos` (`kp_fwd / ki_fwd / kd_fwd`)
+  and the -X strokes always use `pid_neg` (`kp_rev / ki_rev / kd_rev`) —
+  useful for asymmetric hydraulics (extend vs. retract).
+* Tracking error is also **scored per direction**: every run reports OUT
+  (+X) and IN (-X) RMSE / max / mean / cost as separate numbers, and the
+  auto-tuner judges fwd-gain probes only against the fwd subscore (and
+  vice versa). The GUI shows both lines so you can tell which direction is
+  the worse offender at a glance.
+* Auto-tune is coordinate descent ("twiddle") with adaptive step size, scoring
+  each full back-and-forth run with
+  `cost = w_rmse*RMSE + w_max*max|err| + w_overshoot*tail` (computed twice —
+  once per direction). Each iteration cycles deterministically through a
+  3x3 grid of `(z, speed)` built from `z_min..z_max` and `v_min..v_max` so the
+  gains are robust across the whole envelope.
+* No changes to the on-disk control stack — the tuner only mutates the live
+  `controller.joint_pids` list and restores originals on exit.
+
+Recommended starting points for the excavator (x-plane smoothness is the main
+target):
+
+* Joint selector is locked to `boom` (lift), `arm` (tilt) and `bucket` (scoop)
+  — the three joints that actually shape EE x motion. Slew is excluded; it
+  doesn't contribute to +X / -X tracking when the cab faces forward.
+* Auto-tune budget can be generous (e.g. `auto-tune runs = 60..120`); each
+  iteration is one full back-and-forth so the wall time scales with
+  `strokes_per_run * stroke_duration`. Sweeps can run for tens of minutes
+  without issue.
+* For finer convergence, run the auto-tuner twice: first with a wider
+  `(z, v)` envelope to get robust gains, then with a narrow envelope around
+  the operating point you care about most.
+
+The tuner runs paused until the client sends `START`, and PIDs zero outputs
+when paused. See the file docstrings in `tools/pid_tuner_ee.py` and
+`tools/pid_tuner_ee_client.py` for the full CLI, wire format, and algorithm
+notes.
+
 ## Sim Replay Flow
 
 To compare sim and IRL against the same obstacle layout:
@@ -127,6 +188,7 @@ To compare sim and IRL against the same obstacle layout:
 | `pathing/` | Shared planner package, identical to the sim pathing package. |
 | `configuration_files/` | Task, environment, and execution settings. |
 | `modules/` | Hardware interface, controller, math, and realtime helpers. |
+| `tools/` | Developer/diagnostic tools. `pid_tuner_ee.py` + client for EE-plane PID tuning. |
 | `logs_hw/` | Hardware logs when `--log` is enabled. Created at runtime. |
 
 The other folders and scripts are mostly for prototypes, hardware bring-up,

@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import rclpy
@@ -21,6 +20,8 @@ JOINT_NAMES = [
     "revolute_claw_2",
 ]
 
+_N_ACTIVE = 4  # joints with IMU coverage; gripper/claws remain at zero
+
 
 class ImuStateNode(Node):
     def __init__(self) -> None:
@@ -31,17 +32,18 @@ class ImuStateNode(Node):
         self.declare_parameter("config_file", "")
         self.declare_parameter("control_config_file", "")
         self.declare_parameter("publish_tool_pose", True)
+        # fd_only | gyro_only | fused — mirrors ExcavatorController.set_velocity_mode()
+        self.declare_parameter("velocity_mode", "gyro_only")
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
         from modules.differential_ik import get_pose_from_joint_angles
         from modules.differential_ik_cfg import load_excavator_robot_config
-        from modules.excavator_ik_utils import canonical_joint_angles_from_imus
+        from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
         from modules.board import resolve_profile
 
-        self._canonical_joint_angles_from_imus = canonical_joint_angles_from_imus
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
 
         robot_profile = resolve_profile(str(self.get_parameter("robot").value))
@@ -67,11 +69,25 @@ class ImuStateNode(Node):
             cleanup_disable_osc=False,
         )
 
+        self._controller = ExcavatorController(
+            self._hardware,
+            config=None,
+            enable_perf_tracking=False,
+            control_config_file=str(control_config_path),
+        )
+        self._controller.start()
+        velocity_mode = str(self.get_parameter("velocity_mode").value).strip()
+        self._controller.set_velocity_mode(velocity_mode)
+        self._controller.enter_direct_mode()
+
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self.create_timer(1.0 / rate_hz, self._publish)
-        self.get_logger().info(f"Publishing IMU-derived joint_states from {self._project_root}")
+        self.get_logger().info(
+            f"Publishing IMU-derived joint_states from {self._project_root} "
+            f"(velocity_mode={velocity_mode})"
+        )
 
     def _resolve_project_path(self, path_value: str) -> Path:
         path = Path(path_value)
@@ -85,29 +101,28 @@ class ImuStateNode(Node):
 
     def _read_joint_angles(self) -> Optional[np.ndarray]:
         try:
-            quaternions = self._hardware.read_all_imu_quaternions()
-            if quaternions is None:
-                return None
-            sensor_quats = np.asarray(quaternions, dtype=np.float32)
-            return self._canonical_joint_angles_from_imus(sensor_quats, self._robot_config)
+            joint_angles_deg = self._controller.get_joint_angles()
+            joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
         except Exception as exc:
-            self.get_logger().warn(f"IMU state unavailable: {exc}", throttle_duration_sec=2.0)
-            return None
-
-    def _publish(self) -> None:
-        joint_angles = self._read_joint_angles()
-        if joint_angles is None:
+            self.get_logger().warn(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
             return
+
+        joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()
+        if joint_vel_degps is not None and vel_age < 0.2:
+            joint_vel_radps = [float(np.radians(v)) for v in joint_vel_degps[:_N_ACTIVE]]
+        else:
+            joint_vel_radps = [0.0] * _N_ACTIVE
 
         now = self.get_clock().now().to_msg()
         joint_msg = JointState()
         joint_msg.header.stamp = now
         joint_msg.name = JOINT_NAMES
-        joint_msg.position = [float(v) for v in joint_angles[:4]] + [0.0, 0.0, 0.0]
+        joint_msg.position = [float(v) for v in joint_angles_rad[:_N_ACTIVE]] + [0.0, 0.0, 0.0]
+        joint_msg.velocity = joint_vel_radps + [0.0, 0.0, 0.0]
         self._joint_pub.publish(joint_msg)
 
         if bool(self.get_parameter("publish_tool_pose").value):
-            ee_pos, ee_quat = self._get_pose_from_joint_angles(joint_angles, self._robot_config)
+            ee_pos, ee_quat = self._get_pose_from_joint_angles(joint_angles_rad, self._robot_config)
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
             pose_msg.header.frame_id = "excavator"
@@ -121,6 +136,10 @@ class ImuStateNode(Node):
             self._pose_pub.publish(pose_msg)
 
     def destroy_node(self) -> bool:
+        try:
+            self._controller.stop()
+        except Exception:
+            pass
         try:
             self._hardware.shutdown()
         except Exception:

@@ -8,9 +8,10 @@ not the root test_vel_ctrl.py hardware prototype) with hardware deps pre-mocked.
 import math
 import sys
 import time
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -18,7 +19,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from modules.excavator_controller import ExcavatorController
+from modules.excavator_controller import ExcavatorController, _VEL_CMD_JOINTS
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +38,39 @@ class _ControllerProxy:
     _gyro_bias_radps = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     logger = MagicMock()
 
-    set_velocity_mode        = ExcavatorController.set_velocity_mode
+    set_velocity_mode             = ExcavatorController.set_velocity_mode
     get_joint_velocities_with_age = ExcavatorController.get_joint_velocities_with_age
+
+
+class _VelCmdProxy:
+    """Proxy for velocity-command mode methods only."""
+    _direct_mode: bool = False
+    _vel_cmd_mode: bool = False
+    _vel_cmd_commands: dict = {}
+    _vel_cmd_integrals: dict = {j: 0.0 for j in _VEL_CMD_JOINTS}
+    _outputs_zeroed: bool = True
+    _lock = threading.Lock()
+    _vel_cmd_lock = threading.Lock()
+    # PI config — default gains matching simple_drive defaults
+    _vel_kp: float = 0.04
+    _vel_ki: float = 0.008
+    _vel_ki_max: float = 0.4
+    _vel_deadband_radps: float = math.radians(2.0)
+    _vel_stale_timeout_s: float = 0.15
+    _last_joint_vel_radps = None
+    _last_joint_vel_time = None
+    logger = MagicMock()
+    hardware = MagicMock()
+
+    enter_velocity_command_mode = ExcavatorController.enter_velocity_command_mode
+    exit_velocity_command_mode  = ExcavatorController.exit_velocity_command_mode
+    give_velocity_commands      = ExcavatorController.give_velocity_commands
+    _send_velocity_commands     = ExcavatorController._send_velocity_commands
+
+    def _fresh_vel(self, *radps_values):
+        """Inject a fresh velocity reading."""
+        self._last_joint_vel_radps = np.array(radps_values, dtype=np.float32)
+        self._last_joint_vel_time = time.perf_counter()
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +341,204 @@ class TestJointVelocityController(unittest.TestCase):
         ctrl.reset()
         for k, v in ctrl._integral.items():
             self.assertAlmostEqual(v, 0.0, msg=f'integral[{k!r}] not zeroed')
+
+
+# ---------------------------------------------------------------------------
+# enter/exit velocity command mode
+# ---------------------------------------------------------------------------
+
+class TestEnterExitVelocityCommandMode(unittest.TestCase):
+    def setUp(self):
+        self.ctrl = _VelCmdProxy()
+
+    def test_enter_sets_vel_cmd_mode(self):
+        self.ctrl.enter_velocity_command_mode()
+        self.assertTrue(self.ctrl._vel_cmd_mode)
+
+    def test_enter_clears_direct_mode(self):
+        self.ctrl._direct_mode = True
+        self.ctrl.enter_velocity_command_mode()
+        self.assertFalse(self.ctrl._direct_mode)
+
+    def test_enter_resets_integrals(self):
+        for k in self.ctrl._vel_cmd_integrals:
+            self.ctrl._vel_cmd_integrals[k] = 9.9
+        self.ctrl.enter_velocity_command_mode()
+        for k, v in self.ctrl._vel_cmd_integrals.items():
+            self.assertAlmostEqual(v, 0.0, msg=f'integral[{k!r}] not reset')
+
+    def test_enter_clears_commands(self):
+        self.ctrl._vel_cmd_commands = {'lift_boom': 0.5}
+        self.ctrl.enter_velocity_command_mode()
+        self.assertEqual(self.ctrl._vel_cmd_commands, {})
+
+    def test_exit_clears_vel_cmd_mode(self):
+        self.ctrl._vel_cmd_mode = True
+        self.ctrl.exit_velocity_command_mode()
+        self.assertFalse(self.ctrl._vel_cmd_mode)
+
+    def test_exit_resets_integrals(self):
+        self.ctrl._vel_cmd_mode = True
+        for k in self.ctrl._vel_cmd_integrals:
+            self.ctrl._vel_cmd_integrals[k] = 3.0
+        self.ctrl.exit_velocity_command_mode()
+        for k, v in self.ctrl._vel_cmd_integrals.items():
+            self.assertAlmostEqual(v, 0.0, msg=f'integral[{k!r}] not reset on exit')
+
+
+# ---------------------------------------------------------------------------
+# give_velocity_commands
+# ---------------------------------------------------------------------------
+
+class TestGiveVelocityCommands(unittest.TestCase):
+    def setUp(self):
+        self.ctrl = _VelCmdProxy()
+
+    def test_stores_commands(self):
+        cmds = {'lift_boom': 0.3, 'rotate': 0.5}
+        self.ctrl.give_velocity_commands(cmds)
+        with self.ctrl._vel_cmd_lock:
+            stored = dict(self.ctrl._vel_cmd_commands)
+        self.assertEqual(stored, cmds)
+
+    def test_clears_outputs_zeroed(self):
+        self.ctrl._outputs_zeroed = True
+        self.ctrl.give_velocity_commands({'lift_boom': 0.1})
+        self.assertFalse(self.ctrl._outputs_zeroed)
+
+    def test_stores_copy_not_reference(self):
+        cmds = {'lift_boom': 0.1}
+        self.ctrl.give_velocity_commands(cmds)
+        cmds['lift_boom'] = 99.0
+        with self.ctrl._vel_cmd_lock:
+            self.assertNotEqual(self.ctrl._vel_cmd_commands['lift_boom'], 99.0)
+
+
+# ---------------------------------------------------------------------------
+# _send_velocity_commands — PI behaviour
+# ---------------------------------------------------------------------------
+
+class TestSendVelocityCommands(unittest.TestCase):
+    def setUp(self):
+        self.ctrl = _VelCmdProxy()
+        self.ctrl.enter_velocity_command_mode()
+
+    def _set_cmds(self, **kw):
+        self.ctrl.give_velocity_commands(kw)
+
+    def test_empty_commands_calls_hardware_reset(self):
+        self.ctrl._outputs_zeroed = False
+        self.ctrl._vel_cmd_commands = {}
+        self.ctrl._send_velocity_commands(0.01)
+        self.ctrl.hardware.reset.assert_called_once()
+
+    def test_empty_commands_sets_outputs_zeroed(self):
+        self.ctrl._outputs_zeroed = False
+        self.ctrl._vel_cmd_commands = {}
+        self.ctrl._send_velocity_commands(0.01)
+        self.assertTrue(self.ctrl._outputs_zeroed)
+
+    def test_pass_through_joint_clipped_positive(self):
+        self._set_cmds(rotate=0.7)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertAlmostEqual(sent['rotate'], 0.7, places=5)
+
+    def test_pass_through_joint_clipped_to_one(self):
+        self._set_cmds(rotate=5.0)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertLessEqual(sent['rotate'], 1.0)
+
+    def test_pass_through_negative_clipped(self):
+        self._set_cmds(trackL=-2.5)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertGreaterEqual(sent['trackL'], -1.0)
+
+    def test_stale_velocity_zeros_controlled_joint(self):
+        # No velocity reading → stale → output must be 0
+        self._set_cmds(lift_boom=0.5)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertAlmostEqual(sent['lift_boom'], 0.0)
+
+    def test_stale_velocity_resets_integral(self):
+        self.ctrl._vel_cmd_integrals['lift_boom'] = 0.3
+        self._set_cmds(lift_boom=0.5)
+        self.ctrl._send_velocity_commands(0.01)
+        self.assertAlmostEqual(self.ctrl._vel_cmd_integrals['lift_boom'], 0.0)
+
+    def test_desired_below_deadband_zeroes_output(self):
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        # deadband = 2 deg/s ≈ 0.035 rad/s; send 0.01 rad/s
+        self._set_cmds(lift_boom=0.01)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertAlmostEqual(sent['lift_boom'], 0.0)
+
+    def test_proportional_response_at_rest(self):
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        self._set_cmds(lift_boom=0.3)   # 0.3 rad/s desired, 0.0 actual → error = 0.3
+        self.ctrl._vel_ki = 0.0
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        expected = np.clip(self.ctrl._vel_kp * 0.3, -1.0, 1.0)
+        self.assertAlmostEqual(sent['lift_boom'], expected, places=5)
+
+    def test_zero_error_gives_zero_output(self):
+        # actual == desired → error = 0, no integral (ki=0)
+        self.ctrl._fresh_vel(0.0, 0.3, 0.0, 0.0)  # lift idx=1 at 0.3 rad/s
+        self._set_cmds(lift_boom=0.3)
+        self.ctrl._vel_ki = 0.0
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertAlmostEqual(sent['lift_boom'], 0.0, places=5)
+
+    def test_integral_accumulates(self):
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        self._set_cmds(tilt_boom=0.5)
+        self.ctrl._vel_kp = 0.0
+        self.ctrl._send_velocity_commands(0.01)
+        i_after_1 = self.ctrl._vel_cmd_integrals['tilt_boom']
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        self.ctrl._send_velocity_commands(0.01)
+        i_after_2 = self.ctrl._vel_cmd_integrals['tilt_boom']
+        self.assertGreater(i_after_2, i_after_1)
+
+    def test_integral_anti_windup(self):
+        self.ctrl._vel_ki = 1.0
+        self.ctrl._vel_ki_max = 0.4
+        self.ctrl._vel_kp = 0.0
+        for _ in range(500):
+            self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+            self._set_cmds(lift_boom=1.0)
+            self.ctrl._send_velocity_commands(0.01)
+        self.assertLessEqual(self.ctrl._vel_cmd_integrals['lift_boom'], 0.4 + 1e-6)
+
+    def test_output_clamped_to_one(self):
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        self.ctrl._vel_kp = 999.0
+        self._set_cmds(scoop=1.0)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertLessEqual(sent['scoop'], 1.0)
+
+    def test_output_clamped_to_minus_one(self):
+        self.ctrl._fresh_vel(0.0, 0.0, 0.0, 0.0)
+        self.ctrl._vel_kp = 999.0
+        self._set_cmds(scoop=-1.0)
+        self.ctrl._send_velocity_commands(0.01)
+        sent = self.ctrl.hardware.send_named_pwm_commands.call_args[0][0]
+        self.assertGreaterEqual(sent['scoop'], -1.0)
+
+    def test_vel_cmd_joints_constant_covers_expected_joints(self):
+        self.assertIn('lift_boom', _VEL_CMD_JOINTS)
+        self.assertIn('tilt_boom', _VEL_CMD_JOINTS)
+        self.assertIn('scoop', _VEL_CMD_JOINTS)
+        self.assertNotIn('rotate', _VEL_CMD_JOINTS)
+        self.assertNotIn('trackL', _VEL_CMD_JOINTS)
+        self.assertNotIn('trackR', _VEL_CMD_JOINTS)
 
 
 if __name__ == '__main__':

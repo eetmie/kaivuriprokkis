@@ -44,6 +44,7 @@ class ExcavatorGUI3D:
     DEFAULT_X = 0.6
     DEFAULT_Y = 0.0
     DEFAULT_Z = 0.0
+    ORIGIN_HEIGHT_M = 0.07
 
     UDP_HOST = "192.168.0.132"
     UDP_PORT = 8080
@@ -172,7 +173,7 @@ class ExcavatorGUI3D:
         title.grid(row=0, column=0, columnspan=3, pady=(0, 8))
 
         # 3D Visualizer
-        self.visualizer = ArmVisualizer(main, self.WORKSPACE_LIMITS)
+        self.visualizer = ArmVisualizer(main, self.WORKSPACE_LIMITS, origin_height_m=self.ORIGIN_HEIGHT_M)
         canvas_widget = self.visualizer.get_canvas_widget()
         canvas_widget.grid(row=1, column=0, columnspan=3, sticky=(tk.N, tk.S, tk.E, tk.W))
 

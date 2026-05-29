@@ -23,6 +23,7 @@ if str(_ROOT_DIR) not in sys.path:
 
 from modules.udp_socket import UDPSocket
 from modules.excavator_controller import ExcavatorController
+from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
 from modules.control_protocol import (
     COMMAND_PACKET_SIZE,
     TELEMETRY_PACKET_SIZE,
@@ -192,9 +193,41 @@ def main():
     parser.add_argument("--lock-memory", action="store_true", help="Call mlockall() for RT threads")
     parser.add_argument("--control-core", type=int, default=None, help="CPU core for main loop and control loop")
     parser.add_argument("--io-core", type=int, default=None, help="CPU core for USB reader, IMU, and ADC threads")
+    parser.add_argument(
+        "--robot",
+        choices=[*sorted(ROBOT_PROFILES), "auto"],
+        default="auto",
+        help="Robot profile. 'auto' detects the board at startup.",
+    )
+    parser.add_argument("--servo-config", default=None, help="Override PWM servo config path selected by --robot.")
+    parser.add_argument("--control-config", default=None, help="Override controller/IK/IMU config path selected by --robot.")
+    parser.add_argument("--pwm-i2c-bus", type=int, default=None, help="Override PCA9685 Linux I2C bus selected by --robot.")
+    parser.add_argument(
+        "--pwm-i2c-addr",
+        type=lambda value: int(value, 0),
+        default=None,
+        help="Override PCA9685 I2C address selected by --robot, e.g. 0x40.",
+    )
+    parser.add_argument("--disable-imu", action="store_true", help="Disable IMU startup for PWM-only bring-up.")
+    parser.add_argument("--host", default="0.0.0.0", help="Local UDP address to bind.")
+    parser.add_argument("--port", type=int, default=8080, help="Local UDP port to bind.")
+    parser.add_argument("--nominal-rate-hz", type=float, default=20.0, help="Server telemetry rate advertised in UDP handshake.")
     parser.add_argument("--no-limits", action="store_true",
                         help="Disable workspace limits (note: enforced client-side, server has none to disable)")
     args, _ = parser.parse_known_args()
+
+    robot_profile = _resolve_board_profile(args.robot)
+    if args.servo_config is not None:
+        robot_profile["servo_config_file"] = args.servo_config
+        robot_profile["config_file"] = args.servo_config
+    if args.control_config is not None:
+        robot_profile["control_config_file"] = args.control_config
+    if args.pwm_i2c_bus is not None:
+        robot_profile["pwm_i2c_bus"] = args.pwm_i2c_bus
+    if args.pwm_i2c_addr is not None:
+        robot_profile["pwm_i2c_addr"] = args.pwm_i2c_addr
+    if args.disable_imu:
+        robot_profile["enable_imu"] = False
 
     if args.no_limits:
         print("[excv_gui] --no-limits: workspace XYZ limits are enforced client-side only; "
@@ -214,10 +247,20 @@ def main():
         app_logger.info("=" * 60)
         app_logger.info("  EXCAVATOR SERVER — receiving commands from client GUI")
         app_logger.info("=" * 60)
+        app_logger.info(
+            "Robot profile: %s | board=%s | servo=%s | control=%s | I2C bus=%s addr=0x%02X | IMU=%s",
+            args.robot,
+            robot_profile["board"],
+            robot_profile["servo_config_file"],
+            robot_profile["control_config_file"],
+            robot_profile["pwm_i2c_bus"],
+            robot_profile["pwm_i2c_addr"],
+            "on" if robot_profile["enable_imu"] else "off",
+        )
 
     # ---- UDP setup ----
-    server = UDPSocket(local_id=2, max_age_seconds=0.5)
-    server.setup("192.168.0.132", 8080,
+    server = UDPSocket(local_id=2, max_age_seconds=0.5, nominal_rate_hz=args.nominal_rate_hz)
+    server.setup(args.host, args.port,
                  inputs=f'{COMMAND_PACKET_SIZE}b', outputs=f'{TELEMETRY_PACKET_SIZE}b',
                  is_server=True)
 
@@ -238,9 +281,10 @@ def main():
 
     hw_log_level = "WARNING" if quiet else args.log_level.upper()
     hardware = HardwareInterface(
-        config_file="configuration_files/profiles/rpi/servo_config.yaml",
-        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
+        config_file=robot_profile["servo_config_file"],
+        control_config_file=robot_profile["control_config_file"],
         log_level=hw_log_level, pump_auto_mode=False, cleanup_disable_osc=False,
+        enable_imu=bool(robot_profile["enable_imu"]),
         enable_adc=False, start_adc_reader=False,
         rt_lock_memory=args.lock_memory,
         usb_rt_priority=args.fifo_priority,
@@ -249,6 +293,8 @@ def main():
         usb_cpu_core=args.io_core,
         imu_cpu_core=args.io_core,
         adc_cpu_core=args.io_core,
+        pwm_i2c_bus=robot_profile["pwm_i2c_bus"],
+        pwm_i2c_addr=robot_profile["pwm_i2c_addr"],
     )
     while not hardware.is_hardware_ready():
         time.sleep(0.1)
@@ -260,7 +306,7 @@ def main():
         rt_priority=args.fifo_priority,
         rt_lock_memory=args.lock_memory,
         rt_cpu_core=args.control_core,
-        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
+        control_config_file=robot_profile["control_config_file"],
     )
     service = RobotService(controller, hardware)
     service.start()

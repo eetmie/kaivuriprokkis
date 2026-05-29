@@ -19,8 +19,10 @@ class ArmVisualizer:
     """Manages the 3D matplotlib plot showing the excavator arm and target."""
 
     def __init__(self, parent_frame: tk.Widget, workspace_limits: Dict[str, float],
-                 figsize=(7.5, 4.6), dpi=100, max_fps=30):
+                 figsize=(7.5, 4.6), dpi=100, max_fps=30,
+                 origin_height_m: float = 0.07):
         self.workspace_limits = workspace_limits
+        self.origin_height_m = float(origin_height_m)
         self._redraw_interval = 1.0 / max_fps
         self._last_redraw_time = 0.0
         self._mouse_dragging = False
@@ -178,18 +180,20 @@ class ArmVisualizer:
         if not jp or len(jp) < 2:
             return
 
-        # Origin offset (green)
-        first_joint = jp[0]
-        if np.linalg.norm(first_joint) > 0.001:
-            self.ax.plot([0, first_joint[0]], [0, first_joint[1]], [0, first_joint[2]],
+        # Ground to slew/cabin rotation origin (robot.frame.origin_height_m).
+        origin = [0.0, 0.0, self.origin_height_m]
+        if abs(self.origin_height_m) > 0.001:
+            self.ax.plot([0.0, origin[0]], [0.0, origin[1]], [0.0, origin[2]],
                          '-', color='green', linewidth=2.5, label='Origin offset')
-            self.ax.scatter([0], [0], [0], c='green', s=30, marker='s')
+            self.ax.scatter([0.0], [0.0], [0.0], c='green', s=30, marker='s')
 
-        # Joint links (blue)
+        # Joint links (blue). Telemetry positions already include origin_offset,
+        # but the slew origin itself is not part of the compact telemetry packet.
         num_joints = min(4, len(jp) - 1) if len(jp) == 5 else len(jp)
-        xs = [p[0] for p in jp[:num_joints]]
-        ys = [p[1] for p in jp[:num_joints]]
-        zs = [p[2] for p in jp[:num_joints]]
+        link_points = [origin] + jp[:num_joints]
+        xs = [p[0] for p in link_points]
+        ys = [p[1] for p in link_points]
+        zs = [p[2] for p in link_points]
         self.ax.plot(xs, ys, zs, '-o', color='blue', linewidth=2, markersize=4, label='Links')
 
         # EE offset (orange)

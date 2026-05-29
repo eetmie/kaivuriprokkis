@@ -62,7 +62,7 @@ CHANNEL_CONFIGS:
         affects_pump: False
         toggleable: True
         center: None #1637,5. "none" calculates center to in-between
-        direction: 1
+        direction: -1  # was 1 on Jetson
         pulse_min: 1550
         pulse_max: 1725
         deadzone: 0.0
@@ -83,7 +83,7 @@ CHANNEL_CONFIGS:
         affects_pump: True
         toggleable: False
         center: 1650
-        direction: -1
+        direction: -1  # -1
         pulse_min: 1330
         pulse_max: 1980
         deadzone: 0.0
@@ -104,7 +104,7 @@ CHANNEL_CONFIGS:
         affects_pump: True
         toggleable: False
         center: None
-        direction: 1
+        direction: -1 #-1
         pulse_min: 1300
         pulse_max: 1850
         deadzone: 0.0

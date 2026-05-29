@@ -99,6 +99,8 @@ class ExcavatorTargetState:
         self.slew_yaw_deg = slew_yaw_deg
         self.z = float(z)
         self.rot_y_deg = float(rot_y_deg)
+        # TODO: Revisit whether the IK target point should be composed from
+        # the bucket/tool tip, coupler point, or another calibrated work point.
         self.cartesian_x = radius * math.cos(yaw_rad)
         self.cartesian_y = radius * math.sin(yaw_rad)
 

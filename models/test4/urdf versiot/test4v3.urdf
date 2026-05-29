@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  test4.urdf
+  Mini excavator robot description for ROS 2 / ros2_control.
+  This variant uses the edited test4 meshes with the boom/tool pose zeroed
+  in the URDF joint states.  Boom inertials and joint limits are expressed
+  in this zeroed test4 frame.
+
+  Unit conventions (URDF standard):
+    Length  : metres
+    Angle   : radians
+    Mass    : kilograms
+    Inertia : kg·m²
+    Force   : N  |  Torque : N·m  |  Velocity : rad/s
+
+  Kinematic chain (parent → child):
+    excavator (base)
+      └─ revolute_carriage  → upper_carriage   [continuous, Z-axis yaw]
+           └─ revolute_lift → lift_boom         [revolute,   Y-axis pitch]
+                └─ revolute_tilt → tilt_boom    [revolute,   Y-axis pitch]
+                     └─ revolute_tool → tool_body [revolute, Y-axis pitch]
+                          └─ gripper_to_tool (fixed) → gripper_mount
+                               └─ revolute_gripper → gripper_frame [continuous, Z-axis spin]
+                                    ├─ revolute_claw_1 → gripper_claw_1
+                                    └─ revolute_claw_2 → gripper_claw_2
+
+  Collision meshes:
+    Visual elements use *_visuals_Mesh.obj files.
+    Collision elements use matching *_colliders_Mesh.obj files.
+    Mesh vertex data is baked into each link frame: X front, Y left, Z up.
+    These are still mesh collisions; simplify them if simulation performance
+    or contact stability needs improvement.
+
+  ros2_control:
+    Hardware plugin : mock_components/GenericSystem  (swap for real hw plugin)
+    Interfaces      : position command + position/velocity state on all joints
+    Initial values  : all controlled joints start at 0 rad
+-->
+<robot name="excavator_urdf_ros2_ready">
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       JOINTS
+       All revolute velocity limits set to 10 RPM = 1.0472 rad/s.
+       Effort limits are nominal placeholders; tune per actuator spec.
+       ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Slewing ring: full continuous rotation of upper carriage on base (Z) -->
+  <joint name="revolute_carriage" type="continuous">
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+    <parent link="excavator"/>
+    <child link="upper_carriage"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <!-- Continuous joints have no position limits; velocity = 10 RPM -->
+    <limit effort="10000.0" velocity="1.0472"/>
+  </joint>
+  
+  <!-- Lift boom: shoulder pitch in the zeroed test4 frame -->
+  <joint name="revolute_lift" type="revolute">
+    <origin xyz="0.0165 0.0 0.0785" rpy="0.0 0.0 0.0"/>
+    <parent link="upper_carriage"/>
+    <child link="lift_boom"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="-0.8726646" upper="0.5235988" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Tilt boom: elbow pitch; limits are shifted for the rotated test4 mesh -->
+  <joint name="revolute_tilt" type="revolute">
+    <origin xyz="0.4677 0.0 0.0" rpy="0.0 0.0 0.0"/>
+    <parent link="lift_boom"/>
+    <child link="tilt_boom"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="-1.0733775" upper="0.9512044" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Tool pitch: wrist pitch; zero now represents the edited test4 pose -->
+  <joint name="revolute_tool" type="revolute">
+    <origin xyz="0.0 0.0 -0.25" rpy="0.0 0.0 0.0"/>
+    <parent link="tilt_boom"/>
+    <child link="tool_body"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit lower="-0.7835299" upper="1.9217305" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Fixed wrist bracket: attaches gripper_mount rigidly to tool_body -->
+  <joint name="gripper_to_tool" type="fixed">
+    <origin xyz="0.047 0.0 -0.019" rpy="0.0 0.0 0.0"/>
+    <parent link="tool_body"/>
+    <child link="gripper_mount"/>
+  </joint>
+
+  <!-- Gripper spin: continuous rotation of gripper frame around tool Z-axis -->
+  <joint name="revolute_gripper" type="continuous">
+    <origin xyz="-0.0105 0.0 -0.025" rpy="0.0 0.0 -1.5707964"/>
+    <parent link="gripper_mount"/>
+    <child link="gripper_frame"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <!-- Continuous joints have no position limits; velocity = 10 RPM -->
+    <limit effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Gripper claw 1: opens in the positive direction with small close-side overtravel -->
+  <joint name="revolute_claw_1" type="revolute">
+    <origin xyz="0.0 0.025 -0.038" rpy="0.0 0.0 0.0"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_1"/>
+    <axis xyz="1.0 0.0 0.0"/>
+    <limit lower="-0.26" upper="0.8726646" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- Gripper claw 2: mirrors claw 1 with small close-side overtravel -->
+  <joint name="revolute_claw_2" type="revolute">
+    <origin xyz="0.0 -0.025 -0.038" rpy="0.0 0.0 0.0"/>
+    <parent link="gripper_frame"/>
+    <child link="gripper_claw_2"/>
+    <axis xyz="1.0 0.0 0.0"/>
+    <limit lower="-0.8726646" upper="0.26" effort="10000.0" velocity="1.0472"/>
+  </joint>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       LINKS
+       Each link carries: inertial, visual (OBJ), and collision (OBJ).
+       Collision entries point at the *_colliders_Mesh.obj files in meshes/.
+       ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Base link: lower chassis / tracks; treated as world-fixed in simulation -->
+  <link name="excavator">
+    <inertial>
+      <origin xyz="0.0045939 -0.0001728 -0.0382546" rpy="0.0 0.0 0.0"/>
+      <mass value="6.5"/>
+      <inertia ixx="0.049442"  ixy="0.0005321"  ixz="0.0005431"
+               iyy="0.0529756" iyz="-0.0000344"
+               izz="0.0970931"/>
+    </inertial>
+    <visual>
+      <!-- Mesh is baked into the link frame: X front, Y left, Z up -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/lower_carriage_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/lower_carriage_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+ 
+ <!-- Upper carriage: rotating superstructure (cabin, engine, arm base) -->
+  <link name="upper_carriage">
+    <inertial>
+      <origin xyz="-0.0821657 0.0013232 0.0460171" rpy="0.0 0.0 0.0"/>
+      <mass value="8.1"/>
+      <inertia ixx="0.0446463"  ixy="-0.0058658" ixz="0.0002102"
+               iyy="0.0700401"  iyz="-0.0020342"
+               izz="0.095637"/>
+    </inertial>
+    <visual>
+      <!-- Mesh is baked into the link frame: X front, Y left, Z up -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/upper_carriage_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/upper_carriage_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link> 
+
+  <!-- Lift boom: main arm segment; old joint pitch is baked into the mesh frame -->
+  <link name="lift_boom">
+    <inertial>
+      <origin xyz="0.199016 -0.000094 0.0479018" rpy="0.0 0.0 0.0"/>
+      <mass value="1.15299"/>
+      <inertia ixx="0.0014608" ixy="0.0000003" ixz="-0.0001859"
+               iyy="0.021352"  iyz="0.0000042"
+               izz="0.0201932"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/lift_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/lift_boom_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Tilt boom: forearm segment; edited mesh frame is used as the zero pose -->
+  <link name="tilt_boom">
+    <inertial>
+      <origin xyz="0.018407 -0.00005 -0.0648918" rpy="0.0 0.0 0.0"/>
+      <mass value="0.77626"/>
+      <inertia ixx="0.0058744" ixy="0.0"  ixz="-0.0006279"
+               iyy="0.0060442" iyz="0.0"
+               izz="0.0003486"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/tilt_boom_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/tilt_boom_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Tool body: quick-coupler / tool interface plate -->
+  <link name="tool_body">
+    <inertial>
+      <origin xyz="0.0265998 0.0 -0.0101976" rpy="0.0 0.0 0.0"/>
+      <mass value="0.137"/>
+      <inertia ixx="0.0000403" ixy="0.0"       ixz="0.0000048"
+               iyy="0.0000601" iyz="0.0"
+               izz="0.0000815"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/tool_body_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/tool_body_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper mount: bracket that interfaces tool_body to gripper_frame -->
+  <link name="gripper_mount">
+    <inertial>
+      <origin xyz="-0.01131 0.0 -0.01542" rpy="0.0 0.0 0.0"/>
+      <mass value="0.06983"/>
+      <inertia ixx="0.0000177" ixy="0.0"       ixz="0.0000006"
+               iyy="0.0000127" iyz="0.0"
+               izz="0.0000198"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_mount_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_mount_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper frame: structural ring connecting the two claws -->
+  <link name="gripper_frame">
+    <inertial>
+      <origin xyz="0.0 0.0 -0.02261" rpy="0.0 0.0 0.0"/>
+      <mass value="0.07586"/>
+      <inertia ixx="0.0000321" ixy="0.0" ixz="0.0"
+               iyy="0.0000572" iyz="0.0"
+               izz="0.0000607"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_frame_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_frame_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper claw 1 (opens in +X direction) -->
+  <link name="gripper_claw_1">
+    <inertial>
+      <origin xyz="-0.00019 0.0062462 -0.0327046" rpy="0.0 0.0 0.0"/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736"  ixy="-0.0000001" ixz="0.0000012"
+               iyy="0.0003253"  iyz="-0.0000481"
+               izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_claw_1_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_claw_1_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Gripper claw 2 (opens in -X direction, symmetric to claw 1) -->
+  <link name="gripper_claw_2">
+    <inertial>
+      <origin xyz="0.00019 -0.0062462 -0.0327046" rpy="0.0 0.0 0.0"/>
+      <mass value="0.21596"/>
+      <inertia ixx="0.0001736"  ixy="-0.0000001" ixz="-0.0000012"
+               iyy="0.0003253"  iyz="0.0000481"
+               izz="0.000232"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_claw_2_visuals_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </visual>
+    <collision>
+      <!-- Mesh collider; replace with convex/primitive geometry if needed -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <mesh filename="meshes/gripper_claw_2_colliders_Mesh.obj" scale="1.0 1.0 1.0"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       ROS 2 CONTROL
+       Plugin : mock_components/GenericSystem  (for testing / sim)
+       Replace with your real hardware plugin before deployment.
+
+       All joints expose:
+         - command interface : position
+         - state interfaces  : position, velocity
+
+       Initial positions use the zeroed test4 pose:
+         lift  : 0.0 rad
+         tilt  : 0.0 rad
+         tool  : 0.0 rad
+         rest  : 0.0 rad
+       ═══════════════════════════════════════════════════════════════ -->
+	   
+  <ros2_control name="initial_positions" type="system">
+    <hardware>
+      <plugin>mock_components/GenericSystem</plugin>
+    </hardware>
+
+    <!-- Slewing ring - starts at home (0 rad) -->
+    <joint name="revolute_carriage">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper claw 1 - starts closed (0 rad) -->
+    <joint name="revolute_claw_1">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper claw 2 - starts closed (0 rad) -->
+    <joint name="revolute_claw_2">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Gripper spin - starts at home (0 rad) -->
+    <joint name="revolute_gripper">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Lift boom - starts at the zeroed test4 pose -->
+    <joint name="revolute_lift">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Tilt boom - starts at the zeroed test4 pose -->
+    <joint name="revolute_tilt">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+    <!-- Tool pitch - starts at the zeroed test4 pose -->
+    <joint name="revolute_tool">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+
+  </ros2_control>
+
+</robot>
+
+<!--
+  ═══════════════════════════════════════════════════════════════════════
+  COLLISION MESH NOTES
+  ═══════════════════════════════════════════════════════════════════════
+
+  CURRENT STATE
+  ─────────────
+  Collision elements point at meshes/*_colliders_Mesh.obj files, separate
+  from the visual meshes. These files may still be detailed mesh colliders,
+  so simulation performance and contact stability can still improve with
+  simpler geometry.
+
+  RECOMMENDED SIMULATION CLEANUP
+  ──────────────────────────────
+    1. Replace complex collider OBJs with convex hulls or primitive shapes
+       where accuracy is not critical.
+    2. Keep each collision origin/rpy aligned with the matching visual and
+       inertial frame.
+    3. If collider filenames change, update the corresponding <collision>
+       mesh filename in this file.
+  ═══════════════════════════════════════════════════════════════════════
+-->

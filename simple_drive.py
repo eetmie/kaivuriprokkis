@@ -18,11 +18,9 @@ Buttons (remote gamepad, same wire format as drive_logger.py):
     Button 2: toggle hydraulic pump
     Button 3: cycle compensation mode — OFF → raw summary → universal smooth → velocity PID
 
-Left paddle (bench mode): slowly trims pump auto-mode activity_gain_us base level while held.
-    Push forward = more gain, pull back = less. Prints current base value when it changes.
-    In mode 2 (pump gain), the base is further modulated each tick by the universal linkage
-    shape so slow positions get a boost and fast positions are reduced — valve commands stay
-    completely untouched. Also drives left track as normal — fine on the bench.
+In mode 2 (pump gain), the config activity_gain_us is modulated each tick by
+the universal linkage shape so slow positions get a boost and fast positions
+are reduced. Valve commands stay untouched.
 
 The controller runs in DIRECT mode — joystick axes go straight to valves,
 IK/PID are bypassed. Useful for sanity-checking joint readouts (e.g., after
@@ -54,8 +52,6 @@ from tools.linkage_rate_compensation import (
 
 SAMPLING_FREQUENCY = 100              # main loop Hz
 PRINT_DECIMATION = 10                 # print every Nth iteration when enabled (~10Hz)
-PUMP_GAIN_ADJUST_RATE = 80.0         # µs/s per unit of paddle input for bench gain trim
-PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
 
@@ -195,9 +191,9 @@ def parse_args():
     )
     parser.add_argument(
         "--ip",
-        default="192.168.0.132:8080",
+        default="0.0.0.0:8080",
         metavar="HOST[:PORT]",
-        help="UDP remote IP and optional port (default: 192.168.0.132:8080).",
+        help="UDP local bind IP and optional port (default: 0.0.0.0:8080).",
     )
     parser.add_argument(
         "--config-file",
@@ -235,6 +231,11 @@ def parse_args():
         "--linkage-rate-correction",
         action="store_true",
         help="Start with prototype linkage-rate command correction enabled",
+    )
+    parser.add_argument(
+        "--static",
+        action="store_true",
+        help="Use fixed pump static_pulse_us from the PWM config instead of valve-activity auto mode.",
     )
     parser.add_argument(
         "--linkage-rate-table",
@@ -302,6 +303,9 @@ class PWMOnlyController:
     def give_direct_commands(self, commands: dict) -> None:
         self.hardware.send_named_pwm_commands(commands)
 
+    def emergency_stop(self, reset_pump: bool = True) -> None:
+        self.hardware.reset(reset_pump=reset_pump)
+
 
 def main():
     args = parse_args()
@@ -320,9 +324,6 @@ def main():
     else:
         _host, _port = _ip_arg, 8080
 
-    server = UDPSocket(local_id=2)
-    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
-
     # ---- Hardware ----
     _selected = args.robot
     _resolved = robot_profile.get('_resolved_board', _selected)
@@ -333,6 +334,7 @@ def main():
         f"control_config={robot_profile['control_config_file']} | "
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
         f"IMU={'on' if imu_enabled else 'off'} | "
+        f"pump={'static' if args.static else 'auto'} | "
         f"UDP={_host}:{_port} | "
         f"toggleable channels={'disabled' if args.disable else 'enabled'}"
     )
@@ -341,7 +343,7 @@ def main():
     hardware = HardwareInterface(
         config_file=robot_profile['servo_config_file'],
         control_config_file=robot_profile['control_config_file'],
-        pump_auto_mode=True,
+        pump_auto_mode=not args.static,
         toggle_channels=not args.disable,
         stale_timeout_s=0.5,
         enable_pwm=True,
@@ -426,17 +428,28 @@ def main():
 
     print(f"Compensation mode: {COMP_LABELS[comp_mode]}")
 
-    # ---- Pump gain trim state ----
+    # ---- Pump gain state ----
     pwm = hardware.pwm_controller
-    pump_gain_available = pwm is not None and pwm.pump_config is not None and pwm.pump_auto_mode
-    pump_gain_us = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
-    pump_gain_last_printed = pump_gain_us
+    pump_gain_available = (
+        pwm is not None
+        and pwm.pump_config is not None
+        and pwm.pump_auto_mode
+    )
+    pump_gain_base_us = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
     if pump_gain_available:
-        print(f"Pump auto gain trim enabled (left paddle). Initial activity_gain_us={pump_gain_us:.1f} µs")
+        print(f"Pump auto mode enabled. activity_gain_us={pump_gain_base_us:.1f} µs")
+    elif pwm is not None and pwm.pump_config is not None:
+        print(f"Pump static mode enabled. static_pulse_us={pwm.pump_config.static_pulse_us:.1f} µs")
     else:
-        print("Pump gain trim unavailable (no pump config or auto mode off).")
+        print("Pump control unavailable (no pump config).")
 
     # ---- UDP handshake ----
+    # Bind only after hardware/controller startup. If we bind before the slow
+    # init path, clients can send their one-shot handshake and time out before
+    # this process starts reading from the socket.
+    print("Opening UDP listener...")
+    server = UDPSocket(local_id=2)
+    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
     print("Waiting for remote controller...")
     if not server.handshake(timeout=30.0):
         print("UDP handshake failed.")
@@ -500,8 +513,16 @@ def main():
                 # Button B (bit 1): reload PWM/servo config for live valve tuning.
                 if btn(1) and not btn_prev(1):
                     ok = hardware.reload_config()
+                    pump_gain_available = (
+                        pwm is not None
+                        and pwm.pump_config is not None
+                        and pwm.pump_auto_mode
+                    )
+                    if ok and pump_gain_available:
+                        pump_gain_base_us = pwm.get_pump_activity_gain_us()
                     state = "OK" if ok else "FAILED"
-                    print(f"\n[Button B] reload config {state}")
+                    suffix = f" activity_gain_us={pump_gain_base_us:.1f} µs" if ok and pump_gain_available else ""
+                    print(f"\n[Button B] reload config {state}{suffix}")
 
                 # Button X (bit 2): pump toggle (handy on the bench).
                 if btn(2) and not btn_prev(2):
@@ -555,22 +576,13 @@ def main():
                     vel_controller.reset()
             controller.give_direct_commands(canonical_commands)
 
-            # Left paddle: trim the pump activity_gain_us base level.
-            # In mode 2 this base is then further modulated by linkage position below.
-            if pump_gain_available and abs(left_paddle) > 0.05:
-                raw = pump_gain_us + left_paddle * PUMP_GAIN_ADJUST_RATE * loop_period
-                pump_gain_us = float(np.clip(raw, 0.0, pwm.pump_config.pulse_max - pwm.pump_config.pulse_min))
-                if abs(pump_gain_us - pump_gain_last_printed) >= PUMP_GAIN_PRINT_THRESHOLD:
-                    print(f"\n[pump gain base] activity_gain_us={pump_gain_us:.1f} µs")
-                    pump_gain_last_printed = pump_gain_us
-
-            # Apply pump gain: base level, optionally modulated by linkage shape (mode 2).
+            # Apply pump gain: config base level, optionally modulated by linkage shape (mode 2).
             if pump_gain_available:
                 if comp_mode == 2 and universal_compensator is not None:
                     factor = universal_compensator.pump_correction_factor(canonical_commands, joint_angles)
                 else:
                     factor = 1.0
-                pwm.set_pump_activity_gain_us(pump_gain_us * factor)
+                pwm.set_pump_activity_gain_us(pump_gain_base_us * factor)
 
             # Live IMU readout — only when toggled on, decimated to ~10Hz.
             iter_count += 1
@@ -598,14 +610,14 @@ def main():
     finally:
         print("Shutting down...")
         try:
-            controller.give_direct_commands({})       # zero outputs
-            time.sleep(0.2)
-            controller.exit_direct_mode()
+            controller.emergency_stop(reset_pump=True)
+        except Exception:
+            pass
+        try:
             controller.stop()
         except Exception:
             pass
         try:
-            hardware.reset(reset_pump=True)
             hardware.shutdown()
         except Exception:
             pass

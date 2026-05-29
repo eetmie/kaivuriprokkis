@@ -12,7 +12,6 @@ setup(
         (f"share/{package_name}/launch", [
             "launch/bringup_hardware.launch.py",
             "launch/joystick_direct_drive.launch.py",
-            "launch/raw_direct_drive.launch.py",
             "launch/realsense_d435i.launch.py",
         ]),
     ],

@@ -74,12 +74,13 @@ fi
 sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install --upgrade pip
 sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install \
     numpy \
+    scipy \
     numba \
     pyyaml \
     pyserial \
     smbus2
 echo "  OK: Python packages installed into ${VENV_DIR}"
-echo "  NOTE: Skipped Raspberry Pi OLED/display packages and analysis-only scipy/pandas."
+echo "  NOTE: Skipped Raspberry Pi OLED/display packages and analysis-only pandas."
 
 echo ""
 echo "[3/6] Granting device group access..."

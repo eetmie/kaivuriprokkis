@@ -13,23 +13,23 @@ from launch_ros.actions import Node
 def _default_model_dir():
     project_root = os.environ.get("KAIVURI_PROJECT_ROOT")
     if project_root:
-        return str(Path(project_root) / "models" / "test4")
+        return str(Path(project_root) / "models" / "robot")
 
     cwd = Path.cwd()
     candidates = [
-        cwd / "models" / "test4",
-        cwd.parent / "models" / "test4",
-        Path("/home/ai-masi/kaivuriprokkis/models/test4"),
+        cwd / "models" / "robot",
+        cwd.parent / "models" / "robot",
+        Path("/home/ai-masi/kaivuriprokkis/models/robot"),
     ]
     for candidate in candidates:
-        if (candidate / "test.urdf").exists():
+        if (candidate / "robot.urdf").exists():
             return str(candidate)
     return str(candidates[-1])
 
 
 def _load_visual_urdf(model_dir):
     model_dir = Path(model_dir)
-    urdf_path = model_dir / "test.urdf"
+    urdf_path = model_dir / "robot.urdf"
     mesh_dir = model_dir / "meshes"
 
     tree = ET.parse(urdf_path)
@@ -57,7 +57,7 @@ def _load_visual_urdf(model_dir):
 
 def _launch_setup(context, *args, **kwargs):
     description_dir = Path(get_package_share_directory("kaivuri_description"))
-    rviz_config = description_dir / "rviz" / "test4.rviz"
+    rviz_config = description_dir / "rviz" / "robot.rviz"
 
     robot_description = _load_visual_urdf(
         LaunchConfiguration("model_dir").perform(context)

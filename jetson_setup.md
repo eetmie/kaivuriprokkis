@@ -9,7 +9,7 @@ This is the bring-up procedure for the Jetson. Run the stages in order and verif
 ## What the script does
 
 1. Installs OS packages: `python3-pip`, `python3-venv`, `git`, `i2c-tools`, `device-tree-compiler`, `rt-tests`.
-2. Creates/updates the project `.venv` and installs `numpy`, `numba`, `pyyaml`, `pyserial`, `smbus2`.
+2. Creates/updates the project `.venv` and installs `numpy`, `scipy`, `numba`, `pyyaml`, `pyserial`, `smbus2`.
 3. Adds the invoking user to `dialout`, `i2c`, `gpio`, `plugdev` (where present).
 4. **I2C bus 7 → 1 MHz**: builds and applies a device-tree overlay (`clock-frequency = <1000000>` on `/bus@0/i2c@c250000`) via Jetson-IO. Static single speed — correct for a single-device bus.
 5. **RT kernel**: installs NVIDIA prebuilt RT packages from the r36.4 repo, but only after force-checking the board is on r36.4. Skips otherwise.

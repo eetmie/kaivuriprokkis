@@ -750,13 +750,14 @@ class ExcavatorController:
         if self._control_thread is None:
             return
 
+        # Put actuators safe before waiting for the control thread. Thread/USB
+        # teardown can take seconds on Jetson, and the pump must not wait for it.
+        self.emergency_stop(reset_pump=True)
         self._stop_event.set()
         self._control_thread.join(timeout=timeout_s)
         if self._control_thread.is_alive():
             self.logger.warning("Control loop did not stop within timeout; forcing hardware reset")
         self._control_thread = None
-        # Safe actuator state
-        self.hardware.reset(reset_pump=True)
         # Ensure background hardware threads and serial are closed
         try:
             self.hardware.shutdown()
@@ -1255,6 +1256,18 @@ class ExcavatorController:
         with self._direct_lock:
             self._direct_commands = dict(commands)
         self._outputs_zeroed = False
+
+    def emergency_stop(self, reset_pump: bool = True) -> None:
+        """Immediately center valve outputs and optionally stop the pump."""
+        with self._direct_lock:
+            self._direct_commands = {}
+        with self._lock:
+            self._raw_target_position = None
+            self._raw_target_rotation_deg = None
+            self._target_position = None
+            self._target_orientation = None
+        self._outputs_zeroed = True
+        self.hardware.reset(reset_pump=reset_pump)
 
     def _send_direct_commands(self) -> None:
         """Read current direct commands and send them to hardware."""

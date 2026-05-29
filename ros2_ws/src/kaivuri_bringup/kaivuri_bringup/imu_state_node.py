@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import rclpy
@@ -72,7 +73,7 @@ class ImuStateNode(Node):
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
-        self.create_timer(1.0 / rate_hz, self._publish)
+        self.create_timer(1.0 / rate_hz, self._read_joint_angles)
         self.get_logger().info(
             f"Publishing IMU-derived joint_states from {self._project_root} "
             f"(velocity_mode={velocity_mode})"
@@ -119,6 +120,8 @@ class ImuStateNode(Node):
             pose_msg.pose.orientation.y = float(ee_quat[2])
             pose_msg.pose.orientation.z = float(ee_quat[3])
             self._pose_pub.publish(pose_msg)
+
+        return joint_angles_rad
 
     def destroy_node(self) -> bool:
         try:

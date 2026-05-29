@@ -26,9 +26,10 @@ class ImuStateNode(Node):
     def __init__(self) -> None:
         super().__init__("kaivuri_imu_state_node")
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
+        self.declare_parameter("robot", "auto")
         self.declare_parameter("rate_hz", 50.0)
-        self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
-        self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
+        self.declare_parameter("config_file", "")
+        self.declare_parameter("control_config_file", "")
         self.declare_parameter("publish_tool_pose", True)
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
@@ -38,14 +39,23 @@ class ImuStateNode(Node):
         from modules.differential_ik_cfg import load_excavator_robot_config
         from modules.excavator_ik_utils import canonical_joint_angles_from_imus
         from modules.hardware_interface import HardwareInterface
+        from modules.board import resolve_profile
 
         self._canonical_joint_angles_from_imus = canonical_joint_angles_from_imus
         self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        control_config_path = self._resolve_project_path(str(self.get_parameter("control_config_file").value))
+
+        robot_profile = resolve_profile(str(self.get_parameter("robot").value))
+        config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
+        control_config_file = self._param_or_profile("control_config_file", robot_profile["control_config_file"])
+        control_config_path = self._resolve_project_path(control_config_file)
         self._robot_config = load_excavator_robot_config(str(control_config_path))
 
-        config_file = str(self.get_parameter("config_file").value)
         config_path = self._resolve_project_path(config_file)
+        self.get_logger().info(
+            "IMU state profile="
+            f"{robot_profile['profile_name']} board={robot_profile['board']} "
+            f"servo_config={config_path} control_config={control_config_path}"
+        )
         self._hardware = HardwareInterface(
             config_file=str(config_path),
             control_config_file=str(control_config_path),
@@ -68,6 +78,10 @@ class ImuStateNode(Node):
         if path.is_absolute():
             return path
         return self._project_root / path
+
+    def _param_or_profile(self, name: str, profile_value: str) -> str:
+        value = str(self.get_parameter(name).value).strip()
+        return value or profile_value
 
     def _read_joint_angles(self) -> Optional[np.ndarray]:
         try:

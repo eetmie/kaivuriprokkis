@@ -5,23 +5,11 @@ from typing import Dict, List
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
 
 from kaivuri_bringup.project_paths import add_project_import_path, resolve_project_root
 
-
-JOINT_NAMES = [
-    "revolute_carriage",
-    "revolute_lift",
-    "revolute_tilt",
-    "revolute_tool",
-    "revolute_gripper",
-    "revolute_claw_1",
-    "revolute_claw_2",
-]
 
 COMMAND_NAMES = [
     "rotate",
@@ -50,24 +38,18 @@ class RawDirectDriveNode(Node):
         self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("command_topic", "/kaivuri/direct_pwm")
         self.declare_parameter("command_rate_hz", 50.0)
-        self.declare_parameter("state_rate_hz", 30.0)
         self.declare_parameter("command_timeout_s", 0.5)
         self.declare_parameter("ready_timeout_s", 30.0)
         self.declare_parameter("pump_auto_mode", True)
         self.declare_parameter("toggle_channels", True)
         self.declare_parameter("stale_timeout_s", 0.5)
-        self.declare_parameter("publish_tool_pose", True)
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
-        from modules.differential_ik import get_pose_from_joint_angles
-        from modules.differential_ik_cfg import load_excavator_robot_config
-        from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
         from modules.board import resolve_profile
 
-        self._get_pose_from_joint_angles = get_pose_from_joint_angles
         robot_profile = resolve_profile(str(self.get_parameter("robot").value))
         config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
         control_config_file = self._param_or_profile("control_config_file", robot_profile["control_config_file"])
@@ -75,7 +57,6 @@ class RawDirectDriveNode(Node):
         pwm_i2c_addr = self._int_param_or_profile("pwm_i2c_addr", int(robot_profile["pwm_i2c_addr"]), unset=-1)
 
         control_config_path = self._resolve_project_path(control_config_file)
-        self._robot_config = load_excavator_robot_config(str(control_config_path))
 
         config_path = self._resolve_project_path(config_file)
         self.get_logger().info(
@@ -91,9 +72,9 @@ class RawDirectDriveNode(Node):
             toggle_channels=bool(self.get_parameter("toggle_channels").value),
             stale_timeout_s=float(self.get_parameter("stale_timeout_s").value),
             enable_pwm=True,
-            enable_imu=True,
+            enable_imu=False,
             enable_adc=False,
-            start_imu_reader=True,
+            start_imu_reader=False,
             start_adc_reader=False,
             cleanup_disable_osc=False,
             pwm_i2c_bus=pwm_i2c_bus,
@@ -101,28 +82,15 @@ class RawDirectDriveNode(Node):
         )
         self._wait_for_hardware(float(self.get_parameter("ready_timeout_s").value))
 
-        self._controller = ExcavatorController(
-            self._hardware,
-            config=None,
-            enable_perf_tracking=False,
-            control_config_file=str(control_config_path),
-        )
-        self._controller.start()
-        self._controller.enter_direct_mode()
-
         self._latest_commands: Dict[str, float] = {}
         self._last_command_time = 0.0
         self._stale_zeroed = True
 
         command_topic = str(self.get_parameter("command_topic").value)
         self.create_subscription(Float32MultiArray, command_topic, self._on_direct_pwm, 10)
-        self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
-        self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
 
         command_rate_hz = max(1.0, float(self.get_parameter("command_rate_hz").value))
-        state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
         self.create_timer(1.0 / command_rate_hz, self._command_tick)
-        self.create_timer(1.0 / state_rate_hz, self._state_tick)
         self.get_logger().info(
             f"Raw direct drive ready on {command_topic}; order={COMMAND_NAMES}"
         )
@@ -182,47 +150,15 @@ class RawDirectDriveNode(Node):
         age_s = time.monotonic() - self._last_command_time
         if not self._latest_commands or age_s > timeout_s:
             if not self._stale_zeroed:
-                self._controller.give_direct_commands({})
+                self._hardware.reset(reset_pump=False)
                 self._stale_zeroed = True
             return
-        self._controller.give_direct_commands(self._latest_commands)
-
-    def _state_tick(self) -> None:
-        try:
-            joint_angles_deg = self._controller.get_joint_angles()
-            joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
-        except Exception as exc:
-            self.get_logger().warn(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
-            return
-
-        now = self.get_clock().now().to_msg()
-        joint_msg = JointState()
-        joint_msg.header.stamp = now
-        joint_msg.name = JOINT_NAMES
-        joint_msg.position = [float(v) for v in joint_angles_rad[:4]] + [0.0, 0.0, 0.0]
-        self._joint_pub.publish(joint_msg)
-
-        if bool(self.get_parameter("publish_tool_pose").value):
-            ee_pos, ee_quat = self._get_pose_from_joint_angles(joint_angles_rad, self._robot_config)
-            pose_msg = PoseStamped()
-            pose_msg.header.stamp = now
-            pose_msg.header.frame_id = "excavator"
-            pose_msg.pose.position.x = float(ee_pos[0])
-            pose_msg.pose.position.y = float(ee_pos[1])
-            pose_msg.pose.position.z = float(ee_pos[2])
-            pose_msg.pose.orientation.w = float(ee_quat[0])
-            pose_msg.pose.orientation.x = float(ee_quat[1])
-            pose_msg.pose.orientation.y = float(ee_quat[2])
-            pose_msg.pose.orientation.z = float(ee_quat[3])
-            self._pose_pub.publish(pose_msg)
+        self._hardware.send_named_pwm_commands(self._latest_commands)
+        self._stale_zeroed = False
 
     def destroy_node(self) -> bool:
         try:
-            self._controller.give_direct_commands({})
-            self._controller.stop()
-        except Exception:
-            pass
-        try:
+            self._hardware.reset(reset_pump=False)
             self._hardware.shutdown()
         except Exception:
             pass

@@ -14,6 +14,7 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration("use_sim_time")
     project_root = LaunchConfiguration("project_root")
+    robot = LaunchConfiguration("robot")
     rate_hz = LaunchConfiguration("rate_hz")
 
     return LaunchDescription([
@@ -22,6 +23,7 @@ def generate_launch_description():
             "project_root",
             default_value=EnvironmentVariable("KAIVURI_PROJECT_ROOT", default_value="/work"),
         ),
+        DeclareLaunchArgument("robot", default_value="auto"),
         DeclareLaunchArgument("rate_hz", default_value="50.0"),
         Node(
             package="robot_state_publisher",
@@ -40,6 +42,7 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "project_root": project_root,
+                "robot": robot,
                 "rate_hz": rate_hz,
             }],
         ),

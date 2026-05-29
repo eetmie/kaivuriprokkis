@@ -15,6 +15,7 @@ def generate_launch_description():
     raw_max = LaunchConfiguration("raw_max")
     command_timeout_s = LaunchConfiguration("command_timeout_s")
     joystick_publish_rate = LaunchConfiguration("joystick_publish_rate")
+    state_rate_hz = LaunchConfiguration("state_rate_hz")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -29,6 +30,7 @@ def generate_launch_description():
         DeclareLaunchArgument("raw_max", default_value="127.0"),
         DeclareLaunchArgument("command_timeout_s", default_value="0.5"),
         DeclareLaunchArgument("joystick_publish_rate", default_value="100"),
+        DeclareLaunchArgument("state_rate_hz", default_value="50.0"),
         Node(
             package="kaivuri_bringup",
             executable="udp_joystick_values_node", # UDP server  to receive joystick values
@@ -51,6 +53,17 @@ def generate_launch_description():
                 "input_topic": joystick_topic,
                 "output_topic": direct_pwm_topic,
                 "raw_max": raw_max,
+            }],
+        ),
+        Node(
+            package="kaivuri_bringup",
+            executable="imu_state_node",
+            name="kaivuri_imu_state_node",
+            output="screen",
+            parameters=[{
+                "project_root": project_root,
+                "robot": robot,
+                "rate_hz": ParameterValue(state_rate_hz, value_type=float),
             }],
         ),
         Node(

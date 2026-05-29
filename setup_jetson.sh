@@ -6,12 +6,14 @@
 # serial. This intentionally does not configure Raspberry Pi boot overlays,
 # virtual i2c-gpio buses, or the OLED systemd service from setup.sh.
 #
-# I2C bus 7 at 1 MHz:
-#   The RPi dtparam=i2c_arm_baudrate path does NOT apply to Jetson. Instead the
-#   1 MHz speed is set with a device-tree overlay that bumps clock-frequency on
-#   node /bus@0/i2c@c250000 and is applied through Jetson-IO. This script
-#   builds, installs, and applies that overlay (step [4/6]). The bus speed
-#   takes effect after the reboot at the end. See the I2C7/RT guide section 4.
+# I2C bus 7 speed:
+#   The Jetson stock default for node /bus@0/i2c@c250000 is 400 kHz, which the
+#   PCA9685 handles fine, so by default this script leaves the bus alone.
+#   1 MHz is opt-in (SETUP_I2C_1MHZ=1). The RPi dtparam=i2c_arm_baudrate path
+#   does NOT apply to Jetson; when opted in, the 1 MHz speed is set with a
+#   device-tree overlay that bumps clock-frequency on that node and is applied
+#   through Jetson-IO (step [4/6]), taking effect after reboot. Before going to
+#   1 MHz, check pull-ups / rise time on a scope. See the I2C7/RT guide section 4.
 #
 # RT (PREEMPT_RT) kernel:
 #   This script installs NVIDIA's prebuilt RT kernel packages from the r36.4
@@ -27,7 +29,7 @@
 # reboot.
 #
 # Optional toggles (env vars):
-#   SETUP_I2C_1MHZ=0   skip the I2C-7 1 MHz overlay
+#   SETUP_I2C_1MHZ=1   enable the I2C-7 1 MHz overlay (default: off => stock 400 kHz)
 #   SETUP_RT_KERNEL=0  skip the RT kernel install
 #   FORCE_RT=1         install RT packages even if the release is not r36.4
 #                      (not recommended; can break boot on the wrong release)
@@ -91,10 +93,12 @@ for group in dialout i2c gpio plugdev; do
 done
 
 echo ""
-echo "[4/6] Configuring I2C bus ${I2C_BUS} for 1 MHz (device-tree overlay)..."
-if [ "${SETUP_I2C_1MHZ:-1}" != "1" ]; then
-    echo "  SKIP: SETUP_I2C_1MHZ != 1"
+echo "[4/6] I2C bus ${I2C_BUS} speed (1 MHz overlay is opt-in)..."
+if [ "${SETUP_I2C_1MHZ:-0}" != "1" ]; then
+    echo "  SKIP: 1 MHz overlay not requested; bus stays at stock 400 kHz."
+    echo "        Set SETUP_I2C_1MHZ=1 to build and apply the 1 MHz overlay."
 else
+    echo "  Requested 1 MHz; building and applying device-tree overlay..."
     # Verify what Linux calls i2c-7 actually maps to the expected DT node.
     I2C7_OF_NODE=""
     if [ -e "/sys/bus/i2c/devices/i2c-${I2C_BUS}/of_node" ]; then

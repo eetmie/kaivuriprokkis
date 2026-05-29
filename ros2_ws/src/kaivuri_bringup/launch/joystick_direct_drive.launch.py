@@ -57,7 +57,7 @@ def generate_launch_description():
         ),
         Node(
             package="kaivuri_bringup",
-            executable="imu_state_node",
+            executable="imu_state_node", # Reads IMU's and publishes
             name="kaivuri_imu_state_node",
             output="screen",
             parameters=[{

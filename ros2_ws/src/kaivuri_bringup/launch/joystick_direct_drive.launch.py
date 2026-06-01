@@ -13,7 +13,6 @@ def generate_launch_description():
     joystick_topic = LaunchConfiguration("joystick_topic")
     direct_pwm_topic = LaunchConfiguration("direct_pwm_topic")
     raw_max = LaunchConfiguration("raw_max")
-    deadband = LaunchConfiguration("deadband")
     command_timeout_s = LaunchConfiguration("command_timeout_s")
 
     return LaunchDescription([
@@ -27,7 +26,6 @@ def generate_launch_description():
         DeclareLaunchArgument("joystick_topic", default_value="joystick_values"),
         DeclareLaunchArgument("direct_pwm_topic", default_value="/kaivuri/direct_pwm"),
         DeclareLaunchArgument("raw_max", default_value="127.0"),
-        DeclareLaunchArgument("deadband", default_value="0.05"),
         DeclareLaunchArgument("command_timeout_s", default_value="0.5"),
         Node(
             package="kaivuri_bringup",
@@ -50,7 +48,6 @@ def generate_launch_description():
                 "input_topic": joystick_topic,
                 "output_topic": direct_pwm_topic,
                 "raw_max": raw_max,
-                "deadband": deadband,
             }],
         ),
         Node(

@@ -193,6 +193,53 @@ While driving, the same node publishes:
 - `/joint_states`
 - `/kaivuri/tool_pose`
 
+## IK End-Effector Control
+
+Use this only when the machine is safe to move. This starts the existing Python
+`ExcavatorController` in IK mode and exposes ROS topics for end-effector
+targets. The controller still owns the IK, reachability check, PID loop, and PWM
+output.
+
+```bash
+cd /home/joel/kaivuriprokkis
+ros2-jazzy bash -lc 'cd /work/ros2_ws && source install/setup.bash && ros2 launch kaivuri_bringup ik_pose_control.launch.py'
+```
+
+Target topics:
+
+```text
+/kaivuri/target_pose
+geometry_msgs/msg/PoseStamped
+```
+
+Position is `[x, y, z]` in the `excavator` frame. The orientation quaternion is
+reduced to the body-frame tool pitch that the current 4-joint excavator can
+control.
+
+```text
+/kaivuri/target_pose_y
+std_msgs/msg/Float32MultiArray
+```
+
+Data order:
+
+```text
+[x, y, z, rot_y_deg]
+```
+
+Example small target:
+
+```bash
+ros2 topic pub --once /kaivuri/target_pose_y std_msgs/msg/Float32MultiArray \
+  "{data: [0.45, 0.00, 0.02, 0.0]}"
+```
+
+The node clears the active IK target if no new target arrives within
+`command_timeout_s`, default `1.0`. While running, it publishes:
+
+- `/joint_states`
+- `/kaivuri/tool_pose`
+
 If running outside the repo-mounted Docker layout, set:
 
 ```bash

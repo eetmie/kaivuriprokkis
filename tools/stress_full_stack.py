@@ -243,7 +243,7 @@ def main() -> int:
             config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"),
             control_config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
             log_level=args.log_level.upper(),
-            pump_auto_mode=True,
+            pump_auto_mode=False,
             cleanup_disable_osc=False,
             perf_enabled=True,
             enable_adc=True,

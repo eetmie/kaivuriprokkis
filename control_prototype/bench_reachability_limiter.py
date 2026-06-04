@@ -119,7 +119,7 @@ def _build_ik_signals_fn() -> Tuple[Callable[[np.ndarray], Tuple[float, float]],
     signals_fn(angles_rad) -> (yoshikawa, cond) for a 5x4 reduced Jacobian
     (x, y, z, pitch, yaw) -- matches what the live IK exposes.
     """
-    from modules.differential_ik import (
+    from modules.ik import (
         compute_jacobian_from_joint_angles,
         compute_jacobian_metrics,
     )

@@ -12,8 +12,8 @@ cylindrical/radial coordinate support (to be added later).
 import numpy as np
 from typing import Tuple
 
-from .differential_ik_cfg import RobotConfig
-from .differential_ik import (
+from .config import RobotConfig
+from .solver import (
     extract_axis_rotation,
     project_to_rotation_axes,
     propagate_base_rotation,
@@ -26,7 +26,7 @@ from .differential_ik import (
     ik_method_transpose,
     ik_method_damped_least_squares,
 )
-from .quaternion_math import (
+from .math import (
     quat_normalize, quat_multiply, quat_conjugate, quat_from_axis_angle,
 )
 

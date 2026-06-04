@@ -5,7 +5,8 @@ from typing import Optional
 
 import numpy as np
 
-from .excavator_ik_utils import get_joint_positions, get_pose
+from .direct_controller import DirectController
+from .ik import get_joint_positions, get_pose
 from .control_protocol import (
     ControlCommand,
     ControlMode,
@@ -31,6 +32,7 @@ class RobotService:
     def __init__(self, controller, hardware):
         self.controller = controller
         self.hardware = hardware
+        self.direct = DirectController(hardware)
         self.robot_config = getattr(controller, "robot_config", None)
         if self.robot_config is None:
             raise ValueError("RobotService requires controller.robot_config")
@@ -90,10 +92,11 @@ class RobotService:
                 self.state.paused = False
 
             if command.mode == ControlMode.DIRECT and self.state.mode != ControlMode.DIRECT:
-                self.controller.enter_direct_mode()
+                self.controller.suspend_ik_output()
                 self.state.mode = ControlMode.DIRECT
             elif command.mode == ControlMode.IK and self.state.mode != ControlMode.IK:
-                self.controller.exit_direct_mode()
+                self.direct.clear()
+                self.controller.resume_ik_output()
                 self.state.mode = ControlMode.IK
                 try:
                     measured_pos, measured_rot = self.controller.get_pose()
@@ -115,12 +118,13 @@ class RobotService:
                     float(command.direct.bucket),
                 )
                 if not self.state.paused:
-                    self.controller.give_direct_commands({
+                    self.direct.give_commands({
                         "rotate": self.state.direct_command.slew,
                         "lift_boom": self.state.direct_command.boom,
                         "tilt_boom": self.state.direct_command.arm,
                         "scoop": self.state.direct_command.bucket,
                     })
+                    self.direct.send_pending()
             else:
                 requested_pose = PoseTarget(
                     float(command.pose.x),

@@ -82,6 +82,6 @@ def load_real_robot_config():
     Imported lazily so unit tests that don't need the full IK stack
     (and its numba compilation cost) avoid the import.
     """
-    from modules.differential_ik_cfg import load_excavator_robot_config
+    from modules.ik import load_excavator_robot_config
 
     return load_excavator_robot_config("configuration_files/profiles/rpi/control_config.yaml")

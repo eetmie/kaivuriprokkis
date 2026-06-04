@@ -1,3 +1,7 @@
+# TODO(refactor #3 follow-up): hard-code the excavator chain (slew,
+# lift_boom, tilt_boom, scoop, optional rototilt tool) and reject YAMLs
+# that don't match — no more generic N-DOF support. See
+# modules/ik/REFACTOR_NOTES.md for the full plan.
 """
 Configuration dataclasses and robot model loading for differential IK.
 
@@ -278,8 +282,8 @@ class CheckDOF:
                 - "independent_orientation_dofs": int - number of independently controllable orientations
                 - "total_independent_dofs": int - position_rank + independent_orientation_dofs
         """
-        # Lazy import to avoid circular dependency (compute_jacobian is in differential_ik.py)
-        from .differential_ik import compute_jacobian
+        # Lazy import to avoid circular dependency (compute_jacobian lives in .solver)
+        from .solver import compute_jacobian
 
         # 6 x n Jacobian
         J = compute_jacobian(quats, self.robot_config)

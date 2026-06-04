@@ -53,7 +53,7 @@ class RawDirectDriveNode(Node):
         self.declare_parameter("state_rate_hz", 30.0)
         self.declare_parameter("command_timeout_s", 0.5)
         self.declare_parameter("ready_timeout_s", 30.0)
-        self.declare_parameter("pump_auto_mode", True)
+        self.declare_parameter("pump_auto_mode", False)
         self.declare_parameter("toggle_channels", True)
         self.declare_parameter("stale_timeout_s", 0.5)
         self.declare_parameter("publish_tool_pose", True)
@@ -61,8 +61,8 @@ class RawDirectDriveNode(Node):
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
-        from modules.differential_ik import get_pose_from_joint_angles
-        from modules.differential_ik_cfg import load_excavator_robot_config
+        from modules.ik import get_pose_from_joint_angles, load_excavator_robot_config
+        from modules.direct_controller import DirectController
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
         from modules.board import resolve_profile
@@ -108,7 +108,8 @@ class RawDirectDriveNode(Node):
             control_config_file=str(control_config_path),
         )
         self._controller.start()
-        self._controller.enter_direct_mode()
+        self._direct = DirectController(self._hardware)
+        self._controller.suspend_ik_output()
 
         self._latest_commands: Dict[str, float] = {}
         self._last_command_time = 0.0
@@ -182,10 +183,12 @@ class RawDirectDriveNode(Node):
         age_s = time.monotonic() - self._last_command_time
         if not self._latest_commands or age_s > timeout_s:
             if not self._stale_zeroed:
-                self._controller.give_direct_commands({})
+                self._direct.clear()
+                self._direct.send_pending()
                 self._stale_zeroed = True
             return
-        self._controller.give_direct_commands(self._latest_commands)
+        self._direct.give_commands(self._latest_commands)
+        self._direct.send_pending()
 
     def _state_tick(self) -> None:
         try:
@@ -225,7 +228,8 @@ class RawDirectDriveNode(Node):
 
     def destroy_node(self) -> bool:
         try:
-            self._controller.give_direct_commands({})
+            self._direct.clear()
+            self._direct.send_pending()
             self._controller.stop()
         except Exception:
             pass

@@ -13,12 +13,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .differential_ik import (
+from .ik import (
     joint_angles_to_absolute_quaternions,
     forward_kinematics_with_ee_offset_core,
+    compute_relative_joint_angles,
+    quat_from_axis_angle, quat_multiply, quat_normalize,
 )
-from .excavator_ik_utils import compute_relative_joint_angles
-from .quaternion_math import quat_from_axis_angle, quat_multiply, quat_normalize
 
 
 @dataclass(frozen=True)

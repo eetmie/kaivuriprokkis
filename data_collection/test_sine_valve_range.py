@@ -82,8 +82,9 @@ def wait_for_hardware_ready(hardware, timeout_s: float = 15.0) -> None:
         time.sleep(0.1)
 
 
-def settle_joint(controller, settle_s: float) -> None:
-    controller.give_direct_commands(make_zero_commands())
+def settle_joint(direct, settle_s: float) -> None:
+    direct.give_commands(make_zero_commands())
+    direct.send_pending()
     time.sleep(settle_s)
 
 
@@ -100,6 +101,7 @@ def format_step_line(result: dict[str, float | bool]) -> str:
 
 def run_frequency_step(
     controller,
+    direct,
     joint_name: str,
     center_deg: float,
     freq_hz: float,
@@ -136,7 +138,8 @@ def run_frequency_step(
             command = clip(command, -max_command, max_command)
             cmd_dict = make_zero_commands()
             cmd_dict[joint_name] = command
-            controller.give_direct_commands(cmd_dict)
+            direct.give_commands(cmd_dict)
+            direct.send_pending()
 
             angles.append(current_angle_deg)
             commands.append(command)
@@ -151,7 +154,8 @@ def run_frequency_step(
     except KeyboardInterrupt:
         interrupted = True
     finally:
-        controller.give_direct_commands(make_zero_commands())
+        direct.give_commands(make_zero_commands())
+        direct.send_pending()
 
     if not angles:
         raise RuntimeError(f"No IMU samples collected for {joint_name} at {freq_hz:.2f} Hz")
@@ -175,6 +179,7 @@ def run_frequency_step(
 
 def run_joint_sweep(
     controller,
+    direct,
     joint_name: str,
     target_swing_deg: float,
     start_freq_hz: float,
@@ -188,7 +193,7 @@ def run_joint_sweep(
     max_command: float,
     settle_s: float,
 ) -> tuple[list[str], bool]:
-    settle_joint(controller, settle_s)
+    settle_joint(direct, settle_s)
     center_deg = get_joint_angle_deg(controller, joint_name)
 
     lines = []
@@ -210,6 +215,7 @@ def run_joint_sweep(
     while freq_hz <= max_freq_hz + 1e-9:
         result = run_frequency_step(
             controller=controller,
+            direct=direct,
             joint_name=joint_name,
             center_deg=center_deg,
             freq_hz=freq_hz,
@@ -254,6 +260,7 @@ def run_joint_sweep(
 
 
 def run_hardware_test(args) -> list[str]:
+    from modules.direct_controller import DirectController
     from modules.excavator_controller import ExcavatorController
     from modules.hardware_interface import HardwareInterface
 
@@ -276,6 +283,7 @@ def run_hardware_test(args) -> list[str]:
 
     hardware = None
     controller = None
+    direct = None
 
     try:
         print("[hw] Initializing hardware...")
@@ -309,13 +317,15 @@ def run_hardware_test(args) -> list[str]:
         )
         controller.start()
         time.sleep(2.0)
-        controller.enter_direct_mode()
-        print("[hw] Controller ready in direct mode")
+        direct = DirectController(hardware)
+        controller.suspend_ik_output()
+        print("[hw] Controller ready; IK output suspended (DirectController owns bus)")
 
         for joint_name in args.joints:
             print(f"\n[joint] {joint_name}")
             joint_lines, interrupted = run_joint_sweep(
                 controller=controller,
+                direct=direct,
                 joint_name=joint_name,
                 target_swing_deg=args.target_swing_deg,
                 start_freq_hz=args.start_freq_hz,
@@ -336,9 +346,11 @@ def run_hardware_test(args) -> list[str]:
     finally:
         if controller is not None:
             try:
-                controller.give_direct_commands(make_zero_commands())
+                if direct is not None:
+                    direct.give_commands(make_zero_commands())
+                    direct.send_pending()
                 time.sleep(0.3)
-                controller.exit_direct_mode()
+                controller.resume_ik_output()
                 controller.stop()
             except Exception:
                 pass

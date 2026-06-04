@@ -26,16 +26,12 @@ import yaml
 # Import project modules
 from . import reachability as reachability_module
 from .pid import PIDController
-from .differential_ik_cfg import IKControllerConfig, load_excavator_robot_config
-from .differential_ik import (
-    IKController, extract_axis_rotation,
+from .ik import (
+    IKController, IKControllerConfig, load_excavator_robot_config,
+    extract_axis_rotation,
     joint_angles_to_absolute_quaternions, get_pose_from_joint_angles,
-)
-from .excavator_ik_utils import (
     canonical_joint_angles_from_imus, gravity_pitch_from_quat,
     compute_relative_joint_angles, warmup_numba_functions,
-)
-from .quaternion_math import (
     quat_from_axis_angle, quat_multiply, quat_conjugate, quat_normalize,
     compute_pose_error,
 )
@@ -287,13 +283,18 @@ class MotionProcessor:
 
     def sync_feedback(
         self,
-        position: np.ndarray,
+        position: Optional[np.ndarray],
         rotation_deg: float,
         linear_velocity: Optional[float] = None,
         rot_velocity_dps: Optional[float] = None
     ):
-        """Align internal state with measured pose/velocity (cheap re-seed)."""
-        self.state.current_position = np.array(position, dtype=np.float32)
+        """Align internal state with measured pose/velocity (cheap re-seed).
+
+        Pass position=None to skip position reseeding (e.g. in the control loop
+        where reseeding every tick would kill the IK error signal).
+        """
+        if position is not None:
+            self.state.current_position = np.array(position, dtype=np.float32)
         self.state.current_rotation_deg = float(rotation_deg)
         if linear_velocity is not None:
             self.state.current_velocity = float(abs(linear_velocity))
@@ -401,7 +402,8 @@ class ExcavatorController:
                  enable_perf_tracking: bool = False, log_level: str = "INFO",
                  rt_priority: int = 0, rt_lock_memory: bool = False,
                  rt_cpu_core: Optional[int] = None,
-                 control_config_file: Optional[str] = None):
+                 control_config_file: Optional[str] = None,
+                 disable_motion_smoothing: bool = False):
         """Initialize the excavator controller.
 
         Args:
@@ -647,20 +649,19 @@ class ExcavatorController:
             _max_accel = float(_PATHING_CONFIG.max_accel_mps2)
             _max_decel = float(_PATHING_CONFIG.max_decel_mps2)
             _max_jerk = float(_PATHING_CONFIG.max_jerk_mps3)
-            _enable_jerk = bool(getattr(_PATHING_CONFIG, 'enable_jerk', True))
+            _enable_jerk = bool(getattr(_PATHING_CONFIG, 'enable_jerk', False))
         else:
-            # Sensible defaults if pathing_config not available
-            _speed_mps = 0.02
+            _speed_mps = 0.07
             _max_accel = 0.5
             _max_decel = 0.5
             _max_jerk = 2.0
-            _enable_jerk = True
+            _enable_jerk = False
         self.motion_processor = MotionProcessor(
             max_velocity=_speed_mps,
             max_acceleration=_max_accel,
             max_deceleration=_max_decel,
             max_jerk=_max_jerk,
-            enable_smoothing=_enable_jerk,
+            enable_smoothing=_enable_jerk and not disable_motion_smoothing,
         )
 
         # Cache hardware capability flags — hasattr() is non-trivial to call every tick.
@@ -691,10 +692,10 @@ class ExcavatorController:
         self._target_rot_velocity_dps = 0.0
         self._outputs_zeroed = False  # Track whether we've already sent a zero/neutral command
 
-        # Direct control mode (bypasses IK/PID, sends normalized commands straight to valves)
-        self._direct_mode = False
-        self._direct_commands = {}  # joint name -> float [-1, 1]
-        self._direct_lock = threading.Lock()
+        # When True, the IK loop keeps reading sensors but does NOT write
+        # hardware. Callers use this to hand the PWM bus over to a
+        # ``DirectController`` (see modules/direct_controller.py).
+        self._output_suspended = False
 
         # Velocity command mode (joint velocity PI for boom/arm/bucket; slew/tracks pass-through)
         self._vel_cmd_mode = False
@@ -1206,27 +1207,25 @@ class ExcavatorController:
 
     # -------------- Direct control mode (bypass IK/PID) --------------
 
-    def enter_direct_mode(self) -> None:
-        """Switch to direct valve control, bypassing IK and PID."""
-        with self._direct_lock:
-            self._direct_commands = {}
+    def suspend_ik_output(self) -> None:
+        """Hand the PWM bus over to a caller-owned :class:`DirectController`.
+
+        The control loop keeps reading sensors so joint angles, IMU quats and
+        gyro velocities stay fresh, but stops writing to hardware. PIDs and
+        IK command buffers are reset so we don't carry stale state into the
+        next IK resume.
+        """
         for pid in self.joint_pids:
             pid.reset()
         with self._lock:
-            self._direct_mode = True
+            self._output_suspended = True
         self._outputs_zeroed = False
-        self.logger.info("Entered direct control mode")
+        self.logger.info("IK output suspended (DirectController owns PWM bus)")
 
-    def exit_direct_mode(self) -> None:
-        """Switch back to IK mode, syncing targets to current measured pose."""
-        with self._direct_lock:
-            self._direct_commands = {}
-
-        # Reset PIDs to avoid residual terms
+    def resume_ik_output(self) -> None:
+        """Resume IK-driven PWM output, syncing target pose to current measured pose."""
         for pid in self.joint_pids:
             pid.reset()
-
-        # Reset IK internal command buffers
         try:
             self.ik_controller.reset()
         except Exception:
@@ -1238,29 +1237,15 @@ class ExcavatorController:
             position=self._current_position,
             rotation_deg=self._current_orientation_y_deg
         )
-        # Set raw target to current pose so give_pose() starts from reality
         self.give_pose(self._current_position, self._current_orientation_y_deg)
 
         with self._lock:
-            self._direct_mode = False
+            self._output_suspended = False
         self._outputs_zeroed = False
-        self.logger.info("Exited direct control mode (synced to measured pose)")
-
-    def give_direct_commands(self, commands: dict) -> None:
-        """Set normalized [-1, 1] valve commands for direct mode.
-
-        Args:
-            commands: dict of joint name -> float, e.g.
-                      {'rotate': 0.3, 'lift_boom': -0.5, 'tilt_boom': 0.0, 'scoop': 0.0}
-        """
-        with self._direct_lock:
-            self._direct_commands = dict(commands)
-        self._outputs_zeroed = False
+        self.logger.info("IK output resumed (synced to measured pose)")
 
     def emergency_stop(self, reset_pump: bool = True) -> None:
         """Immediately center valve outputs and optionally stop the pump."""
-        with self._direct_lock:
-            self._direct_commands = {}
         with self._lock:
             self._raw_target_position = None
             self._raw_target_rotation_deg = None
@@ -1269,33 +1254,19 @@ class ExcavatorController:
         self._outputs_zeroed = True
         self.hardware.reset(reset_pump=reset_pump)
 
-    def _send_direct_commands(self) -> None:
-        """Read current direct commands and send them to hardware."""
-        with self._direct_lock:
-            cmds = dict(self._direct_commands)
-
-        if not cmds:
-            if not self._outputs_zeroed:
-                self.hardware.reset(reset_pump=False)
-                self._outputs_zeroed = True
-            return
-
-        self.hardware.send_named_pwm_commands(cmds)
-        self._outputs_zeroed = False
-
     def enter_velocity_command_mode(self) -> None:
         """Switch to velocity-command mode.
 
         lift_boom / tilt_boom / scoop are PI-controlled to a desired rad/s target.
         rotate / trackL / trackR pass through as normalized [-1, 1] direct commands.
-        Mutually exclusive with direct mode and IK mode.
+        Mutually exclusive with IK mode and with output-suspended mode.
         """
         with self._vel_cmd_lock:
             self._vel_cmd_commands = {}
             for k in self._vel_cmd_integrals:
                 self._vel_cmd_integrals[k] = 0.0
         with self._lock:
-            self._direct_mode = False
+            self._output_suspended = False
             self._vel_cmd_mode = True
         self._outputs_zeroed = False
         self.logger.info("Entered velocity command mode")
@@ -1574,14 +1545,13 @@ class ExcavatorController:
                 self._perf_tracker.stage_end('sensor')
 
                 with self._lock:
-                    direct_mode = self._direct_mode
+                    output_suspended = self._output_suspended
                     vel_cmd_mode = self._vel_cmd_mode
 
-                if direct_mode:
-                    # Direct mode: bypass smoothing, IK, and PID
-                    self._perf_tracker.stage_start('pwm')
-                    self._send_direct_commands()
-                    self._perf_tracker.stage_end('pwm')
+                if output_suspended:
+                    # Caller (DirectController) owns the PWM bus; we keep
+                    # state fresh but write nothing this tick.
+                    pass
                 elif vel_cmd_mode:
                     # Velocity command mode: PI tracks desired joint velocities
                     self._perf_tracker.stage_start('pwm')
@@ -1696,9 +1666,11 @@ class ExcavatorController:
                 self._target_orientation = None
             return
 
-        # Keep smoother aligned with measured state each loop
+        # Sync only velocity/rotation state — NOT position. Reseeding position
+        # every tick would cap the smoothed target to current_pos + 1 tick of
+        # motion, giving near-zero IK error and near-zero PID output.
         self.motion_processor.sync_feedback(
-            position=current_pos,
+            position=None,
             rotation_deg=current_rot,
             linear_velocity=lin_vel,
             rot_velocity_dps=rot_vel

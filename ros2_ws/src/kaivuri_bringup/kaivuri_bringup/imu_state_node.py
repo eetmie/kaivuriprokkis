@@ -38,8 +38,7 @@ class ImuStateNode(Node):
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
-        from modules.differential_ik import get_pose_from_joint_angles
-        from modules.differential_ik_cfg import load_excavator_robot_config
+        from modules.ik import get_pose_from_joint_angles, load_excavator_robot_config
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
 
@@ -68,7 +67,9 @@ class ImuStateNode(Node):
         self._controller.start()
         velocity_mode = str(self.get_parameter("velocity_mode").value).strip()
         self._controller.set_velocity_mode(velocity_mode)
-        self._controller.enter_direct_mode()
+        # State-only node: suspend the IK loop's PWM output. The controller
+        # keeps reading sensors so joint angles / FK stay fresh.
+        self._controller.suspend_ik_output()
 
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)

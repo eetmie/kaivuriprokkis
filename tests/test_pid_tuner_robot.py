@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from modules.hardware_interface import HardwareInterface  # noqa: E402
 from modules.udp_socket import UDPSocket  # noqa: E402
-from tools import pid_tuner_robot  # noqa: E402
+from tools.pid_tuner import robot as pid_tuner_robot  # noqa: E402
 
 
 class _FakeUDPSocket:
@@ -116,7 +116,8 @@ class PIDTunerRobotTests(unittest.TestCase):
                 return [[1.0, 0.0, 0.0, 0.0]] * 4
 
         expected = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
-        with patch.object(pid_tuner_robot, "canonical_joint_angles_from_imus", return_value=expected) as canonical:
+        with patch.object(pid_tuner_robot, "canonical_joint_angles_from_imus",
+                          return_value=expected) as canonical:
             angles = pid_tuner_robot._read_joint_angles(Hardware(), object())
 
         np.testing.assert_allclose(angles, expected)
@@ -154,34 +155,40 @@ class PIDTunerRobotTests(unittest.TestCase):
 
         with patch.object(pid_tuner_robot, "UDPSocket", _FakeUDPSocket), \
                 patch.object(pid_tuner_robot, "HardwareInterface", _FakeHardware), \
-                patch.object(pid_tuner_robot, "load_excavator_robot_config", return_value=object()), \
+                patch.object(pid_tuner_robot, "load_excavator_robot_config",
+                             return_value=object()), \
                 patch.object(
                     pid_tuner_robot,
                     "canonical_joint_angles_from_imus",
-                    return_value=np.asarray([0.0, 0.0, math.radians(5.0), 0.0], dtype=np.float32),
+                    return_value=np.asarray([0.0, 0.0, math.radians(5.0), 0.0],
+                                            dtype=np.float32),
                 ), \
                 patch.object(sys, "argv", [
-                    "pid_tuner_robot.py",
+                    "robot.py",
                     "--host", "127.0.0.1",
                     "--port", "8090",
                     "--rate", "50",
                     "--log-level", "ERROR",
                 ]):
-            rc = pid_tuner_robot.main()
+            rc = pid_tuner_robot.main_joint()
 
         self.assertEqual(rc, 0)
         self.assertEqual(len(_FakeUDPSocket.instances), 1)
         self.assertEqual(len(_FakeHardware.instances), 1)
 
         sock = _FakeUDPSocket.instances[0]
-        self.assertEqual(sock.setup_kwargs["inputs"], f'{pid_tuner_robot.COMMAND_SIZE}f')
-        self.assertEqual(sock.setup_kwargs["outputs"], f'{pid_tuner_robot.TELEMETRY_SIZE}f')
+        self.assertEqual(sock.setup_kwargs["inputs"],
+                         f'{pid_tuner_robot.COMMAND_SIZE}f')
+        self.assertEqual(sock.setup_kwargs["outputs"],
+                         f'{pid_tuner_robot.TELEMETRY_SIZE}f')
         self.assertTrue(sock.setup_kwargs["is_server"])
         self.assertTrue(sock.closed)
 
         hardware = _FakeHardware.instances[0]
-        self.assertEqual(hardware.kwargs["config_file"], "configuration_files/profiles/rpi/servo_config.yaml")
-        self.assertEqual(hardware.kwargs["control_config_file"], "configuration_files/profiles/rpi/control_config.yaml")
+        self.assertEqual(hardware.kwargs["config_file"],
+                         "configuration_files/profiles/rpi/servo_config.yaml")
+        self.assertEqual(hardware.kwargs["control_config_file"],
+                         "configuration_files/profiles/rpi/control_config.yaml")
         self.assertFalse(hardware.kwargs["pump_auto_mode"])
         self.assertFalse(hardware.kwargs["enable_adc"])
         self.assertFalse(hardware.kwargs["start_adc_reader"])

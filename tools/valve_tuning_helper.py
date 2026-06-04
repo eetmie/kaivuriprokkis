@@ -20,8 +20,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik_cfg import load_excavator_robot_config
-from modules.excavator_ik_utils import canonical_joint_angles_from_imus
+from modules.ik import load_excavator_robot_config, canonical_joint_angles_from_imus
 from modules.hardware_interface import HardwareInterface
 from modules.udp_socket import UDPSocket
 

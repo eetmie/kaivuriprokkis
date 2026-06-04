@@ -1,3 +1,7 @@
+# TODO(refactor #3 follow-up): pull the axis-rotation helpers
+# (extract_axis_rotation, project_to_rotation_axes, propagate_base_rotation)
+# out of modules/ik/solver.py into this file — they're pure quaternion
+# math and don't belong with the solver. See modules/ik/REFACTOR_NOTES.md.
 """
 Common quaternion math operations optimized with numba.
 

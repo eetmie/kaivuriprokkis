@@ -1,43 +1,56 @@
 #!/usr/bin/env python3
-"""End-effector PID tuner — robot/host side.
+"""PID tuner — robot / host side.
 
-This tool runs the full production control stack (``ExcavatorController`` +
-``HardwareInterface``) and drives the EE along a straight line in the world X
-axis, back and forth, at a configurable height (Z) and EE-rate
-(``20..70 mm/s``). EE rotation is held at zero.
+Runs both tuning modes under a single process:
 
-What it is good for
--------------------
-* **Manual tuning:** pick gains in the client GUI, watch the EE follow the
-  ideal X ramp in real time, see RMSE / max / mean tracking error per stroke.
-* **Auto tuning:** let the host search PID gains across multiple runs while
-  the client tracks progress. The default search is a coordinate-descent
-  ("twiddle") loop with adaptive step size — it works well for asymmetric
-  hydraulic actuators because we can score whole runs (not single steps) and
-  it does not need a derivative of the cost surface.
+* **Per-joint mode** (port 8090): direct IMU → PID → single-valve loop via
+  ``HardwareInterface``. Good for rough per-joint gain setting.
+* **EE-plane mode** (port 8091): full IK stack via ``ExcavatorController``.
+  Auto-tunes boom + arm + bucket simultaneously against cartesian X RMSE.
 
-The host does **not** modify the control stack on disk. It only mutates the
-existing ``ExcavatorController.joint_pids`` list at runtime — installing a
-:class:`DirectionalPID` wrapper on the tuned joint when direction-specific
-tuning is requested. Restarting the host restores the controller's defaults
-(from ``control_config.yaml``) on the next process.
+Only one mode may write hardware outputs at a time. The per-joint handler takes
+priority: when it enables output the EE host refuses to start (and aborts any
+running tune). Switch back to EE mode by disabling the per-joint output first.
 
-Protocol
---------
-See :mod:`tools.pid_tuner_ee_common` for packet layout. Default UDP port is
-``8091`` (one above the per-joint tuner on ``8090``).
+TODO(refactor — pid_tuner cleanup):
+    Two things to merge in one pass:
+
+    1. Collapse to a SINGLE UDP port. The dual-port design (8090 joint,
+       8091 EE) only exists because the schemas differ. Add a 1-byte
+       ``mode`` tag in the packet header (see ``common.py``) and route on
+       it server-side. That deletes ``CombinedServer``, the
+       joint-takes-priority mutex, and one handshake.
+
+    2. Move the EE *optimizer* (cost function, ``AllJointGains`` packing,
+       ``CoordinateDescentTuner``, gain ramping, best-cost tracking) to
+       ``tools/pid_tuner/client.py``. The robot's job here should be
+       "execute a stroke with gains X, return (rmse, max_err, time)" — no
+       more. That shrinks ``robot.py`` from ~1.5 kLOC to ~400 LOC and
+       lets the optimizer keep state across robot restarts.
+
+    See the marked sections below and ``common.py`` for the port + mode
+    byte change.
+
+Run on the robot
+----------------
+::
+
+    python -m tools.pid_tuner.robot
+
+or::
+
+    python tools/pid_tuner/robot.py
+
+Then open ``tools/pid_tuner/client.py`` on the PC. Both tabs connect
+independently; you can connect/disconnect each without restarting the robot.
 
 Safety
 ------
-The pump is enabled when a run starts and stays on between auto-tune iterations
-for hydraulic stability. It is disabled on explicit STOP, on error, and at exit.
-The controller zeroes valve outputs while between runs (paused state). Unreachable
-targets are rejected by the controller's reachability check. Always confirm a safe
-A/B sweep range before starting on real hardware.
-
-CLI
----
-Run with no args for the rpi profile; ``-h`` lists every option.
+The hydraulic pump is enabled when an EE run starts and stays on between
+auto-tune iterations for stability. It is disabled on explicit STOP, on error,
+and at exit. The controller zeroes valve outputs while between runs. Unreachable
+targets are rejected by the controller's reachability check. Always confirm a
+safe A/B sweep range before starting on real hardware.
 """
 
 from __future__ import annotations
@@ -54,17 +67,18 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from modules.board import resolve_profile as resolve_board_profile
 from modules.excavator_controller import ExcavatorController
+from modules.ik import load_excavator_robot_config, canonical_joint_angles_from_imus
 from modules.hardware_interface import HardwareInterface
 from modules.pid import PIDController
 from modules.udp_socket import UDPSocket
 
-from tools.pid_tuner_ee_common import (
+from tools.pid_tuner.common import (
     CMD_COST_W_MAX,
     CMD_COST_W_RMSE,
     CMD_FLAGS,
@@ -87,12 +101,19 @@ from tools.pid_tuner_ee_common import (
     CMD_Z,
     CMD_Z_MAX,
     CMD_Z_MIN,
-    COMMAND_SIZE,
-    CommandFlag,
     DEFAULT_COST_WEIGHTS,
     DEFAULT_HOST,
-    DEFAULT_PORT,
-    TELEMETRY_SIZE,
+    EE_COMMAND_SIZE,
+    EE_PORT,
+    EE_TELEMETRY_SIZE,
+    EE_TUNABLE_JOINTS,
+    EECommandFlag,
+    EETunerState,
+    JOINT_COMMAND_SIZE,
+    JOINT_NAMES,
+    JOINT_PORT,
+    JOINT_TELEMETRY_SIZE,
+    PWM_NAMES,
     TLM_BEST_COST,
     TLM_BEST_COST_FWD,
     TLM_BEST_COST_REV,
@@ -135,11 +156,37 @@ from tools.pid_tuner_ee_common import (
     TLM_STROKE_INDEX,
     TLM_TOTAL_STROKES,
     TLM_TUNED_JOINT,
-    TunerState,
 )
 
+# Backward-compat aliases used by tests.
+COMMAND_SIZE = JOINT_COMMAND_SIZE
+TELEMETRY_SIZE = JOINT_TELEMETRY_SIZE
 
-JOINT_NAMES = ["slew", "boom", "arm", "bucket"]
+
+# ---------------------------------------------------------------------------
+# Per-joint helpers
+# ---------------------------------------------------------------------------
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(value)))
+
+
+def _angle_error(target: float, current: float) -> float:
+    return math.atan2(math.sin(target - current), math.cos(target - current))
+
+
+def _safe_joint_id(value: float) -> int:
+    return max(0, min(3, int(round(float(value)))))
+
+
+def _read_joint_angles(hardware: HardwareInterface, robot_config) -> np.ndarray:
+    quats = hardware.read_all_imu_quaternions()
+    if quats is None:
+        raise RuntimeError("IMU quaternions unavailable")
+    return canonical_joint_angles_from_imus(
+        np.asarray(quats, dtype=np.float32), robot_config
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,22 +197,9 @@ JOINT_NAMES = ["slew", "boom", "arm", "bucket"]
 class DirectionalPID:
     """Two :class:`PIDController` instances chosen by stroke direction.
 
-    The production controller calls every joint PID as
-    ``pid.compute(0.0, -angle_error(target, current))``. By default we route
-    positive ``error`` to ``pid_pos`` and negative ``error`` to ``pid_neg``
-    (sign-of-error switching) so the wrapper degrades gracefully when no
-    external direction is known.
-
-    For tuning runs we override that with an *explicit* stroke direction:
-    the host calls :meth:`set_active_direction` at the start of every stroke
-    so the +X (out) strokes always use ``pid_pos`` and the -X (in) strokes
-    always use ``pid_neg``. This gives the auto-tuner a clean attribution
-    between gain dimensions and cost subscores — the fwd cost is shaped only
-    by ``pid_pos``, the rev cost only by ``pid_neg``.
-
-    On every tick we feed the *current measurement* into the inactive PID so
-    its derivative-on-measurement filter and ``last_value`` do not jump when
-    control switches sides.
+    Positive ``error`` → ``pid_pos``; negative → ``pid_neg``.
+    Call :meth:`set_active_direction` at the start of each stroke to pin the
+    active side so per-direction subscores are cleanly attributed.
     """
 
     def __init__(
@@ -186,15 +220,11 @@ class DirectionalPID:
             min_output=min_output, max_output=max_output,
             deriv_filter_tau=deriv_filter_tau,
         )
-        # Mirror the public attributes the production controller reads so the
-        # rest of the stack can treat this as a drop-in PID.
         self.min_output = min_output
         self.max_output = max_output
-        # +1 forces pid_pos, -1 forces pid_neg, 0 falls back to sign-of-error.
         self._active_dir: int = 0
 
     def set_active_direction(self, direction: int) -> None:
-        """Pin which PID handles this tick. Use +1/-1 during a stroke, 0 idle."""
         self._active_dir = +1 if direction > 0 else (-1 if direction < 0 else 0)
 
     @property
@@ -229,7 +259,8 @@ class DirectionalPID:
         self.pid_pos.reset(keep_integral=keep_integral)
         self.pid_neg.reset(keep_integral=keep_integral)
 
-    def compute(self, setpoint: float, current_value: float, dt: Optional[float] = None) -> float:
+    def compute(self, setpoint: float, current_value: float,
+                dt: Optional[float] = None) -> float:
         if self._active_dir > 0:
             active, inactive = self.pid_pos, self.pid_neg
         elif self._active_dir < 0:
@@ -240,21 +271,22 @@ class DirectionalPID:
                 active, inactive = self.pid_pos, self.pid_neg
             else:
                 active, inactive = self.pid_neg, self.pid_pos
-        # Keep inactive's measurement memory hot to avoid derivative kicks on
-        # zero-crossing or direction-pin transitions.
         inactive.last_value = current_value
         return active.compute(setpoint, current_value, dt=dt)
 
 
 # ---------------------------------------------------------------------------
-# Auto-tuner — coordinate descent with adaptive step size
+# Auto-tuner data structures
+# ---------------------------------------------------------------------------
+# TODO(refactor #1): Move EVERYTHING from here through the end of
+# ``CoordinateDescentTuner`` (~line 440) into ``tools/pid_tuner/client.py``.
+# The robot never needs to know how gains are chosen — only how to apply
+# them and report the resulting per-stroke metrics.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class GainsPair:
-    """Six PID gains: (kp, ki, kd) for forward and reverse directions."""
-
     fwd: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     rev: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
@@ -269,84 +301,92 @@ class GainsPair:
         return GainsPair(fwd=list(self.fwd), rev=list(self.rev))
 
 
-_FWD_DIMS = (0, 1, 2)   # kp_fwd, ki_fwd, kd_fwd
-_REV_DIMS = (3, 4, 5)   # kp_rev, ki_rev, kd_rev
+@dataclass
+class AllJointGains:
+    """Gains for all EE-tunable joints.
+
+    Flat vector layout::
+
+        [kp_fwd_0, ki_fwd_0, kd_fwd_0,  # boom fwd
+         kp_fwd_1, ...                   # arm, bucket fwd
+         kp_rev_0, ...                   # boom, arm, bucket rev]
+    """
+
+    per_joint: List[GainsPair]
+
+    @property
+    def n_joints(self) -> int:
+        return len(self.per_joint)
+
+    def as_vector(self) -> List[float]:
+        return ([g for gp in self.per_joint for g in gp.fwd] +
+                [g for gp in self.per_joint for g in gp.rev])
+
+    @staticmethod
+    def from_vector(v: List[float]) -> "AllJointGains":
+        n = len(v) // 6
+        return AllJointGains(per_joint=[
+            GainsPair(fwd=list(v[3 * i: 3 * i + 3]),
+                      rev=list(v[3 * n + 3 * i: 3 * n + 3 * i + 3]))
+            for i in range(n)
+        ])
+
+    def copy(self) -> "AllJointGains":
+        return AllJointGains(per_joint=[gp.copy() for gp in self.per_joint])
 
 
 class CoordinateDescentTuner:
-    """Twiddle-style coordinate descent over PID gains.
+    """Twiddle-style coordinate descent over all EE-joint PID gains simultaneously.
 
-    Algorithm sketch (per iteration over each of the 6 dimensions)::
-
-        try   x[i] += step[i];          run; cost
-        if better: keep,         step[i] *= 1.1
-        else:
-            try   x[i] -= 2*step[i];   run; cost
-            if better: keep,     step[i] *= 1.1
-            else:     revert,    step[i] *= 0.5
-
-    Why this algorithm
-    ------------------
-    * Each "evaluation" is a full back-and-forth run on the real plant — slow
-      and noisy. Coordinate descent only needs one evaluation per direction
-      probed, with no gradient estimation, and tolerates noise well because
-      each step is gated on improvement vs. the current best.
-    * The step-size annealing converges around a local minimum without ever
-      requiring an explicit stopping derivative.
-    * We can freeze ``ki`` / ``kd`` at zero (see ``frozen_mask``) and tune
-      only ``kp`` first, which is the classical hand-tune pattern.
-
-    Limits
-    ------
-    Local minima are real — start the search near a reasonable hand-tuned
-    point (the controller's current gains are loaded by default). The cost
-    must be a *scalar* — see ``score_run`` below for the default weighting.
+    The search covers boom, arm, and bucket at once so the cost signal
+    (cartesian X RMSE) receives contributions from every joint. Fwd stroke costs
+    gate only fwd-gain dimensions; rev costs gate only rev-gain dimensions.
     """
 
     def __init__(
         self,
-        initial: GainsPair,
-        steps: GainsPair,
+        initial: AllJointGains,
+        steps: AllJointGains,
         frozen_mask: Optional[List[bool]] = None,
         grow_factor: float = 1.1,
         shrink_factor: float = 0.5,
         min_step: float = 1e-3,
         gain_bounds: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = (
-            (0.0, 50.0),  # kp
-            (0.0, 20.0),  # ki
-            (0.0, 20.0),  # kd
+            (0.0, 50.0),
+            (0.0, 20.0),
+            (0.0, 20.0),
         ),
     ) -> None:
+        n = initial.n_joints
+        self._n_joints = n
+        self._n_fwd = n * 3
+        self._n_dims = n * 6
+        self._fwd_dims: frozenset = frozenset(range(self._n_fwd))
+        self._rev_dims: frozenset = frozenset(range(self._n_fwd, self._n_dims))
+
         self.current = initial.copy()
         self.best = initial.copy()
-        # Best-cost is tracked **per direction** so each gain triple is judged
-        # only against the strokes it actually shapes.
         self.best_cost_fwd: float = math.inf
         self.best_cost_rev: float = math.inf
         self.step = steps.as_vector()
-        # 6 dims: [kp_f, ki_f, kd_f, kp_r, ki_r, kd_r]
-        self.frozen = list(frozen_mask) if frozen_mask is not None else [False] * 6
+        self.frozen = list(frozen_mask) if frozen_mask is not None else [False] * self._n_dims
         self.grow = float(grow_factor)
         self.shrink = float(shrink_factor)
         self.min_step = float(min_step)
         self.bounds = gain_bounds
-        # State machine for which dimension / which probe direction is active.
         self._dim_index = 0
-        # Probe phase: 0 = need to probe +, 1 = need to probe -, 2 = dim done.
         self._phase = 0
         self._pending_revert: Optional[float] = None
         self._iter = 0
 
     @property
     def best_cost(self) -> float:
-        """Combined-for-display best cost (sum of fwd + rev best). Backwards-compat."""
         f = self.best_cost_fwd if math.isfinite(self.best_cost_fwd) else 0.0
         r = self.best_cost_rev if math.isfinite(self.best_cost_rev) else 0.0
         return f + r
 
     def active_side(self) -> str:
-        """Which gain triple the *next* propose() will modify: 'fwd' or 'rev'."""
-        return "fwd" if self._dim_index in _FWD_DIMS else "rev"
+        return "fwd" if self._dim_index in self._fwd_dims else "rev"
 
     def converged(self) -> bool:
         return all(s <= self.min_step for s, f in zip(self.step, self.frozen) if not f)
@@ -362,21 +402,18 @@ class CoordinateDescentTuner:
         return self.current.as_vector()
 
     def _write_vector(self, v: List[float]) -> None:
-        self.current = GainsPair.from_vector(v)
+        self.current = AllJointGains.from_vector(v)
 
     def _advance_dim(self) -> None:
-        # Move to next non-frozen dimension. Wrap around indefinitely.
-        for _ in range(6):
-            self._dim_index = (self._dim_index + 1) % 6
+        for _ in range(self._n_dims):
+            self._dim_index = (self._dim_index + 1) % self._n_dims
             if not self.frozen[self._dim_index]:
                 break
         self._phase = 0
         self._pending_revert = None
 
-    def propose(self) -> GainsPair:
-        """Return the candidate gain set the host should test next."""
-        # Skip frozen dims if we happen to land on one.
-        for _ in range(6):
+    def propose(self) -> AllJointGains:
+        for _ in range(self._n_dims):
             if not self.frozen[self._dim_index]:
                 break
             self._advance_dim()
@@ -388,30 +425,15 @@ class CoordinateDescentTuner:
         elif self._phase == 1:
             assert self._pending_revert is not None
             v[d] = self._clamp(d, self._pending_revert - self.step[d])
-        # phase 2 means dim is finished and we should not be proposing on it;
-        # caller is expected to call observe() before propose() again.
-        return GainsPair.from_vector(v)
+        return AllJointGains.from_vector(v)
 
     def observe(self, cost_fwd: float, cost_rev: float) -> None:
-        """Update internal state with the cost of the most recently proposed gains.
-
-        ``cost_fwd`` and ``cost_rev`` are the per-direction subscores from the
-        last completed run. Whichever side the active dimension belongs to is
-        the one compared against ``best_cost_<side>`` — the *other* direction's
-        cost is ignored for the gating decision because changing a fwd gain
-        cannot have systematically improved the reverse stroke (and vice
-        versa). We still record the unrelated side's best whenever it
-        coincidentally improves, so the GUI tracks both.
-        """
         self._iter += 1
         d = self._dim_index
-        side = "fwd" if d in _FWD_DIMS else "rev"
+        side = "fwd" if d in self._fwd_dims else "rev"
         my_cost = cost_fwd if side == "fwd" else cost_rev
         my_best = self.best_cost_fwd if side == "fwd" else self.best_cost_rev
 
-        # Opportunistic best tracking on the *other* side — costs there can
-        # also drift around if both directions share dynamics, but we never
-        # gate the search on this.
         if cost_fwd < self.best_cost_fwd:
             self.best_cost_fwd = cost_fwd
         if cost_rev < self.best_cost_rev:
@@ -435,20 +457,17 @@ class CoordinateDescentTuner:
                 self.best = self.current.copy()
                 self.step[d] *= self.grow
             else:
-                # Neither direction improved this side — shrink and move on.
                 self.step[d] *= self.shrink
             self._advance_dim()
-        # else: misuse of the API; ignore silently.
 
 
 # ---------------------------------------------------------------------------
-# Run executor — drives a single back-and-forth program and scores it
+# Run scoring
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class DirectionStats:
-    """Per-direction subscores from a single back-and-forth run."""
     rmse: float = 0.0
     max_abs_err: float = 0.0
     mean_abs_err: float = 0.0
@@ -458,12 +477,6 @@ class DirectionStats:
 
 @dataclass
 class RunResult:
-    """Combined stats plus per-direction breakdown.
-
-    ``cost`` is the combined cost for back-compat / display. ``fwd`` and
-    ``rev`` carry the cost the auto-tuner actually uses when probing
-    the forward (``kp_fwd / ki_fwd / kd_fwd``) or reverse gain dimensions.
-    """
     rmse: float
     max_abs_err: float
     mean_abs_err: float
@@ -484,27 +497,19 @@ class ProgramConfig:
     cost_w_rmse: float = DEFAULT_COST_WEIGHTS[0]
     cost_w_max: float = DEFAULT_COST_WEIGHTS[1]
     cost_w_overshoot: float = DEFAULT_COST_WEIGHTS[2]
-    # Auto-tune sweep brackets. Manual runs use z / speed above; the auto-tune
-    # loop rotates through a small grid built from these (min, max) brackets.
     z_min: float = 0.18
     z_max: float = 0.22
     speed_min: float = 0.020
     speed_max: float = 0.070
 
 
-def _autotune_grid(cfg: "ProgramConfig", n_z: int = 3, n_v: int = 3) -> List[Tuple[float, float]]:
-    """Return a deterministic (z, speed) grid for auto-tune iteration.
-
-    Three z values × three speeds = nine conditions cycled round-robin so the
-    coordinate-descent tuner sees a fixed cost surface from run to run.
-    """
+def _autotune_grid(cfg: ProgramConfig, n_z: int = 3, n_v: int = 3) -> List[Tuple[float, float]]:
     zs = np.linspace(cfg.z_min, cfg.z_max, n_z).tolist() if cfg.z_max > cfg.z_min else [cfg.z]
     vs = np.linspace(cfg.speed_min, cfg.speed_max, n_v).tolist() if cfg.speed_max > cfg.speed_min else [cfg.speed]
     return [(float(z), float(v)) for z in zs for v in vs]
 
 
 def _score_subset(err_mm: np.ndarray, cfg: ProgramConfig) -> DirectionStats:
-    """Cost for a single direction's slice of error samples (mm)."""
     if err_mm.size == 0:
         return DirectionStats()
     rmse = float(np.sqrt(np.mean(err_mm ** 2)))
@@ -512,15 +517,9 @@ def _score_subset(err_mm: np.ndarray, cfg: ProgramConfig) -> DirectionStats:
     mean_abs = float(np.mean(np.abs(err_mm)))
     tail = err_mm[int(0.9 * err_mm.size):]
     overshoot = float(np.mean(np.clip(np.abs(tail) - rmse, 0.0, None))) if tail.size else 0.0
-    cost = (
-        cfg.cost_w_rmse * rmse
-        + cfg.cost_w_max * max_abs
-        + cfg.cost_w_overshoot * overshoot
-    )
-    return DirectionStats(
-        rmse=rmse, max_abs_err=max_abs, mean_abs_err=mean_abs,
-        cost=cost, samples=int(err_mm.size),
-    )
+    cost = cfg.cost_w_rmse * rmse + cfg.cost_w_max * max_abs + cfg.cost_w_overshoot * overshoot
+    return DirectionStats(rmse=rmse, max_abs_err=max_abs, mean_abs_err=mean_abs,
+                          cost=cost, samples=int(err_mm.size))
 
 
 def score_run(
@@ -529,26 +528,6 @@ def score_run(
     stroke_dirs: List[int],
     cfg: ProgramConfig,
 ) -> RunResult:
-    """Score a completed back-and-forth run with a per-direction breakdown.
-
-    The cost is in **millimetre-error units** so that auto-tune step sizes
-    work on intuitive magnitudes. For each sample we know which stroke it
-    belonged to (``stroke_dirs[i] == +1`` for an out / +X stroke, ``-1`` for
-    an in / -X stroke), so we compute three statistics::
-
-        err_mm = (ee_x - cmd_x) * 1000
-        cost(s) = w_rmse*RMSE(s) + w_max*max|err|(s) + w_overshoot*tail(s)
-
-    against three sample sets: all samples (combined), only +X samples
-    (``result.fwd``) and only -X samples (``result.rev``). The auto-tuner
-    feeds the fwd / rev subscore back when it is probing the matching gain
-    triple — that way each direction's three gains see the noise of their
-    own strokes only.
-
-    Speed enters via ``ee_x = cmd_x`` only — runs at different ``speed_mps``
-    naturally accumulate larger errors so the auto-tuner is automatically
-    rewarded for converging at all configured speeds.
-    """
     if not cmd_x_samples or not ee_x_samples:
         return RunResult(0.0, 0.0, 0.0, math.inf, 0)
     n = min(len(cmd_x_samples), len(ee_x_samples), len(stroke_dirs))
@@ -572,19 +551,15 @@ def score_run(
 
 
 # ---------------------------------------------------------------------------
-# Host service
+# EE host shared state
 # ---------------------------------------------------------------------------
 
 
 class _SharedState:
-    """Mutable state shared between the UDP / control / tune threads."""
-
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        # Snapshot consumed by the telemetry sender.
-        self.telemetry: List[float] = [0.0] * TELEMETRY_SIZE
-        # Latest fields the tuner thread publishes:
-        self.state: TunerState = TunerState.IDLE
+        self.telemetry: List[float] = [0.0] * EE_TELEMETRY_SIZE
+        self.state: EETunerState = EETunerState.IDLE
         self.run_index: int = 0
         self.stroke_index: int = 0
         self.ee_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -596,17 +571,29 @@ class _SharedState:
         self.best_cost_rev: float = math.inf
         self.tuner_iter: int = 0
         self.dir_pid_enabled: bool = False
-        self.tuned_joint: int = 1  # boom by default
+        self.tuned_joint: int = 1
         self.cfg: ProgramConfig = ProgramConfig(
-            x_min=0.30, x_max=0.50, y=0.0, z=0.20, speed=0.040,
-            strokes_per_run=4,
+            x_min=0.30, x_max=0.50, y=0.0, z=0.20, speed=0.040, strokes_per_run=4,
         )
         self.num_runs_remaining: int = 0
         self.err_now: float = 0.0
 
 
-class PIDTunerEEHost:
-    """Glue between UDP / control loop / auto-tuner."""
+# ---------------------------------------------------------------------------
+# EE host
+# ---------------------------------------------------------------------------
+
+
+# TODO(refactor #1): EEHost is half "stroke executor" and half "optimizer
+# driver". Split:
+#   - Keep here (rename to EEStrokeExecutor): PID install/restore, command
+#     handling, the run executor that actually drives the controller.
+#   - Move to client: the auto-tune loop (~line 866), best-cost tracking,
+#     telemetry encoding of optimizer-only fields (best/last cost, RMSE
+#     subscores per direction). Robot sends raw per-stroke metrics; client
+#     does the scoring and picks the next gain vector.
+class EEHost:
+    """EE-plane PID tuner host (port 8091)."""
 
     def __init__(
         self,
@@ -626,20 +613,21 @@ class PIDTunerEEHost:
         self.shared = _SharedState()
         self._stop = threading.Event()
         self._tuner_thread: Optional[threading.Thread] = None
-        self._cmd_lock = threading.Lock()
-        self._pending_cmd: Optional[List[float]] = None
-        # Track which PID slots we have replaced so we can restore them.
         self._original_pids: Dict[int, PIDController] = {}
+        self._joint_active: Optional[threading.Event] = None
 
         self.sock = UDPSocket(local_id=14, max_age_seconds=0.5, nominal_rate_hz=rate_hz)
         self.sock.setup(
             host, port,
-            inputs=f"{COMMAND_SIZE}f",
-            outputs=f"{TELEMETRY_SIZE}f",
+            inputs=f"{EE_COMMAND_SIZE}f",
+            outputs=f"{EE_TELEMETRY_SIZE}f",
             is_server=True,
         )
 
-    # ----- joint PID install / restore ------------------------------------
+    def set_joint_priority_flag(self, flag: threading.Event) -> None:
+        self._joint_active = flag
+
+    # ----- PID install / restore ------------------------------------------
 
     def _install_directional_pid(self, joint_idx: int, gains: GainsPair) -> None:
         if joint_idx not in range(4):
@@ -647,16 +635,14 @@ class PIDTunerEEHost:
         existing = self.controller.joint_pids[joint_idx]
         if joint_idx not in self._original_pids:
             self._original_pids[joint_idx] = existing
-        # Inherit output limits from whatever the controller is currently using.
         min_out = float(getattr(existing, "min_output", -1.0))
         max_out = float(getattr(existing, "max_output", 1.0))
-        wrapper = DirectionalPID(
+        self.controller.joint_pids[joint_idx] = DirectionalPID(
             gains_pos=tuple(gains.fwd),
             gains_neg=tuple(gains.rev),
             min_output=min_out,
             max_output=max_out,
         )
-        self.controller.joint_pids[joint_idx] = wrapper
         self.shared.dir_pid_enabled = True
 
     def _restore_pids(self) -> None:
@@ -685,20 +671,19 @@ class PIDTunerEEHost:
         g = [float(pid.kp), float(pid.ki), float(pid.kd)]
         return GainsPair(fwd=g, rev=list(g))
 
-    # ----- UDP receive ----------------------------------------------------
+    # ----- command handling -----------------------------------------------
 
     def _consume_command(self) -> Optional[List[float]]:
         pkt = self.sock.get_latest()
-        if pkt is None or len(pkt) < COMMAND_SIZE:
+        if pkt is None or len(pkt) < EE_COMMAND_SIZE:
             return None
-        return [float(v) for v in pkt[:COMMAND_SIZE]]
+        return [float(v) for v in pkt[:EE_COMMAND_SIZE]]
 
     def _handle_command(self, cmd: List[float]) -> None:
         flags = int(round(cmd[CMD_FLAGS])) & 0xFFFF
         tuned_joint = int(round(cmd[CMD_TUNED_JOINT])) & 0x3
         self.shared.tuned_joint = tuned_joint
 
-        # Always refresh the program config so the next run uses the latest.
         with self.shared.lock:
             self.shared.cfg = ProgramConfig(
                 x_min=float(cmd[CMD_X_MIN]),
@@ -717,26 +702,23 @@ class PIDTunerEEHost:
             )
             self.shared.num_runs_remaining = max(0, int(round(cmd[CMD_NUM_RUNS])))
 
-        if flags & int(CommandFlag.RELOAD_CONFIG):
+        if flags & int(EECommandFlag.RELOAD_CONFIG):
             try:
                 self.hardware.reload_config()
             except Exception as exc:
                 self.log.warning("reload_config failed: %s", exc)
 
-        if flags & int(CommandFlag.RESET_PIDS):
+        if flags & int(EECommandFlag.RESET_PIDS):
             for pid in self.controller.joint_pids:
                 try:
                     pid.reset()
                 except Exception:
                     pass
 
-        if flags & int(CommandFlag.DIR_PID):
-            current = self._read_installed_gains(tuned_joint)
-            self._install_directional_pid(tuned_joint, current)
-        # Note: turning DIR_PID off requires a STOP+RESET — we don't quietly
-        # restore in the middle of a run.
+        if flags & int(EECommandFlag.DIR_PID):
+            self._install_directional_pid(tuned_joint, self._read_installed_gains(tuned_joint))
 
-        if flags & int(CommandFlag.APPLY_GAINS):
+        if flags & int(EECommandFlag.APPLY_GAINS):
             kp_f = float(cmd[CMD_KP_FWD])
             ki_f = float(cmd[CMD_KI_FWD])
             kd_f = float(cmd[CMD_KD_FWD])
@@ -751,24 +733,24 @@ class PIDTunerEEHost:
             else:
                 self._apply_scalar_gains(tuned_joint, kp_f, ki_f, kd_f)
 
-        if flags & int(CommandFlag.STOP):
+        if flags & int(EECommandFlag.STOP):
             self._stop_run()
 
-        if flags & int(CommandFlag.START):
+        if flags & int(EECommandFlag.START):
+            if self._joint_active is not None and self._joint_active.is_set():
+                self.log.warning("START rejected: per-joint tuner is active")
+                return
             with self.shared.lock:
                 cfg = self.shared.cfg
             if cfg.x_min >= cfg.x_max:
                 self.log.warning(
-                    "START rejected: x_min (%.3f) >= x_max (%.3f) — set A/B points first",
-                    cfg.x_min, cfg.x_max,
-                )
+                    "START rejected: x_min (%.3f) >= x_max (%.3f)", cfg.x_min, cfg.x_max)
             elif cfg.z <= 0.0:
                 self.log.warning("START rejected: z=%.3f is not positive", cfg.z)
             else:
-                auto = bool(flags & int(CommandFlag.AUTO_TUNE))
-                self._start_run(auto=auto)
+                self._start_run(auto=bool(flags & int(EECommandFlag.AUTO_TUNE)))
 
-    # ----- tuner thread lifecycle ----------------------------------------
+    # ----- tuner lifecycle ------------------------------------------------
 
     def _start_run(self, auto: bool) -> None:
         if self._tuner_thread is not None and self._tuner_thread.is_alive():
@@ -785,7 +767,7 @@ class PIDTunerEEHost:
             self._tuner_thread.join(timeout=2.0)
             self._tuner_thread = None
         try:
-            self.controller.pause()  # reset_pump=True: explicit stop depressurises
+            self.controller.pause()
         except Exception:
             pass
         try:
@@ -793,32 +775,26 @@ class PIDTunerEEHost:
         except Exception:
             pass
         with self.shared.lock:
-            self.shared.state = TunerState.IDLE
+            self.shared.state = EETunerState.IDLE
             self.shared.ramp_dir = 0
 
-    # ----- back-and-forth runner -----------------------------------------
+    # ----- run executor ---------------------------------------------------
 
     def _execute_run(self) -> Optional[RunResult]:
-        """Drive one back-and-forth program. Returns the run cost."""
         with self.shared.lock:
             cfg = self.shared.cfg
-            self.shared.state = TunerState.RUNNING
+            self.shared.state = EETunerState.RUNNING
 
-        # Resume controller into a known-clean state.
         try:
             self.controller.resume()
         except Exception as exc:
             self.log.warning("controller.resume failed: %s", exc)
 
-        # Pump stays on for the entire tuning session; only STOP / exit disables it.
         try:
             self.hardware.set_pump_enabled(True)
         except Exception as exc:
             self.log.warning("pump enable failed: %s", exc)
 
-        # Raise motion smoother velocity ceiling so our ramp isn't throttled.
-        # Save the original value and restore it after the run so the config
-        # limit isn't silently raised for the rest of the session.
         orig_max_vel: Optional[float] = None
         try:
             orig_max_vel = self.controller.motion_processor.max_velocity
@@ -832,7 +808,6 @@ class PIDTunerEEHost:
         stroke_dirs: List[int] = []
 
         try:
-            # Stroke counter: even index = travelling from x_min -> x_max, odd = back.
             for stroke in range(cfg.strokes_per_run):
                 if self._stop.is_set():
                     return None
@@ -843,13 +818,9 @@ class PIDTunerEEHost:
                 with self.shared.lock:
                     self.shared.stroke_index = stroke
                     self.shared.ramp_dir = direction
-                # Pin every DirectionalPID we own to this stroke's direction so
-                # the per-direction subscores cleanly attribute to the matching
-                # gain triple.
                 for pid in self.controller.joint_pids:
                     if isinstance(pid, DirectionalPID):
                         pid.set_active_direction(direction)
-                x = start_x
                 distance = abs(end_x - start_x)
                 duration = distance / max(cfg.speed, 1e-3)
                 t0 = time.perf_counter()
@@ -857,19 +828,18 @@ class PIDTunerEEHost:
                 while True:
                     if self._stop.is_set():
                         return None
+                    if self._joint_active is not None and self._joint_active.is_set():
+                        self.log.warning("run aborted: per-joint tuner became active")
+                        return None
                     t = time.perf_counter() - t0
-                    if t >= duration:
-                        x = end_x
-                    else:
-                        x = start_x + direction * cfg.speed * t
+                    x = end_x if t >= duration else start_x + direction * cfg.speed * t
                     pos = np.array([x, cfg.y, cfg.z], dtype=np.float32)
                     try:
                         result_reach = self.controller.give_pose(pos, 0.0)
                         if result_reach is not None and not getattr(result_reach, "reachable", True):
-                            self.log.warning("give_pose: target unreachable at x=%.3f z=%.3f", x, cfg.z)
+                            self.log.warning("give_pose: unreachable at x=%.3f z=%.3f", x, cfg.z)
                     except Exception as exc:
                         self.log.warning("give_pose failed: %s", exc)
-                    # Sample measured EE pose.
                     try:
                         measured, _ = self.controller.get_pose()
                     except Exception:
@@ -880,8 +850,7 @@ class PIDTunerEEHost:
                     with self.shared.lock:
                         self.shared.cmd_pos = (float(x), cfg.y, cfg.z)
                         self.shared.ee_pos = (
-                            float(measured[0]), float(measured[1]), float(measured[2])
-                        )
+                            float(measured[0]), float(measured[1]), float(measured[2]))
                         self.shared.err_now = abs(float(measured[0]) - float(x)) * 1000.0
                     if t >= duration:
                         break
@@ -891,10 +860,8 @@ class PIDTunerEEHost:
                         time.sleep(sleep_s)
 
             with self.shared.lock:
-                self.shared.state = TunerState.SCORING
+                self.shared.state = EETunerState.SCORING
                 self.shared.ramp_dir = 0
-            # Release the directional pin so the wrapper falls back to sign-of-error
-            # if anything calls compute() between runs.
             for pid in self.controller.joint_pids:
                 if isinstance(pid, DirectionalPID):
                     pid.set_active_direction(0)
@@ -921,12 +888,11 @@ class PIDTunerEEHost:
             self.log.exception("manual run failed: %s", exc)
         finally:
             try:
-                # Zero valve outputs but keep pump pressurized between runs.
                 self.controller.pause(reset_pump=False)
             except Exception:
                 pass
             with self.shared.lock:
-                self.shared.state = TunerState.IDLE
+                self.shared.state = EETunerState.IDLE
 
     # ----- auto-tune loop -------------------------------------------------
 
@@ -937,38 +903,43 @@ class PIDTunerEEHost:
             self.log.exception("auto-tune failed: %s", exc)
         finally:
             try:
-                # Zero valve outputs but keep pump pressurized between runs.
                 self.controller.pause(reset_pump=False)
             except Exception:
                 pass
             with self.shared.lock:
-                self.shared.state = TunerState.IDLE
+                self.shared.state = EETunerState.IDLE
 
     def _auto_tune_inner(self) -> None:
         with self.shared.lock:
-            joint_idx = self.shared.tuned_joint
             budget = max(1, self.shared.num_runs_remaining)
             cfg_base = self.shared.cfg
 
-        # Ensure directional PID is installed for asymmetric tuning.
-        current = self._read_installed_gains(joint_idx)
-        self._install_directional_pid(joint_idx, current)
+        current_gains: List[GainsPair] = []
+        for jidx in EE_TUNABLE_JOINTS:
+            g = self._read_installed_gains(jidx)
+            self._install_directional_pid(jidx, g)
+            current_gains.append(g)
+        initial = AllJointGains(per_joint=current_gains)
 
-        # Initial step sizes — heuristic: kp 1.0, ki 0.1, kd 0.05.
-        steps = GainsPair(fwd=[1.0, 0.1, 0.05], rev=[1.0, 0.1, 0.05])
-        tuner = CoordinateDescentTuner(initial=current, steps=steps)
+        steps = AllJointGains(per_joint=[
+            GainsPair(fwd=[1.0, 0.1, 0.05], rev=[1.0, 0.1, 0.05])
+            for _ in EE_TUNABLE_JOINTS
+        ])
+        tuner = CoordinateDescentTuner(initial=initial, steps=steps)
 
-        # Build a (z, speed) grid so each candidate is scored across the
-        # configured envelope rather than a single condition.
         grid = _autotune_grid(cfg_base)
         if not grid:
             grid = [(cfg_base.z, cfg_base.speed)]
-        self.log.info("auto-tune grid (%d points): %s",
-                      len(grid), [f"z={z:.3f} v={v*1000:.0f}mm/s" for z, v in grid])
+        self.log.info(
+            "auto-tune: %d joints (%s), %d-dim search, grid %d pts",
+            len(EE_TUNABLE_JOINTS),
+            [JOINT_NAMES[j] for j in EE_TUNABLE_JOINTS],
+            tuner._n_dims,
+            len(grid),
+        )
 
-        # Seed best_cost with a baseline run at the first grid point.
         with self.shared.lock:
-            self.shared.state = TunerState.AUTO_TUNING
+            self.shared.state = EETunerState.AUTO_TUNING
             self.shared.cfg.z = grid[0][0]
             self.shared.cfg.speed = grid[0][1]
 
@@ -977,7 +948,7 @@ class PIDTunerEEHost:
             return
         tuner.best_cost_fwd = baseline.fwd.cost
         tuner.best_cost_rev = baseline.rev.cost
-        tuner.best = current.copy()
+        tuner.best = initial.copy()
         with self.shared.lock:
             self.shared.best_cost = tuner.best_cost
             self.shared.best_cost_fwd = baseline.fwd.cost
@@ -990,9 +961,6 @@ class PIDTunerEEHost:
                 self.log.info("auto-tune converged after %d runs", run_idx)
                 break
             candidate = tuner.propose()
-
-            # Cycle through the (z, speed) grid round-robin so the tuner sees
-            # a fixed reference cost surface (deterministic, not randomised).
             z_now, v_now = grid[run_idx % len(grid)]
             with self.shared.lock:
                 self.shared.cfg.z = z_now
@@ -1000,14 +968,14 @@ class PIDTunerEEHost:
                 self.shared.run_index = run_idx + 1
                 self.shared.tuner_iter = tuner.iter_count()
 
-            # Push candidate into the joint's directional PID.
-            pid = self.controller.joint_pids[joint_idx]
-            if isinstance(pid, DirectionalPID):
-                pid.set_gains_pos(*candidate.fwd)
-                pid.set_gains_neg(*candidate.rev)
-                pid.reset()
-            else:
-                self._apply_scalar_gains(joint_idx, *candidate.fwd)
+            for i, jidx in enumerate(EE_TUNABLE_JOINTS):
+                pid = self.controller.joint_pids[jidx]
+                if isinstance(pid, DirectionalPID):
+                    pid.set_gains_pos(*candidate.per_joint[i].fwd)
+                    pid.set_gains_neg(*candidate.per_joint[i].rev)
+                    pid.reset()
+                else:
+                    self._apply_scalar_gains(jidx, *candidate.per_joint[i].fwd)
 
             side = tuner.active_side()
             result = self._execute_run()
@@ -1020,27 +988,35 @@ class PIDTunerEEHost:
                 self.shared.best_cost_rev = tuner.best_cost_rev
                 self.shared.num_runs_remaining = max(0, budget - (run_idx + 1))
 
+            with self.shared.lock:
+                display_jidx = self.shared.tuned_joint
+            try:
+                di = list(EE_TUNABLE_JOINTS).index(display_jidx)
+            except ValueError:
+                di = 0
+            dg = candidate.per_joint[di]
             self.log.info(
                 "iter %d side=%s (z=%.3f v=%.3f): cost_fwd=%.2f cost_rev=%.2f "
-                "best_fwd=%.2f best_rev=%.2f gains_fwd=%s gains_rev=%s",
+                "best_fwd=%.2f best_rev=%.2f [%s fwd=%s rev=%s]",
                 run_idx + 1, side, z_now, v_now,
                 result.fwd.cost, result.rev.cost,
                 tuner.best_cost_fwd, tuner.best_cost_rev,
-                ["%.3f" % g for g in candidate.fwd],
-                ["%.3f" % g for g in candidate.rev],
+                JOINT_NAMES[display_jidx],
+                ["%.3f" % g for g in dg.fwd],
+                ["%.3f" % g for g in dg.rev],
             )
 
-        # On exit, install the best known gains.
-        pid = self.controller.joint_pids[joint_idx]
-        if isinstance(pid, DirectionalPID):
-            pid.set_gains_pos(*tuner.best.fwd)
-            pid.set_gains_neg(*tuner.best.rev)
-            pid.reset()
+        for i, jidx in enumerate(EE_TUNABLE_JOINTS):
+            pid = self.controller.joint_pids[jidx]
+            if isinstance(pid, DirectionalPID):
+                pid.set_gains_pos(*tuner.best.per_joint[i].fwd)
+                pid.set_gains_neg(*tuner.best.per_joint[i].rev)
+                pid.reset()
 
-    # ----- telemetry pack -------------------------------------------------
+    # ----- telemetry ------------------------------------------------------
 
     def _build_telemetry(self) -> List[float]:
-        out = [0.0] * TELEMETRY_SIZE
+        out = [0.0] * EE_TELEMETRY_SIZE
         with self.shared.lock:
             cfg = self.shared.cfg
             state = self.shared.state
@@ -1110,10 +1086,9 @@ class PIDTunerEEHost:
     # ----- main loop ------------------------------------------------------
 
     def run_forever(self) -> None:
-        self.log.info("Waiting for client on %s:%d", self.host, self.port)
-        if not self.sock.handshake(timeout=120.0):
-            self.log.error("Handshake failed")
-            return
+        self.log.info("EE: waiting for client on %s:%d", self.host, self.port)
+        while not self.sock.handshake(timeout=30.0):
+            self.log.info("EE: no client yet, retrying on %s:%d ...", self.host, self.port)
         self.sock.start_receiving()
         period = 1.0 / self.rate_hz
         next_t = time.perf_counter()
@@ -1136,7 +1111,7 @@ class PIDTunerEEHost:
                 else:
                     next_t = time.perf_counter()
         except KeyboardInterrupt:
-            self.log.info("Interrupted, shutting down")
+            self.log.info("EE: interrupted")
         finally:
             self._stop_run()
             self._restore_pids()
@@ -1147,36 +1122,278 @@ class PIDTunerEEHost:
 
 
 # ---------------------------------------------------------------------------
-# CLI / main
+# Per-joint handler (thread)
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="EE-plane PID tuner (robot/host side)")
-    parser.add_argument("--robot", default="auto", help="board profile name (auto/rpi/jetson)")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Local IP to bind")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP port")
-    parser.add_argument("--rate", type=float, default=50.0, help="UDP / inner loop rate Hz")
+class JointHandler:
+    """Per-joint IMU → PID → valve loop running in its own thread (port 8090)."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        rate_hz: float,
+        hardware: HardwareInterface,
+        robot_config,
+        log: logging.Logger,
+        joint_active: threading.Event,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.rate_hz = float(rate_hz)
+        self.hardware = hardware
+        self.robot_config = robot_config
+        self.log = log
+        self._joint_active = joint_active
+
+        self.sock = UDPSocket(local_id=12, max_age_seconds=0.5, nominal_rate_hz=rate_hz)
+        self.sock.setup(
+            host, port,
+            inputs=f"{JOINT_COMMAND_SIZE}f",
+            outputs=f"{JOINT_TELEMETRY_SIZE}f",
+            is_server=True,
+        )
+
+    def run(self) -> None:
+        self.log.info("Joint: waiting for client on %s:%d", self.host, self.port)
+        while not self.sock.handshake(timeout=30.0):
+            self.log.info("Joint: no client yet, retrying on %s:%d ...", self.host, self.port)
+        self.sock.start_receiving()
+
+        pid = PIDController(kp=0.0, ki=0.0, kd=0.0, min_output=-1.0, max_output=1.0)
+        joint_id = 0
+        target_deg = 0.0
+        enabled = False
+        pump_enabled = False
+        last_gains = (0.0, 0.0, 0.0)
+        last_joint_id = joint_id
+        last_reset_flag = 0.0
+        last_reload_flag = 0.0
+        output = 0.0
+        last_joint_angles: Optional[np.ndarray] = None
+
+        period = 1.0 / max(1.0, self.rate_hz)
+        next_t = time.perf_counter()
+        last_status = time.time()
+
+        try:
+            while True:
+                command = self.sock.get_latest()
+                if command is not None and len(command) >= JOINT_COMMAND_SIZE:
+                    requested_joint_id = _safe_joint_id(command[0])
+                    requested_target_deg = _clamp(command[1], -180.0, 180.0)
+                    kp = _clamp(command[2], 0.0, 50.0)
+                    ki = _clamp(command[3], 0.0, 20.0)
+                    kd = _clamp(command[4], 0.0, 20.0)
+                    new_enabled = command[5] > 0.5
+                    requested_pump = command[6] > 0.5
+                    reload_flag = float(command[7])
+                    reset_flag = float(command[8])
+                    max_output = _clamp(command[9], 0.05, 1.0)
+
+                    joint_changed = requested_joint_id != last_joint_id
+                    joint_id = requested_joint_id
+                    target_deg = requested_target_deg
+
+                    gains = (kp, ki, kd)
+                    if gains != last_gains or joint_changed:
+                        pid = PIDController(
+                            kp=kp, ki=ki, kd=kd,
+                            min_output=-max_output, max_output=max_output,
+                        )
+                        last_gains = gains
+                        last_joint_id = joint_id
+                    else:
+                        pid.min_output = -max_output
+                        pid.max_output = max_output
+
+                    if joint_changed and last_joint_angles is not None:
+                        target_deg = float(math.degrees(last_joint_angles[joint_id]))
+                        pid.reset()
+
+                    if reset_flag > 0.5 and last_reset_flag <= 0.5:
+                        pid.reset()
+                    last_reset_flag = reset_flag
+
+                    if reload_flag > 0.5 and last_reload_flag <= 0.5:
+                        self.hardware.reload_config()
+                    last_reload_flag = reload_flag
+
+                    if requested_pump != pump_enabled:
+                        pump_enabled = requested_pump
+                        self.hardware.set_pump_enabled(pump_enabled)
+
+                    if new_enabled and not enabled:
+                        self._joint_active.set()
+                        self.log.info("Joint output enabled — EE locked out")
+                    elif not new_enabled and enabled:
+                        self._joint_active.clear()
+                        self.log.info("Joint output disabled — EE unlocked")
+                    enabled = new_enabled
+                else:
+                    if enabled:
+                        self._joint_active.clear()
+                    enabled = False
+                    if pump_enabled:
+                        pump_enabled = False
+                        self.hardware.set_pump_enabled(False)
+
+                try:
+                    joint_angles = _read_joint_angles(self.hardware, self.robot_config)
+                    last_joint_angles = joint_angles.copy()
+                    current_rad = float(joint_angles[joint_id])
+                    target_rad = math.radians(target_deg)
+                    error = _angle_error(target_rad, current_rad)
+
+                    if enabled:
+                        output = pid.compute(0.0, -error, dt=period)
+                        self.hardware.send_named_pwm_commands(
+                            {PWM_NAMES[joint_id]: output}, unset_to_zero=True
+                        )
+                    else:
+                        output = 0.0
+                        self.hardware.reset(reset_pump=False)
+
+                    telemetry = [
+                        float(joint_id),
+                        float(math.degrees(joint_angles[0])),
+                        float(math.degrees(joint_angles[1])),
+                        float(math.degrees(joint_angles[2])),
+                        float(math.degrees(joint_angles[3])),
+                        float(target_deg),
+                        float(output),
+                        float(pid.kp),
+                        float(pid.ki),
+                        float(pid.kd),
+                        1.0 if enabled else 0.0,
+                        1.0 if pump_enabled else 0.0,
+                    ]
+                    self.sock.send(telemetry)
+                except Exception as exc:
+                    self.log.warning("Joint loop error: %s", exc)
+                    self.hardware.reset(reset_pump=False)
+
+                now = time.time()
+                if now - last_status >= 1.0:
+                    self.log.info(
+                        "joint: %s target=%+.1f deg output=%+.3f enabled=%s pump=%s",
+                        JOINT_NAMES[joint_id], target_deg, output, enabled, pump_enabled,
+                    )
+                    last_status = now
+
+                next_t += period
+                sleep_s = next_t - time.perf_counter()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    next_t = time.perf_counter()
+
+        except KeyboardInterrupt:
+            self.log.info("Joint: interrupted")
+        finally:
+            self._joint_active.clear()
+            try:
+                self.hardware.reset(reset_pump=True)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Combined server
+# ---------------------------------------------------------------------------
+
+
+# TODO(refactor #1): Delete CombinedServer once the single-port migration
+# lands. Replace with one UDPSocket bound to the new unified port (see
+# ``common.py``); demux ``JointHandler`` vs the new ``EEStrokeExecutor``
+# from the mode byte in the packet header. The "joint mode locks out EE
+# mode" coupling disappears with the second socket.
+class CombinedServer:
+    def __init__(
+        self,
+        host: str,
+        joint_port: int,
+        ee_port: int,
+        rate_hz: float,
+        hardware: HardwareInterface,
+        robot_config,
+        controller: ExcavatorController,
+        log: logging.Logger,
+    ) -> None:
+        self._joint_active = threading.Event()
+
+        self.joint_handler = JointHandler(
+            host=host, port=joint_port, rate_hz=rate_hz,
+            hardware=hardware, robot_config=robot_config,
+            log=log.getChild("joint"), joint_active=self._joint_active,
+        )
+        self.ee_host = EEHost(
+            host=host, port=ee_port, rate_hz=rate_hz,
+            controller=controller, hardware=hardware,
+            log=log.getChild("ee"),
+        )
+        self.ee_host.set_joint_priority_flag(self._joint_active)
+        self._log = log
+
+    def run(self) -> None:
+        joint_thread = threading.Thread(
+            target=self.joint_handler.run, daemon=True, name="joint-tuner"
+        )
+        ee_thread = threading.Thread(
+            target=self.ee_host.run_forever, daemon=True, name="ee-tuner"
+        )
+        joint_thread.start()
+        ee_thread.start()
+        self._log.info(
+            "Both handlers started — joint port %d, EE port %d",
+            self.joint_handler.port, self.ee_host.port,
+        )
+        try:
+            while joint_thread.is_alive() or ee_thread.is_alive():
+                joint_thread.join(timeout=1.0)
+                ee_thread.join(timeout=1.0)
+        except KeyboardInterrupt:
+            self._log.info("Interrupted")
+        finally:
+            self.ee_host._stop.set()
+            joint_thread.join(timeout=3.0)
+            ee_thread.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv=None) -> int:
+    """Combined server: both per-joint (port 8090) and EE-plane (port 8091)."""
+    parser = argparse.ArgumentParser(
+        description="PID tuner — combined robot server (per-joint + EE-plane)"
+    )
+    parser.add_argument("--robot", default="auto")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--joint-port", type=int, default=JOINT_PORT)
+    parser.add_argument("--ee-port", type=int, default=EE_PORT)
+    parser.add_argument("--rate", type=float, default=50.0)
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    parser.add_argument("--warmup", type=float, default=5.0,
-                        help="seconds to wait after controller.start() for numba warmup")
+    parser.add_argument("--warmup", type=float, default=5.0)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="[%(levelname)s] %(name)s: %(message)s",
     )
-    log = logging.getLogger("pid_tuner_ee")
+    log = logging.getLogger("pid_tuner")
 
     profile = resolve_board_profile(args.robot)
-    log.info(
-        "Profile: %s board=%s servo=%s control=%s",
-        profile["profile_name"], profile["board"],
-        profile["servo_config_file"], profile["control_config_file"],
-    )
+    log.info("Profile: %s board=%s", profile["profile_name"], profile["board"])
 
-    log.info("Initializing HardwareInterface...")
     hardware = HardwareInterface(
         config_file=profile["servo_config_file"],
         control_config_file=profile["control_config_file"],
@@ -1187,8 +1404,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         pwm_i2c_bus=profile["pwm_i2c_bus"],
         pwm_i2c_addr=profile["pwm_i2c_addr"],
     )
+    robot_config = load_excavator_robot_config(profile["control_config_file"])
 
-    log.info("Initializing ExcavatorController...")
     controller = ExcavatorController(
         hardware_interface=hardware,
         enable_perf_tracking=False,
@@ -1198,36 +1415,95 @@ def main(argv: Optional[List[str]] = None) -> int:
     controller.start()
 
     if args.warmup > 0:
-        log.info("Warmup sleep %.1fs", args.warmup)
+        log.info("Warmup %.1fs", args.warmup)
         time.sleep(args.warmup)
 
     log.info("Waiting for hardware readiness...")
     t_start = time.time()
     while not hardware.is_hardware_ready():
         if time.time() - t_start > 90.0:
-            log.error("Timed out waiting for hardware readiness")
+            log.error("Timed out waiting for hardware")
             break
         time.sleep(0.5)
 
-    # Start paused — only run when client sends START.
     try:
         controller.pause()
     except Exception:
         pass
 
-    tuner_host = PIDTunerEEHost(
+    server = CombinedServer(
         host=args.host,
-        port=args.port,
+        joint_port=args.joint_port,
+        ee_port=args.ee_port,
         rate_hz=args.rate,
-        controller=controller,
         hardware=hardware,
+        robot_config=robot_config,
+        controller=controller,
         log=log,
     )
     try:
-        tuner_host.run_forever()
+        server.run()
     finally:
         try:
             controller.stop()
+        except Exception:
+            pass
+        try:
+            hardware.reset(reset_pump=True)
+            hardware.shutdown()
+        except Exception:
+            pass
+    return 0
+
+
+def main_joint(argv=None) -> int:
+    """Standalone per-joint server only (no EE, no ExcavatorController)."""
+    parser = argparse.ArgumentParser(
+        description="PID tuner — per-joint server only"
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=JOINT_PORT)
+    parser.add_argument("--rate", type=float, default=50.0)
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--config-file",
+                        default="configuration_files/profiles/rpi/servo_config.yaml")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="[%(levelname)s] %(name)s: %(message)s",
+    )
+    log = logging.getLogger("pid_tuner.joint")
+
+    hardware = HardwareInterface(
+        config_file=args.config_file,
+        control_config_file="configuration_files/profiles/rpi/control_config.yaml",
+        pump_auto_mode=False,
+        cleanup_disable_osc=False,
+        enable_adc=False,
+        start_adc_reader=False,
+        log_level=args.log_level,
+    )
+    robot_config = load_excavator_robot_config(
+        "configuration_files/profiles/rpi/control_config.yaml"
+    )
+
+    log.info("Waiting for hardware")
+    while not hardware.is_hardware_ready():
+        time.sleep(0.1)
+
+    handler = JointHandler(
+        host=args.host, port=args.port, rate_hz=args.rate,
+        hardware=hardware, robot_config=robot_config,
+        log=log, joint_active=threading.Event(),
+    )
+    try:
+        handler.run()
+    finally:
+        try:
+            hardware.reset(reset_pump=True)
+            hardware.shutdown()
         except Exception:
             pass
     return 0

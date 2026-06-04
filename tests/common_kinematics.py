@@ -16,16 +16,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik_cfg import IKControllerConfig, RobotConfig, load_excavator_robot_config  # noqa: E402
-from modules.differential_ik import IKController  # noqa: E402
-from modules.excavator_ik_utils import (  # noqa: E402
+from modules.ik import (  # noqa: E402
+    IKControllerConfig, RobotConfig, load_excavator_robot_config,
+    IKController,
     get_joint_positions, get_pose, compute_relative_joint_angles,
     warmup_numba_functions,
-)
-from modules.quaternion_math import (  # noqa: E402
-    quat_from_axis_angle,
-    quat_multiply,
-    quat_normalize,
+    quat_from_axis_angle, quat_multiply, quat_normalize,
 )
 
 
@@ -125,7 +121,7 @@ def simulate_ik(
     Returns dict with ``converged``, ``iters``, ``final_angles``, ``final_pos``,
     ``pos_error``, ``history`` (positions per iter).
     """
-    from modules.quaternion_math import quat_from_axis_angle
+    from modules.ik import quat_from_axis_angle
 
     ik_controller.ee_pos_des = np.asarray(target_pos, dtype=np.float32)
     ik_controller.ee_quat_des = quat_from_axis_angle(

@@ -90,26 +90,26 @@ pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 5.500 #6
-    ki: 0.200
-    kd: 0.250 # try to increase?
+    kp: 7.000
+    ki: 0.000
+    kd: 0.200
 
   # Joint 1: Boom (lift arm)
   joint1:
     kp: 10.000
-    ki: 0.400
+    ki: 1.000
     kd: 0.000
 
   # Joint 2: Arm (tilt)
   joint2:
     kp: 10.000
-    ki: 0.400
+    ki: 1.000
     kd: 0.000
 
   # Joint 3: Bucket (scoop)
   joint3:
-    kp: 5.000
-    ki: 0.250
+    kp: 10.000
+    ki: 1.000
     kd: 0.000
 
 controller:
@@ -217,5 +217,5 @@ ik:
 reachability:
   enabled: true
   pos_tol_m: 0.005          # Convergence tolerance (m)
-  max_iters: 80             # Hard iteration cap per check
+  max_iters: 20             # Hard iteration cap per check
   min_target_delta_m: 0.002 # Skip re-check when joystick moves less than this

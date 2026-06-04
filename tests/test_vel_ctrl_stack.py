@@ -44,7 +44,7 @@ class _ControllerProxy:
 
 class _VelCmdProxy:
     """Proxy for velocity-command mode methods only."""
-    _direct_mode: bool = False
+    _output_suspended: bool = False
     _vel_cmd_mode: bool = False
     _vel_cmd_commands: dict = {}
     _vel_cmd_integrals: dict = {j: 0.0 for j in _VEL_CMD_JOINTS}
@@ -355,10 +355,10 @@ class TestEnterExitVelocityCommandMode(unittest.TestCase):
         self.ctrl.enter_velocity_command_mode()
         self.assertTrue(self.ctrl._vel_cmd_mode)
 
-    def test_enter_clears_direct_mode(self):
-        self.ctrl._direct_mode = True
+    def test_enter_clears_output_suspended(self):
+        self.ctrl._output_suspended = True
         self.ctrl.enter_velocity_command_mode()
-        self.assertFalse(self.ctrl._direct_mode)
+        self.assertFalse(self.ctrl._output_suspended)
 
     def test_enter_resets_integrals(self):
         for k in self.ctrl._vel_cmd_integrals:

@@ -16,10 +16,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik import IKController  # noqa: E402
-from modules.excavator_ik_utils import compute_relative_joint_angles  # noqa: E402
+from modules.ik import (  # noqa: E402
+    IKController,
+    compute_relative_joint_angles,
+    quat_from_axis_angle,
+)
 from modules.excavator_target_state import ExcavatorTargetState  # noqa: E402
-from modules.quaternion_math import quat_from_axis_angle  # noqa: E402
 
 from tests.common_kinematics import (  # noqa: E402
     build_absolute_quaternions,

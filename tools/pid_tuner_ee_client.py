@@ -202,7 +202,7 @@ class PIDTunerEEClient:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=1)
+        root.rowconfigure(3, weight=1)
 
         self._build_connection_row(root)
         self._build_params_panel(root)
@@ -226,25 +226,33 @@ class PIDTunerEEClient:
         for col in range(8):
             panel.columnconfigure(col, weight=1)
 
-        # Program parameters
-        prog = ttk.LabelFrame(panel, text="Program", padding=6)
-        prog.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=(0, 4))
-        self._labeled_entry(prog, 0, "x_min (m)", self.x_min_var)
-        self._labeled_entry(prog, 1, "x_max (m)", self.x_max_var)
-        self._labeled_entry(prog, 2, "y      (m)", self.y_var)
-        self._labeled_entry(prog, 3, "z      (m)", self.z_var)
-        self._labeled_entry(prog, 4, "speed (m/s)", self.speed_var,
-                            tooltip="EE linear speed for MANUAL runs, range 0.020 .. 0.070")
-        self._labeled_entry(prog, 5, "strokes/run", self.strokes_var)
-        self._labeled_entry(prog, 6, "auto-tune runs", self.num_runs_var)
-        self._labeled_entry(prog, 7, "z_min (m)", self.z_min_var,
-                            tooltip="Auto-tune Z sweep lower bound")
-        self._labeled_entry(prog, 8, "z_max (m)", self.z_max_var,
-                            tooltip="Auto-tune Z sweep upper bound")
-        self._labeled_entry(prog, 9, "v_min (m/s)", self.speed_min_var,
-                            tooltip="Auto-tune speed sweep lower bound (e.g. 0.020)")
-        self._labeled_entry(prog, 10, "v_max (m/s)", self.speed_max_var,
-                            tooltip="Auto-tune speed sweep upper bound (e.g. 0.070)")
+        # Sweep parameters — used by every run (manual and auto-tune).
+        sweep = ttk.LabelFrame(panel, text="Sweep", padding=6)
+        sweep.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 4))
+        self._labeled_entry(sweep, 0, "x_min (m)", self.x_min_var, tooltip="A point (near)")
+        self._labeled_entry(sweep, 1, "x_max (m)", self.x_max_var, tooltip="B point (far)")
+        self._labeled_entry(sweep, 2, "y      (m)", self.y_var)
+        self._labeled_entry(sweep, 3, "z      (m)", self.z_var,
+                            tooltip="EE height for manual runs")
+        self._labeled_entry(sweep, 4, "speed (m/s)", self.speed_var,
+                            tooltip="EE linear speed for MANUAL runs (0.020..0.070)")
+        self._labeled_entry(sweep, 5, "strokes/run", self.strokes_var)
+
+        # Auto-tune parameters — only used when Auto-tune checkbox is set.
+        # The tuner cycles through a (z, speed) grid built from these ranges
+        # so the found gains are robust across the operating envelope.
+        atune = ttk.LabelFrame(panel, text="Auto-tune", padding=6)
+        atune.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(0, 4))
+        self._labeled_entry(atune, 0, "runs", self.num_runs_var,
+                            tooltip="Max auto-tune iterations (budget)")
+        self._labeled_entry(atune, 1, "z_min (m)", self.z_min_var,
+                            tooltip="Z sweep lower bound")
+        self._labeled_entry(atune, 2, "z_max (m)", self.z_max_var,
+                            tooltip="Z sweep upper bound")
+        self._labeled_entry(atune, 3, "v_min (m/s)", self.speed_min_var,
+                            tooltip="Speed sweep lower bound (e.g. 0.020)")
+        self._labeled_entry(atune, 4, "v_max (m/s)", self.speed_max_var,
+                            tooltip="Speed sweep upper bound (e.g. 0.070)")
 
         # Joint + PID selection
         sel = ttk.LabelFrame(panel, text="Joint / PID", padding=6)
@@ -295,9 +303,9 @@ class PIDTunerEEClient:
             row=5, column=0, columnspan=3, sticky="ew"
         )
 
-        # Run control row
+        # Run control row — must be row=2 (panel is row=1; same row would overlap)
         runrow = ttk.Frame(parent)
-        runrow.grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        runrow.grid(row=2, column=0, sticky="ew", pady=(2, 4))
         ttk.Button(runrow, text="START", command=self._start).pack(side=tk.LEFT)
         ttk.Button(runrow, text="STOP", command=self._stop).pack(side=tk.LEFT, padx=4)
         ttk.Label(runrow, text="cost weights — rmse:").pack(side=tk.LEFT, padx=(16, 2))
@@ -322,7 +330,7 @@ class PIDTunerEEClient:
 
     def _build_plot_area(self, parent: ttk.Frame) -> None:
         plots = ttk.Frame(parent)
-        plots.grid(row=2, column=0, sticky="nsew")
+        plots.grid(row=3, column=0, sticky="nsew")
         plots.columnconfigure(0, weight=2)
         plots.columnconfigure(1, weight=1)
         plots.rowconfigure(0, weight=1)
@@ -337,7 +345,7 @@ class PIDTunerEEClient:
 
     def _build_status_row(self, parent: ttk.Frame) -> None:
         row = ttk.Frame(parent)
-        row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         self.metrics_var = tk.StringVar(value="no telemetry yet")
         self.gains_var = tk.StringVar(value="")
         self.split_var = tk.StringVar(value="OUT/IN breakdown will appear after first scored run")

@@ -29,10 +29,11 @@ See :mod:`tools.pid_tuner_ee_common` for packet layout. Default UDP port is
 
 Safety
 ------
-On this test bench the actuators are not connected, so the script is safe to
-run blind. On real hardware the same rules as production apply: the controller
-zeroes outputs when paused, the pump is gated by ``hardware.set_pump_enabled``,
-and unreachable targets are rejected by the controller's reachability check.
+The pump is enabled when a run starts and stays on between auto-tune iterations
+for hydraulic stability. It is disabled on explicit STOP, on error, and at exit.
+The controller zeroes valve outputs while between runs (paused state). Unreachable
+targets are rejected by the controller's reachability check. Always confirm a safe
+A/B sweep range before starting on real hardware.
 
 CLI
 ---
@@ -754,8 +755,18 @@ class PIDTunerEEHost:
             self._stop_run()
 
         if flags & int(CommandFlag.START):
-            auto = bool(flags & int(CommandFlag.AUTO_TUNE))
-            self._start_run(auto=auto)
+            with self.shared.lock:
+                cfg = self.shared.cfg
+            if cfg.x_min >= cfg.x_max:
+                self.log.warning(
+                    "START rejected: x_min (%.3f) >= x_max (%.3f) — set A/B points first",
+                    cfg.x_min, cfg.x_max,
+                )
+            elif cfg.z <= 0.0:
+                self.log.warning("START rejected: z=%.3f is not positive", cfg.z)
+            else:
+                auto = bool(flags & int(CommandFlag.AUTO_TUNE))
+                self._start_run(auto=auto)
 
     # ----- tuner thread lifecycle ----------------------------------------
 
@@ -774,7 +785,11 @@ class PIDTunerEEHost:
             self._tuner_thread.join(timeout=2.0)
             self._tuner_thread = None
         try:
-            self.controller.pause()
+            self.controller.pause()  # reset_pump=True: explicit stop depressurises
+        except Exception:
+            pass
+        try:
+            self.hardware.set_pump_enabled(False)
         except Exception:
             pass
         with self.shared.lock:
@@ -795,12 +810,19 @@ class PIDTunerEEHost:
         except Exception as exc:
             self.log.warning("controller.resume failed: %s", exc)
 
-        # Seed motion smoother with a high velocity ceiling so our ramp drives
-        # the actual reference without being slowed by jerk-limited smoothing.
+        # Pump stays on for the entire tuning session; only STOP / exit disables it.
         try:
-            self.controller.motion_processor.max_velocity = max(
-                self.controller.motion_processor.max_velocity, cfg.speed * 4.0
-            )
+            self.hardware.set_pump_enabled(True)
+        except Exception as exc:
+            self.log.warning("pump enable failed: %s", exc)
+
+        # Raise motion smoother velocity ceiling so our ramp isn't throttled.
+        # Save the original value and restore it after the run so the config
+        # limit isn't silently raised for the rest of the session.
+        orig_max_vel: Optional[float] = None
+        try:
+            orig_max_vel = self.controller.motion_processor.max_velocity
+            self.controller.motion_processor.max_velocity = max(orig_max_vel, cfg.speed * 4.0)
         except Exception:
             pass
 
@@ -809,74 +831,83 @@ class PIDTunerEEHost:
         ee_x_samples: List[float] = []
         stroke_dirs: List[int] = []
 
-        # Stroke counter: even index = travelling from x_min -> x_max, odd = back.
-        for stroke in range(cfg.strokes_per_run):
-            if self._stop.is_set():
-                return None
-            forward = (stroke % 2 == 0)
-            start_x = cfg.x_min if forward else cfg.x_max
-            end_x = cfg.x_max if forward else cfg.x_min
-            direction = +1 if forward else -1
-            with self.shared.lock:
-                self.shared.stroke_index = stroke
-                self.shared.ramp_dir = direction
-            # Pin every DirectionalPID we own to this stroke's direction so
-            # the per-direction subscores cleanly attribute to the matching
-            # gain triple.
-            for pid in self.controller.joint_pids:
-                if isinstance(pid, DirectionalPID):
-                    pid.set_active_direction(direction)
-            x = start_x
-            distance = abs(end_x - start_x)
-            duration = distance / max(cfg.speed, 1e-3)
-            t0 = time.perf_counter()
-            next_t = t0
-            while True:
+        try:
+            # Stroke counter: even index = travelling from x_min -> x_max, odd = back.
+            for stroke in range(cfg.strokes_per_run):
                 if self._stop.is_set():
                     return None
-                t = time.perf_counter() - t0
-                if t >= duration:
-                    x = end_x
-                else:
-                    x = start_x + direction * cfg.speed * t
-                pos = np.array([x, cfg.y, cfg.z], dtype=np.float32)
-                try:
-                    self.controller.give_pose(pos, 0.0)
-                except Exception as exc:
-                    self.log.warning("give_pose failed: %s", exc)
-                # Sample measured EE pose.
-                try:
-                    measured, _ = self.controller.get_pose()
-                except Exception:
-                    measured = np.array([np.nan, np.nan, np.nan])
-                cmd_x_samples.append(float(x))
-                ee_x_samples.append(float(measured[0]))
-                stroke_dirs.append(direction)
+                forward = (stroke % 2 == 0)
+                start_x = cfg.x_min if forward else cfg.x_max
+                end_x = cfg.x_max if forward else cfg.x_min
+                direction = +1 if forward else -1
                 with self.shared.lock:
-                    self.shared.cmd_pos = (float(x), cfg.y, cfg.z)
-                    self.shared.ee_pos = (
-                        float(measured[0]), float(measured[1]), float(measured[2])
-                    )
-                    self.shared.err_now = abs(float(measured[0]) - float(x)) * 1000.0
-                if t >= duration:
-                    break
-                next_t += dt
-                sleep_s = next_t - time.perf_counter()
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                    self.shared.stroke_index = stroke
+                    self.shared.ramp_dir = direction
+                # Pin every DirectionalPID we own to this stroke's direction so
+                # the per-direction subscores cleanly attribute to the matching
+                # gain triple.
+                for pid in self.controller.joint_pids:
+                    if isinstance(pid, DirectionalPID):
+                        pid.set_active_direction(direction)
+                x = start_x
+                distance = abs(end_x - start_x)
+                duration = distance / max(cfg.speed, 1e-3)
+                t0 = time.perf_counter()
+                next_t = t0
+                while True:
+                    if self._stop.is_set():
+                        return None
+                    t = time.perf_counter() - t0
+                    if t >= duration:
+                        x = end_x
+                    else:
+                        x = start_x + direction * cfg.speed * t
+                    pos = np.array([x, cfg.y, cfg.z], dtype=np.float32)
+                    try:
+                        result_reach = self.controller.give_pose(pos, 0.0)
+                        if result_reach is not None and not getattr(result_reach, "reachable", True):
+                            self.log.warning("give_pose: target unreachable at x=%.3f z=%.3f", x, cfg.z)
+                    except Exception as exc:
+                        self.log.warning("give_pose failed: %s", exc)
+                    # Sample measured EE pose.
+                    try:
+                        measured, _ = self.controller.get_pose()
+                    except Exception:
+                        measured = np.array([np.nan, np.nan, np.nan])
+                    cmd_x_samples.append(float(x))
+                    ee_x_samples.append(float(measured[0]))
+                    stroke_dirs.append(direction)
+                    with self.shared.lock:
+                        self.shared.cmd_pos = (float(x), cfg.y, cfg.z)
+                        self.shared.ee_pos = (
+                            float(measured[0]), float(measured[1]), float(measured[2])
+                        )
+                        self.shared.err_now = abs(float(measured[0]) - float(x)) * 1000.0
+                    if t >= duration:
+                        break
+                    next_t += dt
+                    sleep_s = next_t - time.perf_counter()
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
 
-        with self.shared.lock:
-            self.shared.state = TunerState.SCORING
-            self.shared.ramp_dir = 0
-        # Release the directional pin so the wrapper falls back to sign-of-error
-        # if anything calls compute() between runs.
-        for pid in self.controller.joint_pids:
-            if isinstance(pid, DirectionalPID):
-                pid.set_active_direction(0)
-        result = score_run(cmd_x_samples, ee_x_samples, stroke_dirs, cfg)
-        with self.shared.lock:
-            self.shared.last_result = result
-        return result
+            with self.shared.lock:
+                self.shared.state = TunerState.SCORING
+                self.shared.ramp_dir = 0
+            # Release the directional pin so the wrapper falls back to sign-of-error
+            # if anything calls compute() between runs.
+            for pid in self.controller.joint_pids:
+                if isinstance(pid, DirectionalPID):
+                    pid.set_active_direction(0)
+            result = score_run(cmd_x_samples, ee_x_samples, stroke_dirs, cfg)
+            with self.shared.lock:
+                self.shared.last_result = result
+            return result
+        finally:
+            if orig_max_vel is not None:
+                try:
+                    self.controller.motion_processor.max_velocity = orig_max_vel
+                except Exception:
+                    pass
 
     def _manual_run_loop(self) -> None:
         try:
@@ -890,7 +921,8 @@ class PIDTunerEEHost:
             self.log.exception("manual run failed: %s", exc)
         finally:
             try:
-                self.controller.pause()
+                # Zero valve outputs but keep pump pressurized between runs.
+                self.controller.pause(reset_pump=False)
             except Exception:
                 pass
             with self.shared.lock:
@@ -905,7 +937,8 @@ class PIDTunerEEHost:
             self.log.exception("auto-tune failed: %s", exc)
         finally:
             try:
-                self.controller.pause()
+                # Zero valve outputs but keep pump pressurized between runs.
+                self.controller.pause(reset_pump=False)
             except Exception:
                 pass
             with self.shared.lock:

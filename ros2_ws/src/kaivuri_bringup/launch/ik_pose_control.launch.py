@@ -1,32 +1,40 @@
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
-def generate_launch_description():
-    description_dir = Path(get_package_share_directory("kaivuri_description"))
-    urdf_path = description_dir / "robot" / "robot.urdf"
-    robot_description = urdf_path.read_text(encoding="utf-8")
+def _load_urdf(model_dir: str) -> str:
+    model_dir_path = Path(model_dir)
+    urdf_path = model_dir_path / "test4v6.urdf"
+    if not urdf_path.exists():
+        raise FileNotFoundError(f"URDF not found: {urdf_path}")
 
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+
+    for mesh in root.findall(".//mesh"):
+        filename = mesh.attrib.get("filename", "")
+        if not filename or "://" in filename or filename.startswith("package:"):
+            continue
+        mesh.set("filename", (model_dir_path / filename).resolve().as_uri())
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def _launch_setup(context, *args, **kwargs):
+    robot_description = _load_urdf(LaunchConfiguration("model_dir").perform(context))
     use_sim_time = LaunchConfiguration("use_sim_time")
     project_root = LaunchConfiguration("project_root")
     robot = LaunchConfiguration("robot")
     state_rate_hz = LaunchConfiguration("state_rate_hz")
     command_timeout_s = LaunchConfiguration("command_timeout_s")
+    visualization_only = LaunchConfiguration("visualization_only")
 
-    return LaunchDescription([
-        DeclareLaunchArgument("use_sim_time", default_value="false"),
-        DeclareLaunchArgument(
-            "project_root",
-            default_value=EnvironmentVariable("KAIVURI_PROJECT_ROOT", default_value="/work"),
-        ),
-        DeclareLaunchArgument("robot", default_value="auto"),
-        DeclareLaunchArgument("state_rate_hz", default_value="30.0"),
-        DeclareLaunchArgument("command_timeout_s", default_value="1.0"),
+    return [
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
@@ -47,6 +55,26 @@ def generate_launch_description():
                 "robot": robot,
                 "state_rate_hz": state_rate_hz,
                 "command_timeout_s": command_timeout_s,
+                "visualization_only": visualization_only,
             }],
         ),
+    ]
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            "model_dir",
+            default_value="/root/kaivuriprokkis/models/test4/",
+        ),
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument(
+            "project_root",
+            default_value=EnvironmentVariable("KAIVURI_PROJECT_ROOT", default_value="/work"),
+        ),
+        DeclareLaunchArgument("robot", default_value="auto"),
+        DeclareLaunchArgument("state_rate_hz", default_value="30.0"),
+        DeclareLaunchArgument("command_timeout_s", default_value="1.0"),
+        DeclareLaunchArgument("visualization_only", default_value="false"),
+        OpaqueFunction(function=_launch_setup),
     ])

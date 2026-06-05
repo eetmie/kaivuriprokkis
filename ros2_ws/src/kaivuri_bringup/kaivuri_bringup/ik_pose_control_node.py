@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import numpy as np
 import rclpy
+import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -25,6 +26,154 @@ JOINT_NAMES = [
 
 _N_ACTIVE = 4
 _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+_Z_AXIS = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+
+class VisualizationIkController:
+    """Small IK-only controller used to drive RViz without real PWM/IMU hardware."""
+
+    def __init__(self, control_config_file: str, initial_joint_deg: List[float]) -> None:
+        from modules.differential_ik import (
+            IKController,
+            get_pose_from_joint_angles,
+            joint_angles_to_absolute_quaternions,
+        )
+        from modules.differential_ik_cfg import IKControllerConfig, load_excavator_robot_config
+        from modules.quaternion_math import quat_from_axis_angle, quat_multiply, quat_normalize
+
+        self._get_pose_from_joint_angles = get_pose_from_joint_angles
+        self._joint_angles_to_absolute_quaternions = joint_angles_to_absolute_quaternions
+        self._quat_from_axis_angle = quat_from_axis_angle
+        self._quat_multiply = quat_multiply
+        self._quat_normalize = quat_normalize
+
+        self.robot_config = load_excavator_robot_config(control_config_file)
+        control_config = self._load_control_config(control_config_file)
+        rates_cfg = control_config.get("rates", {})
+        self._dt = 1.0 / max(1.0, float(rates_cfg.get("control_hz", 100.0)))
+
+        ik_cfg = control_config.get("ik", {})
+        ctrl_cfg = control_config.get("controller", {})
+        if not ik_cfg:
+            raise RuntimeError("Missing 'ik' section in control_config.yaml")
+
+        joint_limits = self._parse_joint_limits(ik_cfg.get("joint_limits_relative"))
+        per_joint_max = ctrl_cfg.get("per_joint_max_velocity")
+        max_joint_velocities = None
+        if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == _N_ACTIVE:
+            max_joint_velocities = [float(v) for v in per_joint_max]
+
+        self._ik = IKController(
+            IKControllerConfig(
+                command_type=ik_cfg["command_type"],
+                ik_method=ik_cfg["method"],
+                use_relative_mode=bool(ik_cfg.get("use_relative_mode", False)),
+                ik_params=ik_cfg.get("params", {}),
+                enable_velocity_limiting=bool(ctrl_cfg.get("enable_velocity_limiting", True)),
+                max_joint_velocities=max_joint_velocities,
+                joint_limits=joint_limits,
+                velocity_mode=bool(ik_cfg.get("velocity_mode", False)),
+                velocity_error_gain=float(ik_cfg.get("velocity_error_gain", 1.0)),
+                use_rotational_velocity=bool(ik_cfg.get("use_rotational_velocity", True)),
+                enable_adaptive_damping=bool(ik_cfg.get("enable_adaptive_damping", True)),
+                adaptive_damping_max_multiplier=float(
+                    ik_cfg.get("adaptive_damping_max_multiplier", 2.0)
+                ),
+                condition_number_threshold=float(ik_cfg.get("condition_number_threshold", 40.0)),
+            ),
+            self.robot_config,
+            verbose=False,
+            default_dt=self._dt,
+        )
+
+        initial = np.asarray(initial_joint_deg[:_N_ACTIVE], dtype=np.float32)
+        if initial.size < _N_ACTIVE:
+            initial = np.pad(initial, (0, _N_ACTIVE - initial.size))
+        self._joint_angles = np.radians(initial).astype(np.float32)
+        self._joint_angles = self._clamp_to_limits(self._joint_angles, joint_limits)
+        self._target_position: Optional[np.ndarray] = None
+        self._target_rot_y_deg = 0.0
+        self._last_joint_vel_radps: Optional[np.ndarray] = None
+        self._last_joint_vel_time: Optional[float] = None
+
+    @staticmethod
+    def _load_control_config(path: str) -> dict:
+        with Path(path).open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _parse_joint_limits(value) -> Optional[List[tuple]]:
+        if not isinstance(value, (list, tuple)) or len(value) != _N_ACTIVE:
+            return None
+
+        limits = []
+        for pair in value:
+            if pair is None or (isinstance(pair, (list, tuple)) and len(pair) == 0):
+                limits.append((float("-inf"), float("inf")))
+                continue
+            q_min, q_max = float(pair[0]), float(pair[1])
+            if max(abs(q_min), abs(q_max)) > np.pi + 1e-6:
+                q_min, q_max = np.radians(q_min), np.radians(q_max)
+            limits.append((q_min, q_max))
+        return limits
+
+    @staticmethod
+    def _clamp_to_limits(joint_angles: np.ndarray, limits: Optional[List[tuple]]) -> np.ndarray:
+        if limits is None:
+            return joint_angles
+        out = joint_angles.copy()
+        for i, (q_min, q_max) in enumerate(limits):
+            out[i] = np.clip(out[i], q_min, q_max)
+        return out
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def clear_target(self) -> None:
+        self._target_position = None
+
+    def give_pose(self, position: np.ndarray, rotation_y_deg: float):
+        self._target_position = np.asarray(position, dtype=np.float32)
+        self._target_rot_y_deg = float(rotation_y_deg)
+        return None
+
+    def update(self) -> None:
+        if self._target_position is None:
+            return
+
+        prev = self._joint_angles.copy()
+        ee_pos, ee_quat = self._get_pose_from_joint_angles(self._joint_angles, self.robot_config)
+        joint_quats = self._joint_angles_to_absolute_quaternions(self._joint_angles, self.robot_config)
+        slew_angle = float(self._joint_angles[0])
+        slew_quat = self._quat_from_axis_angle(_Z_AXIS, np.float32(slew_angle))
+        pitch_quat = self._quat_from_axis_angle(_Y_AXIS, np.radians(self._target_rot_y_deg))
+        target_quat = self._quat_normalize(self._quat_multiply(slew_quat, pitch_quat))
+
+        command = np.concatenate([self._target_position, target_quat]).astype(np.float32)
+        self._ik.set_command(command)
+        self._joint_angles = self._ik.compute(
+            ee_pos,
+            ee_quat,
+            self._joint_angles,
+            joint_quats=joint_quats,
+            dt=self._dt,
+        )
+
+        now = time.perf_counter()
+        self._last_joint_vel_radps = (self._joint_angles - prev) / self._dt
+        self._last_joint_vel_time = now
+
+    def get_joint_angles(self) -> np.ndarray:
+        return np.degrees(self._joint_angles.copy())
+
+    def get_joint_velocities_with_age(self) -> tuple:
+        if self._last_joint_vel_radps is None or self._last_joint_vel_time is None:
+            return None, float("inf")
+        return list(np.degrees(self._last_joint_vel_radps)), time.perf_counter() - self._last_joint_vel_time
 
 
 class IkPoseControlNode(Node):
@@ -60,6 +209,8 @@ class IkPoseControlNode(Node):
         self.declare_parameter("stale_timeout_s", 0.5)
         self.declare_parameter("publish_tool_pose", True)
         self.declare_parameter("log_reachability_rejections", True)
+        self.declare_parameter("visualization_only", False)
+        self.declare_parameter("visual_initial_joint_deg", [0.0, 0.0, 90.0, 0.0])
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
@@ -90,29 +241,43 @@ class IkPoseControlNode(Node):
             f"I2C bus={pwm_i2c_bus} addr=0x{pwm_i2c_addr:02X}"
         )
 
-        self._hardware = HardwareInterface(
-            config_file=str(config_path),
-            control_config_file=str(control_config_path),
-            pump_auto_mode=bool(self.get_parameter("pump_auto_mode").value),
-            toggle_channels=bool(self.get_parameter("toggle_channels").value),
-            stale_timeout_s=float(self.get_parameter("stale_timeout_s").value),
-            enable_pwm=True,
-            enable_imu=True,
-            enable_adc=False,
-            start_imu_reader=True,
-            start_adc_reader=False,
-            cleanup_disable_osc=False,
-            pwm_i2c_bus=pwm_i2c_bus,
-            pwm_i2c_addr=pwm_i2c_addr,
-        )
-        self._wait_for_hardware(float(self.get_parameter("ready_timeout_s").value))
+        self._hardware = None
+        self._visualization_only = bool(self.get_parameter("visualization_only").value)
+        if self._visualization_only:
+            initial_joint_deg = self._finite_values(
+                list(self.get_parameter("visual_initial_joint_deg").value)
+            )
+            self._controller = VisualizationIkController(
+                str(control_config_path),
+                initial_joint_deg,
+            )
+            self.get_logger().warn(
+                "IK pose control running in visualization_only mode; no PWM or IMU hardware is used"
+            )
+        else:
+            self._hardware = HardwareInterface(
+                config_file=str(config_path),
+                control_config_file=str(control_config_path),
+                pump_auto_mode=bool(self.get_parameter("pump_auto_mode").value),
+                toggle_channels=bool(self.get_parameter("toggle_channels").value),
+                stale_timeout_s=float(self.get_parameter("stale_timeout_s").value),
+                enable_pwm=True,
+                enable_imu=True,
+                enable_adc=False,
+                start_imu_reader=True,
+                start_adc_reader=False,
+                cleanup_disable_osc=False,
+                pwm_i2c_bus=pwm_i2c_bus,
+                pwm_i2c_addr=pwm_i2c_addr,
+            )
+            self._wait_for_hardware(float(self.get_parameter("ready_timeout_s").value))
 
-        self._controller = ExcavatorController(
-            self._hardware,
-            config=None,
-            enable_perf_tracking=False,
-            control_config_file=str(control_config_path),
-        )
+            self._controller = ExcavatorController(
+                self._hardware,
+                config=None,
+                enable_perf_tracking=False,
+                control_config_file=str(control_config_path),
+            )
         self._controller.start()
 
         self._last_command_time: Optional[float] = None
@@ -206,6 +371,8 @@ class IkPoseControlNode(Node):
 
     def _state_tick(self) -> None:
         self._clear_stale_target_if_needed()
+        if self._visualization_only:
+            self._controller.update()
         self._publish_state()
 
     def _clear_stale_target_if_needed(self) -> None:
@@ -260,7 +427,8 @@ class IkPoseControlNode(Node):
         except Exception:
             pass
         try:
-            self._hardware.shutdown()
+            if self._hardware is not None:
+                self._hardware.shutdown()
         except Exception:
             pass
         return super().destroy_node()

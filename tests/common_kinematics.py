@@ -46,7 +46,7 @@ def build_absolute_quaternions(
 
     absolute = np.zeros((len(joint_angles), 4), dtype=np.float32)
 
-    # Slew is absolute about Z (matches what excavator_controller feeds from encoder).
+    # Slew is absolute about Z from the canonical IMU-derived joint state.
     absolute[0] = quat_from_axis_angle(axes[0], np.float32(joint_angles[0]))
 
     # Downstream joints are composed: q_abs[i] = q_abs[i-1] * q_local[i]

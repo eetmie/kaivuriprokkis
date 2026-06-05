@@ -529,17 +529,17 @@ class HardwareInterface:
                         for i in range(self._expected_imu_count)
                     ]
                     capture_debug = self._debug_telemetry_enabled
-                    gyro_only = [
+                    corrected_gyro = [
                         self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
                         for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
                     ]
                     # Build all derived values before acquiring the lock so the
                     # lock hold time is just a burst of reference assignments.
-                    new_imu_gyro = [gyro_only[i] for i in self._imu_joint_indices] if gyro_only is not None else None
+                    new_imu_gyro = [corrected_gyro[i] for i in self._imu_joint_indices]
                     new_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
                     new_base_imu_gyro = (
-                        gyro_only[self._base_imu_index].copy()
-                        if gyro_only is not None and self._base_imu_index is not None else None
+                        corrected_gyro[self._base_imu_index].copy()
+                        if self._base_imu_index is not None else None
                     )
 
                     # Validate quaternion magnitudes for all configured IMUs (should be ~1.0).

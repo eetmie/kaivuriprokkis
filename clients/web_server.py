@@ -275,12 +275,6 @@ class ExcavatorApp:
 
     def _on_telemetry(self, telemetry: RobotTelemetry):
         mode_name = "DIRECT" if telemetry.mode == ControlMode.DIRECT else "IK"
-        if telemetry.slew_fusion_active:
-            fusion = "fused"
-        elif telemetry.slew_fusion_enabled:
-            fusion = "enc"
-        else:
-            fusion = "off"
         with self._lock:
             self.joint_positions = [list(p) for p in telemetry.joint_positions]
             self.joint_angles_deg = telemetry.joint_angles_deg
@@ -289,7 +283,7 @@ class ExcavatorApp:
             self.measured_z = telemetry.measured_pose.z
             self.measured_rot_y = telemetry.measured_pose.rot_y_deg
             self._has_telemetry = True
-            self.recv_label = f"{mode_name} {fusion}"
+            self.recv_label = mode_name
             if self._sync_target_from_telemetry and not self.direct_mode:
                 if self._sync_target_from_measured():
                     self._sync_target_from_telemetry = False

@@ -544,10 +544,9 @@ class ExcavatorGUI3D:
         self.measured_rot_y = telemetry.measured_pose.rot_y_deg
         self._has_telemetry = True
         mode_name = "DIRECT" if telemetry.mode == ControlMode.DIRECT else "IK"
-        fusion = "fused" if telemetry.slew_fusion_active else ("enc" if telemetry.slew_fusion_enabled else "off")
-        self.root.after(0, self._apply_telemetry_to_view, self.joint_positions, mode_name, fusion)
+        self.root.after(0, self._apply_telemetry_to_view, self.joint_positions, mode_name)
 
-    def _apply_telemetry_to_view(self, joint_positions, mode_name: str, fusion: str):
+    def _apply_telemetry_to_view(self, joint_positions, mode_name: str):
         if self._sync_target_from_telemetry and not self.direct_mode:
             if self._sync_target_from_measured():
                 self._sync_target_from_telemetry = False
@@ -556,7 +555,7 @@ class ExcavatorGUI3D:
             joint_positions=joint_positions,
         )
         self.visualizer.request_redraw(self.root)
-        self.recv_label.config(text=f"Recv: {mode_name} {fusion}")
+        self.recv_label.config(text=f"Recv: {mode_name}")
 
     def _update_hz(self, hz: float):
         self.hz_label.config(text=f"Send Hz: {hz:4.1f}")

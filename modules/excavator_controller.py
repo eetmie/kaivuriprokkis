@@ -56,9 +56,9 @@ else:
 # Defining them here avoids per-tick allocation / nested-function overhead.
 _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-# Joints that receive gyro-derived velocity feedback in velocity-command mode.
+# Joints that receive measured velocity feedback in velocity-command mode.
 # Maps joint name → index into the 4-element joint velocity array.
-# rotate (slew) has no boom-axis gyro; trackL/trackR are pass-through in all modes.
+# rotate (slew) and trackL/trackR are pass-through in all modes.
 _VEL_CMD_JOINTS: Dict[str, int] = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
 
 
@@ -519,26 +519,6 @@ class ExcavatorController:
         if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == 4:
             max_joint_velocities = [float(v) for v in per_joint_max]
 
-        # Joint velocity estimation mode
-        self._gyro_velocity_mode = str(ctrl_cfg.get('gyro_velocity_mode', 'fd_only')).strip().lower()
-        if self._gyro_velocity_mode not in {'fd_only', 'gyro_only', 'fused'}:
-            raise RuntimeError(
-                "Invalid 'controller.gyro_velocity_mode' in control_config.yaml. "
-                "Expected one of: fd_only, gyro_only, fused"
-        )
-        self._gyro_blend_alpha = float(np.clip(float(ctrl_cfg.get('gyro_blend_alpha', 0.30)), 0.0, 1.0))
-        self._gyro_timeout_s = float(max(0.0, float(ctrl_cfg.get('gyro_timeout_s', 0.08))))
-        self._gyro_max_abs_radps = float(np.radians(max(1e-3, float(ctrl_cfg.get('gyro_max_abs_degps', 180.0)))))
-
-        bias_cfg = ctrl_cfg.get('gyro_bias_comp', {})
-        self._gyro_bias_enabled = bool(bias_cfg.get('enabled', True))
-        self._gyro_bias_stationarity_radps = float(
-            np.radians(max(0.0, float(bias_cfg.get('stationarity_degps', 1.5))))
-        )
-        self._gyro_bias_adaptation_rate = float(
-            np.clip(float(bias_cfg.get('adaptation_rate', 0.01)), 0.0, 1.0)
-        )
-
         # Velocity-command mode PI gains (control_config.yaml → controller.velocity_command)
         vel_cmd_cfg = ctrl_cfg.get('velocity_command', {}) if isinstance(ctrl_cfg, dict) else {}
         self._vel_kp = float(vel_cmd_cfg.get('kp', 0.04))
@@ -548,9 +528,6 @@ class ExcavatorController:
             np.radians(max(0.0, float(vel_cmd_cfg.get('deadband_degps', 2.0))))
         )
         self._vel_stale_timeout_s = float(max(0.0, float(vel_cmd_cfg.get('stale_timeout_s', 0.15))))
-
-        # Slew/yaw now comes from the configured IMU canonical state extractor.
-        self._slew_fusion_enabled = False
 
         # Joint limits.  Per-joint null/[] is treated as "unbounded" — the
         # IK final clamp degenerates to a no-op (np.clip with ±inf) and the
@@ -664,9 +641,6 @@ class ExcavatorController:
             enable_smoothing=_enable_jerk and not disable_motion_smoothing,
         )
 
-        # Cache hardware capability flags — hasattr() is non-trivial to call every tick.
-        self._hw_has_try_read_imu_gyro: bool = hasattr(self.hardware, 'try_read_imu_gyro')
-
         # Thread control
         self._control_thread = None
         self._stop_event = threading.Event()
@@ -710,17 +684,11 @@ class ExcavatorController:
         self._prev_joint_time = None
         self._last_joint_vel_radps = None
         self._last_joint_vel_time: Optional[float] = None
-        self._last_joint_vel_source = 'none'
-        self._gyro_bias_radps = np.zeros(3, dtype=np.float32)
         # Pre-allocated buffers for hot-path — avoids per-tick GC pressure.
-        self._gyro_joint_rates = np.zeros(3, dtype=np.float32)
         self._pi_outputs = np.zeros(4, dtype=np.float32)
         self._named_commands: Dict[str, float] = {
             'scoop': 0.0, 'lift_boom': 0.0, 'rotate': 0.0, 'tilt_boom': 0.0,
         }
-        self._last_gyro_wall_t = None
-        self._last_gyro_device_ts_us = None
-        self._gyro_fallback_counter = 0
         self._prev_pose_time = None
         self._prev_pose = None
         self._prev_orientation_deg = None
@@ -1058,13 +1026,6 @@ class ExcavatorController:
                 'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
                 'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
                 'effective_vel_cap_degps': [],
-                'gyro_velocity_mode': self._gyro_velocity_mode,
-                'joint_velocity_source': self._last_joint_vel_source,
-                'gyro_fallback_count': int(self._gyro_fallback_counter),
-                'slew_fusion_enabled': False,
-                'slew_fusion_active': False,
-                'slew_fusion_gyro_z_degps': 0.0,
-                'slew_fusion_alpha': 0.0,
             }
         else:
             # Map tracker stats to expected output format
@@ -1121,13 +1082,6 @@ class ExcavatorController:
                 'avg_pwm_ms': pwm_stats.get('avg_ms', 0.0),
                 'min_pwm_ms': pwm_stats.get('min_ms', 0.0),
                 'max_pwm_ms': pwm_stats.get('max_ms', 0.0),
-                'gyro_velocity_mode': self._gyro_velocity_mode,
-                'joint_velocity_source': self._last_joint_vel_source,
-                'gyro_fallback_count': int(self._gyro_fallback_counter),
-                'slew_fusion_enabled': False,
-                'slew_fusion_active': False,
-                'slew_fusion_gyro_z_degps': 0.0,
-                'slew_fusion_alpha': 0.0,
             }
 
             # Add IK limiter telemetry in deg/s for easier interpretation
@@ -1176,21 +1130,6 @@ class ExcavatorController:
         if hasattr(self.ik_controller, 'verbose'):
             self.ik_controller.verbose = ik_verbose
 
-    def set_velocity_mode(self, mode: str) -> None:
-        """Set joint velocity estimation mode: 'fd_only', 'gyro_only', or 'fused'."""
-        valid = ('fd_only', 'gyro_only', 'fused')
-        mode = mode.strip().lower()
-        if mode not in valid:
-            raise ValueError(f"velocity mode must be one of {valid}, got {mode!r}")
-        if mode == self._gyro_velocity_mode:
-            return
-        self._gyro_velocity_mode = mode
-        self._last_gyro_device_ts_us = None
-        self._last_gyro_wall_t = None
-        self._gyro_fallback_counter = 0
-        self._gyro_bias_radps = np.zeros(3, dtype=np.float32)
-        self.logger.info("Joint velocity mode set to %s", mode)
-
     def get_joint_velocities_with_age(self) -> tuple:
         """Return (velocities_degps, age_s). age=inf if never computed."""
         if self._last_joint_vel_radps is None or self._last_joint_vel_time is None:
@@ -1211,7 +1150,7 @@ class ExcavatorController:
         """Hand the PWM bus over to a caller-owned :class:`DirectController`.
 
         The control loop keeps reading sensors so joint angles, IMU quats and
-        gyro velocities stay fresh, but stops writing to hardware. PIDs and
+        finite-difference velocities stay fresh, but stops writing to hardware. PIDs and
         IK command buffers are reset so we don't carry stale state into the
         next IK resume.
         """
@@ -1288,7 +1227,7 @@ class ExcavatorController:
         Args:
             commands: {joint_name: value} where:
               - lift_boom, tilt_boom, scoop: desired velocity in rad/s (PI-controlled,
-                gyro feedback from boom/arm/bucket IMUs)
+                finite-difference feedback from Pico-fused joint angles)
               - rotate, trackL, trackR: normalized [-1, 1] pass-through (no feedback)
         """
         with self._vel_cmd_lock:
@@ -1296,7 +1235,7 @@ class ExcavatorController:
         self._outputs_zeroed = False
 
     def _send_velocity_commands(self, dt: float) -> None:
-        """PI tick: compute PWM outputs from desired joint velocities and gyro feedback."""
+        """PI tick: compute PWM outputs from desired and measured joint velocities."""
         with self._vel_cmd_lock:
             cmds = dict(self._vel_cmd_commands)
 
@@ -1359,113 +1298,20 @@ class ExcavatorController:
         fd_joint_vel = None
         if self._prev_joint_angles is not None and self._prev_joint_time is not None:
             dtj = max(1e-6, now_t - self._prev_joint_time)
-            fd_joint_vel = (current_joint_angles - self._prev_joint_angles) / dtj
+            delta = np.arctan2(
+                np.sin(current_joint_angles - self._prev_joint_angles),
+                np.cos(current_joint_angles - self._prev_joint_angles),
+            )
+            fd_joint_vel = delta / dtj
         self._prev_joint_angles = current_joint_angles.copy()
         self._prev_joint_time = now_t
         return fd_joint_vel
 
-    def _compute_gyro_joint_velocity(self, now_t: float) -> Optional[np.ndarray]:
-        """Estimate joint velocity from IMU gyro and project to joint axes (rad/s)."""
-        if self._gyro_velocity_mode == 'fd_only':
-            return None
-
-        payload = None
-        try:
-            if self._hw_has_try_read_imu_gyro:
-                payload = self.hardware.try_read_imu_gyro()
-            else:
-                gyro = self.hardware.read_imu_gyro()
-                if gyro is not None:
-                    payload = {'gyro': gyro, 'device_timestamp_us': None}
-        except Exception:
-            payload = None
-
-        if not payload:
-            return None
-
-        gyro_packets = payload.get('gyro')
-        if gyro_packets is None or len(gyro_packets) < 3:
-            return None
-
-        dev_ts = payload.get('device_timestamp_us')
-        if isinstance(dev_ts, (int, float)):
-            if self._last_gyro_device_ts_us != dev_ts:
-                self._last_gyro_device_ts_us = dev_ts
-                self._last_gyro_wall_t = now_t
-            elif self._last_gyro_wall_t is not None and self._gyro_timeout_s > 0.0:
-                if (now_t - self._last_gyro_wall_t) > self._gyro_timeout_s:
-                    return None
-
-        joint_rates = self._gyro_joint_rates
-        joint_rates[:] = 0.0
-        for i in range(3):
-            gyro_vec_dps = np.asarray(gyro_packets[i], dtype=np.float32)
-            gyro_vec_rad = np.radians(gyro_vec_dps)
-
-            axis = self.robot_config.rotation_axes[i + 1]
-            axis_norm = axis / (np.linalg.norm(axis) + 1e-12)
-            joint_rates[i] = float(np.dot(gyro_vec_rad, axis_norm))
-
-        if self._gyro_bias_enabled:
-            if np.max(np.abs(joint_rates)) <= self._gyro_bias_stationarity_radps:
-                k = self._gyro_bias_adaptation_rate
-                self._gyro_bias_radps = (1.0 - k) * self._gyro_bias_radps + k * joint_rates
-            joint_rates = joint_rates - self._gyro_bias_radps
-
-        joint_rates = np.clip(joint_rates, -self._gyro_max_abs_radps, self._gyro_max_abs_radps)
-
-        out = np.zeros(4, dtype=np.float32)
-        out[1:] = joint_rates
-        return out
-
-    def _select_joint_velocity(
-        self,
-        fd_joint_vel: Optional[np.ndarray],
-        gyro_joint_vel: Optional[np.ndarray]
-    ) -> Optional[np.ndarray]:
-        """Select/control fusion of joint velocity estimate by configured mode."""
-        mode = self._gyro_velocity_mode
-
-        if mode == 'fd_only':
-            self._last_joint_vel_source = 'fd'
-            return None if fd_joint_vel is None else fd_joint_vel.astype(np.float32)
-
-        if gyro_joint_vel is None:
-            self._gyro_fallback_counter += 1
-            if self._gyro_fallback_counter % 200 == 1:
-                self.logger.warning("Gyro velocity unavailable; falling back to finite-difference estimate")
-            self._last_joint_vel_source = 'fd_fallback'
-            return None if fd_joint_vel is None else fd_joint_vel.astype(np.float32)
-
-        # Gyro provides boom/arm/bucket; slew remains finite-difference based.
-        out = np.zeros(4, dtype=np.float32)
-        if fd_joint_vel is not None:
-            out[:] = fd_joint_vel
-        elif self._last_joint_vel_radps is not None:
-            out[:] = self._last_joint_vel_radps
-
-        if mode == 'gyro_only':
-            out[1:] = gyro_joint_vel[1:]
-            self._last_joint_vel_source = 'gyro'
-            return out
-
-        alpha = self._gyro_blend_alpha
-        if fd_joint_vel is None:
-            out[1:] = gyro_joint_vel[1:]
-            self._last_joint_vel_source = 'gyro_fallback'
-            return out
-
-        out[1:] = alpha * gyro_joint_vel[1:] + (1.0 - alpha) * fd_joint_vel[1:]
-        self._last_joint_vel_source = 'fused'
-        return out
-
     def _update_joint_velocity_estimate(self, current_joint_angles: np.ndarray, now_t: float) -> None:
-        """Update joint velocity telemetry/control estimate from current state and IMU gyro."""
+        """Update joint velocity telemetry/control estimate from Pico-fused joint angles."""
         fd_joint_vel = self._compute_fd_joint_velocity(current_joint_angles, now_t)
-        gyro_joint_vel = self._compute_gyro_joint_velocity(now_t=now_t)
-        selected_joint_vel = self._select_joint_velocity(fd_joint_vel, gyro_joint_vel)
-        if selected_joint_vel is not None:
-            self._last_joint_vel_radps = selected_joint_vel
+        if fd_joint_vel is not None:
+            self._last_joint_vel_radps = fd_joint_vel.astype(np.float32)
             self._last_joint_vel_time = now_t
 
     def reset_performance_stats(self) -> None:

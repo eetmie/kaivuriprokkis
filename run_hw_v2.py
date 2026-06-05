@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-#only rpi support atm!
+# Primary target: Raspberry Pi. Jetson Orin Nano Super support is WIP
+# (see README "Jetson Orin Nano Super WIP Notes"); the legacy Maxwell Jetson
+# Nano is not supported.
 """Hardware pathing + logging demo.
 
 Mirrors the structure of ``Isaac-Pathing/scripts/masi/pathing/run_sim_v2.py`` so
@@ -51,8 +53,9 @@ from configuration_files.pathing_config import (
 )
 from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
 from modules.excavator_controller import ExcavatorController
+from modules.bringup import wait_for_hardware_ready
 from modules.hardware_interface import HardwareFaultError, HardwareInterface
-from modules.quaternion_math import quat_from_axis_angle
+from modules.ik import quat_from_axis_angle
 from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread, reset_to_normal
 from pathing import path_planning_algorithms as planner_algos
 from pathing import path_utils as path_utils_mod
@@ -1238,42 +1241,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not apply_rt_to_thread(priority=args.rt_priority, policy=SCHED_FIFO, quiet=True):
             logger.warning("Failed to apply RT priority (run as root for RT scheduling).")
 
-    logger.info("Waiting for IMU to become ready (Pico self-calibrates ~30 s stationary)...")
-    _hw_wait_start = time.time()
-    _hw_wait_timeout = 90.0
-    _hw_last_status_log = -999.0
-    while True:
+    try:
+        wait_for_hardware_ready(hardware, logger=logger)
+    except (HardwareFaultError, TimeoutError) as exc:
+        logger.critical("Hardware bring-up failed — cannot continue: %s", exc)
         try:
-            if hardware.is_hardware_ready():
-                logger.info("Hardware ready after %.1f s.", time.time() - _hw_wait_start)
-                break
-        except HardwareFaultError as exc:
-            logger.critical("Hardware fault during startup — cannot continue: %s", exc)
-            try:
-                hardware.shutdown()
-            except Exception:
-                pass
-            return 1
-        elapsed = time.time() - _hw_wait_start
-        if elapsed >= _hw_wait_timeout:
-            logger.critical(
-                "Timed out waiting for hardware readiness after %.0f s. "
-                "Check IMU connection and ensure robot is stationary during calibration.",
-                elapsed,
-            )
-            try:
-                hardware.shutdown()
-            except Exception:
-                pass
-            return 1
-        if elapsed - _hw_last_status_log >= 5.0:
-            status = hardware.get_status()
-            logger.info(
-                "  IMU state: %s | %.0f s elapsed (timeout %.0f s)",
-                status.get("imu_state", "unknown"), elapsed, _hw_wait_timeout,
-            )
-            _hw_last_status_log = elapsed
-        time.sleep(0.5)
+            hardware.shutdown()
+        except Exception:
+            pass
+        return 1
 
     controller.pause()
 

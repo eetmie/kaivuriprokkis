@@ -32,9 +32,6 @@ class ImuStateNode(Node):
         self.declare_parameter("config_file", "configuration_files/profiles/rpi/servo_config.yaml")
         self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
         self.declare_parameter("publish_tool_pose", True)
-        # fd_only | gyro_only | fused — mirrors ExcavatorController.set_velocity_mode()
-        self.declare_parameter("velocity_mode", "gyro_only")
-
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
@@ -65,8 +62,6 @@ class ImuStateNode(Node):
             control_config_file=str(control_config_path),
         )
         self._controller.start()
-        velocity_mode = str(self.get_parameter("velocity_mode").value).strip()
-        self._controller.set_velocity_mode(velocity_mode)
         # State-only node: suspend the IK loop's PWM output. The controller
         # keeps reading sensors so joint angles / FK stay fresh.
         self._controller.suspend_ik_output()
@@ -77,7 +72,7 @@ class ImuStateNode(Node):
         self.create_timer(1.0 / rate_hz, self._read_joint_angles)
         self.get_logger().info(
             f"Publishing IMU-derived joint_states from {self._project_root} "
-            f"(velocity_mode={velocity_mode})"
+            "(finite-difference velocities from Pico-fused joint angles)"
         )
 
     def _resolve_project_path(self, path_value: str) -> Path:

@@ -108,9 +108,6 @@ class _FakeHardware:
     def is_hardware_ready(self):
         return self._ready
 
-    def read_base_imu(self):
-        return None
-
 
 class ServiceSubmitCommandTests(unittest.TestCase):
     """RobotService.submit_command routes commands to controller/hardware correctly."""

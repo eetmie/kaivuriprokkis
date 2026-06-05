@@ -171,18 +171,12 @@ class RobotService:
 
     def get_debug_state(self) -> dict:
         """Return debug info for diagnostics without exposing controller internals."""
-        state = {
+        return {
             'fk_quaternions': self.controller.get_fk_quaternions(),
             'condition_number': self.controller.get_condition_number(),
             'perf_stats': self.controller.get_performance_stats() or {},
             'robot_config': self.robot_config,
         }
-        # Include base IMU if available
-        base_imu = self.hardware.read_base_imu()
-        if base_imu is not None:
-            state['base_imu_quat'] = base_imu.get('quat')
-            state['base_imu_gyro'] = base_imu.get('gyro')
-        return state
 
     def get_pose(self):
         """Return (position_array, rot_y_deg) from the controller."""
@@ -200,13 +194,6 @@ class RobotService:
             positions = [tuple(float(v) for v in pos) for pos in jp]
             positions.append(tuple(float(v) for v in ee_pos))
             joint_positions = tuple(positions[:5])
-
-        perf_stats = {}
-        try:
-            perf_stats = self.controller.get_performance_stats() or {}
-        except Exception as exc:
-            self._log_service_warning("Controller perf stats unavailable: %s", exc)
-            perf_stats = {}
 
         try:
             hardware_ready = bool(self.hardware.is_hardware_ready())
@@ -232,8 +219,6 @@ class RobotService:
             mode=mode,
             paused=paused,
             hardware_ready=hardware_ready,
-            slew_fusion_enabled=bool(perf_stats.get("slew_fusion_enabled", False)),
-            slew_fusion_active=bool(perf_stats.get("slew_fusion_active", False)),
             measured_pose=PoseTarget(
                 float(measured_pos[0]),
                 float(measured_pos[1]),
@@ -243,5 +228,4 @@ class RobotService:
             target_pose=target_pose,
             joint_angles_deg=tuple(float(v) for v in np.asarray(joint_angles, dtype=np.float32).tolist()),
             joint_positions=joint_positions,
-            slew_fusion_gyro_z_degps=float(perf_stats.get("slew_fusion_gyro_z_degps", 0.0)),
         )

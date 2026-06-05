@@ -47,21 +47,13 @@ def _fmt_vec(v, n=3):
 def _print_normal(last_command, actual_pos, actual_rot, packet_rate, packets_received, debug_state):
     cond = debug_state.get('condition_number', 0) if debug_state else 0
     cond_str = f" | Cond: {cond:.1f}" if cond > 0 else ""
-    base_str = ""
-    if debug_state:
-        base_quat = debug_state.get('base_imu_quat')
-        if base_quat is not None and len(base_quat) >= 4:
-            w, x, y, z = float(base_quat[0]), float(base_quat[1]), float(base_quat[2]), float(base_quat[3])
-            pitch_rad = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
-            base_str = f" | Base: [{_fmt_vec(base_quat, n=4)}] pitch={np.degrees(pitch_rad):+.1f}°"
     print(f"[{packet_rate:.1f} Hz] "
           f"Target: [{last_command.pose.x:+.3f}, {last_command.pose.y:+.3f}, {last_command.pose.z:+.3f}]m "
           f"Rot: {last_command.pose.rot_y_deg:+.1f}° | "
           f"Actual: [{actual_pos[0]:+.3f}, {actual_pos[1]:+.3f}, {actual_pos[2]:+.3f}]m "
           f"Rot: {actual_rot:+.1f}° | "
           f"Packets: {packets_received}"
-          f"{cond_str}"
-          f"{base_str}")
+          f"{cond_str}")
 
 
 def _print_perf(debug_state, network_times, packet_rate, perf_only):

@@ -24,8 +24,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from drive_logger import JOINT_NAMES
+from simple_drive import JOINT_NAMES
 
 
 RESULTS_DIR = Path(__file__).parent / "test_results"

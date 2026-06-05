@@ -6,7 +6,7 @@ from typing import List, Sequence, Tuple
 
 
 MAGIC = b"EXCV"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class MessageType(IntEnum):
@@ -29,12 +29,10 @@ class TelemetryFlags(IntEnum):
     PAUSED = 1 << 0
     DIRECT_MODE = 1 << 1
     HW_READY = 1 << 2
-    SLEW_FUSION_ENABLED = 1 << 3
-    SLEW_FUSION_ACTIVE = 1 << 4
 
 
 COMMAND_STRUCT = struct.Struct("<4sBBBBII8f")
-TELEMETRY_STRUCT = struct.Struct("<4sBBBBII13f15f")
+TELEMETRY_STRUCT = struct.Struct("<4sBBBBII12f15f")
 
 COMMAND_PACKET_SIZE = COMMAND_STRUCT.size
 TELEMETRY_PACKET_SIZE = TELEMETRY_STRUCT.size
@@ -99,8 +97,6 @@ class RobotTelemetry:
     mode: ControlMode = ControlMode.IK
     paused: bool = False
     hardware_ready: bool = False
-    slew_fusion_enabled: bool = False
-    slew_fusion_active: bool = False
     measured_pose: PoseTarget = field(default_factory=PoseTarget)
     target_pose: PoseTarget = field(default_factory=PoseTarget)
     joint_angles_deg: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
@@ -111,8 +107,6 @@ class RobotTelemetry:
         (0.0, 0.0, 0.0),
         (0.0, 0.0, 0.0),
     )
-    slew_fusion_gyro_z_degps: float = 0.0
-
     def flags(self) -> int:
         flags = 0
         if self.paused:
@@ -121,10 +115,6 @@ class RobotTelemetry:
             flags |= int(TelemetryFlags.DIRECT_MODE)
         if self.hardware_ready:
             flags |= int(TelemetryFlags.HW_READY)
-        if self.slew_fusion_enabled:
-            flags |= int(TelemetryFlags.SLEW_FUSION_ENABLED)
-        if self.slew_fusion_active:
-            flags |= int(TelemetryFlags.SLEW_FUSION_ACTIVE)
         return flags
 
 
@@ -201,7 +191,6 @@ def encode_telemetry_message(telemetry: RobotTelemetry) -> List[int]:
         float(telemetry.joint_angles_deg[1]),
         float(telemetry.joint_angles_deg[2]),
         float(telemetry.joint_angles_deg[3]),
-        float(telemetry.slew_fusion_gyro_z_degps),
         *flat_positions,
     )
     return _bytes_to_signed_list(payload)
@@ -222,8 +211,7 @@ def decode_telemetry_message(values: Sequence[int]) -> RobotTelemetry:
     measured_pose = PoseTarget(*floats[0:4])
     target_pose = PoseTarget(*floats[4:8])
     joint_angles = tuple(float(v) for v in floats[8:12])
-    slew_gyro_z = float(floats[12])
-    pos_vals = floats[13:28]
+    pos_vals = floats[12:27]
     positions = []
     for idx in range(0, len(pos_vals), 3):
         positions.append((float(pos_vals[idx]), float(pos_vals[idx + 1]), float(pos_vals[idx + 2])))
@@ -234,11 +222,8 @@ def decode_telemetry_message(values: Sequence[int]) -> RobotTelemetry:
         mode=ControlMode(mode),
         paused=bool(flags & int(TelemetryFlags.PAUSED)),
         hardware_ready=bool(flags & int(TelemetryFlags.HW_READY)),
-        slew_fusion_enabled=bool(flags & int(TelemetryFlags.SLEW_FUSION_ENABLED)),
-        slew_fusion_active=bool(flags & int(TelemetryFlags.SLEW_FUSION_ACTIVE)),
         measured_pose=measured_pose,
         target_pose=target_pose,
         joint_angles_deg=joint_angles,  # type: ignore[arg-type]
         joint_positions=tuple(positions[:5]),
-        slew_fusion_gyro_z_degps=slew_gyro_z,
     )

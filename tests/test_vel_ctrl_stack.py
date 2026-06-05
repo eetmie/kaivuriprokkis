@@ -29,16 +29,13 @@ from modules.excavator_controller import ExcavatorController, _VEL_CMD_JOINTS
 # ---------------------------------------------------------------------------
 
 class _ControllerProxy:
-    _gyro_velocity_mode: str = 'fd_only'
+    _prev_joint_angles = None
+    _prev_joint_time = None
     _last_joint_vel_radps = None
     _last_joint_vel_time = None
-    _last_gyro_device_ts_us = 123
-    _last_gyro_wall_t = 456.0
-    _gyro_fallback_counter = 7
-    _gyro_bias_radps = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     logger = MagicMock()
 
-    set_velocity_mode             = ExcavatorController.set_velocity_mode
+    _compute_fd_joint_velocity = ExcavatorController._compute_fd_joint_velocity
     get_joint_velocities_with_age = ExcavatorController.get_joint_velocities_with_age
 
 
@@ -71,80 +68,6 @@ class _VelCmdProxy:
         """Inject a fresh velocity reading."""
         self._last_joint_vel_radps = np.array(radps_values, dtype=np.float32)
         self._last_joint_vel_time = time.perf_counter()
-
-
-# ---------------------------------------------------------------------------
-# set_velocity_mode()
-# ---------------------------------------------------------------------------
-
-class TestSetVelocityMode(unittest.TestCase):
-    def setUp(self):
-        self.ctrl = _ControllerProxy()
-
-    def test_fd_only(self):
-        self.ctrl.set_velocity_mode('fd_only')
-        self.assertEqual(self.ctrl._gyro_velocity_mode, 'fd_only')
-
-    def test_gyro_only(self):
-        self.ctrl.set_velocity_mode('gyro_only')
-        self.assertEqual(self.ctrl._gyro_velocity_mode, 'gyro_only')
-
-    def test_fused(self):
-        self.ctrl.set_velocity_mode('fused')
-        self.assertEqual(self.ctrl._gyro_velocity_mode, 'fused')
-
-    def test_strips_whitespace_and_lowercases(self):
-        self.ctrl.set_velocity_mode('  GYRO_ONLY  ')
-        self.assertEqual(self.ctrl._gyro_velocity_mode, 'gyro_only')
-
-    def test_invalid_raises_value_error(self):
-        with self.assertRaises(ValueError):
-            self.ctrl.set_velocity_mode('bad_mode')
-
-    def test_error_message_lists_all_valid_options(self):
-        with self.assertRaises(ValueError) as ctx:
-            self.ctrl.set_velocity_mode('banana')
-        msg = str(ctx.exception)
-        self.assertIn('fd_only', msg)
-        self.assertIn('gyro_only', msg)
-        self.assertIn('fused', msg)
-
-    def test_mode_unchanged_after_invalid(self):
-        self.ctrl._gyro_velocity_mode = 'fused'
-        try:
-            self.ctrl.set_velocity_mode('bad')
-        except ValueError:
-            pass
-        self.assertEqual(self.ctrl._gyro_velocity_mode, 'fused')
-
-    def test_switching_modes_resets_gyro_state(self):
-        self.ctrl._gyro_velocity_mode = 'fd_only'
-        self.ctrl._last_gyro_device_ts_us = 123
-        self.ctrl._last_gyro_wall_t = 456.0
-        self.ctrl._gyro_fallback_counter = 7
-        self.ctrl._gyro_bias_radps = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-
-        self.ctrl.set_velocity_mode('gyro_only')
-
-        self.assertIsNone(self.ctrl._last_gyro_device_ts_us)
-        self.assertIsNone(self.ctrl._last_gyro_wall_t)
-        self.assertEqual(self.ctrl._gyro_fallback_counter, 0)
-        self.assertTrue(np.array_equal(self.ctrl._gyro_bias_radps, np.zeros(3, dtype=np.float32)))
-
-    def test_same_mode_is_noop(self):
-        bias = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-        self.ctrl._gyro_velocity_mode = 'fd_only'
-        self.ctrl._last_gyro_device_ts_us = 123
-        self.ctrl._last_gyro_wall_t = 456.0
-        self.ctrl._gyro_fallback_counter = 7
-        self.ctrl._gyro_bias_radps = bias.copy()
-
-        self.ctrl.set_velocity_mode('fd_only')
-
-        self.assertEqual(self.ctrl._last_gyro_device_ts_us, 123)
-        self.assertEqual(self.ctrl._last_gyro_wall_t, 456.0)
-        self.assertEqual(self.ctrl._gyro_fallback_counter, 7)
-        self.assertTrue(np.array_equal(self.ctrl._gyro_bias_radps, bias))
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +123,44 @@ class TestGetJointVelocitiesWithAge(unittest.TestCase):
         self.ctrl._last_joint_vel_time = time.perf_counter()
         vels, _ = self.ctrl.get_joint_velocities_with_age()
         self.assertIsInstance(vels, list)
+
+
+# ---------------------------------------------------------------------------
+# finite-difference joint velocity
+# ---------------------------------------------------------------------------
+
+class TestFiniteDifferenceJointVelocity(unittest.TestCase):
+    def setUp(self):
+        self.ctrl = _ControllerProxy()
+        self.ctrl._prev_joint_angles = None
+        self.ctrl._prev_joint_time = None
+
+    def test_first_sample_seeds_without_velocity(self):
+        vel = self.ctrl._compute_fd_joint_velocity(np.zeros(4, dtype=np.float32), 10.0)
+        self.assertIsNone(vel)
+
+    def test_velocity_scales_by_elapsed_time(self):
+        self.ctrl._compute_fd_joint_velocity(np.zeros(4, dtype=np.float32), 10.0)
+        vel = self.ctrl._compute_fd_joint_velocity(
+            np.array([0.0, 0.2, -0.4, 0.6], dtype=np.float32),
+            10.2,
+        )
+        self.assertIsNotNone(vel)
+        self.assertAlmostEqual(float(vel[1]), 1.0, places=5)
+        self.assertAlmostEqual(float(vel[2]), -2.0, places=5)
+        self.assertAlmostEqual(float(vel[3]), 3.0, places=5)
+
+    def test_wrap_crossing_uses_short_angle_delta(self):
+        self.ctrl._compute_fd_joint_velocity(
+            np.array([math.radians(179.0), 0.0, 0.0, 0.0], dtype=np.float32),
+            10.0,
+        )
+        vel = self.ctrl._compute_fd_joint_velocity(
+            np.array([math.radians(-179.0), 0.0, 0.0, 0.0], dtype=np.float32),
+            11.0,
+        )
+        self.assertIsNotNone(vel)
+        self.assertAlmostEqual(float(vel[0]), math.radians(2.0), places=5)
 
 
 # ---------------------------------------------------------------------------

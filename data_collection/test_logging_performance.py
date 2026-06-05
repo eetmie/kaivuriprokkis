@@ -44,9 +44,7 @@ from modules.excavator_controller import ExcavatorController, ControllerConfig
 from modules.perf_tracker import LoopPerfTracker
 from modules.rt_utils import apply_rt_to_thread, reset_to_normal, SCHED_FIFO
 
-# Import logger classes from drive_logger
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from drive_logger import DataLogger, SineExcitationGenerator, JOINT_NAMES
+from simple_drive import DataLogger, SineExcitationGenerator, JOINT_NAMES
 
 RESULTS_DIR = Path(__file__).parent / "test_results"
 LOGGING_HZ = 100  # Fixed — always 100Hz

@@ -12,7 +12,7 @@ imu:
   # Startup gyro-bias calibration is automatic in Pico firmware: 30 s stationary
   # measurement, firmware-owned thresholds, and a host calibration report.
   # Named IMU mapping: logical role -> physical sensor index
-  # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
+  # The base IMU is the slew/yaw source; all joints are IMU-only.
   # The mapping length defines the expected IMU count from firmware
   imu_mapping:
     base: 1
@@ -21,8 +21,7 @@ imu:
     bucket: 3
   # IMU role chain and extraction rules for canonical controller joints.
   # imu_mapping above can be changed when sensors are wired/enumerated differently.
-  # Use parent_role: null for a gravity/level parent. If base is omitted from
-  # imu_mapping, lift falls back to that same level-gravity parent.
+  # Use parent_role: null for a gravity/level parent.
   chain:
     - joint: slew
       output_index: 0
@@ -124,31 +123,6 @@ controller:
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
   per_joint_max_velocity: [0.10, 0.12, 0.12, 0.12]
-
-  # Joint velocity estimation mode for controller telemetry/velocity-aware IK
-  # - fd_only: stock behavior (finite-difference from joint angles)
-  # - gyro_only: use IMU gyro rates for boom/arm/bucket (slew remains FD)
-  # - fused: blend gyro + FD for boom/arm/bucket (slew remains FD)
-  gyro_velocity_mode: "fd_only"
-
-  # Blend factor for fused mode: v = alpha*gyro + (1-alpha)*fd
-  # Only used when gyro_velocity_mode: "fused"
-  gyro_blend_alpha: 0.30
-
-  # Gyro data freshness timeout (seconds)
-  # If gyro sample is stale longer than this, controller falls back to FD
-  gyro_timeout_s: 0.08
-
-  # Sanity clamp for gyro-derived joint speed magnitude (deg/s)
-  gyro_max_abs_degps: 180.0
-
-  # Slow online bias compensation for gyro-derived joint velocity
-  gyro_bias_comp:
-    enabled: False
-    # Consider near-stationary below this magnitude (deg/s)
-    stationarity_degps: 1.5
-    # Bias adaptation gain per control update (0..1)
-    adaptation_rate: 0.01
 
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController

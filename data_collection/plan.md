@@ -81,7 +81,7 @@ Before fitting models:
 - exclude near-stall and end-stop regions for the first models
 - verify the logged velocity source is consistent across sessions
 
-If velocity estimates are noisy, prefer gyro-only or fused velocity during logging if that proves cleaner than finite-difference.
+If velocity estimates are noisy, improve the Pico-fused joint-angle stream or finite-difference smoothing rather than adding a second host-side gyro fusion path.
 
 ## Modeling Roadmap
 

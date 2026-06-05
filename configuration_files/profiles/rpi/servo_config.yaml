@@ -10,6 +10,12 @@ pwm_frequency: 200
 
 CHANNEL_CONFIGS:
 
+    trackL:
+        enabled: false
+
+    trackR:
+        enabled: false
+
     pump:
         output_channel: 9
         pulse_min: 1000
@@ -19,7 +25,7 @@ CHANNEL_CONFIGS:
         activity_gain_us: 150  #150 extra us added at full average valve activity in auto mode
 
 
-    lift_boom:
+    boom:
         output_channel: 3  # output pin on the servo board
         affects_pump: True # whether moving this servo affects the pump speed (if set to variable)
         toggleable: False  # whether this servo can be toggled on/off via call
@@ -45,7 +51,7 @@ CHANNEL_CONFIGS:
 
 
 
-    tilt_boom:
+    arm:
         output_channel: 4
         affects_pump: True
         toggleable: False
@@ -66,7 +72,7 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.2
 
-    scoop:
+    bucket:
         output_channel: 2
         affects_pump: True
         toggleable: False
@@ -87,7 +93,7 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    rotate:
+    slew:
         output_channel: 5
         affects_pump: False
         toggleable: False

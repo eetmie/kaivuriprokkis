@@ -40,7 +40,7 @@ from modules.hardware_interface import HardwareInterface
 
 JOINT_NAME = "bucket"
 JOINT_INDEX = 3
-PWM_NAME = "scoop"
+PWM_NAME = "bucket"
 DEFAULT_OUTPUT_DIR = "data_collection/hydraulic_data"
 DEFAULT_COMMANDS = "0.08,0.12,0.16,0.22,0.30,0.42,0.55"
 

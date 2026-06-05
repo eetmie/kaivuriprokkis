@@ -1,5 +1,5 @@
 # TODO(refactor #3 follow-up): hard-code the excavator chain (slew,
-# lift_boom, tilt_boom, scoop, optional rototilt tool) and reject YAMLs
+# boom, arm, bucket, optional rototilt tool) and reject YAMLs
 # that don't match — no more generic N-DOF support. See
 # modules/ik/REFACTOR_NOTES.md for the full plan.
 """

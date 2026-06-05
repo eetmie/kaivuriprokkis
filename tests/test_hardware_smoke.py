@@ -106,15 +106,15 @@ class HardwareSmokeTests(unittest.TestCase):
 
     def test_expected_pwm_channel_names_exist(self):
         names = set(self.hw.get_pwm_channel_names(include_pump=True))
-        for required in ("lift_boom", "tilt_boom", "scoop", "rotate", "pump"):
+        for required in ("slew", "boom", "arm", "bucket", "pump"):
             self.assertIn(required, names, msg=f"missing channel: {required}")
 
     def test_zero_named_pwm_commands_accepted(self):
         ok = self.hw.send_named_pwm_commands({
-            "rotate": 0.0,
-            "lift_boom": 0.0,
-            "tilt_boom": 0.0,
-            "scoop": 0.0,
+            "slew": 0.0,
+            "boom": 0.0,
+            "arm": 0.0,
+            "bucket": 0.0,
         })
         self.assertTrue(ok)
 

@@ -119,10 +119,10 @@ class RobotService:
                 )
                 if not self.state.paused:
                     self.direct.give_commands({
-                        "rotate": self.state.direct_command.slew,
-                        "lift_boom": self.state.direct_command.boom,
-                        "tilt_boom": self.state.direct_command.arm,
-                        "scoop": self.state.direct_command.bucket,
+                        "slew": self.state.direct_command.slew,
+                        "boom": self.state.direct_command.boom,
+                        "arm": self.state.direct_command.arm,
+                        "bucket": self.state.direct_command.bucket,
                     })
                     self.direct.send_pending()
             else:

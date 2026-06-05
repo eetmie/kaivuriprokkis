@@ -93,19 +93,19 @@ pid:
     ki: 0.000
     kd: 0.200
 
-  # Joint 1: Boom (lift arm)
+  # Joint 1: Boom
   joint1:
     kp: 10.000
     ki: 1.000
     kd: 0.000
 
-  # Joint 2: Arm (tilt)
+  # Joint 2: Arm
   joint2:
     kp: 10.000
     ki: 1.000
     kd: 0.000
 
-  # Joint 3: Bucket (scoop)
+  # Joint 3: Bucket
   joint3:
     kp: 10.000
     ki: 1.000

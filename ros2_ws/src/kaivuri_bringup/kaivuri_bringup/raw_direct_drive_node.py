@@ -24,10 +24,10 @@ JOINT_NAMES = [
 ]
 
 COMMAND_NAMES = [
-    "rotate",
-    "lift_boom",
-    "tilt_boom",
-    "scoop",
+    "slew",
+    "boom",
+    "arm",
+    "bucket",
     "trackL",
     "trackR",
 ]
@@ -37,7 +37,7 @@ class RawDirectDriveNode(Node):
     """Raw normalized valve/track command bridge for ROS testing.
 
     Subscribes to std_msgs/Float32MultiArray on /kaivuri/direct_pwm.
-    Data order is [rotate, lift_boom, tilt_boom, scoop, trackL, trackR].
+    Data order is [slew, boom, arm, bucket, trackL, trackR].
     """
 
     def __init__(self) -> None:

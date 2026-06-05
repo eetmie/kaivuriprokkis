@@ -4,14 +4,14 @@
 # (numba cores) and trim this file down to the IKController + ik_method_*
 # dispatch. Also see modules/ik/REFACTOR_NOTES.md for the bigger note
 # about locking the IK in as excavator-specific (4 fixed joints: slew,
-# lift_boom, tilt_boom, scoop, plus optional rototilt tool).
+# boom, arm, bucket, plus optional rototilt tool).
 """
 Differential IK controller with numpy+numba optimization.
 
 Contains:
 - Axis-rotation helpers (generic quaternion utilities)
 - Numba-optimized FK, Jacobian, and IK method functions
-- Base rotation propagation and Jacobian wrapper
+- Jacobian wrappers
 - IKController class (the main solver)
 
 IMPORTANT: Origin and end-effector offset handling:
@@ -34,14 +34,38 @@ Notes:
 import numpy as np
 import numba
 import logging
+from dataclasses import dataclass
 from typing import Optional, List
 
 from .config import IKControllerConfig, RobotConfig
 from .math import (
-    quat_normalize, quat_multiply, quat_conjugate, quat_rotate_vector,
+    quat_normalize, quat_multiply, quat_rotate_vector,
     quat_from_axis_angle, axis_angle_from_quat, compute_pose_error,
     apply_delta_pose
 )
+
+
+@dataclass(frozen=True)
+class KinematicState:
+    """Named FK bundle computed from canonical joint angles in radians."""
+
+    joint_angles_rad: np.ndarray
+    link_positions: np.ndarray
+    link_orientations: np.ndarray
+    ee_position: np.ndarray
+    ee_orientation: np.ndarray
+
+
+@dataclass(frozen=True)
+class JacobianState:
+    """Named Jacobian + metric bundle computed from canonical joint angles."""
+
+    joint_angles_rad: np.ndarray
+    link_orientations: np.ndarray
+    jacobian: np.ndarray
+    condition_number: float
+    singular_values: np.ndarray
+    yoshikawa_index: float
 
 
 # ----------------------------
@@ -66,7 +90,7 @@ def extract_axis_rotation(quat: np.ndarray, axis: np.ndarray) -> float:
     v = np.array([x, y, z], dtype=np.float32)
     s = float(np.dot(v, a))  # signed component along axis
     ang = 2.0 * np.arctan2(s, w)
-    # Wrap angle to (-pi, pi] without relying on external helpers.
+    # Wrap angle to (-pi, pi]
     pi = np.float32(3.141592653589793)
     two_pi = np.float32(6.283185307179586)
     ang = (np.float32(ang) + pi) % two_pi - pi
@@ -195,6 +219,7 @@ def compute_jacobian_core(quats, link_lengths, link_directions, rotation_axes, o
     return jacobian
 
 
+# TODO: check usage, this goes backwards!
 def joint_angles_to_absolute_quaternions(joint_angles: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
     """Compose absolute link quaternions from canonical relative joint angles."""
     joint_angles = np.asarray(joint_angles, dtype=np.float32)
@@ -210,27 +235,68 @@ def joint_angles_to_absolute_quaternions(joint_angles: np.ndarray, robot_config:
     return absolute
 
 
-def get_all_poses_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
-    """Return joint poses and EE pose from canonical joint angles."""
-    quats = joint_angles_to_absolute_quaternions(joint_angles, robot_config)
-    joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
+def get_kinematic_state(joint_angles_rad: np.ndarray, robot_config: RobotConfig) -> KinematicState:
+    """Return all FK pose data from canonical joint angles in radians."""
+    joint_angles_rad = np.asarray(joint_angles_rad, dtype=np.float32)
+    quats = joint_angles_to_absolute_quaternions(joint_angles_rad, robot_config)
+    link_positions, ee_position = forward_kinematics_with_ee_offset_core(
         quats,
         robot_config.link_lengths,
         robot_config.link_directions,
         robot_config.origin_offset,
         robot_config.ee_offset,
     )
-    return joint_positions, quats, ee_position, quats[-1].copy()
+    return KinematicState(
+        joint_angles_rad=joint_angles_rad.copy(),
+        link_positions=np.asarray(link_positions, dtype=np.float32),
+        link_orientations=quats,
+        ee_position=np.asarray(ee_position, dtype=np.float32),
+        ee_orientation=quats[-1].copy(),
+    )
+
+
+def get_all_poses_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
+    """Return joint poses and EE pose from canonical joint angles.
+
+    Compatibility wrapper around get_kinematic_state(). New code should prefer
+    the named KinematicState return value.
+    """
+    state = get_kinematic_state(joint_angles, robot_config)
+    return state.link_positions, state.link_orientations, state.ee_position, state.ee_orientation
 
 
 def get_pose_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
     """Return end-effector pose from canonical joint angles."""
-    _, _, ee_position, ee_orientation = get_all_poses_from_joint_angles(joint_angles, robot_config)
-    return ee_position, ee_orientation
+    state = get_kinematic_state(joint_angles, robot_config)
+    return state.ee_position, state.ee_orientation
+
+
+def compute_jacobian_state(joint_angles_rad: np.ndarray, robot_config: RobotConfig) -> JacobianState:
+    """Return Jacobian and metrics from canonical joint angles in radians."""
+    joint_angles_rad = np.asarray(joint_angles_rad, dtype=np.float32)
+    quats = joint_angles_to_absolute_quaternions(joint_angles_rad, robot_config)
+    jacobian = compute_jacobian_core(
+        quats,
+        robot_config.link_lengths,
+        robot_config.link_directions,
+        robot_config.rotation_axes,
+        robot_config.origin_offset,
+        robot_config.ee_offset,
+    )
+    condition_number, singular_values, yoshikawa_index = compute_jacobian_metrics(jacobian)
+    return JacobianState(
+        joint_angles_rad=joint_angles_rad.copy(),
+        link_orientations=quats,
+        jacobian=jacobian,
+        condition_number=condition_number,
+        singular_values=singular_values,
+        yoshikawa_index=yoshikawa_index,
+    )
 
 
 def compute_jacobian_from_joint_angles(joint_angles: np.ndarray, robot_config: RobotConfig):
     """Compute the geometric Jacobian from canonical joint angles."""
+    joint_angles = np.asarray(joint_angles, dtype=np.float32)
     quats = joint_angles_to_absolute_quaternions(joint_angles, robot_config)
     return compute_jacobian_core(
         quats,
@@ -310,51 +376,6 @@ def ik_method_damped_least_squares(jacobian: np.ndarray, delta_pose: np.ndarray,
     return np.dot(jac_f32.T, solved)
 
 
-# ----------------------------
-# Base rotation propagation & Jacobian wrapper
-# ----------------------------
-
-def propagate_base_rotation(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """
-    Propagate base joint rotation to downstream joints in kinematic chain.
-
-    For 6-axis IMUs without magnetometers, yaw (Z-rotation) is unmeasurable.
-    When the base joint (slew) rotates, downstream links (boom/arm/bucket)
-    physically rotate in the world XY plane, but their IMUs cannot detect this.
-
-    This function projects downstream IMU quaternions to their rotation axes only
-    (removing roll/yaw drift), then composes with the slew rotation to get
-    world-frame orientations.
-
-    Args:
-        quats: Input quaternions [base, link1, link2, ...] where base rotation is
-               provided as a clean Z-rotation and downstream orientations are from IMUs
-        robot_config: Robot configuration containing rotation axes for each joint
-
-    Returns:
-        Quaternions with base rotation propagated to all downstream joints
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-    propagated_quats = quats.copy()
-
-    # Base stays as-is (already a clean Z-rotation)
-    base_quat = quats[0]
-
-    # Project downstream joints to their rotation axes (removes roll/yaw drift)
-    if len(quats) > 1:
-        downstream_quats = quats[1:]
-        downstream_axes = np.array(robot_config.rotation_axes[1:], dtype=np.float32)
-
-        # Extract ONLY axis twist component (e.g., Y-axis pitch for boom/arm/bucket)
-        projected_quats = project_to_rotation_axes(downstream_quats, downstream_axes)
-
-        # Compose with base rotation: q_world = q_base * q_local_projected
-        for i, proj_quat in enumerate(projected_quats):
-            propagated_quats[i+1] = quat_normalize(quat_multiply(base_quat, proj_quat))
-
-    return propagated_quats
-
-
 def compute_jacobian(quats: np.ndarray, robot_config: RobotConfig):
     """Jacobian computation wrapper using absolute link quaternions."""
     quats = np.asarray(quats, dtype=np.float32)
@@ -379,7 +400,7 @@ class IKController:
         self,
         cfg: IKControllerConfig,
         robot_config: RobotConfig,
-        verbose: bool = True,
+        verbose: bool = False,
         log_level: str = "INFO",
         default_dt: float = 0.01,
     ):
@@ -563,33 +584,6 @@ class IKController:
         self.ee_pos_des.fill(0.0)
         self.ee_quat_des = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self._command.fill(0.0)
-
-    def _transform_to_robot_local_frame(self, quat: np.ndarray, joint_quats: np.ndarray) -> np.ndarray:
-        """
-        Transform a quaternion from global frame to robot's local frame by removing slew rotation.
-
-        This removes the base (slew) yaw component so that pitch/roll are expressed
-        relative to the robot's current heading, not the global frame.
-
-        Args:
-            quat: Quaternion in global frame [w, x, y, z]
-            joint_quats: Current joint quaternions (for extracting slew angle)
-
-        Returns:
-            Quaternion in robot's local frame [w, x, y, z]
-        """
-        # Extract slew angle from joint 0 (Z-axis rotation)
-        slew_angle = extract_axis_rotation(joint_quats[0], self.robot_config.rotation_axes[0])
-
-        # Create slew quaternion (yaw rotation around Z)
-        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        slew_quat = quat_from_axis_angle(z_axis, np.float32(slew_angle))
-        slew_quat_inv = quat_conjugate(slew_quat)
-
-        # Remove slew from quaternion: q_local = q_slew^-1 * q_global
-        quat_local = quat_normalize(quat_multiply(slew_quat_inv, quat))
-
-        return quat_local
 
     def set_log_level(self, level: str) -> None:
         """Change the logging level at runtime.

@@ -17,12 +17,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from modules.ik import (  # noqa: E402
     compute_jacobian, compute_jacobian_from_joint_angles,
-    compute_jacobian_metrics, project_to_rotation_axes, propagate_base_rotation,
+    compute_jacobian_metrics, compute_jacobian_state, project_to_rotation_axes,
     extract_axis_rotation,
     RobotConfig,
-    get_all_poses, compute_relative_joint_angles,
+    get_all_poses, get_kinematic_state, compute_relative_joint_angles,
     canonical_joint_angles_from_imus,
-    absolute_link_angles_from_quats,
     get_joint_positions,
     quat_from_axis_angle, quat_multiply, quat_normalize, quat_rotate_vector,
 )
@@ -130,6 +129,18 @@ class ForwardKinematicsTests(unittest.TestCase):
 
         # EE orientation is the last joint orientation.
         self.assertTrue(np.allclose(jo[-1], ee_o, atol=1e-5))
+
+    def test_get_kinematic_state_from_joint_angles_matches_pose_wrappers(self):
+        angles = np.array([0.5, -0.4, 0.2, -0.3], dtype=np.float32)
+        state = get_kinematic_state(angles, self.rc)
+        quats = build_absolute_quaternions(angles, self.rc)
+        jp, jo, ee_p, ee_o = get_all_poses(quats, self.rc)
+
+        self.assertTrue(np.allclose(state.joint_angles_rad, angles, atol=1e-6))
+        self.assertTrue(np.allclose(state.link_positions, jp, atol=1e-5))
+        self.assertTrue(np.allclose(state.link_orientations, jo, atol=1e-5))
+        self.assertTrue(np.allclose(state.ee_position, ee_p, atol=1e-5))
+        self.assertTrue(np.allclose(state.ee_orientation, ee_o, atol=1e-5))
 
     def test_compute_relative_joint_angles_recovers_inputs(self):
         """Absolute -> relative decomposition should recover the original angles."""
@@ -265,28 +276,6 @@ class ForwardKinematicsTests(unittest.TestCase):
         ang = extract_axis_rotation(q, np.array([0, 0, 1], np.float32))
         self.assertAlmostEqual(ang, math.radians(179.5), places=4)
 
-    def test_absolute_link_angles_match_cumulative_body_pitch(self):
-        """abs angles: slew is world Z; downstream are cumulative cab-frame pitch."""
-        for slew_deg in (-150.0, -45.0, 0.0, 45.0, 90.0, 135.0):
-            slew = math.radians(slew_deg)
-            rel = np.array([slew, math.radians(-30), math.radians(20), math.radians(-10)],
-                           dtype=np.float32)
-            quats = build_absolute_quaternions(rel, self.rc)
-            abs_rad = np.asarray(absolute_link_angles_from_quats(quats, self.rc),
-                                 dtype=np.float64)
-
-            self.assertAlmostEqual(abs_rad[0], slew, places=4,
-                                   msg=f"slew abs at {slew_deg}: {abs_rad[0]}")
-            self.assertAlmostEqual(abs_rad[1], float(rel[1]), places=4)
-            self.assertAlmostEqual(abs_rad[2], float(rel[1] + rel[2]), places=4)
-            self.assertAlmostEqual(abs_rad[3],
-                                   float(rel[1] + rel[2] + rel[3]), places=4)
-
-    def test_absolute_link_angles_handles_empty_chain(self):
-        """Zero-length input should not crash (defensive guard for early states)."""
-        out = absolute_link_angles_from_quats(np.zeros((0, 4), dtype=np.float32), self.rc)
-        self.assertEqual(out.shape, (0,))
-
     def test_extract_axis_rotation_orthogonal_axis_returns_zero(self):
         """A pure Z-rotation has zero twist about Y."""
         q = quat_from_axis_angle(np.array([0, 0, 1], np.float32), np.float32(1.0))
@@ -311,20 +300,6 @@ class BasePropagationTests(unittest.TestCase):
                 np.allclose(out[0], q, atol=1e-5),
                 msg=f"projection changed pure Y quat at {ang}: {out[0]} vs {q}",
             )
-
-    def test_propagate_base_rotation_identity_on_zero_base(self):
-        """With the base at identity, propagation leaves downstream unchanged."""
-        idq = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        boom = quat_from_axis_angle(np.array([0.0, 1.0, 0.0], dtype=np.float32), np.float32(0.3))
-        arm = quat_from_axis_angle(np.array([0.0, 1.0, 0.0], dtype=np.float32), np.float32(-0.2))
-        bucket = quat_from_axis_angle(np.array([0.0, 1.0, 0.0], dtype=np.float32), np.float32(0.1))
-
-        quats = np.array([idq, boom, arm, bucket], dtype=np.float32)
-        out = propagate_base_rotation(quats, self.rc)
-        self.assertTrue(np.allclose(out[1], boom, atol=1e-5))
-        self.assertTrue(np.allclose(out[2], arm, atol=1e-5))
-        self.assertTrue(np.allclose(out[3], bucket, atol=1e-5))
-
 
 class JacobianSanityTests(unittest.TestCase):
     """Compare the analytic position Jacobian against a numerical one."""
@@ -364,6 +339,18 @@ class JacobianSanityTests(unittest.TestCase):
             j_angles = np.asarray(compute_jacobian_from_joint_angles(angles, self.rc))[:3]
             self.assertTrue(np.allclose(j_ana, j_angles, atol=1e-6))
             self.assertLess(diff, 2e-3)
+
+    def test_jacobian_state_returns_metrics_in_one_bundle(self):
+        angles = np.array([0.4, -0.3, 0.2, -0.1], dtype=np.float32)
+        state = compute_jacobian_state(angles, self.rc)
+        jacobian = compute_jacobian_from_joint_angles(angles, self.rc)
+        cond, singular_values, yoshikawa = compute_jacobian_metrics(jacobian)
+
+        self.assertTrue(np.allclose(state.joint_angles_rad, angles, atol=1e-6))
+        self.assertTrue(np.allclose(state.jacobian, jacobian, atol=1e-6))
+        self.assertAlmostEqual(state.condition_number, cond, places=5)
+        self.assertTrue(np.allclose(state.singular_values, singular_values, atol=1e-6))
+        self.assertAlmostEqual(state.yoshikawa_index, yoshikawa, places=5)
 
     def test_condition_number_finite_away_from_singularity(self):
         angles = np.array([0.1, -0.4, 0.3, -0.1], dtype=np.float32)

@@ -44,9 +44,9 @@ from modules.hardware_interface import HardwareInterface
 
 
 JOINTS = {
-    "boom": {"index": 1, "pwm": "lift_boom"},
-    "arm": {"index": 2, "pwm": "tilt_boom"},
-    "bucket": {"index": 3, "pwm": "scoop"},
+    "boom": {"index": 1, "pwm": "boom"},
+    "arm": {"index": 2, "pwm": "arm"},
+    "bucket": {"index": 3, "pwm": "bucket"},
 }
 DEFAULT_ORDER = ["bucket", "arm", "boom"]
 COMMAND_AMPLITUDES = [0.2, 0.4, 0.6, 0.8, 1.0]

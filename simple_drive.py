@@ -59,7 +59,7 @@ PRINT_DECIMATION           = 10     # IMU print decimation (→ ~10 Hz)
 
 LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
 
-JOINT_NAMES       = ['rotate', 'lift_boom', 'tilt_boom', 'scoop']
+JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
 AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5]
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
@@ -67,7 +67,7 @@ IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
 
 # ── velocity PID ─────────────────────────────────────────────────────────────
 
-_VEL_CTRL_JOINTS = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
+_VEL_CTRL_JOINTS = {'boom': 1, 'arm': 2, 'bucket': 3}
 
 
 class JointVelocityController:
@@ -180,10 +180,10 @@ class SineExcitationGenerator:
     """
 
     _PHASES = {
-        'rotate':    (0.0,   0.0),
-        'lift_boom': (1.571, 0.785),
-        'tilt_boom': (3.142, 1.571),
-        'scoop':     (4.712, 2.356),
+        'slew':   (0.0,   0.0),
+        'boom':   (1.571, 0.785),
+        'arm':    (3.142, 1.571),
+        'bucket': (4.712, 2.356),
     }
 
     def __init__(self):
@@ -325,12 +325,12 @@ class DataLogger:
 
         df = pd.DataFrame({
             'timestamp': self._ts, 'sample_idx': self._idx, 'segment_id': self._seg,
-            'manual_cmd_rotate': man[:,0], 'manual_cmd_lift': man[:,1],
-            'manual_cmd_tilt':   man[:,2], 'manual_cmd_scoop': man[:,3],
-            'sine_cmd_rotate':   sin[:,0], 'sine_cmd_lift':   sin[:,1],
-            'sine_cmd_tilt':     sin[:,2], 'sine_cmd_scoop':  sin[:,3],
-            'combined_cmd_rotate': com[:,0], 'combined_cmd_lift': com[:,1],
-            'combined_cmd_tilt':   com[:,2], 'combined_cmd_scoop': com[:,3],
+            'manual_cmd_slew': man[:,0], 'manual_cmd_boom': man[:,1],
+            'manual_cmd_arm':  man[:,2], 'manual_cmd_bucket': man[:,3],
+            'sine_cmd_slew':   sin[:,0], 'sine_cmd_boom':   sin[:,1],
+            'sine_cmd_arm':    sin[:,2], 'sine_cmd_bucket': sin[:,3],
+            'combined_cmd_slew': com[:,0], 'combined_cmd_boom': com[:,1],
+            'combined_cmd_arm':  com[:,2], 'combined_cmd_bucket': com[:,3],
             'joint_pos_slew':   pos[:,0], 'joint_pos_boom': pos[:,1],
             'joint_pos_arm':    pos[:,2], 'joint_pos_bucket': pos[:,3],
             'joint_vel_boom': self._vb, 'joint_vel_arm': self._va, 'joint_vel_bucket': self._vbkt,
@@ -394,7 +394,7 @@ def _parse_args():
     # data collection
     p.add_argument("--record",       action="store_true", help="Enable data recording")
     p.add_argument("--out",          default=str(LOG_OUTPUT_DIR), help="Output dir for drive logs")
-    p.add_argument("--enable-slew",  action="store_true", help="Allow slew/rotate in commands and sine")
+    p.add_argument("--enable-slew",  action="store_true", help="Allow slew in commands and sine")
     p.add_argument("--auto-save-min", type=float, default=10.0, help="Auto-save interval in min (0=off)")
     # compensation (static, not button-toggled)
     p.add_argument("--comp", choices=["none", "raw", "universal", "vel-pid"], default="none",
@@ -422,6 +422,9 @@ def _resolve_profile(args) -> dict:
     if args.pwm_i2c_addr is not None: profile['pwm_i2c_addr'] = args.pwm_i2c_addr
     if args.disable_imu:              profile['enable_imu']   = False
     return profile
+
+
+resolve_robot_profile = _resolve_profile
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -625,16 +628,16 @@ def main():
             is_logging = logger is not None and logger.is_logging
 
             manual = {
-                'rotate':    left_rl if args.enable_slew else 0.0,
-                'lift_boom': right_ud,
-                'tilt_boom': left_ud,
-                'scoop':     right_rl,
+                'slew':   left_rl if args.enable_slew else 0.0,
+                'boom':   right_ud,
+                'arm':    left_ud,
+                'bucket': right_rl,
             }
 
             t = time.perf_counter()
             sine = sine_gen.get_all(t) if is_logging else {n: 0.0 for n in JOINT_NAMES}
             if not args.enable_slew:
-                sine['rotate'] = 0.0
+                sine['slew'] = 0.0
 
             combined = {n: float(np.clip(manual[n] + sine[n], -1.0, 1.0)) for n in JOINT_NAMES}
             combined['trackR'] = right_paddle

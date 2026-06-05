@@ -190,7 +190,7 @@ class ServiceSubmitCommandTests(unittest.TestCase):
         self.assertEqual(controller.suspend_ik_output_calls, 1)
         self.assertEqual(len(hardware.pwm_log), 1)
         self.assertEqual(hardware.pwm_log[-1],
-                         {"rotate": 0.1, "lift_boom": 0.2, "tilt_boom": 0.3, "scoop": 0.4})
+                         {"slew": 0.1, "boom": 0.2, "arm": 0.3, "bucket": 0.4})
 
         service.submit_command(ControlCommand(
             sequence=2, mode=ControlMode.IK,

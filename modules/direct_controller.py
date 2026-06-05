@@ -2,7 +2,7 @@
 
 Owns its own command queue and a thin send method. Lightweight; runs on the
 caller's thread (no background loop of its own — the caller drives ticks).
-Stale-command timeouts already live in :mod:`modules.PCA9685_controller`'s
+Stale-command timeouts already live in :mod:`modules.pwm`'s
 PWM layer, so sparse ``send_pending`` calls are still safe.
 
 Typical use::

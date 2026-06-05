@@ -22,17 +22,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from modules.ik import (
-    compute_jacobian_from_joint_angles,
-    get_pose_from_joint_angles,
+    compute_jacobian_state,
+    get_kinematic_state,
     load_excavator_robot_config,
 )
 
 
 JOINTS = [
-    ("joint0", "slew", "rotate"),
-    ("joint1", "boom", "lift_boom"),
-    ("joint2", "arm", "tilt_boom"),
-    ("joint3", "bucket", "scoop"),
+    ("joint0", "slew", "slew"),
+    ("joint1", "boom", "boom"),
+    ("joint2", "arm", "arm"),
+    ("joint3", "bucket", "bucket"),
 ]
 
 
@@ -111,8 +111,10 @@ def main() -> int:
     robot_cfg = load_excavator_robot_config(str(control_path))
 
     joint_angles = np.radians(np.asarray(args.angles_deg, dtype=np.float32))
-    ee_pos, _ = get_pose_from_joint_angles(joint_angles, robot_cfg)
-    jacobian = compute_jacobian_from_joint_angles(joint_angles, robot_cfg)
+    kinematic_state = get_kinematic_state(joint_angles, robot_cfg)
+    jacobian_state = compute_jacobian_state(joint_angles, robot_cfg)
+    ee_pos = kinematic_state.ee_position
+    jacobian = jacobian_state.jacobian
     pid_cfg = control_cfg.get("pid", {})
 
     print("PID geometry helper")

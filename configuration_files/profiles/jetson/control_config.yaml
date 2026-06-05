@@ -105,7 +105,7 @@ pid:
     ki: 0.400
     kd: 0.000
 
-  # Joint 3: Bucket (scoop)
+  # Joint 3: Bucket
   joint3:
     kp: 5.000
     ki: 0.250

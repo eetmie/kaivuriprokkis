@@ -19,7 +19,7 @@ from pathlib import Path
 import threading
 import yaml
 
-from .PCA9685_controller import PWMController
+from .pwm import PWMController
 try:
     from .usb_serial_reader import USBSerialReader
 except Exception:
@@ -1000,6 +1000,43 @@ class HardwareInterface:
         except Exception as e:
             self.logger.error(f"PWM named command error: {e}")
             return False
+
+    def send_named_pwm_pulse_us(self, commands: Dict[str, float], *,
+                                unset_to_center: Optional[bool] = None,
+                                command_ts: Optional[float] = None) -> bool:
+        """Send name-based direct PWM pulse-width commands in microseconds.
+
+        Unknown names are ignored. Values are clamped to each channel's configured
+        pulse_min/pulse_max range by the PWM controller.
+        """
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return False
+        try:
+            self.pwm_controller.update_named_us(commands,
+                                                unset_to_center=unset_to_center,
+                                                command_ts=command_ts)
+            return True
+        except Exception as e:
+            self.logger.error(f"PWM direct pulse command error: {e}")
+            return False
+
+    def set_named_pwm_pulse_us(self, commands: Dict[str, float], *,
+                               unset_to_center: Optional[bool] = None,
+                               command_ts: Optional[float] = None) -> bool:
+        """Alias for send_named_pwm_pulse_us() with explicit direct-set naming."""
+        return self.send_named_pwm_pulse_us(commands,
+                                            unset_to_center=unset_to_center,
+                                            command_ts=command_ts)
+
+    def get_current_pwm_pulses_us(self) -> Dict[str, float]:
+        """Return last commanded pulse widths by PWM channel name, in microseconds."""
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return {}
+        try:
+            return self.pwm_controller.get_current_pulses_us()
+        except Exception as e:
+            self.logger.error(f"PWM pulse readback error: {e}")
+            return {}
 
     def set_pump_enabled(self, enabled: bool, *, flush: bool = True) -> bool:
         """Enable or disable the hydraulic pump immediately."""

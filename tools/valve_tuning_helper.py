@@ -51,12 +51,12 @@ BUTTON_THRESHOLD = 0.5
 
 BASE_CONFIG = ROOT_DIR / "configuration_files" / "servo_config_base.yaml"
 OUTPUT_DIR = ROOT_DIR / "configuration_files"
-CHANNEL_ORDER = ["scoop", "tilt_boom", "lift_boom", "rotate"]
+CHANNEL_ORDER = ["bucket", "arm", "boom", "slew"]
 JOINT_BY_CHANNEL = {
-    "rotate": (0, "slew"),
-    "lift_boom": (1, "boom"),
-    "tilt_boom": (2, "arm"),
-    "scoop": (3, "bucket"),
+    "slew": (0, "slew"),
+    "boom": (1, "boom"),
+    "arm": (2, "arm"),
+    "bucket": (3, "bucket"),
 }
 
 
@@ -280,10 +280,10 @@ class ValveTuner:
 
                 button_prev = buttons
                 commands = {
-                    "rotate": float_data[7],
-                    "lift_boom": float_data[8],
-                    "tilt_boom": float_data[6],
-                    "scoop": float_data[9],
+                    "slew": float_data[7],
+                    "boom": float_data[8],
+                    "arm": float_data[6],
+                    "bucket": float_data[9],
                 }
                 self.hardware.send_named_pwm_commands(commands, unset_to_zero=True)
             else:

@@ -29,7 +29,7 @@ from .pid import PIDController
 from .ik import (
     IKController, IKControllerConfig, load_excavator_robot_config,
     extract_axis_rotation,
-    joint_angles_to_absolute_quaternions, get_pose_from_joint_angles,
+    get_kinematic_state,
     canonical_joint_angles_from_imus, gravity_pitch_from_quat,
     compute_relative_joint_angles, warmup_numba_functions,
     quat_from_axis_angle, quat_multiply, quat_conjugate, quat_normalize,
@@ -58,8 +58,8 @@ _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 # Joints that receive measured velocity feedback in velocity-command mode.
 # Maps joint name → index into the 4-element joint velocity array.
-# rotate (slew) and trackL/trackR are pass-through in all modes.
-_VEL_CMD_JOINTS: Dict[str, int] = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
+# slew and trackL/trackR are pass-through in all modes.
+_VEL_CMD_JOINTS: Dict[str, int] = {'boom': 1, 'arm': 2, 'bucket': 3}
 
 
 def _angle_error(target: float, current: float) -> float:
@@ -687,7 +687,7 @@ class ExcavatorController:
         # Pre-allocated buffers for hot-path — avoids per-tick GC pressure.
         self._pi_outputs = np.zeros(4, dtype=np.float32)
         self._named_commands: Dict[str, float] = {
-            'scoop': 0.0, 'lift_boom': 0.0, 'rotate': 0.0, 'tilt_boom': 0.0,
+            'slew': 0.0, 'boom': 0.0, 'arm': 0.0, 'bucket': 0.0,
         }
         self._prev_pose_time = None
         self._prev_pose = None
@@ -1196,8 +1196,8 @@ class ExcavatorController:
     def enter_velocity_command_mode(self) -> None:
         """Switch to velocity-command mode.
 
-        lift_boom / tilt_boom / scoop are PI-controlled to a desired rad/s target.
-        rotate / trackL / trackR pass through as normalized [-1, 1] direct commands.
+        boom / arm / bucket are PI-controlled to a desired rad/s target.
+        slew / trackL / trackR pass through as normalized [-1, 1] direct commands.
         Mutually exclusive with IK mode and with output-suspended mode.
         """
         with self._vel_cmd_lock:
@@ -1226,9 +1226,9 @@ class ExcavatorController:
 
         Args:
             commands: {joint_name: value} where:
-              - lift_boom, tilt_boom, scoop: desired velocity in rad/s (PI-controlled,
+              - boom, arm, bucket: desired velocity in rad/s (PI-controlled,
                 finite-difference feedback from Pico-fused joint angles)
-              - rotate, trackL, trackR: normalized [-1, 1] pass-through (no feedback)
+              - slew, trackL, trackR: normalized [-1, 1] pass-through (no feedback)
         """
         with self._vel_cmd_lock:
             self._vel_cmd_commands = dict(commands)
@@ -1452,8 +1452,10 @@ class ExcavatorController:
 
             # Convert sensor quats once into canonical relative joint angles.
             joint_angles = canonical_joint_angles_from_imus(sensor_quats, self.robot_config)
-            joint_quats = joint_angles_to_absolute_quaternions(joint_angles, self.robot_config)
-            ee_pos, ee_quat = get_pose_from_joint_angles(joint_angles, self.robot_config)
+            kinematic_state = get_kinematic_state(joint_angles, self.robot_config)
+            joint_quats = kinematic_state.link_orientations
+            ee_pos = kinematic_state.ee_position
+            ee_quat = kinematic_state.ee_orientation
 
             # Extract Y-axis rotation for end-effector orientation in body frame.
             # Remove slew (Z-axis) rotation so pitch is relative to the upper body,
@@ -1666,10 +1668,10 @@ class ExcavatorController:
         ):
             pi_outputs[i] = pid.compute(0.0, -_angle_error(target_angle, current_angle), dt=loop_dt)
 
-        self._named_commands['scoop']     = float(pi_outputs[3])  # bucket
-        self._named_commands['lift_boom'] = float(pi_outputs[1])  # boom
-        self._named_commands['rotate']    = float(pi_outputs[0])  # slew
-        self._named_commands['tilt_boom'] = float(pi_outputs[2])  # arm
+        self._named_commands['slew']   = float(pi_outputs[0])
+        self._named_commands['boom']   = float(pi_outputs[1])
+        self._named_commands['arm']    = float(pi_outputs[2])
+        self._named_commands['bucket'] = float(pi_outputs[3])
         named_commands = self._named_commands
 
         # Debug telemetry capture (always enabled for get_last_* methods)

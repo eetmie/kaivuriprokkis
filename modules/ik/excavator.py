@@ -15,8 +15,6 @@ from typing import Tuple
 from .config import RobotConfig
 from .solver import (
     extract_axis_rotation,
-    project_to_rotation_axes,
-    propagate_base_rotation,
     forward_kinematics_core,
     forward_kinematics_with_ee_offset_core,
     compute_jacobian_core,
@@ -137,6 +135,9 @@ def canonical_joint_angles_from_imus(imu_quats: np.ndarray, robot_config: RobotC
     chain = getattr(robot_config, 'imu_chain', None) or []
 
     z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
+    # TODO(test): Compare averaged slew yaw against base-only yaw on real logs.
+    # Single base-IMU yaw would simplify the IMU role structure, but averaging
+    # may reduce noise if all corrected IMUs share the same stable Z twist.
     slew_quat = average_axis_twist_quaternion(imu_quats, z_axis)
 
     angles = np.zeros(robot_config.num_joints, dtype=np.float32)
@@ -182,48 +183,6 @@ def canonical_joint_angles_from_imus(imu_quats: np.ndarray, robot_config: RobotC
             raise ValueError(f"Unsupported IMU extraction mode '{extraction}'")
 
     return angles
-
-
-def absolute_link_angles_from_quats(
-    quats: np.ndarray, robot_config: RobotConfig
-) -> np.ndarray:
-    """Per-link absolute angles in radians.
-
-    For the excavator chain (slew about Z, boom/arm/bucket about body Y) this
-    returns:
-      - angles[0]  = world-frame slew yaw (twist of quats[0] about Z)
-      - angles[i>=1] = cab-frame twist of link i about its own rotation axis,
-        i.e. cumulative pitch from horizontal as a link-mounted inclinometer
-        would read it.
-
-    The slew yaw is removed before extracting downstream twists so the result
-    is independent of cab heading. Generalises naturally to a future rototilt
-    tool (roll about X, yaw about Z) because each joint's own rotation axis
-    drives the extraction.
-
-    Mounting offsets are NOT re-applied here — the hardware layer has already
-    mounting-corrected the IMU quaternions (see ``imu.mounting_offsets_quat``
-    in ``control_config.yaml`` and ``hardware_interface._correct_imu_quaternion``)
-    before they reach the controller, so the canonical absolute link quats are
-    the right inputs as-is.
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-    n = len(quats)
-    out = np.zeros(n, dtype=np.float32)
-    if n == 0:
-        return out
-
-    z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
-    out[0] = extract_axis_rotation(quats[0], z_axis)
-
-    if n > 1:
-        slew_quat = quat_from_axis_angle(z_axis, np.float32(out[0]))
-        slew_inv = quat_conjugate(slew_quat)
-        for i in range(1, n):
-            body_q = quat_normalize(quat_multiply(slew_inv, quats[i]))
-            axis_i = np.asarray(robot_config.rotation_axes[i], dtype=np.float32)
-            out[i] = extract_axis_rotation(body_q, axis_i)
-    return out
 
 
 def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:

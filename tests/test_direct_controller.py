@@ -46,7 +46,7 @@ class DirectControllerTests(unittest.TestCase):
         self.assertEqual(self.hardware.pwm_log, [])
 
     def test_give_then_send_pushes_to_hardware(self):
-        cmds = {"rotate": 0.1, "lift_boom": -0.5, "tilt_boom": 0.0, "scoop": 0.3}
+        cmds = {"slew": 0.1, "boom": -0.5, "arm": 0.0, "bucket": 0.3}
         self.direct.give_commands(cmds)
         self.direct.send_pending()
         self.assertEqual(len(self.hardware.pwm_log), 1)
@@ -54,14 +54,14 @@ class DirectControllerTests(unittest.TestCase):
         self.assertEqual(self.hardware.reset_log, [])
 
     def test_give_commands_copies_dict(self):
-        cmds = {"rotate": 0.1, "lift_boom": 0.0, "tilt_boom": 0.0, "scoop": 0.0}
+        cmds = {"slew": 0.1, "boom": 0.0, "arm": 0.0, "bucket": 0.0}
         self.direct.give_commands(cmds)
-        cmds["rotate"] = 99.9  # mutate after handoff
+        cmds["slew"] = 99.9  # mutate after handoff
         self.direct.send_pending()
-        self.assertEqual(self.hardware.pwm_log[-1]["rotate"], 0.1)
+        self.assertEqual(self.hardware.pwm_log[-1]["slew"], 0.1)
 
     def test_clear_zeroes_on_next_send(self):
-        self.direct.give_commands({"rotate": 0.4})
+        self.direct.give_commands({"slew": 0.4})
         self.direct.send_pending()
         self.assertEqual(len(self.hardware.pwm_log), 1)
 
@@ -75,16 +75,16 @@ class DirectControllerTests(unittest.TestCase):
 
     def test_new_commands_after_zero_resume_pushes(self):
         self.direct.send_pending()  # zeros once
-        self.direct.give_commands({"rotate": 0.7})
+        self.direct.give_commands({"slew": 0.7})
         self.direct.send_pending()
-        self.assertEqual(self.hardware.pwm_log[-1], {"rotate": 0.7})
+        self.assertEqual(self.hardware.pwm_log[-1], {"slew": 0.7})
         # Subsequent empty send must zero again.
         self.direct.clear()
         self.direct.send_pending()
         self.assertEqual(self.hardware.reset_log, [False, False])
 
     def test_emergency_stop_clears_and_resets_pump_by_default(self):
-        self.direct.give_commands({"rotate": 0.5})
+        self.direct.give_commands({"slew": 0.5})
         self.direct.emergency_stop()
         self.assertEqual(self.hardware.reset_log, [True])
         # Next send_pending must not re-push the cleared dict.

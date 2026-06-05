@@ -22,9 +22,9 @@ DEFAULT_TABLE = ROOT_DIR / "data_collection" / "hydraulic_data" / "processed_uni
 DEFAULT_UNIVERSAL_TABLE = DEFAULT_TABLE.parent / DEFAULT_TABLE.name.replace("_summary.csv", "_universal_shape.csv")
 
 COMMAND_TO_JOINT = {
-    "lift_boom": ("boom", 1),
-    "tilt_boom": ("arm", 2),
-    "scoop": ("bucket", 3),
+    "boom": ("boom", 1),
+    "arm": ("arm", 2),
+    "bucket": ("bucket", 3),
 }
 
 
@@ -248,7 +248,7 @@ def main() -> int:
     parser.add_argument("--angle-deg", type=float, required=True)
     args = parser.parse_args()
 
-    command_name = {"boom": "lift_boom", "arm": "tilt_boom", "bucket": "scoop"}[args.joint]
+    command_name = args.joint
     joint_index = COMMAND_TO_JOINT[command_name][1]
     angles = np.zeros(4, dtype=np.float32)
     angles[joint_index] = args.angle_deg

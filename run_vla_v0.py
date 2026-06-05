@@ -16,7 +16,7 @@ robot that maps to ``ExcavatorController.give_pose(position, rotation_y_deg)``,
 the same surface ``run_hw_v2.py`` uses. If you later want joint-space control
 instead, switch to ``controller.suspend_ik_output()`` + a
 ``DirectController`` (modules/direct_controller.py) driving the four
-normalized valve channels: rotate, lift_boom, tilt_boom, scoop.
+normalized valve channels: slew, boom, arm, bucket.
 """
 
 from __future__ import annotations

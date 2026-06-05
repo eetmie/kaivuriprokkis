@@ -42,7 +42,7 @@ JOINT_TELEMETRY_SIZE = 12
 JOINT_PORT = 8090
 
 JOINT_NAMES = ["slew", "boom", "arm", "bucket"]
-PWM_NAMES = ["rotate", "lift_boom", "tilt_boom", "scoop"]
+PWM_NAMES = ["slew", "boom", "arm", "bucket"]
 
 # Command indices (client → host)
 JCMD_JOINT_ID = 0

@@ -31,13 +31,13 @@ RESULTS_DIR = Path(__file__).parent / "test_results"
 
 # controller.get_joint_angles() returns [slew, boom, arm, bucket]
 JOINT_TO_IMU_IDX = {
-    "rotate": 0,
-    "lift_boom": 1,
-    "tilt_boom": 2,
-    "scoop": 3,
+    "slew": 0,
+    "boom": 1,
+    "arm": 2,
+    "bucket": 3,
 }
 
-DEFAULT_JOINTS = ["lift_boom", "tilt_boom", "scoop"]
+DEFAULT_JOINTS = ["boom", "arm", "bucket"]
 DEFAULT_TARGET_SWING_DEG = 20.0
 DEFAULT_START_FREQ_HZ = 0.10
 DEFAULT_FREQ_STEP_HZ = 0.05
@@ -369,7 +369,7 @@ def parse_args() -> argparse.Namespace:
         dest="joints",
         action="append",
         choices=JOINT_NAMES,
-        help="Joint to test. Repeat to test multiple joints. Default: lift_boom, tilt_boom, scoop",
+        help="Joint to test. Repeat to test multiple joints. Default: boom, arm, bucket",
     )
     parser.add_argument("--target-swing-deg", type=float, default=DEFAULT_TARGET_SWING_DEG)
     parser.add_argument("--start-freq-hz", type=float, default=DEFAULT_START_FREQ_HZ)

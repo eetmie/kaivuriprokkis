@@ -12,7 +12,6 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.hardware_interface import HardwareInterface  # noqa: E402
 from modules.udp_socket import UDPSocket  # noqa: E402
 from tools.pid_tuner import robot as pid_tuner_robot  # noqa: E402
 
@@ -124,7 +123,10 @@ class PIDTunerRobotTests(unittest.TestCase):
         self.assertEqual(canonical.call_args.args[0].shape, (4, 4))
 
     def test_robot_tuner_uses_current_hardware_and_udp_apis(self):
-        hw_sig = inspect.signature(HardwareInterface)
+        import importlib
+        hardware_interface_module = importlib.import_module("modules.hardware_interface")
+        HardwareInterfaceClass = hardware_interface_module.HardwareInterface
+        hw_sig = inspect.signature(HardwareInterfaceClass)
         for name in (
             "config_file",
             "pump_auto_mode",
@@ -144,7 +146,7 @@ class PIDTunerRobotTests(unittest.TestCase):
             "reset",
             "shutdown",
         ):
-            self.assertTrue(hasattr(HardwareInterface, method), method)
+            self.assertTrue(hasattr(HardwareInterfaceClass, method), method)
 
         for method in ("setup", "handshake", "start_receiving", "get_latest", "send", "close"):
             self.assertTrue(hasattr(UDPSocket, method), method)
@@ -195,9 +197,9 @@ class PIDTunerRobotTests(unittest.TestCase):
         self.assertEqual(hardware.pump_log, [True])
         self.assertEqual(len(hardware.command_log), 1)
         commands, unset_to_zero, command_ts = hardware.command_log[0]
-        self.assertEqual(set(commands), {"tilt_boom"})
-        self.assertGreater(commands["tilt_boom"], 0.0)
-        self.assertLessEqual(commands["tilt_boom"], 0.5)
+        self.assertEqual(set(commands), {"arm"})
+        self.assertGreater(commands["arm"], 0.0)
+        self.assertLessEqual(commands["arm"], 0.5)
         self.assertTrue(unset_to_zero)
         self.assertIsNone(command_ts)
         self.assertIn(True, hardware.reset_log)

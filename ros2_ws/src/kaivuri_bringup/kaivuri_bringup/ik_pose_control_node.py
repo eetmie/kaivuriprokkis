@@ -204,7 +204,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("state_rate_hz", 30.0)
         self.declare_parameter("command_timeout_s", 1.0)
         self.declare_parameter("ready_timeout_s", 30.0)
-        self.declare_parameter("pump_auto_mode", True)
+        self.declare_parameter("pump_auto_mode", False)
         self.declare_parameter("toggle_channels", True)
         self.declare_parameter("stale_timeout_s", 0.5)
         self.declare_parameter("publish_tool_pose", True)
@@ -216,8 +216,11 @@ class IkPoseControlNode(Node):
         add_project_import_path(self._project_root)
 
         from modules.board import resolve_profile
-        from modules.differential_ik import extract_axis_rotation, get_pose_from_joint_angles
-        from modules.differential_ik_cfg import load_excavator_robot_config
+        from modules.ik import (
+            extract_axis_rotation,
+            get_pose_from_joint_angles,
+            load_excavator_robot_config,
+        )
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
 

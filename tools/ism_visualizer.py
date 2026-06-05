@@ -28,7 +28,7 @@ import numpy as np
 
 from tools.ascii_cube import render_frame, clear_screen
 from modules.usb_serial_reader import USBSerialReader
-from modules.quaternion_math import (
+from modules.ik import (
     quat_normalize,
     quat_conjugate,
     quat_multiply,

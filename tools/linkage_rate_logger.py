@@ -39,8 +39,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik_cfg import load_excavator_robot_config
-from modules.excavator_ik_utils import canonical_joint_angles_from_imus
+from modules.ik import load_excavator_robot_config, canonical_joint_angles_from_imus
 from modules.hardware_interface import HardwareInterface
 
 
@@ -75,6 +74,9 @@ class LinkageRateLogger:
         self.hardware = HardwareInterface(
             config_file=args.config_file,
             control_config_file="configuration_files/profiles/rpi/control_config.yaml",
+            # Intentional: linkage-rate logging needs activity-correlated pump
+            # behaviour, so this tool stays on auto pump even though the
+            # project default is fixed pump everywhere else.
             pump_auto_mode=True,
             cleanup_disable_osc=False,
             enable_adc=False,

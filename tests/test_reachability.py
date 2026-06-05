@@ -22,8 +22,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik import IKController  # noqa: E402
-from modules.excavator_ik_utils import get_pose  # noqa: E402
+from modules.ik import IKController, get_pose  # noqa: E402
 from modules.reachability import check_reachability  # noqa: E402
 
 from tests.common_kinematics import (  # noqa: E402

@@ -41,6 +41,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
+from modules.direct_controller import DirectController
 from modules.udp_socket import UDPSocket
 from tools.linkage_rate_compensation import (
     DEFAULT_TABLE,
@@ -233,9 +234,10 @@ def parse_args():
         help="Start with prototype linkage-rate command correction enabled",
     )
     parser.add_argument(
-        "--static",
+        "--auto-pump",
+        dest="auto_pump",
         action="store_true",
-        help="Use fixed pump static_pulse_us from the PWM config instead of valve-activity auto mode.",
+        help="Use valve-activity-based auto pump speed. Default is fixed pump (static_pulse_us from PWM config).",
     )
     parser.add_argument(
         "--linkage-rate-table",
@@ -274,7 +276,11 @@ def resolve_robot_profile(args) -> dict:
 
 
 class PWMOnlyController:
-    """Small direct-mode controller facade used when IMUs are disabled."""
+    """Stand-in for ExcavatorController when IMUs are disabled — IK output is
+    always suspended (there is no IK) so the main loop talks straight to a
+    :class:`DirectController`. Joint-state methods return zeros so callers
+    that read them (velocity PI etc.) gracefully no-op.
+    """
 
     def __init__(self, hardware):
         self.hardware = hardware
@@ -285,10 +291,10 @@ class PWMOnlyController:
     def stop(self) -> None:
         return
 
-    def enter_direct_mode(self) -> None:
+    def suspend_ik_output(self) -> None:
         return
 
-    def exit_direct_mode(self) -> None:
+    def resume_ik_output(self) -> None:
         return
 
     def set_velocity_mode(self, _mode: str) -> None:
@@ -299,9 +305,6 @@ class PWMOnlyController:
 
     def get_joint_velocities_with_age(self) -> tuple:
         return None, float('inf')
-
-    def give_direct_commands(self, commands: dict) -> None:
-        self.hardware.send_named_pwm_commands(commands)
 
     def emergency_stop(self, reset_pump: bool = True) -> None:
         self.hardware.reset(reset_pump=reset_pump)
@@ -334,7 +337,7 @@ def main():
         f"control_config={robot_profile['control_config_file']} | "
         f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
         f"IMU={'on' if imu_enabled else 'off'} | "
-        f"pump={'static' if args.static else 'auto'} | "
+        f"pump={'auto' if args.auto_pump else 'static'} | "
         f"UDP={_host}:{_port} | "
         f"toggleable channels={'disabled' if args.disable else 'enabled'}"
     )
@@ -343,7 +346,7 @@ def main():
     hardware = HardwareInterface(
         config_file=robot_profile['servo_config_file'],
         control_config_file=robot_profile['control_config_file'],
-        pump_auto_mode=not args.static,
+        pump_auto_mode=args.auto_pump,
         toggle_channels=not args.disable,
         stale_timeout_s=0.5,
         enable_pwm=True,
@@ -356,15 +359,17 @@ def main():
         pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
     )
 
-    print("Waiting for hardware to be ready...")
+    from modules.bringup import wait_for_hardware_ready
     try:
-        while not hardware.is_hardware_ready():
-            time.sleep(0.1)
-        print("Hardware ready.")
+        wait_for_hardware_ready(hardware)
     except HardwareFaultError as e:
         subsystem = getattr(e, 'subsystem', 'hardware')
         reason = getattr(e, 'reason', str(e))
         print(f"\n*** HARDWARE FAULT ({subsystem}): {reason} ***")
+        hardware.shutdown()
+        raise SystemExit(1)
+    except TimeoutError as e:
+        print(f"\n*** {e} ***")
         hardware.shutdown()
         raise SystemExit(1)
 
@@ -384,7 +389,8 @@ def main():
     controller.start()
     if imu_enabled:
         time.sleep(2.0)             # numba JIT warmup
-    controller.enter_direct_mode()
+    direct = DirectController(hardware)
+    controller.suspend_ik_output()
     controller.set_velocity_mode('gyro_only')
     control_joint_names = get_control_joint_names(controller)
     imu_role_order = get_imu_role_order(controller)
@@ -453,7 +459,8 @@ def main():
     print("Waiting for remote controller...")
     if not server.handshake(timeout=30.0):
         print("UDP handshake failed.")
-        controller.exit_direct_mode()
+        direct.clear()
+        controller.resume_ik_output()
         controller.stop()
         hardware.shutdown()
         raise SystemExit(1)
@@ -492,7 +499,7 @@ def main():
                 right_ud    = float_axes[1]   # lift
                 # float_axes[2] = right_rocker (unused)
                 left_rl     = float_axes[3]   # rotate (slew)
-                left_ud     = float_axes[4]   # tilt
+                left_ud     = float_axes[4]   # arm (tilt_boom)
                 # float_axes[5] = left_rocker (unused)
                 right_paddle = float_axes[6]  # trackR
                 left_paddle  = float_axes[7]  # trackL
@@ -574,7 +581,8 @@ def main():
                     canonical_commands = vel_controller.apply(canonical_commands, joint_vels, actual_dt)
                 else:
                     vel_controller.reset()
-            controller.give_direct_commands(canonical_commands)
+            direct.give_commands(canonical_commands)
+            direct.send_pending()
 
             # Apply pump gain: config base level, optionally modulated by linkage shape (mode 2).
             if pump_gain_available:

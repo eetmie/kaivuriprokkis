@@ -21,8 +21,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik import compute_jacobian_from_joint_angles, get_pose_from_joint_angles
-from modules.differential_ik_cfg import load_excavator_robot_config
+from modules.ik import (
+    compute_jacobian_from_joint_angles,
+    get_pose_from_joint_angles,
+    load_excavator_robot_config,
+)
 
 
 JOINTS = [

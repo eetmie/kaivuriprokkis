@@ -38,6 +38,7 @@ if str(_ROOT) not in sys.path:
 
 from modules.udp_socket import UDPSocket
 from modules.hardware_interface import HardwareInterface, HardwareFaultError
+from modules.direct_controller import DirectController
 from modules.excavator_controller import ExcavatorController
 from modules.perf_tracker import LoopPerfTracker
 from modules.rt_utils import apply_rt_to_thread, SCHED_FIFO
@@ -346,11 +347,12 @@ class DataLogger:
         print(f"{'='*60}\n")
         return filename
 
-    def save_with_pause(self, controller):
+    def save_with_pause(self, direct):
         """Save data while machine is stopped (safe for Pi).
 
-        Zeroes valve outputs via controller (keeps sensor loop alive),
-        saves synchronously, then starts a new segment.
+        Zeroes valve outputs via the :class:`DirectController` (the controller's
+        sensor loop keeps running), saves synchronously, then starts a new
+        segment.
         """
         if not self.timestamps:
             print("No data to save!")
@@ -361,7 +363,8 @@ class DataLogger:
 
         # Zero all outputs (controller bg thread keeps reading sensors)
         print("\n[PAUSE] Stopping machine for save...")
-        controller.give_direct_commands({})
+        direct.clear()
+        direct.send_pending()
         time.sleep(0.3)
 
         filename = self.save()
@@ -470,7 +473,8 @@ def main():
     )
     controller.start()
     time.sleep(2.0)  # warmup (numba JIT)
-    controller.enter_direct_mode()
+    direct = DirectController(hardware)
+    controller.suspend_ik_output()
     controller.set_velocity_mode('gyro_only')
     print("Controller in DIRECT mode (IK/PID bypassed)")
     if args.enable_slew:
@@ -498,7 +502,8 @@ def main():
     print("Waiting for remote controller...")
     if not server.handshake(timeout=30.0):
         print("UDP handshake failed!")
-        controller.exit_direct_mode()
+        direct.clear()
+        controller.resume_ik_output()
         controller.stop()
         hardware.shutdown()
         raise SystemExit(1)
@@ -553,7 +558,7 @@ def main():
                         logger.start()
                     else:
                         print("\n[Button A] Stopping data collection and saving...")
-                        logger.save_with_pause(controller)
+                        logger.save_with_pause(direct)
                         logger.is_logging = False
 
                 # Button B (bit 1): Toggle sine excitation
@@ -601,8 +606,9 @@ def main():
             combined_cmds['trackR'] = right_paddle
             combined_cmds['trackL'] = left_paddle
 
-            # --- 5. Send to controller ---
-            controller.give_direct_commands(combined_cmds)
+            # --- 5. Send to direct controller ---
+            direct.give_commands(combined_cmds)
+            direct.send_pending()
 
             # --- 6. Log ---
             if logger.is_logging:
@@ -623,7 +629,7 @@ def main():
                 if (current_time - last_auto_save_time) >= (AUTO_SAVE_INTERVAL_MINUTES * 60):
                     last_auto_save_time = current_time
                     print(f"\n[AUTO-SAVE] Periodic save ({AUTO_SAVE_INTERVAL_MINUTES} min)")
-                    logger.save_with_pause(controller)
+                    logger.save_with_pause(direct)
 
             # --- 8. Status print ---
             if current_time - last_status_time >= STATUS_PRINT_INTERVAL:
@@ -679,10 +685,11 @@ def main():
         if logger.get_sample_count() > 0:
             print("Final save...")
             logger.is_logging = False
-            controller.give_direct_commands({})
+            direct.clear()
+            direct.send_pending()
             time.sleep(0.2)
             logger.save()
-        controller.exit_direct_mode()
+        controller.resume_ik_output()
         controller.stop()
         hardware.reset(reset_pump=True)
         try:

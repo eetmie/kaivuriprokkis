@@ -15,19 +15,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik import (  # noqa: E402
+from modules.ik import (  # noqa: E402
     compute_jacobian, compute_jacobian_from_joint_angles,
     compute_jacobian_metrics, project_to_rotation_axes, propagate_base_rotation,
     extract_axis_rotation,
-)
-from modules.differential_ik_cfg import RobotConfig  # noqa: E402
-from modules.excavator_ik_utils import (  # noqa: E402
+    RobotConfig,
     get_all_poses, compute_relative_joint_angles,
     canonical_joint_angles_from_imus,
     absolute_link_angles_from_quats,
     get_joint_positions,
-)
-from modules.quaternion_math import (  # noqa: E402
     quat_from_axis_angle, quat_multiply, quat_normalize, quat_rotate_vector,
 )
 
@@ -115,7 +111,7 @@ class ForwardKinematicsTests(unittest.TestCase):
         # Last joint position + rotated ee_offset should equal FK output.
         ee_pos, ee_quat = fk_from_angles(angles, self.rc)
         last = np.asarray(jp[-1], dtype=np.float64)
-        from modules.quaternion_math import quat_rotate_vector
+        from modules.ik import quat_rotate_vector
 
         ee_from_chain = last + np.asarray(
             quat_rotate_vector(ee_quat, self.rc.ee_offset), dtype=np.float64
@@ -453,7 +449,7 @@ class JacobianSanityTests(unittest.TestCase):
         quats_a = build_absolute_quaternions(angles, rc_a)
         jp_a = np.asarray(get_joint_positions(quats_a, rc_a), dtype=np.float64)
         ee_a, _, _, _ = (None, None, None, None)
-        from modules.excavator_ik_utils import get_pose
+        from modules.ik import get_pose
         ee_a, _ = get_pose(quats_a, rc_a)
         ee_a = np.asarray(ee_a, dtype=np.float64)
 

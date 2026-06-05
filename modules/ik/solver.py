@@ -1,3 +1,10 @@
+# TODO(refactor #3 follow-up): this file still bundles three concerns
+# (axis-rotation helpers, @njit FK/Jacobian cores, IKController + solver
+# methods). The next step is to split it into modules/ik/kinematics.py
+# (numba cores) and trim this file down to the IKController + ik_method_*
+# dispatch. Also see modules/ik/REFACTOR_NOTES.md for the bigger note
+# about locking the IK in as excavator-specific (4 fixed joints: slew,
+# lift_boom, tilt_boom, scoop, plus optional rototilt tool).
 """
 Differential IK controller with numpy+numba optimization.
 
@@ -29,8 +36,8 @@ import numba
 import logging
 from typing import Optional, List
 
-from .differential_ik_cfg import IKControllerConfig, RobotConfig
-from .quaternion_math import (
+from .config import IKControllerConfig, RobotConfig
+from .math import (
     quat_normalize, quat_multiply, quat_conjugate, quat_rotate_vector,
     quat_from_axis_angle, axis_angle_from_quat, compute_pose_error,
     apply_delta_pose

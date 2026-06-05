@@ -24,7 +24,7 @@ try:
     from .usb_serial_reader import USBSerialReader
 except Exception:
     USBSerialReader = None  # type: ignore
-from .quaternion_math import (
+from .ik import (
     quat_normalize,
     quat_multiply,
     quat_conjugate,

@@ -22,8 +22,10 @@ if str(_ROOT_DIR) not in sys.path:
     sys.path.append(str(_ROOT_DIR))
 
 from modules.udp_socket import UDPSocket
+from modules.bringup import wait_for_hardware_ready
 from modules.excavator_controller import ExcavatorController
 from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
+from modules.hardware_interface import HardwareFaultError
 from modules.control_protocol import (
     COMMAND_PACKET_SIZE,
     TELEMETRY_PACKET_SIZE,
@@ -130,7 +132,7 @@ def _print_jacobian(telemetry, actual_pos, last_command, debug_state, state):
     if fk_quats is None or len(fk_quats) < 4 or robot_config is None:
         return
     try:
-        from modules.differential_ik import compute_jacobian, extract_axis_rotation, project_to_rotation_axes
+        from modules.ik import compute_jacobian, extract_axis_rotation, project_to_rotation_axes
 
         J = compute_jacobian(fk_quats, robot_config)
         J_pos = J[0:3, :]
@@ -189,6 +191,7 @@ def main():
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--jac", action="store_true", help="Jacobian debug output")
     parser.add_argument("--perf", action="store_true", help="Performance monitoring output")
+    parser.add_argument("--debug", action="store_true", help="Print PID inputs/outputs each interval to diagnose clamping")
     parser.add_argument("--fifo-priority", "--rt-priority", dest="fifo_priority", type=int, default=75)
     parser.add_argument("--lock-memory", action="store_true", help="Call mlockall() for RT threads")
     parser.add_argument("--control-core", type=int, default=None, help="CPU core for main loop and control loop")
@@ -258,25 +261,11 @@ def main():
             "on" if robot_profile["enable_imu"] else "off",
         )
 
-    # ---- UDP setup ----
-    server = UDPSocket(local_id=2, max_age_seconds=0.5, nominal_rate_hz=args.nominal_rate_hz)
-    server.setup(args.host, args.port,
-                 inputs=f'{COMMAND_PACKET_SIZE}b', outputs=f'{TELEMETRY_PACKET_SIZE}b',
-                 is_server=True)
-
-    if not quiet:
-        app_logger.info("Waiting for GUI connection...")
-    if not server.handshake(timeout=30.0):
-        app_logger.error("Handshake failed!")
-        return
-    handshake_info = server.get_handshake_info()
-    client_rate_hz = handshake_info.get("remote_nominal_rate_hz")
-    if not quiet:
-        app_logger.info("Connected to GUI!")
-        if client_rate_hz is not None:
-            app_logger.info(f"Client nominal rate: {client_rate_hz:.2f} Hz")
-
     # ---- Hardware ----
+    # Bring up hardware BEFORE the UDP handshake. The Pico self-calibration
+    # takes ~30 s; if we handshake first the client connects then sits without
+    # telemetry until calibration finishes, and a stale client handshake can
+    # time out before this process is ready to drive the socket.
     from modules.hardware_interface import HardwareInterface
 
     hw_log_level = "WARNING" if quiet else args.log_level.upper()
@@ -296,10 +285,10 @@ def main():
         pwm_i2c_bus=robot_profile["pwm_i2c_bus"],
         pwm_i2c_addr=robot_profile["pwm_i2c_addr"],
     )
-    while not hardware.is_hardware_ready():
-        time.sleep(0.1)
 
     # ---- Controller + Service ----
+    # Construct the controller before waiting so numba JIT warmup overlaps the
+    # remainder of the Pico calibration.
     ctrl_log_level = "WARNING" if quiet else ("DEBUG" if args.jac else args.log_level.upper())
     controller = ExcavatorController(
         hardware, config=None, enable_perf_tracking=args.perf, log_level=ctrl_log_level,
@@ -311,9 +300,42 @@ def main():
     service = RobotService(controller, hardware)
     service.start()
 
+    try:
+        wait_for_hardware_ready(hardware, logger=app_logger)
+    except (HardwareFaultError, TimeoutError) as exc:
+        app_logger.critical("Hardware bring-up failed: %s", exc)
+        try:
+            service.stop()
+        except Exception:
+            pass
+        try:
+            hardware.shutdown()
+        except Exception:
+            pass
+        return
+
+    # ---- UDP handshake (after hardware is ready) ----
+    server = UDPSocket(local_id=2, max_age_seconds=0.5, nominal_rate_hz=args.nominal_rate_hz)
+    server.setup(args.host, args.port,
+                 inputs=f'{COMMAND_PACKET_SIZE}b', outputs=f'{TELEMETRY_PACKET_SIZE}b',
+                 is_server=True)
+
     if not quiet:
-        app_logger.info("Controller started, warming up...")
-    time.sleep(5.0)
+        app_logger.info("Waiting for GUI connection...")
+    if not server.handshake(timeout=30.0):
+        app_logger.error("Handshake failed!")
+        try:
+            service.stop()
+        except Exception:
+            pass
+        hardware.shutdown()
+        return
+    handshake_info = server.get_handshake_info()
+    client_rate_hz = handshake_info.get("remote_nominal_rate_hz")
+    if not quiet:
+        app_logger.info("Connected to GUI!")
+        if client_rate_hz is not None:
+            app_logger.info(f"Client nominal rate: {client_rate_hz:.2f} Hz")
 
     # RT priority
     if args.fifo_priority > 0 or args.lock_memory or args.control_core is not None:
@@ -347,7 +369,7 @@ def main():
     last_print_time = time.time()
     network_times = []
     print_interval = 2.0 if args.perf else 1.0
-    needs_debug = args.perf or args.jac
+    needs_debug = args.perf or args.jac or args.debug
     loop_rate_hz = max(1.0, float(client_rate_hz)) if client_rate_hz is not None and client_rate_hz > 0 else 20.0
     loop_period = 1.0 / loop_rate_hz
     next_run_time = time.perf_counter()
@@ -403,6 +425,20 @@ def main():
                         _print_jacobian(telemetry, actual_pos, last_command, debug_state, jac_state)
                     else:
                         _print_normal(last_command, actual_pos, actual_rot, packet_rate, packets_received, debug_state)
+                    if args.debug:
+                        pid_out = service.controller.get_last_pid_outputs()
+                        pwm_cmd = service.controller.get_last_pwm_commands()
+                        joints = ['slew', 'boom', 'arm', 'bucket']
+                        raw_target = getattr(service.controller, '_raw_target_position', None)
+                        smoothed = getattr(service.controller, '_target_position', None)
+                        if pid_out is not None:
+                            out_str = " ".join(f"{n}={v:+.4f}" for n, v in zip(joints, pid_out))
+                            print(f"  [PID out] {out_str}")
+                        if pwm_cmd:
+                            pwm_str = " ".join(f"{k}={v:+.4f}" for k, v in sorted(pwm_cmd.items()))
+                            print(f"  [PWM cmd] {pwm_str}")
+                        if raw_target is not None and smoothed is not None:
+                            print(f"  [target] raw=[{_fmt_vec(raw_target)}] smoothed=[{_fmt_vec(smoothed)}]")
                 elif telemetry is None and not quiet:
                     stats = server.get_connection_stats()
                     if stats['is_connected']:

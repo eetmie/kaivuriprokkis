@@ -17,9 +17,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from modules.differential_ik import IKController  # noqa: E402
-from modules.excavator_ik_utils import compute_relative_joint_angles  # noqa: E402
-from modules.quaternion_math import (  # noqa: E402
+from modules.ik import (  # noqa: E402
+    IKController,
+    compute_relative_joint_angles,
     quat_from_axis_angle, quat_multiply, quat_normalize,
 )
 
@@ -102,7 +102,7 @@ class IKFeatureTests(unittest.TestCase):
         # Large target to saturate the velocity limiter.
         target = start_pos + np.array([0.4, 0.3, -0.3], dtype=np.float32)
 
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_pos_des = target.astype(np.float32)
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
@@ -140,7 +140,7 @@ class IKFeatureTests(unittest.TestCase):
         pos, quat = fk_from_angles(angles, self.rc)
 
         ik.ee_pos_des = pos.astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         new_angles = ik.compute(
@@ -189,7 +189,7 @@ class IKFeatureTests(unittest.TestCase):
         rel = compute_relative_joint_angles(quats, self.rc)
         pos, quat = fk_from_angles(angles, self.rc)
         ik.ee_pos_des = pos.astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         _ = ik.compute(ee_pos=pos, ee_quat=quat, joint_angles=rel, joint_quats=quats, dt=0.005)
@@ -220,7 +220,7 @@ class IKFeatureTests(unittest.TestCase):
         angles = np.array([3.5, 0.0, 0.0, 0.0], dtype=np.float32)  # slew already past π
         pos, quat = fk_from_angles(angles, self.rc)
         ik.ee_pos_des = (pos + np.array([0.01, 0.0, 0.0], dtype=np.float32)).astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle as q_aa
+        from modules.ik import quat_from_axis_angle as q_aa
         ik.ee_quat_des = q_aa(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         quats = build_absolute_quaternions(angles, self.rc)
@@ -252,7 +252,7 @@ class IKFeatureTests(unittest.TestCase):
         # 1m offset is well past the workspace.
         target = pos + np.array([1.0, 1.0, 0.0], dtype=np.float32)
         ik.ee_pos_des = target.astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         quats = build_absolute_quaternions(angles, self.rc)
@@ -287,7 +287,7 @@ class IKFeatureTests(unittest.TestCase):
         angles = np.array([0.0, -0.49, 0.0, 0.0], dtype=np.float32)
         pos, quat = fk_from_angles(angles, self.rc)
         ik.ee_pos_des = pos.astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         quats = build_absolute_quaternions(angles, self.rc)
@@ -316,7 +316,7 @@ class IKFeatureTests(unittest.TestCase):
         pos, quat = fk_from_angles(angles, self.rc)
         # Set target = current so error is exactly zero — only feedforward contributes.
         ik.ee_pos_des = pos.astype(np.float32)
-        from modules.quaternion_math import quat_from_axis_angle
+        from modules.ik import quat_from_axis_angle
         ik.ee_quat_des = quat_from_axis_angle(np.array([0, 1, 0], np.float32), np.float32(0.0))
 
         desired_vel = np.array([0.05, 0.0, 0.0], dtype=np.float32)  # 5cm/s along +x
@@ -379,7 +379,7 @@ class IKPoseModeTests(unittest.TestCase):
         return IKController(cfg, self.rc, verbose=False, default_dt=0.005)
 
     def _make_target_quat(self, slew_rad: float, total_pitch_rad: float):
-        from modules.quaternion_math import quat_from_axis_angle as q_aa
+        from modules.ik import quat_from_axis_angle as q_aa
         slew_q = q_aa(np.array([0, 0, 1], np.float32), np.float32(slew_rad))
         pitch_q = q_aa(np.array([0, 1, 0], np.float32), np.float32(total_pitch_rad))
         return quat_normalize(quat_multiply(slew_q, pitch_q))
@@ -387,7 +387,7 @@ class IKPoseModeTests(unittest.TestCase):
     def _solve_to_pose(self, ik, start_angles, target_pos, target_quat,
                        max_iters=500, pos_tol=3e-3, ang_tol=math.radians(1.0),
                        dt=0.005):
-        from modules.quaternion_math import compute_pose_error
+        from modules.ik import compute_pose_error
         ik.ee_pos_des = target_pos.astype(np.float32)
         ik.ee_quat_des = target_quat.astype(np.float32)
         angles = np.asarray(start_angles, dtype=np.float32).copy()
@@ -417,8 +417,8 @@ class IKPoseModeTests(unittest.TestCase):
         pos0, _ = fk_from_angles(start, self.rc)
 
         # Target: same position, +5° body pitch.
-        from modules.differential_ik import extract_axis_rotation
-        from modules.quaternion_math import quat_conjugate
+        from modules.ik import extract_axis_rotation
+        from modules.ik import quat_conjugate
         _, q0 = fk_from_angles(start, self.rc)
         slew_q = quat_from_axis_angle(np.array([0, 0, 1], np.float32),
                                       np.float32(0.0))
@@ -435,8 +435,8 @@ class IKPoseModeTests(unittest.TestCase):
         slew = math.radians(45.0)
         start = self._start_angles(slew)
         pos0, q0 = fk_from_angles(start, self.rc)
-        from modules.differential_ik import extract_axis_rotation
-        from modules.quaternion_math import quat_conjugate
+        from modules.ik import extract_axis_rotation
+        from modules.ik import quat_conjugate
         slew_q = quat_from_axis_angle(np.array([0, 0, 1], np.float32),
                                       np.float32(slew))
         body_q = quat_normalize(quat_multiply(quat_conjugate(slew_q), q0))
@@ -460,8 +460,8 @@ class IKPoseModeTests(unittest.TestCase):
         slew = math.pi / 2
         start = self._start_angles(slew)
         pos0, q0 = fk_from_angles(start, self.rc)
-        from modules.differential_ik import extract_axis_rotation
-        from modules.quaternion_math import quat_conjugate
+        from modules.ik import extract_axis_rotation
+        from modules.ik import quat_conjugate
         slew_q = quat_from_axis_angle(np.array([0, 0, 1], np.float32),
                                       np.float32(slew))
         body_q = quat_normalize(quat_multiply(quat_conjugate(slew_q), q0))
@@ -480,8 +480,8 @@ class IKPoseModeTests(unittest.TestCase):
             slew = math.radians(slew_deg)
             start = self._start_angles(slew)
             pos0, q0 = fk_from_angles(start, self.rc)
-            from modules.differential_ik import extract_axis_rotation
-            from modules.quaternion_math import quat_conjugate
+            from modules.ik import extract_axis_rotation
+            from modules.ik import quat_conjugate
             slew_q = quat_from_axis_angle(np.array([0, 0, 1], np.float32),
                                           np.float32(slew))
             body_q = quat_normalize(quat_multiply(quat_conjugate(slew_q), q0))

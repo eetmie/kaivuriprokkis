@@ -1,7 +1,3 @@
-# TODO(refactor #3 follow-up): pull the axis-rotation helpers
-# (extract_axis_rotation, project_to_rotation_axes)
-# out of modules/ik/solver.py into this file — they're pure quaternion
-# math and don't belong with the solver. See modules/ik/REFACTOR_NOTES.md.
 """
 Common quaternion math operations optimized with numba.
 
@@ -433,3 +429,48 @@ def apply_delta_pose(source_pos, source_quat, delta_pose, eps=1e-6):
         target_quat = source_quat.copy()
 
     return target_pos, quat_normalize(target_quat)
+
+
+# ----------------------------
+# Axis-rotation helpers (FULL quaternion -> axis twist)
+# ----------------------------
+
+def extract_axis_rotation(quat: np.ndarray, axis: np.ndarray) -> float:
+    """
+    Extract twist angle about `axis` from quaternion `quat` using swing-twist.
+
+    Args:
+        quat: [w, x, y, z] unit quaternion (will be normalized)
+        axis: [3] unit axis (will be normalized)
+
+    Returns:
+        angle (radians) in (-pi, pi]
+    """
+    q = quat_normalize(np.asarray(quat, dtype=np.float32))
+    a = np.asarray(axis, dtype=np.float32)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    v = np.array([x, y, z], dtype=np.float32)
+    s = float(np.dot(v, a))  # signed component along axis
+    ang = 2.0 * np.arctan2(s, w)
+    # Wrap angle to (-pi, pi]
+    pi = np.float32(3.141592653589793)
+    two_pi = np.float32(6.283185307179586)
+    ang = (np.float32(ang) + pi) % two_pi - pi
+    return float(ang)
+
+
+def project_to_rotation_axes(quats: np.ndarray, axes: np.ndarray) -> np.ndarray:
+    """
+    Project each quaternion to a pure rotation about its corresponding axis.
+    Input quats are assumed FULL; output quats have only axis twist preserved.
+    """
+    quats = np.asarray(quats, dtype=np.float32)
+    axes = np.asarray(axes, dtype=np.float32)
+    out = np.zeros_like(quats, dtype=np.float32)
+    for i in range(len(quats)):
+        axis = axes[i]
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        theta = extract_axis_rotation(quats[i], axis)
+        out[i] = quat_from_axis_angle(axis, np.float32(theta))
+    return out

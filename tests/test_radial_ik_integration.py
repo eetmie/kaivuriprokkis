@@ -17,44 +17,37 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from modules.ik import (  # noqa: E402
-    IKController,
-    compute_relative_joint_angles,
+    get_state,
     quat_from_axis_angle,
+    solve_ik_step,
 )
 from modules.excavator_target_state import ExcavatorTargetState  # noqa: E402
 
 from tests.common_kinematics import (  # noqa: E402
-    build_absolute_quaternions,
     fk_from_angles,
     load_robot_config,
     make_ik_config,
 )
 
 
-def _solve_toward(ik_controller, rc, angles, target_pos, target_rot_y_deg=0.0,
+def _solve_toward(ik_cfg, rc, angles, target_pos, target_rot_y_deg=0.0,
                   max_iters=300, pos_tol=2e-3, dt=0.005):
-    """Run the inner IK loop until the EE reaches target_pos or iterations run out."""
+    """Drive ``solve_ik_step`` (position-only) toward target_pos.
+
+    These radial-integration tests historically used position-mode IK; the
+    target orientation argument is accepted but not enforced here.
+    """
+    del target_rot_y_deg  # unused: kept for back-compat with old call sites
     target = np.asarray(target_pos, dtype=np.float32)
-    target_quat = quat_from_axis_angle(
-        np.array([0, 1, 0], dtype=np.float32),
-        np.float32(math.radians(target_rot_y_deg)),
-    )
-    ik_controller.ee_pos_des = target
-    ik_controller.ee_quat_des = target_quat
 
     last_pos = None
     for _ in range(max_iters):
-        pos, quat = fk_from_angles(angles, rc)
-        last_pos = pos
-        if np.linalg.norm(target - pos) < pos_tol:
-            return angles, pos, True
-        quats = build_absolute_quaternions(angles, rc)
-        rel = compute_relative_joint_angles(quats, rc)
-        new_angles = ik_controller.compute(
-            ee_pos=pos, ee_quat=quat,
-            joint_angles=rel, joint_quats=quats, dt=dt,
-        )
-        angles = np.asarray(new_angles, dtype=np.float32)
+        state = get_state(angles, rc)
+        last_pos = np.asarray(state.ee_position, dtype=np.float32)
+        if np.linalg.norm(target - last_pos) < pos_tol:
+            return angles, last_pos, True
+        result = solve_ik_step(angles, target, None, rc, ik_cfg, dt=dt, state=state)
+        angles = np.asarray(result.q_next_rad, dtype=np.float32)
 
     pos, _ = fk_from_angles(angles, rc)
     return angles, pos, np.linalg.norm(target - pos) < pos_tol
@@ -69,12 +62,11 @@ class RadialTargetIKTests(unittest.TestCase):
         cls.rc = load_robot_config()
 
     def _make_ik(self):
-        cfg = make_ik_config(
+        return make_ik_config(
             method="dls",
             enable_velocity_limiting=False,
             ik_params={"k_val": 0.5, "min_singular_value": 1e-4, "lambda_val": 0.02},
         )
-        return IKController(cfg, self.rc, verbose=False, default_dt=0.005)
 
     def _nominal_start_angles(self):
         # Near a realistic mid-workspace posture.
@@ -256,12 +248,11 @@ class MixedRadialIntegrationTests(unittest.TestCase):
         cls.rc = load_robot_config()
 
     def _make_ik(self):
-        cfg = make_ik_config(
+        return make_ik_config(
             method="dls",
             enable_velocity_limiting=False,
             ik_params={"k_val": 0.5, "min_singular_value": 1e-4, "lambda_val": 0.02},
         )
-        return IKController(cfg, self.rc, verbose=False, default_dt=0.005)
 
     def test_combined_radius_slew_z_delta_reaches_composed_target(self):
         ik = self._make_ik()

@@ -1,46 +1,98 @@
-# IK package — what was moved and what's next
+# IK package — current state
+
+The package is now a clean URDF-style kinematics layer with a single rich
+state object and a pure-functional IK step.
+
+## Layout
+
+| File          | Role                                                                  |
+|---------------|-----------------------------------------------------------------------|
+| `math.py`     | Quaternion / vector primitives + axis-rotation helpers                |
+| `model.py`    | `Joint`, `Tool`, `ExcavatorModel`, `load_excavator_model()` (URDF YAML) |
+| `kinematics.py` | `RobotKinematicState`, `get_state(q, model)` — one rich FK + Jacobian pass |
+| `solver.py`   | `IKConfig`, `IKResult`, `solve_ik_step(q, target_pos, target_quat, model, ik_cfg, dt)` |
+| `excavator.py` | `IMUConfig`, `joint_angles_from_imus(imu_quats, imu_cfg, model)`, numba warmup |
+| `__init__.py` | Public re-exports                                                     |
+
+## YAML — new shape
+
+The `robot:` section is now URDF-style:
+
+```yaml
+robot:
+  joints:
+    - { name: slew,   axis: [0,0,1], parent_to_joint_xyz: [0.0,    0.0, 0.07  ] }
+    - { name: boom,   axis: [0,1,0], parent_to_joint_xyz: [0.0165, 0.0, 0.0645] }
+    - { name: arm,    axis: [0,1,0], parent_to_joint_xyz: [0.468,  0.0, 0.0   ] }
+    - { name: bucket, axis: [0,1,0], parent_to_joint_xyz: [0.250,  0.0, 0.0   ] }
+  tool:
+    parent_to_tip_xyz: [0.031, 0.0, -0.142]
+```
+
+Adding a wrist/tool joint (rototilt etc.) is one extra entry in `joints`.
 
 ## Done
 
-The four top-level IK files were moved into this package:
+- File moves into `modules/ik/` (previous pass).
+- Split solver out of FK; axis-rotation helpers moved into `math.py`.
+- **URDF-style `ExcavatorModel`** replaces the old `RobotConfig` (no more
+  `link_lengths` / `link_directions` / `origin_offset` / `ee_offset`
+  separation). One joint = one fixed translation + one rotation axis.
+- **One rich state**: `get_state(q, model)` returns `RobotKinematicState`
+  with joint origins, joint axes in world frame, link orientations, EE
+  pose, Jacobian, condition number, singular values, and Yoshikawa index
+  in a single FK+Jacobian pass. The wrapper zoo
+  (`get_pose_from_joint_angles`, `get_all_poses_from_joint_angles`,
+  `compute_jacobian_state`, `compute_jacobian_from_joint_angles`,
+  `compute_jacobian`, `joint_angles_to_absolute_quaternions` as a public
+  helper, etc.) is gone — only `joint_angles_to_absolute_quaternions` is
+  kept as a thin compat shim used by the IMU code.
+- **`solve_ik_step(...) → IKResult`** replaces the stateful
+  `IKController`. The caller holds its own target and joint state; the
+  solver is pure-functional. `IKResult` carries `q_next_rad`, `dq_rad`,
+  `task_error`, `rejected`, `reason`, the `state` snapshot used, and the
+  adaptive damping that was applied.
+- **IMU layer** uses `IMUConfig` + `joint_angles_from_imus(imu_quats,
+  imu_cfg, model)`; no more `RobotConfig`-embedded IMU fields.
+- `command_type: "pose"` vs `"position"` is now expressed at call time:
+  pass `target_quat=None` for position-only mode.
 
-| Before                              | After                  |
-|-------------------------------------|------------------------|
-| `modules/quaternion_math.py`        | `modules/ik/math.py`    |
-| `modules/differential_ik.py`        | `modules/ik/solver.py`  |
-| `modules/differential_ik_cfg.py`    | `modules/ik/config.py`  |
-| `modules/excavator_ik_utils.py`     | `modules/ik/excavator.py` |
+## Modules-level migration — DONE
 
-`modules/ik/__init__.py` re-exports the full public API, so callers can do
-`from modules.ik import IKController, RobotConfig, canonical_joint_angles_from_imus, quat_normalize, ...`. Submodule imports
-(`from modules.ik.solver import IKController`) also work and are preferable in
-hot-path code where the dependency should be visually explicit.
+The rest of `modules/` is now on the new API:
 
-All call sites were updated in one pass; the old paths are gone.
+- `modules/reachability.py` drives `solve_ik_step` + `get_state` directly
+  (signature: `check_reachability(model, ik_cfg, current_joint_angles,
+  target_pos, target_rot_y_deg, ...)`).
+- `modules/excavator_controller.py` holds `self.model`, `self.imu_cfg`,
+  `self.ik_cfg`, plus its own target pose buffers and last-tick metrics.
+  Every tick: `joint_angles_from_imus` → `get_state(..., include_jacobian=False)`
+  for the state-update half, then `solve_ik_step` in the compute half.
+- `modules/joint_compensator.py` takes the `ExcavatorModel` as `model`
+  (reads only `num_joints`).
+- `modules/robot_service.py` exposes `self.model` and calls
+  `get_state(q_rad, model, include_jacobian=False)` to populate
+  joint-position telemetry from joint angles.
+- `modules/bringup.py` never touched the IK package — unchanged.
 
-## Follow-ups (next IK pass)
+## Top-level files still on the old API
 
-### 1. Split `solver.py` into `kinematics.py` + `solver.py`
+These are intentionally left for the user to rewrite — top-level scripts
+are easy to update:
 
-`solver.py` still bundles three concerns:
-- Axis-rotation helpers (`extract_axis_rotation`, `project_to_rotation_axes`) — pure quaternion math, belongs in `math.py`.
-- `@njit` FK/Jacobian cores (`forward_kinematics_core`, `forward_kinematics_with_ee_offset_core`, `compute_jacobian_core`, `_compute_ee_position_core`) — the numba hot path; pull into `kinematics.py`.
-- `IKController` + `ik_method_*` solver dispatch — what `solver.py` actually ends up being.
+- `excv_gui.py` — used `compute_jacobian`, `extract_axis_rotation`,
+  `project_to_rotation_axes`. `extract_axis_rotation` and
+  `project_to_rotation_axes` are still in `modules.ik` (math).
+  `compute_jacobian` is now `get_state(q, model).jacobian`.
+- `control_prototype/excv_gui_relative.py` — same pattern.
+- Any standalone tools/demos referencing the old IK surface.
 
-This split is a pure code move within the package; the public re-exports in `__init__.py` insulate callers from it.
+## Follow-ups still on the table (todo.txt)
 
-### 2. Lock it in as excavator-specific
-
-The fleet is excavators only. Stop pretending the IK is robot-agnostic.
-
-- **Joint order is fixed**: `slew → boom → arm → bucket` (4 DOF). The `RobotConfig` YAML loader in `config.py` can stop accepting arbitrary chain lengths and hard-code the four named links. Catch shape mismatches at load time with a clear error instead of silently propagating wrong-sized arrays through FK.
-- **All joint axes follow the same pattern** (slew around world-Y, the rest around the arm plane). The generic axis-rotation helpers can be replaced with a small `EXCAVATOR_JOINT_AXES` constant and inline rotation that drops branches in the numba hot path.
-- **End-effector variation**: standard bucket vs. an optional rototilt addon (adds two extra DOF at the wrist). Model this as a small `ToolKinematics` enum / dataclass appended after `scoop`, not as a fully generic chain.
-- **Drop unused flexibility**: if `command_type: "pose"` is never actually used on real hardware, delete it. Same goes for any `ik_method_*` that's never selected by a real config.
-
-Net effect: smaller hot path, fewer branches in numba, no more "what if someone configures a 7-DOF arm" defensive code.
-
-## Don't pull into this package
-
-- Hall homing (still robot-specific, lives in `run_hw_v2.py`).
-- `joint_compensator.py` / linkage-rate compensation — those are servo/hydraulic, not kinematics.
+- Decide whether to drop `pinv` / `svd` / `trans` methods if real
+  hardware only ever uses `dls`. Right now all four are still wired.
+- Decide whether the IK step should know about velocity-mode integration
+  or whether the controller stays responsible for converting joystick
+  twists into absolute targets.
+- Move PID gains / `controller.*` out of `control_config.yaml` if the
+  IK package no longer owns them (it doesn't).

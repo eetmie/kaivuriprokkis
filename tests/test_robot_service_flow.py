@@ -39,7 +39,7 @@ class _FakeController:
         self.suspend_ik_output_calls = 0
         self.resume_ik_output_calls = 0
         self.perf_resets = 0
-        self.robot_config = object()
+        self.model = object()
 
     def get_pose(self):
         position, rotation = self.initial_pose

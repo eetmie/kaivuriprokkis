@@ -1,49 +1,177 @@
 """
-Excavator-specific kinematics utilities.
+IMU glue for the excavator: convert corrected absolute IMU quaternions to
+canonical joint angles in radians.
 
-Contains FK wrappers, relative joint angle computation, and numba warmup.
-These functions handle the IMU-quaternion-based state representation
-specific to the real excavator hardware.
+This module is the boundary between the sensor layer and the kinematics
+package. Inputs are corrected absolute IMU quaternions (mounting offsets
+already removed by the hardware layer) in a known role order. Output is
+``q_rad`` in the model's joint order.
 
-Corresponds to the sim's excavator_state.py role, but without
-cylindrical/radial coordinate support (to be added later).
+Extraction rules supported in ``IMUConfig.chain``:
+
+  average_z_yaw          — average Z twist across all IMUs (slew yaw)
+  gravity_pitch_delta    — pitch of child against gravity, minus parent pitch
+  relative_axis_twist    — twist of child relative to parent about a local axis
+
+A joint without a chain entry remains zero.
 """
 
-import numpy as np
-from typing import Tuple
+from __future__ import annotations
 
-from .config import RobotConfig
-from .solver import (
-    extract_axis_rotation,
-    forward_kinematics_core,
-    forward_kinematics_with_ee_offset_core,
-    compute_jacobian_core,
-    compute_jacobian_metrics,
-    ik_method_pinv,
-    ik_method_svd,
-    ik_method_transpose,
-    ik_method_damped_least_squares,
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Optional, Tuple
+
+import numpy as np
+import yaml
+
+from .kinematics import (
+    _fk_core,
+    _jacobian_core,
+    _jacobian_metrics,
 )
 from .math import (
-    quat_normalize, quat_multiply, quat_conjugate, quat_from_axis_angle,
+    extract_axis_rotation,
+    quat_conjugate,
+    quat_from_axis_angle,
+    quat_multiply,
+    quat_normalize,
 )
+from .model import ExcavatorModel
 
+
+# ----------------------------
+# IMU config
+# ----------------------------
+
+@dataclass(frozen=True)
+class IMUChainStep:
+    joint: str
+    output_index: int
+    extraction: str                  # 'average_z_yaw' | 'gravity_pitch_delta' | 'relative_axis_twist'
+    role: Optional[str] = None       # sensor role for child link (None for slew)
+    parent_role: Optional[str] = None
+    axis: Optional[str] = None       # 'x' | 'y' | 'z' for twist extractions
+
+
+@dataclass(frozen=True)
+class IMUConfig:
+    """IMU layout and extraction rules.
+
+    sensor_order is the order the ``imu_quats`` array uses when calling
+    :func:`joint_angles_from_imus`. ``mapping`` (role -> physical sensor
+    index) and ``mounting_offsets`` (role -> [w, x, y, z]) are kept here
+    for the hardware layer to use; this module does not apply them.
+    """
+
+    sensor_order: Tuple[str, ...]
+    mapping: Mapping[str, int]
+    chain: Tuple[IMUChainStep, ...]
+    mounting_offsets: Mapping[str, np.ndarray]
+
+
+def _to_quat(value: Any, field_name: str) -> np.ndarray:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"{field_name} must be a list of 4 numbers, got {value!r}")
+    return np.asarray(value, dtype=np.float32)
+
+
+def build_imu_config(imu_section: Mapping[str, Any]) -> IMUConfig:
+    """Build an IMUConfig from a parsed YAML 'imu' section dict."""
+    mapping = imu_section.get("imu_mapping")
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("imu.imu_mapping must be a non-empty mapping of role -> index")
+
+    chain_raw = imu_section.get("chain")
+    if not isinstance(chain_raw, list) or not chain_raw:
+        raise ValueError("imu.chain must be a non-empty list")
+
+    steps: list[IMUChainStep] = []
+    for i, item in enumerate(chain_raw):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"imu.chain[{i}] must be a mapping")
+        extraction = item.get("extraction")
+        if extraction not in ("average_z_yaw", "gravity_pitch_delta", "relative_axis_twist"):
+            raise ValueError(
+                f"imu.chain[{i}].extraction must be one of "
+                f"average_z_yaw/gravity_pitch_delta/relative_axis_twist, got {extraction!r}"
+            )
+        if "output_index" not in item:
+            raise ValueError(f"imu.chain[{i}].output_index is required")
+        steps.append(IMUChainStep(
+            joint=str(item.get("joint", f"joint_{i}")),
+            output_index=int(item["output_index"]),
+            extraction=str(extraction),
+            role=item.get("role"),
+            parent_role=item.get("parent_role"),
+            axis=item.get("axis"),
+        ))
+
+    # Sensor order: collect role + parent_role mentions in chain order,
+    # filtered to roles that exist in the mapping.
+    sensor_order: list[str] = []
+    def _add(role: Optional[str]) -> None:
+        if role and role in mapping and role not in sensor_order:
+            sensor_order.append(role)
+    for step in steps:
+        _add(step.parent_role)
+        _add(step.role)
+    if not sensor_order:
+        sensor_order = list(mapping.keys())
+
+    offsets_raw = imu_section.get("mounting_offsets_quat") or {}
+    if not isinstance(offsets_raw, dict):
+        raise ValueError("imu.mounting_offsets_quat must be a mapping when present")
+    offsets = {
+        role: _to_quat(q, f"imu.mounting_offsets_quat.{role}")
+        for role, q in offsets_raw.items()
+    }
+
+    return IMUConfig(
+        sensor_order=tuple(sensor_order),
+        mapping=dict(mapping),
+        chain=tuple(steps),
+        mounting_offsets=offsets,
+    )
+
+
+def _load_yaml(path: str | Path) -> dict[str, Any]:
+    p = Path(path)
+    if not p.is_absolute():
+        candidates = [p, Path(__file__).resolve().parents[2] / p]
+        p = next((c for c in candidates if c.exists()), p)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with p.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Top-level YAML in {p} must be a mapping")
+    return data
+
+
+def load_imu_config(path: str | Path) -> IMUConfig:
+    """Load IMUConfig from a control_config.yaml file."""
+    cfg = _load_yaml(path)
+    imu = cfg.get("imu")
+    if not isinstance(imu, dict):
+        raise ValueError("control_config.yaml is missing top-level 'imu' section")
+    return build_imu_config(imu)
+
+
+# ----------------------------
+# Extraction primitives
+# ----------------------------
 
 def average_axis_twist_quaternion(quats: np.ndarray, axis: np.ndarray) -> np.ndarray:
-    """Average the twist component of multiple quaternions about one axis.
-
-    This keeps yaw/pitch extraction in quaternion space and avoids Euler-angle
-    wrap issues.  Quaternion signs are hemisphere-aligned before summing so
-    +179/-179 degree samples average to 180 instead of cancelling.
-    """
+    """Hemisphere-aligned average of per-quaternion twists about ``axis``."""
     quats = np.asarray(quats, dtype=np.float32)
     axis = np.asarray(axis, dtype=np.float32)
-    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    axis = axis / (float(np.linalg.norm(axis)) + 1e-12)
     if quats.ndim != 2 or quats.shape[1] != 4 or len(quats) == 0:
         raise ValueError("Expected quats with shape (n, 4)")
 
     accum = np.zeros(4, dtype=np.float32)
-    reference = None
+    reference: Optional[np.ndarray] = None
     for q in quats:
         angle = extract_axis_rotation(q, axis)
         twist = quat_from_axis_angle(axis, np.float32(angle))
@@ -52,7 +180,6 @@ def average_axis_twist_quaternion(quats: np.ndarray, axis: np.ndarray) -> np.nda
         elif float(np.dot(reference, twist)) < 0.0:
             twist = -twist
         accum += twist
-
     if float(np.linalg.norm(accum)) < 1e-9:
         return reference if reference is not None else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     return quat_normalize(accum)
@@ -67,285 +194,140 @@ def gravity_pitch_from_quat(quat: np.ndarray) -> np.float32:
     return np.float32(np.arctan2(-gx, gz))
 
 
-def _wrap_angle_pi(angle: np.float32) -> np.float32:
-    """Wrap an angle in radians to [-pi, pi)."""
-    return np.float32((angle + np.pi) % (np.float32(2.0) * np.pi) - np.pi)
+def _wrap_angle_pi(angle: float) -> float:
+    a = float(angle)
+    return float((a + np.pi) % (2.0 * np.pi) - np.pi)
 
 
-def _configured_sensor_role_order(robot_config: RobotConfig) -> list[str]:
-    """Role order expected for IMU quaternion arrays."""
-    cached_roles = getattr(robot_config, 'imu_sensor_roles', None)
-    if cached_roles:
-        return list(cached_roles)
-
-    chain = getattr(robot_config, 'imu_chain', None) or []
-    mapping = getattr(robot_config, 'imu_mapping', None) or {}
-    roles = []
-
-    def add_role(role):
-        if role and role != 'all' and role in mapping and role not in roles:
-            roles.append(role)
-
-    for item in chain:
-        if not isinstance(item, dict):
-            continue
-        add_role(item.get('parent_role'))
-        add_role(item.get('role'))
-
-    if roles:
-        return roles
-    return ['base', 'boom', 'arm', 'bucket']
+_AXIS_LOOKUP = {
+    "x": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    "y": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+    "z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+}
 
 
-def _axis_from_config(axis_name: str, fallback: np.ndarray) -> np.ndarray:
-    if axis_name == 'x':
-        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    if axis_name == 'y':
-        return np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    if axis_name == 'z':
-        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+def _axis_from_name(name: Optional[str], fallback: np.ndarray) -> np.ndarray:
+    if name in _AXIS_LOOKUP:
+        return _AXIS_LOOKUP[name]
     return np.asarray(fallback, dtype=np.float32)
 
 
-def canonical_joint_angles_from_imus(imu_quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """Convert four corrected absolute IMU quats to canonical joint angles.
+# ----------------------------
+# Main API
+# ----------------------------
 
-    The configured default sensor order is [base, boom/lift, arm, bucket].
-    The returned controller order remains [slew, boom/lift, arm, bucket]:
-      - slew: common Z-axis yaw from available IMUs
-      - boom/lift: lift IMU pitch against base IMU pitch, or level gravity if base is absent
-      - arm: arm IMU pitch against lift IMU pitch
-      - bucket: bucket IMU pitch against arm IMU pitch
+def joint_angles_from_imus(
+    imu_quats: np.ndarray,
+    imu_cfg: IMUConfig,
+    model: ExcavatorModel,
+) -> np.ndarray:
+    """Convert corrected absolute IMU quats to canonical joint angles.
 
-    Additional joints can be described in ``imu.chain`` using
-    ``gravity_pitch_delta`` or ``relative_axis_twist`` extraction.
+    ``imu_quats`` must be shape (len(imu_cfg.sensor_order), 4), in the role
+    order ``imu_cfg.sensor_order`` (e.g. base, boom, arm, bucket).
+
+    Returns ``q_rad`` of shape (model.num_joints,), with joint i populated
+    only when the chain has an entry whose ``output_index == i``. Joints
+    without a chain entry stay at 0.
     """
     imu_quats = np.asarray(imu_quats, dtype=np.float32)
     if imu_quats.ndim != 2 or imu_quats.shape[1] != 4:
-        raise ValueError(f"Expected IMU quaternions with shape (n, 4), got {imu_quats.shape}")
+        raise ValueError(f"imu_quats must have shape (n, 4), got {imu_quats.shape}")
+    if imu_quats.shape[0] != len(imu_cfg.sensor_order):
+        raise ValueError(
+            f"Expected {len(imu_cfg.sensor_order)} IMU quaternions (one per role "
+            f"in {imu_cfg.sensor_order}), got {imu_quats.shape[0]}"
+        )
 
-    role_order = _configured_sensor_role_order(robot_config)
-    if len(imu_quats) != len(role_order):
-        if len(imu_quats) == 4:
-            role_order = ['base', 'boom', 'arm', 'bucket']
-        else:
-            raise ValueError(f"Expected {len(role_order)} IMU quaternions for roles {role_order}, got {len(imu_quats)}")
+    role_quats = {role: imu_quats[i] for i, role in enumerate(imu_cfg.sensor_order)}
 
-    role_quats = {role: imu_quats[i] for i, role in enumerate(role_order)}
-    chain = getattr(robot_config, 'imu_chain', None) or []
+    angles = np.zeros(model.num_joints, dtype=np.float32)
 
-    z_axis = np.asarray(robot_config.rotation_axes[0], dtype=np.float32)
-    # TODO(test): Compare averaged slew yaw against base-only yaw on real logs.
-    # Single base-IMU yaw would simplify the IMU role structure, but averaging
-    # may reduce noise if all corrected IMUs share the same stable Z twist.
-    slew_quat = average_axis_twist_quaternion(imu_quats, z_axis)
+    # Cache average-Z-yaw quat lazily (used by slew step).
+    slew_axis_local = model.axes[0]  # first joint axis in its parent frame
+    z_world = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    averaged_yaw_quat: Optional[np.ndarray] = None
 
-    angles = np.zeros(robot_config.num_joints, dtype=np.float32)
+    for step in imu_cfg.chain:
+        i = step.output_index
+        if i < 0 or i >= angles.shape[0]:
+            raise ValueError(
+                f"imu.chain step for joint '{step.joint}' has output_index={i} "
+                f"out of range for model with {angles.shape[0]} joints"
+            )
 
-    if not chain:
-        chain = [
-            {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
-            {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-            {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-            {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
-        ]
-
-    for item in chain:
-        if not isinstance(item, dict) or 'output_index' not in item:
-            continue
-        output_index = int(item['output_index'])
-        if output_index < 0 or output_index >= len(angles):
+        if step.extraction == "average_z_yaw":
+            axis = _axis_from_name(step.axis, z_world)
+            if averaged_yaw_quat is None:
+                averaged_yaw_quat = average_axis_twist_quaternion(imu_quats, axis)
+            angles[i] = extract_axis_rotation(averaged_yaw_quat, slew_axis_local if i == 0 else axis)
             continue
 
-        extraction = item.get('extraction')
-        if extraction == 'average_z_yaw':
-            axis = _axis_from_config(item.get('axis', 'z'), z_axis)
-            angles[output_index] = extract_axis_rotation(slew_quat, axis)
-            continue
+        if step.role is None or step.role not in role_quats:
+            raise ValueError(
+                f"imu.chain step '{step.joint}' (extraction={step.extraction}) "
+                f"requires role '{step.role}' to be in sensor_order {imu_cfg.sensor_order}"
+            )
+        child_q = role_quats[step.role]
+        parent_q = role_quats[step.parent_role] if step.parent_role in role_quats else None
 
-        role = item.get('role')
-        if role not in role_quats:
-            raise ValueError(f"IMU role '{role}' is required for joint '{item.get('joint', output_index)}'")
-        parent_role = item.get('parent_role')
-
-        if extraction == 'gravity_pitch_delta':
-            parent_pitch = gravity_pitch_from_quat(role_quats[parent_role]) if parent_role in role_quats else np.float32(0.0)
-            child_pitch = gravity_pitch_from_quat(role_quats[role])
-            angles[output_index] = _wrap_angle_pi(child_pitch - parent_pitch)
-        elif extraction == 'relative_axis_twist':
-            axis = _axis_from_config(item.get('axis', 'y'), robot_config.rotation_axes[output_index])
-            if parent_role in role_quats:
-                rel_quat = quat_normalize(quat_multiply(quat_conjugate(role_quats[parent_role]), role_quats[role]))
+        if step.extraction == "gravity_pitch_delta":
+            child_pitch = float(gravity_pitch_from_quat(child_q))
+            parent_pitch = float(gravity_pitch_from_quat(parent_q)) if parent_q is not None else 0.0
+            angles[i] = np.float32(_wrap_angle_pi(child_pitch - parent_pitch))
+        elif step.extraction == "relative_axis_twist":
+            axis = _axis_from_name(step.axis, model.axes[i])
+            if parent_q is not None:
+                rel = quat_normalize(quat_multiply(quat_conjugate(parent_q), child_q))
             else:
-                rel_quat = role_quats[role]
-            angles[output_index] = extract_axis_rotation(rel_quat, axis)
+                rel = child_q
+            angles[i] = extract_axis_rotation(rel, axis)
         else:
-            raise ValueError(f"Unsupported IMU extraction mode '{extraction}'")
+            raise ValueError(f"Unsupported extraction mode {step.extraction!r}")
 
     return angles
 
 
-def compute_relative_joint_angles(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
+# ----------------------------
+# Numba warmup
+# ----------------------------
+
+def warmup_numba_functions() -> None:
+    """Prime the numba JIT for the FK/Jacobian/metric cores.
+
+    Call this once at startup so the first real IK tick doesn't pay the
+    compile cost. Uses a 3-joint dummy chain — input layout matches the
+    real model so all branches compile.
     """
-    Compute relative joint angles from absolute IMU quaternions.
-
-    For a robot with absolute IMU orientations, joint limits are defined
-    relative to the parent link. This function extracts the relative rotation
-    about each joint's axis.
-
-    Example for excavator:
-    - Joint 0 (slew): Absolute yaw angle around Z-axis
-    - Joint 1 (boom): Relative pitch from world horizontal (parent is slew, which only rotates in Z)
-    - Joint 2 (arm): Relative pitch from boom orientation
-    - Joint 3 (bucket): Relative pitch from arm orientation
-
-    Args:
-        quats: Absolute joint quaternions already corrected into joint frames
-        robot_config: Robot configuration with rotation axes
-
-    Returns:
-        np.ndarray: Relative joint angles in radians [n_joints]
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-
-    n_joints = len(quats)
-    relative_angles = np.zeros(n_joints, dtype=np.float32)
-
-    # Joint 0 (slew): Extract absolute rotation about Z-axis
-    relative_angles[0] = extract_axis_rotation(
-        quats[0],
-        robot_config.rotation_axes[0]
-    )
-
-    # Joints 1+ : Extract relative rotation from parent link
-    for i in range(1, n_joints):
-        # Get parent orientation (world frame)
-        parent_quat = quats[i-1]
-        current_quat = quats[i]
-
-        # Compute relative orientation: q_rel = q_parent^-1 * q_current
-        parent_quat_inv = quat_conjugate(parent_quat)
-        relative_quat = quat_normalize(quat_multiply(parent_quat_inv, current_quat))
-
-        # Extract rotation about this joint's axis (in parent's local frame)
-        relative_angles[i] = extract_axis_rotation(
-            relative_quat,
-            robot_config.rotation_axes[i]
-        )
-
-    return relative_angles
-
-
-def get_joint_positions(quats: np.ndarray, robot_config: RobotConfig) -> np.ndarray:
-    """Get joint positions from absolute link quats with origin_offset applied.
-
-    Returns:
-        np.ndarray: Joint positions [n x 3] including origin_offset, without end-effector offset
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-    return forward_kinematics_core(
-        quats,
-        robot_config.link_lengths,
-        robot_config.link_directions,
-        robot_config.origin_offset
-    )
-
-
-def get_all_poses(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Get all joint poses (positions + orientations) and end-effector pose.
-
-    This is the most comprehensive FK function - returns everything computed.
-    Zero overhead compared to get_pose() since all values are computed anyway.
-
-    Args:
-        quats: Absolute link quaternions from canonical joint angles
-        robot_config: Robot configuration
-
-    Returns:
-        Tuple of:
-        - joint_positions [n x 3]: Position of each joint (with origin_offset)
-        - joint_orientations [n x 4]: Orientation of each joint [w, x, y, z]
-        - ee_position [3]: End-effector position (with origin_offset + ee_offset)
-        - ee_orientation [4]: End-effector orientation [w, x, y, z]
-    """
-    quats = np.asarray(quats, dtype=np.float32)
-
-    # Get joint positions and ee_position with offsets
-    joint_positions, ee_position = forward_kinematics_with_ee_offset_core(
-        quats,
-        robot_config.link_lengths,
-        robot_config.link_directions,
-        robot_config.origin_offset,
-        robot_config.ee_offset
-    )
-
-    # Joint orientations are the supplied absolute link quaternions
-    joint_orientations = quats.copy()
-
-    # End-effector orientation is the last joint's orientation
-    ee_orientation = quats[-1].copy()
-
-    return joint_positions, joint_orientations, ee_position, ee_orientation
-
-
-def get_pose(quats: np.ndarray, robot_config: RobotConfig) -> Tuple[np.ndarray, np.ndarray]:
-    """Get end-effector pose (position and orientation) only.
-
-    Convenience wrapper around get_all_poses() for when you only need EE pose.
-
-    Args:
-        quats: Absolute link quaternions from canonical joint angles
-        robot_config: Robot configuration
-
-    Returns:
-        Tuple of (ee_position [x, y, z], ee_orientation [w, x, y, z])
-    """
-    _, _, ee_position, ee_orientation = get_all_poses(quats, robot_config)
-    return ee_position, ee_orientation
-
-
-def warmup_numba_functions():
-    """
-    Warmup Numba JIT compilation by calling functions with dummy data.
-    This prevents compilation delays during actual operation.
-    """
-    # Create dummy data with correct types
-    dummy_quats = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.9, 0.0, 0.3, 0.0],
-        [0.95, 0.0, 0.2, 0.0]
-    ], dtype=np.float32)
-
-    dummy_link_lengths = np.array([0.2, 0.15, 0.1], dtype=np.float32)
-    dummy_link_directions = np.array([
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0]
-    ], dtype=np.float32)
-    dummy_rotation_axes = np.array([
+    q = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+    axes = np.array([
+        [0.0, 0.0, 1.0],
         [0.0, 1.0, 0.0],
         [0.0, 1.0, 0.0],
-        [0.0, 1.0, 0.0]
     ], dtype=np.float32)
-    dummy_origin_offset = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    dummy_ee_offset = np.array([0.0, 0.0, -0.1], dtype=np.float32)
+    offsets = np.array([
+        [0.0, 0.0, 0.05],
+        [0.02, 0.0, 0.06],
+        [0.4, 0.0, 0.0],
+    ], dtype=np.float32)
+    tip = np.array([0.03, 0.0, -0.14], dtype=np.float32)
 
-    # Warmup all Numba functions
     try:
-        dummy_jacobian = np.random.rand(6, 3).astype(np.float32)
-        dummy_delta_pose = np.random.rand(6).astype(np.float32)
-
-        for _ in range(3):  # Multiple calls to ensure compilation
-            # Forward kinematics functions
-            _ = forward_kinematics_core(dummy_quats, dummy_link_lengths, dummy_link_directions, dummy_origin_offset)
-            _ = forward_kinematics_with_ee_offset_core(dummy_quats, dummy_link_lengths, dummy_link_directions, dummy_origin_offset, dummy_ee_offset)
-            _ = compute_jacobian_core(dummy_quats, dummy_link_lengths, dummy_link_directions, dummy_rotation_axes, dummy_origin_offset, dummy_ee_offset)
-
-            # IK method functions
-            _ = ik_method_pinv(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
-            _ = ik_method_svd(dummy_jacobian, dummy_delta_pose, np.float32(1.0), np.float32(1e-5))
-            _ = ik_method_transpose(dummy_jacobian, dummy_delta_pose, np.float32(1.0))
-            _ = ik_method_damped_least_squares(dummy_jacobian, dummy_delta_pose, np.float32(0.1))
-            _ = compute_jacobian_metrics(dummy_jacobian)
-    except Exception as e:
+        for _ in range(2):
+            origins, axes_w, _, ee_pos, _ = _fk_core(q, axes, offsets, tip)
+            J = _jacobian_core(origins, axes_w, ee_pos)
+            _jacobian_metrics(J)
+    except Exception as e:  # pragma: no cover
         print(f"Numba warmup failed: {e}")
+
+
+__all__ = [
+    "IMUChainStep",
+    "IMUConfig",
+    "build_imu_config",
+    "load_imu_config",
+    "joint_angles_from_imus",
+    "average_axis_twist_quaternion",
+    "gravity_pitch_from_quat",
+    "warmup_numba_functions",
+]

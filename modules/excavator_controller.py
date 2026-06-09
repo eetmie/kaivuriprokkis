@@ -27,13 +27,11 @@ import yaml
 from . import reachability as reachability_module
 from .pid import PIDController
 from .ik import (
-    IKController, IKControllerConfig, load_excavator_robot_config,
-    extract_axis_rotation,
-    get_kinematic_state,
-    canonical_joint_angles_from_imus, gravity_pitch_from_quat,
-    compute_relative_joint_angles, warmup_numba_functions,
+    IKConfig, solve_ik_step, get_state,
+    load_excavator_model, load_imu_config,
+    joint_angles_from_imus, gravity_pitch_from_quat,
+    extract_axis_rotation, warmup_numba_functions,
     quat_from_axis_angle, quat_multiply, quat_conjugate, quat_normalize,
-    compute_pose_error,
 )
 from .reachability import ReachabilityResult
 from .perf_tracker import ControlLoopPerfTracker
@@ -481,43 +479,52 @@ class ExcavatorController:
         if not isinstance(self._control_config, dict) or not self._control_config:
             raise RuntimeError("Controller configuration requires control_config.yaml")
 
-        # Robot configuration
-        self.robot_config = load_excavator_robot_config(self.control_config_file)
+        # Robot model (URDF-style) + IMU layout
+        self.model = load_excavator_model(self.control_config_file)
+        self.imu_cfg = load_imu_config(self.control_config_file)
         warmup_numba_functions()
 
-        # IK controller setup (pull settings from control_config.yaml - fail hard if missing)
-        ik_cfg = self._control_config.get('ik', {})
-        if not ik_cfg:
+        # IK config (pull settings from control_config.yaml - fail hard if missing)
+        ik_section = self._control_config.get('ik', {})
+        if not isinstance(ik_section, dict) or not ik_section:
             raise RuntimeError("Missing 'ik' section in control_config.yaml")
 
         try:
-            _ik_cmd_type = ik_cfg['command_type']
-            _ik_method = ik_cfg['method']
-            _ik_rel = bool(ik_cfg.get('use_relative_mode', False))
-            _ik_params = ik_cfg.get('params', {})
-            _joint_limits_rel = ik_cfg.get('joint_limits_relative', None)
-            _ik_velocity_mode = bool(ik_cfg.get('velocity_mode', False))
-            _ik_velocity_error_gain = float(ik_cfg.get('velocity_error_gain', 1.0))
-            _ik_use_rot_vel = bool(ik_cfg.get('use_rotational_velocity', True))
-            # Adaptive damping settings (DLS method)
-            _enable_adaptive_damping = bool(ik_cfg.get('enable_adaptive_damping', True))
-            _adaptive_damping_max_mult = float(ik_cfg.get('adaptive_damping_max_multiplier', 2.0))
-            _cond_threshold = float(ik_cfg.get('condition_number_threshold', 40.0))
+            self._command_type: str = ik_section['command_type']
+            _ik_method = ik_section['method']
+            self._use_relative_mode: bool = bool(ik_section.get('use_relative_mode', False))
+            _ik_params = ik_section.get('params', {})
+            _joint_limits_rel = ik_section.get('joint_limits_relative', None)
+            # velocity_mode is parsed for forward-compat but the pure-functional
+            # solve_ik_step does not support integrating a desired EE twist.
+            # See modules/ik/todo.txt — caller can compose targets externally.
+            self._ik_velocity_mode_enabled: bool = bool(ik_section.get('velocity_mode', False))
+            self._ik_use_rotational_velocity: bool = bool(ik_section.get('use_rotational_velocity', True))
+            _enable_adaptive_damping = bool(ik_section.get('enable_adaptive_damping', True))
+            _adaptive_damping_max_mult = float(ik_section.get('adaptive_damping_max_multiplier', 2.0))
+            _cond_threshold = float(ik_section.get('condition_number_threshold', 40.0))
         except KeyError as e:
             raise RuntimeError(f"Missing required IK configuration in control_config.yaml: {e}")
 
-        # IK config: orientation is handled by target construction (pitch composed
-        # with current slew quaternion in _refresh_smoothed_target). Uncontrollable
-        # axes (roll for this robot) are auto-detected from joint rotation axes.
-        # Prepare optional IK V2 extras from control_config
-        ctrl_cfg = self._control_config.get('controller', {}) if isinstance(self._control_config, dict) else {}
+        if self._command_type not in ("position", "pose"):
+            raise RuntimeError(f"Invalid ik.command_type {self._command_type!r}; expected 'position' or 'pose'")
+        if self._ik_velocity_mode_enabled:
+            self.logger.warning(
+                "ik.velocity_mode is set to True but the new pure-functional IK "
+                "does not integrate a desired EE twist; falling back to absolute targets."
+            )
 
-        # Velocity limiting settings
-        enable_vel_limit = bool(ctrl_cfg.get('enable_velocity_limiting', True))
+        # Controller-level settings (velocity limiting, velocity-command mode PI gains)
+        ctrl_cfg = self._control_config.get('controller', {}) if isinstance(self._control_config, dict) else {}
+        self._enable_velocity_limiting: bool = bool(ctrl_cfg.get('enable_velocity_limiting', True))
         per_joint_max = ctrl_cfg.get('per_joint_max_velocity', None)
-        max_joint_velocities = None
-        if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == 4:
-            max_joint_velocities = [float(v) for v in per_joint_max]
+        n_joints = self.model.num_joints
+        if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == n_joints:
+            max_joint_vel_tuple = tuple(float(v) for v in per_joint_max)
+            self._max_joint_velocities = np.asarray(max_joint_vel_tuple, dtype=np.float32)
+        else:
+            max_joint_vel_tuple = None
+            self._max_joint_velocities = np.full(n_joints, 0.035, dtype=np.float32)
 
         # Velocity-command mode PI gains (control_config.yaml → controller.velocity_command)
         vel_cmd_cfg = ctrl_cfg.get('velocity_command', {}) if isinstance(ctrl_cfg, dict) else {}
@@ -529,55 +536,52 @@ class ExcavatorController:
         )
         self._vel_stale_timeout_s = float(max(0.0, float(vel_cmd_cfg.get('stale_timeout_s', 0.15))))
 
-        # Joint limits.  Per-joint null/[] is treated as "unbounded" — the
-        # IK final clamp degenerates to a no-op (np.clip with ±inf) and the
-        # joint-limit-avoidance loop skips inf-bounded joints because all of
-        # its boundary comparisons go through NaN. Use this for slew when
-        # continuous rotation past ±π is desired.
-        joint_limits = None
-        if isinstance(_joint_limits_rel, (list, tuple)) and len(_joint_limits_rel) == 4:
-            # Accept degrees or radians; assume degrees if magnitudes > pi
+        # Joint limits.  Per-joint null/[] => unbounded (no clip, no avoidance).
+        joint_limits_rad: Optional[Tuple[Optional[Tuple[float, float]], ...]] = None
+        if isinstance(_joint_limits_rel, (list, tuple)) and len(_joint_limits_rel) == n_joints:
             def _to_rad_pair(p):
                 if p is None or (isinstance(p, (list, tuple)) and len(p) == 0):
-                    return (float("-inf"), float("inf"))
+                    return None
                 a, b = float(p[0]), float(p[1])
                 if max(abs(a), abs(b)) > np.pi + 1e-6:
-                    return (np.radians(a), np.radians(b))
+                    return (float(np.radians(a)), float(np.radians(b)))
                 return (a, b)
-            joint_limits = [_to_rad_pair(p) for p in _joint_limits_rel]
+            joint_limits_rad = tuple(_to_rad_pair(p) for p in _joint_limits_rel)
 
-        self.ik_config = IKControllerConfig(
-            command_type=_ik_cmd_type,
-            ik_method=_ik_method,
-            use_relative_mode=_ik_rel,
-            ik_params=_ik_params,
-            enable_velocity_limiting=enable_vel_limit,
-            max_joint_velocities=max_joint_velocities,
-            joint_limits=joint_limits,
-            velocity_mode=_ik_velocity_mode,
-            velocity_error_gain=_ik_velocity_error_gain,
-            use_rotational_velocity=_ik_use_rot_vel,
-            # Adaptive damping (DLS)
+        # IK method parameters
+        _k_val = float(_ik_params.get('k_val', 1.0)) if isinstance(_ik_params, dict) else 1.0
+        _lambda_val = float(_ik_params.get('lambda_val', 1e-3)) if isinstance(_ik_params, dict) else 1e-3
+        _min_sv = float(_ik_params.get('min_singular_value', 1e-5)) if isinstance(_ik_params, dict) else 1e-5
+        _weights = _ik_params.get('joint_weights') if isinstance(_ik_params, dict) else None
+        _weights_tuple = tuple(float(w) for w in _weights) if _weights else None
+
+        self.ik_cfg = IKConfig(
+            method=_ik_method,
+            k_val=_k_val,
+            lambda_val=_lambda_val,
+            min_singular_value=_min_sv,
+            joint_weights=_weights_tuple,
+            joint_limits_rad=joint_limits_rad,
+            max_joint_velocity_rad_per_step=max_joint_vel_tuple,
+            enable_velocity_limiting=self._enable_velocity_limiting,
+            enable_joint_limit_avoidance=True,
             enable_adaptive_damping=_enable_adaptive_damping,
             adaptive_damping_max_multiplier=_adaptive_damping_max_mult,
             condition_number_threshold=_cond_threshold,
         )
-        # Pass verbose flag if IK controller supports it, else use DEBUG level check
-        ik_verbose = self.logger.level <= logging.DEBUG
-        ik_default_dt = 1.0 / float(self.config.control_frequency)
-        self.ik_controller = IKController(
-            self.ik_config,
-            self.robot_config,
-            verbose=ik_verbose,
-            default_dt=ik_default_dt
-        )
+        self._ik_default_dt = 1.0 / float(self.config.control_frequency)
 
-        # Cache IK config flags — fixed at init, avoid getattr() on every tick.
-        self._ik_velocity_mode_enabled: bool = bool(getattr(self.ik_config, "velocity_mode", False))
-        self._ik_use_rotational_velocity: bool = bool(getattr(self.ik_config, "use_rotational_velocity", True))
+        # Pure-functional IK: caller holds target + last-tick metrics.
+        self._target_pos_des: Optional[np.ndarray] = None
+        self._target_quat_des: Optional[np.ndarray] = None
+        self._last_condition_number: float = 0.0
+        self._last_adaptive_lambda: float = float(_lambda_val)
+        self._last_yoshikawa_index: float = 0.0
+        self._last_singular_values: np.ndarray = np.zeros(n_joints, dtype=np.float32)
 
-        # Condition number threshold gating — read from ik_config (shared with adaptive damping).
-        self._cond_threshold = self.ik_config.condition_number_threshold
+        # Condition number threshold gating — solver also flags result.rejected
+        # at this threshold; we keep a counter for telemetry.
+        self._cond_threshold = _cond_threshold
         self._cond_reject_count = 0
 
         # Pre-flight reachability check
@@ -769,11 +773,9 @@ class ExcavatorController:
         for pid in self.joint_pids:
             pid.reset()
 
-        # Reset IK internal command buffers to avoid stale desired pose
-        try:
-            self.ik_controller.reset()
-        except Exception:
-            pass
+        # Reset IK target buffers to avoid stale desired pose
+        self._target_pos_des = None
+        self._target_quat_des = None
 
         # IMPORTANT: Update current state before resuming
         # This prevents IK confusion from stale position data
@@ -832,10 +834,8 @@ class ExcavatorController:
 
         with self._lock:
             cached_angles = getattr(self, '_current_joint_angles', None)
-            cached_quats = getattr(self, '_current_fk_quats', None)
             current_angles = None if cached_angles is None else cached_angles.copy()
-            fk_quats = None if cached_quats is None else cached_quats.copy()
-        if current_angles is None and fk_quats is None:
+        if current_angles is None:
             # No state yet — can't simulate; allow command through.
             self.logger.warning(
                 "Reachability check skipped because current joint state is unavailable; allowing target %s rot=%.2f deg",
@@ -850,18 +850,16 @@ class ExcavatorController:
                 final_cond_number=0.0,
             )
 
-        if current_angles is None:
-            current_angles = compute_relative_joint_angles(fk_quats, self.robot_config)
         result = reachability_module.check_reachability(
-            self.ik_controller,
-            self.robot_config,
+            self.model,
+            self.ik_cfg,
             current_joint_angles=current_angles,
             target_pos=target_pos,
             target_rot_y_deg=rot_deg,
             pos_tol=self._reach_pos_tol,
             max_iters=self._reach_max_iters,
             cond_threshold=self._cond_threshold,
-            dt=1.0 / float(self.config.control_frequency),
+            dt=self._ik_default_dt,
         )
         if result.reachable:
             self._last_validated_target = target_pos.copy()
@@ -878,12 +876,10 @@ class ExcavatorController:
         Args:
             enabled: Whether to use relative mode (delta pose commands)
         """
-        self.ik_config.use_relative_mode = bool(enabled)
-        # Reset IK internal buffers when toggling modes
-        try:
-            self.ik_controller.reset()
-        except Exception:
-            pass
+        self._use_relative_mode = bool(enabled)
+        # Clear stale target pose when toggling modes
+        self._target_pos_des = None
+        self._target_quat_des = None
 
     def clear_target(self) -> None:
         """Clear the current IK target and reset controller state.
@@ -952,15 +948,15 @@ class ExcavatorController:
 
     def get_condition_number(self) -> float:
         """Get the Jacobian condition number from the last IK solve."""
-        return float(self.ik_controller.last_condition_number)
+        return float(self._last_condition_number)
 
     def get_yoshikawa_index(self) -> float:
         """Yoshikawa manipulability index from the last IK solve."""
-        return float(self.ik_controller.last_yoshikawa_index)
+        return float(self._last_yoshikawa_index)
 
     def get_singular_values(self) -> np.ndarray:
-        """Jacobian singular values (4-element float32) from the last IK solve."""
-        return self.ik_controller.last_singular_values.copy()
+        """Jacobian singular values from the last IK solve."""
+        return self._last_singular_values.copy()
 
     def get_hardware_status(self) -> dict:
         """Get hardware status including all ADC channels for logging."""
@@ -1023,7 +1019,7 @@ class ExcavatorController:
                 'avg_ik_fk_ms': 0.0, 'min_ik_fk_ms': 0.0, 'max_ik_fk_ms': 0.0,
                 'avg_pwm_ms': 0.0, 'min_pwm_ms': 0.0, 'max_pwm_ms': 0.0,
                 # IK telemetry
-                'ik_vel_lim_enabled': bool(getattr(self.ik_config, 'enable_velocity_limiting', False)),
+                'ik_vel_lim_enabled': self._enable_velocity_limiting,
                 'last_joint_vel_degps': [] if self._last_joint_vel_radps is None else list(np.degrees(self._last_joint_vel_radps)),
                 'effective_vel_cap_degps': [],
             }
@@ -1085,7 +1081,7 @@ class ExcavatorController:
             }
 
             # Add IK limiter telemetry in deg/s for easier interpretation
-            ik_vel_lim_enabled = bool(getattr(self.ik_config, 'enable_velocity_limiting', False))
+            ik_vel_lim_enabled = self._enable_velocity_limiting
             stats['ik_vel_lim_enabled'] = ik_vel_lim_enabled
             # Last measured joint velocities (deg/s)
             if self._last_joint_vel_radps is not None:
@@ -1093,8 +1089,8 @@ class ExcavatorController:
             else:
                 stats['last_joint_vel_degps'] = []
             # Effective cap in deg/s, inferred from rad/iter caps and actual loop Hz
-            if ik_vel_lim_enabled and hasattr(self.ik_controller, 'max_joint_velocities') and actual_hz > 0.0:
-                cap_degps = np.degrees(self.ik_controller.max_joint_velocities) * actual_hz
+            if ik_vel_lim_enabled and actual_hz > 0.0:
+                cap_degps = np.degrees(self._max_joint_velocities) * actual_hz
                 stats['effective_vel_cap_degps'] = list(cap_degps)
             else:
                 stats['effective_vel_cap_degps'] = []
@@ -1124,11 +1120,6 @@ class ExcavatorController:
         """
         self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
         self.logger.info(f"Log level changed to {level.upper()}")
-
-        # Update IK controller verbose flag if DEBUG level
-        ik_verbose = self.logger.level <= logging.DEBUG
-        if hasattr(self.ik_controller, 'verbose'):
-            self.ik_controller.verbose = ik_verbose
 
     def get_joint_velocities_with_age(self) -> tuple:
         """Return (velocities_degps, age_s). age=inf if never computed."""
@@ -1165,10 +1156,9 @@ class ExcavatorController:
         """Resume IK-driven PWM output, syncing target pose to current measured pose."""
         for pid in self.joint_pids:
             pid.reset()
-        try:
-            self.ik_controller.reset()
-        except Exception:
-            pass
+        # Clear stale IK target buffers before re-seeding from measured pose.
+        self._target_pos_des = None
+        self._target_quat_des = None
 
         # Sync smoother and IK target to current measured EE so there's no jump
         self._update_current_state()
@@ -1282,8 +1272,8 @@ class ExcavatorController:
     def get_ik_debug_info(self) -> dict:
         """Return IK telemetry such as adaptive damping and condition number."""
         return {
-            'adaptive_lambda': float(self.ik_controller.last_adaptive_lambda),
-            'condition_number': float(self.ik_controller.last_condition_number),
+            'adaptive_lambda': float(self._last_adaptive_lambda),
+            'condition_number': float(self._last_condition_number),
             'cond_reject_count': self._cond_reject_count,
         }
 
@@ -1451,8 +1441,9 @@ class ExcavatorController:
                 return
 
             # Convert sensor quats once into canonical relative joint angles.
-            joint_angles = canonical_joint_angles_from_imus(sensor_quats, self.robot_config)
-            kinematic_state = get_kinematic_state(joint_angles, self.robot_config)
+            joint_angles = joint_angles_from_imus(sensor_quats, self.imu_cfg, self.model)
+            # No Jacobian needed here; the IK tick recomputes its own.
+            kinematic_state = get_state(joint_angles, self.model, include_jacobian=False)
             joint_quats = kinematic_state.link_orientations
             ee_pos = kinematic_state.ee_position
             ee_quat = kinematic_state.ee_orientation
@@ -1561,80 +1552,63 @@ class ExcavatorController:
 
                 target_pos = self._target_position.copy()
                 target_quat = self._target_orientation.copy()
-                current_pos = self._current_position.copy()
                 joint_angles = None if self._current_joint_angles is None else self._current_joint_angles.copy()
-                joint_quats = self._current_fk_quats
-                current_ee_quat_full = self._current_ee_quat_full
-                target_lin_vel = self._target_linear_velocity.copy()
-                target_rot_vel_dps = float(self._target_rot_velocity_dps)
 
-            if joint_angles is None or joint_quats is None:
+            if joint_angles is None:
                 return
             current_joint_angles = joint_angles
 
-            # Outer Loop: Task-space IK control
-            # Note: Using current_ee_quat_full (including Z-rotation from slew) for IK.
-            # The Jacobian's structure naturally constrains which rotations each joint can achieve
-            # based on rotation_axes config (slew=Z, boom/arm/bucket=Y).
-            if self.ik_config.use_relative_mode:
-                # Compute error w.r.t target
-                if self.ik_config.command_type == "position":
-                    pos_err = target_pos - current_pos
-                    self.ik_controller.set_command(pos_err, ee_pos=current_pos, ee_quat=current_ee_quat_full)
-                else:
-                    # Pose: 6D delta [dx, dy, dz, rx, ry, rz]
-                    # Orientation locks are now applied internally by IK controller
-                    pos_err, axis_angle_err = compute_pose_error(
-                        current_pos, current_ee_quat_full, target_pos, target_quat
-                    )
-                    delta_pose = np.concatenate([pos_err, axis_angle_err])
-                    self.ik_controller.set_command(delta_pose, ee_pos=current_pos, ee_quat=current_ee_quat_full)
+            # Outer Loop: Task-space IK control.
+            #
+            # The pure-functional solve_ik_step takes an absolute Cartesian
+            # target. Relative-mode and absolute-mode differ in how the
+            # target is composed, not in what the solver receives:
+            #   - relative+position : target_pos = current_pos + delta (delta = target_pos - current_pos here)
+            #   - relative+pose     : target_pos/target_quat already composed by _refresh_smoothed_target
+            #   - absolute+position : target_pos as-is, no orientation target
+            #   - absolute+pose     : target_pos + target_quat as-is
+            # The Jacobian's controllable-DOF reduction handles "no roll" intrinsically.
+            if self._command_type == "position":
+                target_pos_world = target_pos
+                target_quat_world = None  # position-only mode
             else:
-                if self.ik_config.command_type == "position":
-                    # Position-only mode: command is just [x, y, z]
-                    position_command = target_pos
-                    self.ik_controller.set_command(position_command, ee_quat=current_ee_quat_full)
-                else:
-                    # Pose mode: command is [x, y, z, qw, qx, qy, qz]
-                    # Orientation locks are now applied internally by IK controller
-                    pose_command = np.concatenate([target_pos, target_quat])
-                    self.ik_controller.set_command(pose_command)
+                target_pos_world = target_pos
+                target_quat_world = target_quat
 
-            desired_vel = None
-            if self._ik_velocity_mode_enabled:
-                if self.ik_config.command_type == "position":
-                    desired_vel = target_lin_vel
-                else:
-                    if self._ik_use_rotational_velocity:
-                        rot_vel_rad_s = np.radians(target_rot_vel_dps)
-                        desired_vel = np.concatenate([
-                            target_lin_vel,
-                            np.array([0.0, rot_vel_rad_s, 0.0], dtype=np.float32)
-                        ])
-                    else:
-                        desired_vel = np.concatenate([target_lin_vel, np.zeros(3, dtype=np.float32)])
+            self._target_pos_des = target_pos_world
+            self._target_quat_des = target_quat_world
 
-            target_joint_angles = self.ik_controller.compute(
-                ee_pos=current_pos,
-                ee_quat=current_ee_quat_full,  # Full orientation incl. slew yaw
-                joint_angles=current_joint_angles,
-                joint_quats=joint_quats,
-                desired_ee_velocity=desired_vel,
+            # NOTE: velocity_mode (desired EE twist integration) is not yet
+            # supported by the new pure-functional IK. The YAML knob is
+            # accepted but treated as off here. See modules/ik/todo.txt.
+
+            ik_result = solve_ik_step(
+                current_joint_angles,
+                target_pos_world,
+                target_quat_world,
+                self.model,
+                self.ik_cfg,
                 dt=loop_dt,
-                current_joint_velocities=self._last_joint_vel_radps,
             )
+            target_joint_angles = ik_result.q_next_rad
+
+            # Cache telemetry for getters / debug info.
+            self._last_condition_number = float(ik_result.state.condition_number)
+            self._last_adaptive_lambda = float(ik_result.adaptive_lambda)
+            self._last_yoshikawa_index = float(ik_result.state.yoshikawa_index)
+            sv = ik_result.state.singular_values
+            n_sv = min(self._last_singular_values.shape[0], sv.shape[0])
+            self._last_singular_values[:] = 0.0
+            self._last_singular_values[:n_sv] = sv[:n_sv]
 
             # DEBUG: Periodic IK output check (every ~1 second at 50Hz)
             self._ik_debug_counter += 1
             if self.logger.level <= logging.DEBUG and self._ik_debug_counter % 50 == 0:
-                if target_joint_angles is not None:
-                    delta_angles = target_joint_angles - current_joint_angles
-                    delta_deg = np.degrees(delta_angles)
-                    max_delta = np.max(np.abs(delta_deg))
-                    if max_delta > 0.1:
-                        self.logger.debug(f"IK delta: {delta_deg} deg (max={max_delta:.2f})")
-                else:
-                    self.logger.warning("IK returned None!")
+                delta_angles = target_joint_angles - current_joint_angles
+                delta_deg = np.degrees(delta_angles)
+                max_delta = np.max(np.abs(delta_deg))
+                if max_delta > 0.1:
+                    self.logger.debug(f"IK delta: {delta_deg} deg (max={max_delta:.2f})")
 
         except Exception as e:
             self.logger.error(f"Error in control computation: {e}")
@@ -1643,21 +1617,12 @@ class ExcavatorController:
                 traceback.print_exc()
             return
 
-        if target_joint_angles is None:
-            # If IK failed, command neutral once (avoid constant zeroing)
-            if not self._outputs_zeroed:
-                self.logger.warning("IK returned None, sending neutral command")
-                self.hardware.reset(reset_pump=False)
-                self._outputs_zeroed = True
-            return
-
         # Reject commands when Jacobian is near-singular (just skip, don't reset hardware)
-        if self._cond_threshold > 0 and self.ik_controller.last_condition_number > self._cond_threshold:
+        if ik_result.rejected:
             self._cond_reject_count += 1
             if self._cond_reject_count % 200 == 1:
                 self.logger.warning(
-                    f"Condition number {self.ik_controller.last_condition_number:.1f} "
-                    f"exceeds threshold {self._cond_threshold:.1f}, skipping IK output"
+                    "IK rejected (%s); skipping output", ik_result.reason,
                 )
             return
 

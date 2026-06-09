@@ -68,22 +68,27 @@ imu:
     bucket: [1.0, 0.0, 0.0, 0.0]
 
 robot:
-  frame:
-    # Ground to slew/cabin rotation origin
-    origin_height_m: 0.07 #0.075
-  links:
-    # Vector from slew origin to first boom pivot in slew-local coordinates
-    boom_mount_offset_m: [0.0165, 0.0, 0.0645]
-    boom_length_m: 0.468
-    arm_length_m: 0.250
-    # Link from arm joint to tool coupler center
-    coupler_length_m: 0.031
-  tools:
-    active: default_bucket_tip
-    presets:
-      default_bucket_tip:
-        # Local-frame offset from coupler center to tool tip / working point
-        tip_offset_m: [0.0, 0.0, -0.142]
+  # URDF-style chain. Each joint has a fixed translation from its parent's
+  # rotated frame (parent_to_joint_xyz) and a unit rotation axis. The tool
+  # has a single rigid offset from the last joint's rotated frame to the
+  # working point. Adding a joint = one extra entry below.
+  joints:
+    - name: slew
+      axis: [0.0, 0.0, 1.0]
+      parent_to_joint_xyz: [0.0, 0.0, 0.07]      # ground -> slew origin
+    - name: boom
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.0165, 0.0, 0.0645] # slew -> boom pivot
+    - name: arm
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.468, 0.0, 0.0]     # boom -> arm pivot
+    - name: bucket
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.250, 0.0, 0.0]     # arm  -> bucket pivot
+  tool:
+    # Bucket pivot -> tool tip. Combines coupler length (0.031 along bucket x)
+    # with bucket tip drop (-0.142 along bucket z).
+    parent_to_tip_xyz: [0.031, 0.0, -0.142]
 
 pid:
   # PID controller gains for each joint

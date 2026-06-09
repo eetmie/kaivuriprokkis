@@ -1,133 +1,119 @@
-"""Excavator IK package.
+"""Excavator IK package — URDF-style kinematics + pure-functional IK step.
 
 Submodules:
-    math       — quaternion + vector primitives (used everywhere)
-    solver     — IKController, @njit FK/Jacobian cores, solver dispatch
-    config     — IKControllerConfig, RobotConfig, YAML loader
-    excavator  — IMU→canonical-joint-angle glue, FK wrappers, numba warmup
+    math        — quaternion + vector primitives, axis-rotation helpers
+    model       — Joint, Tool, ExcavatorModel, YAML loader (URDF-style)
+    kinematics  — RobotKinematicState + get_state(q_rad, model)
+    solver      — IKConfig, IKResult, solve_ik_step(...)
+    excavator   — IMUConfig, joint_angles_from_imus(...), numba warmup
 
-Public API is re-exported here so callers can do::
+Typical use::
 
-    from modules.ik import IKController, RobotConfig, canonical_joint_angles_from_imus
+    from modules.ik import (
+        load_excavator_model, load_imu_config,
+        get_state, IKConfig, solve_ik_step,
+        joint_angles_from_imus, warmup_numba_functions,
+    )
 
-Submodule imports are still supported and are preferable in tight hot-path
-code where you want the dependency to be visually explicit.
+    model   = load_excavator_model("configuration_files/profiles/jetson/control_config.yaml")
+    imu_cfg = load_imu_config("configuration_files/profiles/jetson/control_config.yaml")
+    ik_cfg  = IKConfig(method="dls", lambda_val=1e-3, ...)
 
-See REFACTOR_NOTES.md for in-progress follow-ups (split solver into
-kinematics+solver, lock the chain in as excavator-specific).
+    q       = joint_angles_from_imus(corrected_imu_quats, imu_cfg, model)
+    result  = solve_ik_step(q, target_pos, target_quat, model, ik_cfg, dt=0.01)
+    q_next  = result.q_next_rad
 """
 
-from .config import (
-    IKControllerConfig,
-    RobotConfig,
-    CheckDOF,
-    load_excavator_robot_config,
-    create_excavator_config,
-)
 from .math import (
-    normalize_vector,
-    quat_normalize,
-    quat_multiply,
-    quat_conjugate,
-    quat_rotate_vector,
-    quat_from_axis_angle,
-    axis_angle_from_quat,
-    quat_from_euler_xyz,
-    euler_xyz_from_quat,
-    quat_unique,
-    quat_enforce_hemisphere,
-    quat_slerp,
-    quat_remove_yaw,
-    compute_quat_error,
-    compute_pose_error,
     apply_delta_pose,
+    axis_angle_from_quat,
+    compute_pose_error,
+    compute_quat_error,
+    euler_xyz_from_quat,
+    extract_axis_rotation,
+    normalize_vector,
+    project_to_rotation_axes,
+    quat_conjugate,
+    quat_enforce_hemisphere,
+    quat_from_axis_angle,
+    quat_from_euler_xyz,
+    quat_multiply,
+    quat_normalize,
+    quat_remove_yaw,
+    quat_rotate_vector,
+    quat_slerp,
+    quat_unique,
+)
+from .model import (
+    ExcavatorModel,
+    Joint,
+    Tool,
+    build_excavator_model,
+    load_excavator_model,
+)
+from .kinematics import (
+    RobotKinematicState,
+    get_state,
+    joint_angles_to_absolute_quaternions,
 )
 from .solver import (
-    KinematicState,
-    JacobianState,
-    IKController,
-    extract_axis_rotation,
-    project_to_rotation_axes,
-    forward_kinematics_core,
-    forward_kinematics_with_ee_offset_core,
-    compute_jacobian_core,
-    compute_jacobian_metrics,
-    compute_jacobian,
-    compute_jacobian_state,
-    compute_jacobian_from_joint_angles,
-    joint_angles_to_absolute_quaternions,
-    get_kinematic_state,
-    get_all_poses_from_joint_angles,
-    get_pose_from_joint_angles,
-    ik_method_pinv,
-    ik_method_svd,
-    ik_method_transpose,
-    ik_method_damped_least_squares,
+    IKConfig,
+    IKResult,
+    solve_ik_step,
 )
 from .excavator import (
+    IMUChainStep,
+    IMUConfig,
     average_axis_twist_quaternion,
+    build_imu_config,
     gravity_pitch_from_quat,
-    canonical_joint_angles_from_imus,
-    compute_relative_joint_angles,
-    get_joint_positions,
-    get_all_poses,
-    get_pose,
+    joint_angles_from_imus,
+    load_imu_config,
     warmup_numba_functions,
 )
 
 
 __all__ = [
-    # config
-    "IKControllerConfig",
-    "RobotConfig",
-    "CheckDOF",
-    "load_excavator_robot_config",
-    "create_excavator_config",
     # math
-    "normalize_vector",
-    "quat_normalize",
-    "quat_multiply",
-    "quat_conjugate",
-    "quat_rotate_vector",
-    "quat_from_axis_angle",
-    "axis_angle_from_quat",
-    "quat_from_euler_xyz",
-    "euler_xyz_from_quat",
-    "quat_unique",
-    "quat_enforce_hemisphere",
-    "quat_slerp",
-    "quat_remove_yaw",
-    "compute_quat_error",
-    "compute_pose_error",
     "apply_delta_pose",
-    # solver
-    "KinematicState",
-    "JacobianState",
-    "IKController",
+    "axis_angle_from_quat",
+    "compute_pose_error",
+    "compute_quat_error",
+    "euler_xyz_from_quat",
     "extract_axis_rotation",
+    "normalize_vector",
     "project_to_rotation_axes",
-    "forward_kinematics_core",
-    "forward_kinematics_with_ee_offset_core",
-    "compute_jacobian_core",
-    "compute_jacobian_metrics",
-    "compute_jacobian",
-    "compute_jacobian_state",
-    "compute_jacobian_from_joint_angles",
+    "quat_conjugate",
+    "quat_enforce_hemisphere",
+    "quat_from_axis_angle",
+    "quat_from_euler_xyz",
+    "quat_multiply",
+    "quat_normalize",
+    "quat_remove_yaw",
+    "quat_rotate_vector",
+    "quat_slerp",
+    "quat_unique",
+    # model
+    "ExcavatorModel",
+    "Joint",
+    "Tool",
+    "build_excavator_model",
+    "load_excavator_model",
+    # kinematics
+    "RobotKinematicState",
+    "get_state",
     "joint_angles_to_absolute_quaternions",
-    "get_kinematic_state",
-    "get_all_poses_from_joint_angles",
-    "get_pose_from_joint_angles",
-    "ik_method_pinv",
-    "ik_method_svd",
-    "ik_method_transpose",
-    "ik_method_damped_least_squares",
-    # excavator glue
+    # solver
+    "IKConfig",
+    "IKResult",
+    "solve_ik_step",
+    # excavator / IMU
+    "IMUChainStep",
+    "IMUConfig",
     "average_axis_twist_quaternion",
+    "build_imu_config",
     "gravity_pitch_from_quat",
-    "canonical_joint_angles_from_imus",
-    "compute_relative_joint_angles",
-    "get_joint_positions",
-    "get_all_poses",
-    "get_pose",
+    "joint_angles_from_imus",
+    "load_imu_config",
     "warmup_numba_functions",
 ]

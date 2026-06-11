@@ -219,3 +219,10 @@ logs*/
 data_collection/hydraulic_data/
 data_collection/test_results/
 /old
+
+# Shell history
+.bash_history
+
+# Early-stage lerobot integration proto (not run on the RPi yet)
+integrations/
+tests/test_lerobot_kaivuri.py

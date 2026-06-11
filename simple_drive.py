@@ -10,10 +10,11 @@ Usage:
     python simple_drive.py --robot jetson --record --enable-slew
     python simple_drive.py --comp vel-pid
     python simple_drive.py --auto-pump
+    python simple_drive.py --sine-test          # drive with sine, no logging
 
 Button Controls:
     Button A (bit 0): Start / Stop data logging (saves segment on stop)
-    Button B (bit 1): Toggle sine excitation on / off
+    Button B (bit 1): Toggle sine excitation on / off (default: OFF)
     Button X (bit 2): Toggle hydraulic pump
     Button Y (bit 3): Cycle sine amplitude
 
@@ -186,8 +187,8 @@ class SineExcitationGenerator:
         'bucket': (4.712, 2.356),
     }
 
-    def __init__(self):
-        self.enabled       = True
+    def __init__(self, enabled: bool = False):
+        self.enabled       = enabled
         self.speed_scale   = 1.0
         self._amp_idx      = 2
         self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
@@ -395,6 +396,8 @@ def _parse_args():
     p.add_argument("--record",       action="store_true", help="Enable data recording")
     p.add_argument("--out",          default=str(LOG_OUTPUT_DIR), help="Output dir for drive logs")
     p.add_argument("--enable-slew",  action="store_true", help="Allow slew in commands and sine")
+    p.add_argument("--sine-test",    action="store_true",
+                   help="Sine driving test mode: inject sine excitation even without logging (starts with sine ON)")
     p.add_argument("--auto-save-min", type=float, default=10.0, help="Auto-save interval in min (0=off)")
     # compensation (static, not button-toggled)
     p.add_argument("--comp", choices=["none", "raw", "universal", "vel-pid"], default="none",
@@ -532,7 +535,8 @@ def main():
 
     print(f"Comp: {args.comp} | pump: {'auto' if args.auto_pump else 'static'}"
           f" | slew: {'on' if args.enable_slew else 'off'}"
-          f" | record: {'on' if args.record else 'off'}")
+          f" | record: {'on' if args.record else 'off'}"
+          f" | sine-test: {'on' if args.sine_test else 'off'}")
 
     # ── RT scheduling (Linux only) ─────────────────────────────────────────────
     try:
@@ -542,7 +546,7 @@ def main():
         pass
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    sine_gen = SineExcitationGenerator()
+    sine_gen = SineExcitationGenerator(enabled=args.sine_test)
     logger   = DataLogger(out_dir) if args.record else None
 
     # ── UDP handshake ─────────────────────────────────────────────────────────
@@ -635,7 +639,8 @@ def main():
             }
 
             t = time.perf_counter()
-            sine = sine_gen.get_all(t) if is_logging else {n: 0.0 for n in JOINT_NAMES}
+            sine_active = is_logging or args.sine_test
+            sine = sine_gen.get_all(t) if sine_active else {n: 0.0 for n in JOINT_NAMES}
             if not args.enable_slew:
                 sine['slew'] = 0.0
 

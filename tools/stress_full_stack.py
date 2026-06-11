@@ -2,12 +2,15 @@
 """Run the excavator stack at a fixed rate while forcing zero PWM commands.
 
 This is a hardware stress/integration test, not a unit test.
-It starts the real hardware interface and controller, submits IK commands through
-the service/protocol boundary, and forces every named PWM valve command to zero
-before it reaches hardware.
+It starts the real hardware interface and controller, submits IK and/or direct
+joystick-style commands through the service/protocol boundary, and by default
+forces every named PWM valve command to zero before it reaches hardware.
 
 The pump channel is left under the normal controller logic so valve zeros still
 exercise the real PWM update path with the configured pump behavior.
+
+UDP model: the robot only receives commands (decode path). Telemetry encoding
+is not part of the control loop in real use, so it is excluded from the hot path.
 """
 
 import argparse
@@ -37,12 +40,14 @@ from modules.control_protocol import (  # noqa: E402
     PoseTarget,
     decode_command_message,
     encode_command_message,
-    encode_telemetry_message,
 )
+from modules.board import PROFILES, resolve_profile  # noqa: E402
+from modules.bringup import DEFAULT_READY_TIMEOUT_S, wait_for_hardware_ready  # noqa: E402
 from modules.excavator_controller import ControllerConfig, ExcavatorController  # noqa: E402
 from modules.hardware_interface import HardwareInterface  # noqa: E402
 from modules.robot_service import RobotService  # noqa: E402
 from modules.rt_utils import apply_rt_to_thread, reset_to_normal, SCHED_FIFO  # noqa: E402
+from clients.input_handler import InputHandler  # noqa: E402
 
 
 TRAJECTORY_CSV_COLUMNS = [
@@ -60,7 +65,10 @@ TRAJECTORY_CSV_COLUMNS = [
 
 STRESS_LOG_COLUMNS = [
     't_s',
+    'command_mode',
     'cmd_x', 'cmd_y', 'cmd_z',
+    'joy_slew', 'joy_boom', 'joy_arm', 'joy_bucket',
+    'direct_slew', 'direct_boom', 'direct_arm', 'direct_bucket',
     'act_rot_y_deg',
     'joint_0_deg', 'joint_1_deg', 'joint_2_deg', 'joint_3_deg',
     'vel_0_degps', 'vel_1_degps', 'vel_2_degps', 'vel_3_degps',
@@ -181,7 +189,11 @@ def _read_sensor_snapshot(hardware, imu_roles: list[str], adc_names: list[str]) 
 
 
 def _load_rate_config():
-    cfg_path = ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"
+    return _load_profile_rate_config(resolve_profile("rpi"))
+
+
+def _load_profile_rate_config(profile: dict):
+    cfg_path = ROOT / str(profile["control_config_file"])
     with cfg_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
 
@@ -196,13 +208,39 @@ def _load_rate_config():
     return control_hz, output_limits
 
 
+def _synthetic_controller_state(sequence: int, target_hz: float, amplitude: float) -> dict:
+    """Generate joystick-like analog input for direct-mode stress ticks."""
+    t = float(sequence) / max(1.0, float(target_hz))
+    amp = max(0.0, min(1.0, float(amplitude)))
+    return {
+        "LeftBumper": True,
+        "LeftJoystickX": amp * math.sin(2.0 * math.pi * 0.17 * t),
+        "LeftJoystickY": amp * math.sin(2.0 * math.pi * 0.23 * t + 0.7),
+        "RightJoystickX": amp * math.sin(2.0 * math.pi * 0.31 * t + 1.4),
+        "RightJoystickY": amp * math.sin(2.0 * math.pi * 0.19 * t + 2.1),
+        "LeftTrigger": 0.0,
+        "RightTrigger": 0.0,
+    }
+
+
+def _select_command_mode(command_mode: str, sequence: int, target_hz: float, mixed_block_s: float) -> ControlMode:
+    if command_mode == "direct":
+        return ControlMode.DIRECT
+    if command_mode == "ik":
+        return ControlMode.IK
+    block_cycles = max(1, int(round(max(0.05, float(mixed_block_s)) * max(1.0, float(target_hz)))))
+    return ControlMode.DIRECT if (sequence // block_cycles) % 2 else ControlMode.IK
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Full-stack stress test with explicit zero PWM commands")
+    parser.add_argument("--robot", choices=["auto", *sorted(PROFILES.keys())], default=os.environ.get("KAIVURI_TEST_ROBOT", "auto"),
+                        help="Robot/profile to load (default: auto, or KAIVURI_TEST_ROBOT)")
     parser.add_argument("--rate-hz", type=float, default=None,
                         help="Override control rate; IMU is firmware-fixed at 200 Hz, ADC is fixed at 20 Hz")
     parser.add_argument("--duration-s", type=float, default=30.0)
     parser.add_argument("--warmup-s", type=float, default=5.0)
-    parser.add_argument("--ready-timeout-s", type=float, default=30.0)
+    parser.add_argument("--ready-timeout-s", type=float, default=DEFAULT_READY_TIMEOUT_S)
     parser.add_argument("--fifo-priority", type=int, default=75)
     parser.add_argument("--control-core", type=int, default=2,
                         help="CPU core for sender + control loop (default: 2)")
@@ -210,6 +248,16 @@ def main() -> int:
                         help="CPU core for USB reader + IMU + ADC threads (default: 3)")
     parser.add_argument("--ik-dither-m", type=float, default=0.004,
                         help="Small IK target oscillation to exercise reachability checks; valves remain zero")
+    parser.add_argument("--command-mode", choices=["ik", "direct", "mixed"], default="mixed",
+                        help="Command stream to stress: IK only, joystick/direct only, or alternating blocks")
+    parser.add_argument("--mixed-block-s", type=float, default=1.0,
+                        help="Seconds per IK/direct block when --command-mode=mixed")
+    parser.add_argument("--direct-amplitude", type=float, default=0.15,
+                        help="Synthetic joystick amplitude for direct-mode valve commands in [-1, 1]")
+    parser.add_argument("--allow-live-valve-output", action="store_true",
+                        help="Send generated valve commands to hardware. Default forces all valve outputs to zero.")
+    parser.add_argument("--enable-adc", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable pressure ADC reader/logging during the stress run (default: selected profile)")
     parser.add_argument("--settle-s", type=float, default=12.0,
                         help="Seconds to run after warmup before recording stats; must exceed the controller's "
                              "rolling-window size (deadline_window_sec, typically 10 s) for clean ctrl-miss readings")
@@ -236,17 +284,20 @@ def main() -> int:
     prev_joint_vel_t = None
 
     try:
-        config_control_hz, output_limits = _load_rate_config()
+        profile = resolve_profile(args.robot)
+        config_control_hz, output_limits = _load_profile_rate_config(profile)
         target_hz = float(args.rate_hz) if args.rate_hz is not None else float(config_control_hz)
+        enable_adc = bool(profile.get("enable_adc", False)) if args.enable_adc is None else bool(args.enable_adc)
 
         hardware = HardwareInterface(
-            config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"),
-            control_config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
+            config_file=str(ROOT / str(profile["servo_config_file"])),
+            control_config_file=str(ROOT / str(profile["control_config_file"])),
             log_level=args.log_level.upper(),
             pump_auto_mode=False,
             cleanup_disable_osc=False,
             perf_enabled=True,
-            enable_adc=True,
+            enable_imu=bool(profile.get("enable_imu", True)),
+            enable_adc=enable_adc,
             adc_sample_hz=20.0,
             rt_lock_memory=True,
             usb_rt_priority=args.fifo_priority,
@@ -255,13 +306,16 @@ def main() -> int:
             usb_cpu_core=args.io_core,
             imu_cpu_core=args.io_core,
             adc_cpu_core=args.io_core,
+            pwm_i2c_bus=int(profile["pwm_i2c_bus"]),
+            pwm_i2c_addr=int(profile["pwm_i2c_addr"]),
         )
 
-        deadline = time.time() + max(1.0, args.ready_timeout_s)
-        while not hardware.is_hardware_ready():
-            if time.time() >= deadline:
-                raise TimeoutError("Hardware did not become ready before timeout")
-            time.sleep(0.1)
+        wait_for_hardware_ready(
+            hardware,
+            timeout_s=max(1.0, args.ready_timeout_s),
+            poll_interval_s=0.1,
+            logger=logging.getLogger(__name__),
+        )
 
         original_send_named_pwm_commands = hardware.send_named_pwm_commands
 
@@ -269,7 +323,8 @@ def main() -> int:
             zero_commands = {name: 0.0 for name in dict(commands)}
             return original_send_named_pwm_commands(zero_commands)
 
-        hardware.send_named_pwm_commands = send_zero_named_pwm_commands
+        if not args.allow_live_valve_output:
+            hardware.send_named_pwm_commands = send_zero_named_pwm_commands
 
         controller = ExcavatorController(
             hardware,
@@ -279,10 +334,11 @@ def main() -> int:
             rt_priority=args.fifo_priority,
             rt_lock_memory=True,
             rt_cpu_core=args.control_core,
-            control_config_file=str(ROOT / "configuration_files" / "profiles" / "rpi" / "control_config.yaml"),
+            control_config_file=str(ROOT / str(profile["control_config_file"])),
         )
         service = RobotService(controller, hardware)
         service.start()
+        input_handler = InputHandler()
 
         if args.log:
             log_columns, log_imu_roles, log_adc_names, _ = _discover_log_schema(hardware)
@@ -315,10 +371,12 @@ def main() -> int:
         started = settle_started  # overwritten when settle ends
 
         print(
-            f"[stress] full stack start: control={target_hz:.1f}Hz imu=200Hz(fw) "
-            f"adc=20Hz settle={args.settle_s:.1f}s duration={args.duration_s:.1f}s "
+            f"[stress] full stack start: profile={profile['profile_name']} control={target_hz:.1f}Hz imu=200Hz(fw) "
+            f"adc={'20Hz' if enable_adc else 'disabled'} settle={args.settle_s:.1f}s duration={args.duration_s:.1f}s "
             f"fifo={args.fifo_priority} control_core={args.control_core} io_core={args.io_core} "
-            f"lock_memory=True ik_dither={dither_m:.4f}m valves=forced_zero"
+            f"lock_memory=True command_mode={args.command_mode} ik_dither={dither_m:.4f}m "
+            f"direct_amp={max(0.0, min(1.0, args.direct_amplitude)):.2f} "
+            f"valves={'live_output' if args.allow_live_valve_output else 'forced_zero'}"
             + (" CSV_log=enabled" if args.log else "")
         )
 
@@ -351,19 +409,21 @@ def main() -> int:
             if measuring:
                 last_sender_start = loop_start
 
+            selected_mode = _select_command_mode(args.command_mode, sequence, target_hz, args.mixed_block_s)
             phase = 1.0 if sequence % 2 == 0 else -1.0
+            cmd_pos = np.asarray([base_x + phase * dither_m, base_y, base_z], dtype=np.float32)
+            joystick_state = _synthetic_controller_state(sequence, target_hz, args.direct_amplitude)
+            direct_slew, direct_boom, direct_arm, direct_bucket = input_handler.tick_direct(set(), joystick_state)
             ik_cmd = ControlCommand(
                 sequence=sequence,
                 timestamp_ms=int(time.time() * 1000) & 0xFFFFFFFF,
-                mode=ControlMode.IK,
-                pose=PoseTarget(base_x + phase * dither_m, base_y, base_z, base_rot),
-                direct=DirectCommand(0.0, 0.0, 0.0, 0.0),
+                mode=selected_mode,
+                pose=PoseTarget(float(cmd_pos[0]), float(cmd_pos[1]), float(cmd_pos[2]), base_rot),
+                direct=DirectCommand(direct_slew, direct_boom, direct_arm, direct_bucket),
             )
+            # Simulate UDP receive: encode is just test scaffolding; only decode runs in real use.
             decoded = decode_command_message(encode_command_message(ik_cmd))
             service.submit_command(decoded)
-
-            telemetry = service.get_state()
-            encode_telemetry_message(telemetry)
 
             if measuring:
                 sender_cycle_count += 1
@@ -373,7 +433,6 @@ def main() -> int:
                 perf_stats = service.get_debug_state().get("perf_stats", {})
                 hw_stats = perf_stats.get('hardware_stats', {})
                 act_pos, act_rot_deg = service.get_pose()
-                cmd_pos = np.asarray([base_x + phase * dither_m, base_y, base_z], dtype=np.float32)
                 joint_deg = np.asarray(controller.get_joint_angles(), dtype=np.float32)
                 if joint_deg.shape[0] < 4:
                     joint_deg = np.pad(joint_deg, (0, 4 - joint_deg.shape[0]))
@@ -393,6 +452,10 @@ def main() -> int:
                 planned_quat = _quat_from_y_deg(base_rot)
                 actual_quat = _quat_from_y_deg(act_rot_deg)
                 cond = controller.get_condition_number()
+                yosh = controller.get_yoshikawa_index()
+                singular_values = np.asarray(controller.get_singular_values(), dtype=np.float32)
+                if singular_values.shape[0] < 4:
+                    singular_values = np.pad(singular_values, (0, 4 - singular_values.shape[0]), constant_values=np.nan)
                 t_elapsed = loop_start - started
                 progress = min(max(t_elapsed / max(args.duration_s, 1e-6), 0.0), 1.0)
                 sensor_values = _read_sensor_snapshot(hardware, log_imu_roles, log_adc_names)
@@ -405,12 +468,17 @@ def main() -> int:
                     float(joint_vel_rad[0]), float(joint_vel_rad[1]), float(joint_vel_rad[2]), float(joint_vel_rad[3]),
                     float(joint_acc_rad[0]), float(joint_acc_rad[1]), float(joint_acc_rad[2]), float(joint_acc_rad[3]),
                     float(joint_pos_rad[0]), float(joint_pos_rad[1]), float(joint_pos_rad[2]), float(joint_pos_rad[3]),
-                    float(cond), float('nan'),
-                    float('nan'), float('nan'), float('nan'), float('nan'),
+                    float(cond), float(yosh),
+                    float(singular_values[0]), float(singular_values[1]), float(singular_values[2]), float(singular_values[3]),
                     int(sequence % 2),
                     float(progress),
                     round(t_elapsed, 6),
+                    selected_mode.name.lower(),
                     round(base_x + phase * dither_m, 6), round(base_y, 6), round(base_z, 6),
+                    round(float(direct_slew), 4), round(float(direct_boom), 4),
+                    round(float(direct_arm), 4), round(float(direct_bucket), 4),
+                    round(float(direct_slew), 4), round(float(direct_boom), 4),
+                    round(float(direct_arm), 4), round(float(direct_bucket), 4),
                     round(float(act_rot_deg), 4),
                     round(float(joint_deg[0]), 4), round(float(joint_deg[1]), 4),
                     round(float(joint_deg[2]), 4), round(float(joint_deg[3]), 4),
@@ -481,6 +549,7 @@ def main() -> int:
 
         perf_stats = service.get_debug_state().get("perf_stats", {})
         hw_stats = perf_stats.get('hardware_stats', {})
+        ik_debug = controller.get_ik_debug_info()
         sender_avg_hz = sender_cycle_count / max(1e-6, time.perf_counter() - started)
         print(
             "[stress] done | "
@@ -490,7 +559,8 @@ def main() -> int:
             f"procCPU={perf_stats.get('process_cpu_pct', 0.0):.1f}% "
             f"loopUtil={perf_stats.get('loop_util_pct', perf_stats.get('cpu_usage_pct', 0.0)):.1f}% "
             f"sender_miss1%={sender_miss_count} ({(sender_miss_count / max(1, sender_cycle_count - 1)) * 100.0:.1f}% cumulative) "
-            f"ctrl_miss1%={perf_stats.get('deadline_miss_1pct_count_recent', 0)} ({perf_stats.get('deadline_miss_1pct_pct_recent', 0.0):.1f}% recent)"
+            f"ctrl_miss1%={perf_stats.get('deadline_miss_1pct_count_recent', 0)} ({perf_stats.get('deadline_miss_1pct_pct_recent', 0.0):.1f}% recent) "
+            f"reach_reject={ik_debug.get('reach_reject_count', 0)} cond_reject={ik_debug.get('cond_reject_count', 0)}"
         )
         imu_s = hw_stats.get('imu', {})
         adc_s = hw_stats.get('adc', {})

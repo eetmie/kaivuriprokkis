@@ -583,6 +583,7 @@ class ExcavatorController:
         # at this threshold; we keep a counter for telemetry.
         self._cond_threshold = _cond_threshold
         self._cond_reject_count = 0
+        self._reach_reject_count = 0
 
         # Pre-flight reachability check
         reach_cfg = self._control_config.get('reachability', {}) if isinstance(self._control_config, dict) else {}
@@ -801,13 +802,16 @@ class ExcavatorController:
         if self._reach_enabled:
             result = self._evaluate_reachability(target_pos, rot_deg)
             if not result.reachable:
-                self.logger.warning(
-                    "Rejecting unreachable target %s rot=%.2f deg (closest=%s, "
-                    "pos_err=%.4fm, cond=%.1f, iters=%d)",
-                    np.round(target_pos, 4), rot_deg,
-                    np.round(result.closest_position, 4),
-                    result.pos_error_m, result.final_cond_number, result.iters,
-                )
+                self._reach_reject_count += 1
+                if self._reach_reject_count % 200 == 1:
+                    self.logger.warning(
+                        "Rejecting unreachable target %s rot=%.2f deg (closest=%s, "
+                        "pos_err=%.4fm, cond=%.1f, iters=%d) [total_rejected=%d]",
+                        np.round(target_pos, 4), rot_deg,
+                        np.round(result.closest_position, 4),
+                        result.pos_error_m, result.final_cond_number, result.iters,
+                        self._reach_reject_count,
+                    )
                 return result
 
         with self._lock:
@@ -1275,6 +1279,7 @@ class ExcavatorController:
             'adaptive_lambda': float(self._last_adaptive_lambda),
             'condition_number': float(self._last_condition_number),
             'cond_reject_count': self._cond_reject_count,
+            'reach_reject_count': self._reach_reject_count,
         }
 
     def get_joint_velocities_degps(self):

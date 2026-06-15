@@ -57,17 +57,17 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    rotate:
+    slew:
         output_channel: 2
         affects_pump: False
         toggleable: True
         center: None #1637,5. "none" calculates center to in-between
-        direction: 1
+        direction: -1  # was 1 on Jetson
         pulse_min: 1550
         pulse_max: 1725
         deadzone: 0.0
-        deadband_us_pos: 0.0
-        deadband_us_neg: 0.0
+        deadband_us_pos: 44.0
+        deadband_us_neg: 45.0
         dither_enable: False
         dither_amp_us: 25.0
         dither_hz: 33.0
@@ -78,18 +78,18 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    lift_boom:
+    boom:
         output_channel: 3
         affects_pump: True
         toggleable: False
-        center: 1500
-        direction: -1
-        pulse_min: 1000
-        pulse_max: 2000
+        center: None
+        direction: -1  # -1
+        pulse_min: 1330
+        pulse_max: 1980
         deadzone: 0.0
-        deadband_us_pos: 0.0
-        deadband_us_neg: 0.0
-        dither_enable: False
+        deadband_us_pos: 140.0
+        deadband_us_neg: 150.0
+        dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0
         dither_taper: False
@@ -99,18 +99,18 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    tilt_boom:
+    arm:
         output_channel: 4
         affects_pump: True
         toggleable: False
-        center: 1500
-        direction: -1
-        pulse_min: 1000
-        pulse_max: 2000
+        center: None
+        direction: -1 #-1
+        pulse_min: 1300
+        pulse_max: 1850
         deadzone: 0.0
-        deadband_us_pos: 0.0
-        deadband_us_neg: 0.0
-        dither_enable: False
+        deadband_us_pos: 160.0
+        deadband_us_neg: 160.0
+        dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0
         dither_taper: False
@@ -120,18 +120,18 @@ CHANNEL_CONFIGS:
         ramp_skip_deadband: False
         gamma: 1.0
 
-    scoop:
+    bucket:
         output_channel: 5
         affects_pump: True
         toggleable: False
-        center: 1500
+        center: None
         direction: -1
-        pulse_min: 1000
-        pulse_max: 2000
+        pulse_min: 1330
+        pulse_max: 1880
         deadzone: 0.0
-        deadband_us_pos: 0.0
-        deadband_us_neg: 0.0
-        dither_enable: False
+        deadband_us_pos: 160.0
+        deadband_us_neg: 160.0
+        dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0
         dither_taper: False
@@ -189,4 +189,4 @@ CHANNEL_CONFIGS:
         pulse_max: 1650
         static_pulse_us: 1550
         base_pulse_us: 1540
-        activity_gain_us: 120
+        activity_gain_us: 120 

@@ -1,10 +1,11 @@
-"""Hardware smoke tests — real PCA9685 on bus 1, IMU/ADC disabled.
+"""Hardware smoke tests — real PCA9685 using the selected robot profile.
 
 Safe to run on the bench: every test path ends with a pump-stop + PWM reset.
 If the PWM controller cannot be reached (no I2C hardware) the whole suite is
 skipped.
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -13,16 +14,39 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+
+def _resolve_hardware_profile() -> dict:
+    """Resolve board/profile defaults exactly like runtime scripts.
+
+    Override with KAIVURI_TEST_ROBOT=rpi|jetson|auto, KAIVURI_TEST_I2C_BUS,
+    or KAIVURI_TEST_I2C_ADDR when testing a non-default wiring.
+    """
+    try:
+        from modules.board import resolve_profile  # noqa: E402
+    except Exception as exc:
+        raise unittest.SkipTest(f"Board profile resolver unavailable: {exc}") from exc
+
+    profile = resolve_profile(os.environ.get("KAIVURI_TEST_ROBOT", "auto"))
+    if "KAIVURI_TEST_I2C_BUS" in os.environ:
+        profile["pwm_i2c_bus"] = int(os.environ["KAIVURI_TEST_I2C_BUS"], 0)
+    if "KAIVURI_TEST_I2C_ADDR" in os.environ:
+        profile["pwm_i2c_addr"] = int(os.environ["KAIVURI_TEST_I2C_ADDR"], 0)
+    return profile
+
+
+_PROFILE = _resolve_hardware_profile()
+
+
 def _pwm_available() -> bool:
-    """Return True if a PCA9685 is reachable on bus 1 (0x40)."""
+    """Return True if the profile-selected PCA9685 is reachable."""
     try:
         import smbus2  # type: ignore
     except Exception:
         return False
     try:
-        bus = smbus2.SMBus(1)
+        bus = smbus2.SMBus(int(_PROFILE["pwm_i2c_bus"]))
         try:
-            bus.read_byte(0x40)
+            bus.read_byte(int(_PROFILE["pwm_i2c_addr"]))
             return True
         except Exception:
             return False
@@ -43,7 +67,11 @@ def _load_hardware_interface():
         raise unittest.SkipTest(f"Hardware interface unavailable: {exc}") from exc
 
 
-@unittest.skipUnless(_pwm_available(), "PCA9685 not reachable on I2C bus 1")
+@unittest.skipUnless(
+    _pwm_available(),
+    f"PCA9685 not reachable on I2C bus {_PROFILE['pwm_i2c_bus']} "
+    f"addr 0x{int(_PROFILE['pwm_i2c_addr']):02X}",
+)
 class HardwareSmokeTests(unittest.TestCase):
     """Hardware safety sanity — every test resets the PWM layer afterwards."""
 
@@ -56,6 +84,10 @@ class HardwareSmokeTests(unittest.TestCase):
             enable_adc=False,
             log_level="WARNING",
             pump_auto_mode=False,
+            config_file=_PROFILE["servo_config_file"],
+            control_config_file=_PROFILE["control_config_file"],
+            pwm_i2c_bus=int(_PROFILE["pwm_i2c_bus"]),
+            pwm_i2c_addr=int(_PROFILE["pwm_i2c_addr"]),
         )
 
     @classmethod
@@ -74,15 +106,15 @@ class HardwareSmokeTests(unittest.TestCase):
 
     def test_expected_pwm_channel_names_exist(self):
         names = set(self.hw.get_pwm_channel_names(include_pump=True))
-        for required in ("lift_boom", "tilt_boom", "scoop", "rotate", "pump"):
+        for required in ("slew", "boom", "arm", "bucket", "pump"):
             self.assertIn(required, names, msg=f"missing channel: {required}")
 
     def test_zero_named_pwm_commands_accepted(self):
         ok = self.hw.send_named_pwm_commands({
-            "rotate": 0.0,
-            "lift_boom": 0.0,
-            "tilt_boom": 0.0,
-            "scoop": 0.0,
+            "slew": 0.0,
+            "boom": 0.0,
+            "arm": 0.0,
+            "bucket": 0.0,
         })
         self.assertTrue(ok)
 

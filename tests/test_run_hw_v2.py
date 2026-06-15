@@ -247,6 +247,7 @@ class RunHwV2Tests(unittest.TestCase):
                 patch.object(run_hw_v2.time, "sleep"):
             rc = run_hw_v2.main([
                 "--algorithm", "a_star",
+                "--robot", "rpi",
                 "-r",
                 "-p",
                 "--task", "in-and-out",

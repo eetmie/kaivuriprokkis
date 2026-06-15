@@ -93,7 +93,7 @@ def main():
         sys.exit(1)
 
     # ---- low-level PWM writer (bypass full stack for simplicity) ----
-    from modules.PCA9685_controller import DirectPWMWriter  # type: ignore
+    from modules.pwm import DirectPWMWriter  # type: ignore
 
     import smbus2
     i2c = smbus2.SMBus(1)
@@ -115,9 +115,9 @@ def main():
     last_pulse = start_us
 
     def _set_pulse(us: float):
-        duty = int((us / pwm_period_us) * 65535)
-        duty = max(0, min(65535, duty))
-        writer.set_channel(output_channel, duty)
+        count = int((us / pwm_period_us) * 4095)
+        count = max(0, min(4095, count))
+        writer.set_channel(output_channel, count)
         writer.flush()
 
     def _stop():

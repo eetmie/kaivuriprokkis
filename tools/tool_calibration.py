@@ -28,7 +28,7 @@ from typing import Iterable
 import numpy as np
 
 from modules.usb_serial_reader import USBSerialReader
-from modules.quaternion_math import (
+from modules.ik import (
     quat_conjugate,
     quat_multiply,
     quat_normalize,

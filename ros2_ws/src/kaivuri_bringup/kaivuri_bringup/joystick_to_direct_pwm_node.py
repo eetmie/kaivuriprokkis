@@ -6,10 +6,10 @@ from std_msgs.msg import Float32MultiArray
 
 
 COMMAND_NAMES = [
-    "rotate",
-    "lift_boom",
-    "tilt_boom",
-    "scoop",
+    "slew",
+    "boom",
+    "arm",
+    "bucket",
     "trackL",
     "trackR",
 ]

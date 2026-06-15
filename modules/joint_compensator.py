@@ -131,7 +131,7 @@ class JointCompensator:
     """Stub. Returns zeros until populated.
 
     Intended public surface:
-        comp = JointCompensator(cfg, robot_config)
+        comp = JointCompensator(cfg, model)
         ff = comp.compute(
             joint_angles=...,        # rad (n_joints,)
             joint_quats=...,         # absolute link quats (n_joints, 4)
@@ -144,12 +144,15 @@ class JointCompensator:
     Each `_compute_*` method below is a hook to fill in. They all currently
     return zeros, so wiring this in produces no change in behaviour until
     individual terms are enabled.
+
+    ``model`` is the URDF-style ``ExcavatorModel`` (from ``modules.ik``); only
+    ``num_joints`` is read here, so any object with that attribute works.
     """
 
-    def __init__(self, cfg: JointCompensatorConfig, robot_config) -> None:
+    def __init__(self, cfg: JointCompensatorConfig, model) -> None:
         self.cfg = cfg
-        self.robot_config = robot_config
-        self.n = int(getattr(robot_config, "num_joints", 4))
+        self.model = model
+        self.n = int(getattr(model, "num_joints", 4))
 
     # ------------------------------------------------------------------
     # Individual term hooks — each returns a length-n_joints np.float32

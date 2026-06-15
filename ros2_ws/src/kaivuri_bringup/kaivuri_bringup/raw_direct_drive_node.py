@@ -12,10 +12,10 @@ from kaivuri_bringup.project_paths import add_project_import_path, resolve_proje
 
 
 COMMAND_NAMES = [
-    "rotate",
-    "lift_boom",
-    "tilt_boom",
-    "scoop",
+    "slew",
+    "boom",
+    "arm",
+    "bucket",
     "trackL",
     "trackR",
 ]
@@ -25,7 +25,7 @@ class RawDirectDriveNode(Node):
     """Raw normalized valve/track command bridge for ROS testing.
 
     Subscribes to std_msgs/Float32MultiArray on /kaivuri/direct_pwm.
-    Data order is [rotate, lift_boom, tilt_boom, scoop, trackL, trackR].
+    Data order is [slew, boom, arm, bucket, trackL, trackR].
     """
 
     def __init__(self) -> None:
@@ -40,7 +40,7 @@ class RawDirectDriveNode(Node):
         self.declare_parameter("command_rate_hz", 50.0)
         self.declare_parameter("command_timeout_s", 0.5)
         self.declare_parameter("ready_timeout_s", 30.0)
-        self.declare_parameter("pump_auto_mode", True)
+        self.declare_parameter("pump_auto_mode", False)
         self.declare_parameter("toggle_channels", True)
         self.declare_parameter("stale_timeout_s", 0.5)
 

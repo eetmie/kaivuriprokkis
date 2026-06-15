@@ -1,6 +1,7 @@
 import logging
 import importlib
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -226,17 +227,131 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
             self.assertEqual(hw.get_status()["adc_state"], ReadyState.READY)
             self.assertEqual(
                 hw.get_pwm_channel_names(include_pump=True),
-                ["trackL", "trackR", "rotate", "lift_boom", "tilt_boom", "scoop", "extra1", "extra2", "pump"],
+                ["trackL", "trackR", "slew", "boom", "arm", "bucket", "extra1", "extra2", "pump"],
             )
             self.assertTrue(hw.send_named_pwm_commands({
                 "trackL": 0.0,
                 "trackR": 0.0,
-                "rotate": 0.0,
-                "lift_boom": 0.0,
-                "tilt_boom": 0.0,
-                "scoop": 0.0,
+                "slew": 0.0,
+                "boom": 0.0,
+                "arm": 0.0,
+                "bucket": 0.0,
             }))
             self.assertIn(("block", 0x40, 0x06, 32), calls)
+        finally:
+            hw.shutdown()
+
+    def test_direct_pwm_pulse_us_commands_clamp_and_report_current_pulses(self):
+        calls = []
+
+        def open_bus(bus_number):
+            calls.append(("bus", bus_number))
+            return _FakeSmbus(calls)
+
+        with patch("modules.PCA9685_controller._open_smbus", side_effect=open_bus):
+            hw = HardwareInterface(
+                config_file=str(ROOT_DIR / "configuration_files" / "profiles" / "jetson" / "servo_config.yaml"),
+                enable_pwm=True,
+                enable_imu=False,
+                enable_adc=False,
+                start_imu_reader=False,
+                start_adc_reader=False,
+                input_rate_threshold=0,
+                stale_timeout_s=0.0,
+                cleanup_disable_osc=False,
+                pwm_i2c_bus=7,
+                pwm_i2c_addr=0x40,
+                log_level="CRITICAL",
+        )
+
+        try:
+            self.assertEqual(hw.get_current_pwm_pulses_us()["boom"], 1655.0)
+
+            self.assertTrue(hw.send_named_pwm_pulse_us({
+                "boom": 1900.0,
+                "arm": 1000.0,
+            }))
+
+            pulses = hw.get_current_pwm_pulses_us()
+            self.assertEqual(pulses["boom"], 1900.0)
+            self.assertEqual(pulses["arm"], 1300.0)
+            self.assertEqual(pulses["pump"], 1550.0)
+            self.assertNotIn("missing", pulses)
+
+            self.assertTrue(hw.set_named_pwm_pulse_us({"boom": 1800.0}, unset_to_center=False))
+            self.assertEqual(hw.get_current_pwm_pulses_us()["boom"], 1800.0)
+            self.assertIn(("block", 0x40, 0x06, 32), calls)
+        finally:
+            hw.shutdown()
+
+    def test_disabled_track_channels_still_initialize(self):
+        calls = []
+
+        def open_bus(bus_number):
+            calls.append(("bus", bus_number))
+            return _FakeSmbus(calls)
+
+        with patch("modules.PCA9685_controller._open_smbus", side_effect=open_bus):
+            hw = HardwareInterface(
+                config_file=str(ROOT_DIR / "configuration_files" / "profiles" / "rpi" / "servo_config.yaml"),
+                enable_pwm=True,
+                enable_imu=False,
+                enable_adc=False,
+                start_imu_reader=False,
+                start_adc_reader=False,
+                input_rate_threshold=0,
+                stale_timeout_s=0.0,
+                cleanup_disable_osc=False,
+                pwm_i2c_bus=1,
+                pwm_i2c_addr=0x40,
+                log_level="CRITICAL",
+            )
+
+        try:
+            self.assertTrue(hw.is_hardware_ready())
+            names = hw.get_pwm_channel_names(include_pump=True)
+            self.assertIn("slew", names)
+            self.assertIn("boom", names)
+            self.assertNotIn("trackL", names)
+            self.assertNotIn("trackR", names)
+        finally:
+            hw.shutdown()
+
+    def test_missing_canonical_channel_faults_pwm_init(self):
+        config = """
+pwm_frequency: 100
+CHANNEL_CONFIGS:
+  slew:
+    enabled: false
+  boom:
+    enabled: false
+  arm:
+    enabled: false
+  bucket:
+    enabled: false
+  trackL:
+    enabled: false
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "servo_config.yaml"
+            config_path.write_text(config, encoding="utf-8")
+
+            hw = HardwareInterface(
+                config_file=str(config_path),
+                enable_pwm=True,
+                enable_imu=False,
+                enable_adc=False,
+                start_imu_reader=False,
+                start_adc_reader=False,
+                input_rate_threshold=0,
+                stale_timeout_s=0.0,
+                cleanup_disable_osc=False,
+                log_level="CRITICAL",
+            )
+
+        try:
+            self.assertEqual(hw.get_status()["pwm_state"], ReadyState.FAULT)
+            self.assertIn("trackR", hw.get_status()["pwm_fault"])
         finally:
             hw.shutdown()
 

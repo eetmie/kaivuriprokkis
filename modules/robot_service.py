@@ -5,7 +5,8 @@ from typing import Optional
 
 import numpy as np
 
-from .excavator_ik_utils import get_joint_positions, get_pose
+from .direct_controller import DirectController
+from .ik import get_state
 from .control_protocol import (
     ControlCommand,
     ControlMode,
@@ -31,9 +32,10 @@ class RobotService:
     def __init__(self, controller, hardware):
         self.controller = controller
         self.hardware = hardware
-        self.robot_config = getattr(controller, "robot_config", None)
-        if self.robot_config is None:
-            raise ValueError("RobotService requires controller.robot_config")
+        self.direct = DirectController(hardware)
+        self.model = getattr(controller, "model", None)
+        if self.model is None:
+            raise ValueError("RobotService requires controller.model (ExcavatorModel)")
         self._state_lock = threading.Lock()
         self.state = RobotServiceState()
         self._telemetry_sequence = 0
@@ -90,10 +92,11 @@ class RobotService:
                 self.state.paused = False
 
             if command.mode == ControlMode.DIRECT and self.state.mode != ControlMode.DIRECT:
-                self.controller.enter_direct_mode()
+                self.controller.suspend_ik_output()
                 self.state.mode = ControlMode.DIRECT
             elif command.mode == ControlMode.IK and self.state.mode != ControlMode.IK:
-                self.controller.exit_direct_mode()
+                self.direct.clear()
+                self.controller.resume_ik_output()
                 self.state.mode = ControlMode.IK
                 try:
                     measured_pos, measured_rot = self.controller.get_pose()
@@ -115,12 +118,13 @@ class RobotService:
                     float(command.direct.bucket),
                 )
                 if not self.state.paused:
-                    self.controller.give_direct_commands({
-                        "rotate": self.state.direct_command.slew,
-                        "lift_boom": self.state.direct_command.boom,
-                        "tilt_boom": self.state.direct_command.arm,
-                        "scoop": self.state.direct_command.bucket,
+                    self.direct.give_commands({
+                        "slew": self.state.direct_command.slew,
+                        "boom": self.state.direct_command.boom,
+                        "arm": self.state.direct_command.arm,
+                        "bucket": self.state.direct_command.bucket,
                     })
+                    self.direct.send_pending()
             else:
                 requested_pose = PoseTarget(
                     float(command.pose.x),
@@ -167,18 +171,12 @@ class RobotService:
 
     def get_debug_state(self) -> dict:
         """Return debug info for diagnostics without exposing controller internals."""
-        state = {
+        return {
             'fk_quaternions': self.controller.get_fk_quaternions(),
             'condition_number': self.controller.get_condition_number(),
             'perf_stats': self.controller.get_performance_stats() or {},
-            'robot_config': self.robot_config,
+            'model': self.model,
         }
-        # Include base IMU if available
-        base_imu = self.hardware.read_base_imu()
-        if base_imu is not None:
-            state['base_imu_quat'] = base_imu.get('quat')
-            state['base_imu_gyro'] = base_imu.get('gyro')
-        return state
 
     def get_pose(self):
         """Return (position_array, rot_y_deg) from the controller."""
@@ -186,23 +184,19 @@ class RobotService:
 
     def get_state(self) -> RobotTelemetry:
         measured_pos, measured_rot = self.controller.get_pose()
-        joint_angles = self.controller.get_joint_angles()
-        fk_quats = self.controller.get_fk_quaternions()
+        joint_angles_deg = self.controller.get_joint_angles()
 
         joint_positions = tuple((0.0, 0.0, 0.0) for _ in range(5))
-        if fk_quats is not None and len(fk_quats) >= 4:
-            jp = get_joint_positions(fk_quats, self.robot_config)
-            ee_pos, _ = get_pose(fk_quats, self.robot_config)
-            positions = [tuple(float(v) for v in pos) for pos in jp]
-            positions.append(tuple(float(v) for v in ee_pos))
+        joint_angles_arr = np.asarray(joint_angles_deg, dtype=np.float32)
+        # Guard against duck-typed stubs in tests that pass an opaque model.
+        model_num_joints = getattr(self.model, "num_joints", None)
+        if model_num_joints is not None and joint_angles_arr.shape[0] == model_num_joints:
+            q_rad = np.radians(joint_angles_arr)
+            # FK only (no Jacobian) — telemetry just wants link origins + tip.
+            kin = get_state(q_rad, self.model, include_jacobian=False)
+            positions = [tuple(float(v) for v in pos) for pos in kin.joint_origins_world]
+            positions.append(tuple(float(v) for v in kin.ee_position))
             joint_positions = tuple(positions[:5])
-
-        perf_stats = {}
-        try:
-            perf_stats = self.controller.get_performance_stats() or {}
-        except Exception as exc:
-            self._log_service_warning("Controller perf stats unavailable: %s", exc)
-            perf_stats = {}
 
         try:
             hardware_ready = bool(self.hardware.is_hardware_ready())
@@ -228,8 +222,6 @@ class RobotService:
             mode=mode,
             paused=paused,
             hardware_ready=hardware_ready,
-            slew_fusion_enabled=bool(perf_stats.get("slew_fusion_enabled", False)),
-            slew_fusion_active=bool(perf_stats.get("slew_fusion_active", False)),
             measured_pose=PoseTarget(
                 float(measured_pos[0]),
                 float(measured_pos[1]),
@@ -237,7 +229,6 @@ class RobotService:
                 float(measured_rot),
             ),
             target_pose=target_pose,
-            joint_angles_deg=tuple(float(v) for v in np.asarray(joint_angles, dtype=np.float32).tolist()),
+            joint_angles_deg=tuple(float(v) for v in joint_angles_arr.tolist()),
             joint_positions=joint_positions,
-            slew_fusion_gyro_z_degps=float(perf_stats.get("slew_fusion_gyro_z_degps", 0.0)),
         )

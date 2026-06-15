@@ -39,13 +39,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from modules.hardware_interface import HardwareInterface, HardwareFaultError
+from modules.direct_controller import DirectController
 from modules.excavator_controller import ExcavatorController, ControllerConfig
 from modules.perf_tracker import LoopPerfTracker
 from modules.rt_utils import apply_rt_to_thread, reset_to_normal, SCHED_FIFO
 
-# Import logger classes from drive_logger
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from drive_logger import DataLogger, SineExcitationGenerator, JOINT_NAMES
+from simple_drive import DataLogger, SineExcitationGenerator, JOINT_NAMES
 
 RESULTS_DIR = Path(__file__).parent / "test_results"
 LOGGING_HZ = 100  # Fixed — always 100Hz
@@ -197,7 +196,8 @@ def main():
         )
         controller.start()
         time.sleep(max(1.0, args.warmup_s))
-        controller.enter_direct_mode()
+        direct = DirectController(hardware)
+        controller.suspend_ik_output()
 
         # ---- Logger + Sine ----
         data_logger = DataLogger()
@@ -254,9 +254,10 @@ def main():
             for name in JOINT_NAMES:
                 combined[name] = float(np.clip(zero_cmds[name] + sine_cmds[name], -1.0, 1.0))
 
-            # Send to controller (timed)
+            # Send to direct controller (timed)
             cmd_start = time.perf_counter()
-            controller.give_direct_commands(combined)
+            direct.give_commands(combined)
+            direct.send_pending()
             give_cmd_times_ms.append((time.perf_counter() - cmd_start) * 1000.0)
 
             # Log sample (timed)
@@ -340,7 +341,7 @@ def main():
             results.append(f"max_ms: {max(sines):.4f}")
         results.append("")
 
-        results.append("[give_direct_commands_timing]")
+        results.append("[direct_send_pending_timing]")
         if cmds:
             results.append(f"mean_ms: {sum(cmds)/len(cmds):.4f}")
             results.append(f"max_ms: {max(cmds):.4f}")
@@ -393,7 +394,7 @@ def main():
         reset_to_normal(quiet=True)
         if controller is not None:
             try:
-                controller.exit_direct_mode()
+                controller.resume_ik_output()
                 controller.stop()
             except Exception:
                 pass

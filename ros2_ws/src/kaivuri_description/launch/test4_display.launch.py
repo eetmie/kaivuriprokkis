@@ -11,26 +11,27 @@ from launch_ros.actions import Node
 
 
 def _default_model_dir():
+    candidates = []
+
     project_root = os.environ.get("KAIVURI_PROJECT_ROOT")
     if project_root:
-        return str(Path(project_root) / "models" / "test4")
+        candidates.append(Path(project_root) / "models" / "test4")
 
-    cwd = Path.cwd()
-    candidates = [
-        cwd / "models" / "test4",
-        cwd.parent / "models" / "test4",
-        Path("/home/ai-masi/kaivuriprokkis/models/test4"),
-    ]
+    for base in [Path.cwd(), Path(__file__).resolve().parent]:
+        candidates.extend(parent / "models" / "test4" for parent in [base, *base.parents])
+
     for candidate in candidates:
-        if (candidate / "test.urdf").exists():
+        if (candidate / "test4v6.urdf").exists():
             return str(candidate)
-    return str(candidates[-1])
+
+    return str(candidates[0])
 
 
 def _load_visual_urdf(model_dir):
     model_dir = Path(model_dir)
-    urdf_path = model_dir / "test.urdf"
-    mesh_dir = model_dir / "meshes"
+    urdf_path = model_dir / "test4v6.urdf"
+    if not urdf_path.exists():
+        raise FileNotFoundError(f"URDF not found: {urdf_path}")
 
     tree = ET.parse(urdf_path)
     root = tree.getroot()
@@ -45,7 +46,10 @@ def _load_visual_urdf(model_dir):
                 continue
 
             filename = mesh.attrib.get("filename", "")
-            mesh_path = mesh_dir / Path(filename).name
+            if not filename or "://" in filename or filename.startswith("package:"):
+                continue
+
+            mesh_path = model_dir / filename
             if not mesh_path.exists():
                 link.remove(visual)
                 continue
@@ -57,7 +61,7 @@ def _load_visual_urdf(model_dir):
 
 def _launch_setup(context, *args, **kwargs):
     description_dir = Path(get_package_share_directory("kaivuri_description"))
-    rviz_config = description_dir / "rviz" / "test4.rviz"
+    rviz_config = description_dir / "rviz" / "kaivuri.rviz"
 
     robot_description = _load_visual_urdf(
         LaunchConfiguration("model_dir").perform(context)

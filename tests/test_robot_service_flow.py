@@ -34,13 +34,12 @@ class _FakeController:
         self.initial_pose = initial_pose
         self.pose_log = []
         self.next_pose_result = None
-        self.direct_log = []
         self.pause_calls = 0
         self.resume_calls = 0
-        self.enter_direct_calls = 0
-        self.exit_direct_calls = 0
+        self.suspend_ik_output_calls = 0
+        self.resume_ik_output_calls = 0
         self.perf_resets = 0
-        self.robot_config = object()
+        self.model = object()
 
     def get_pose(self):
         position, rotation = self.initial_pose
@@ -52,18 +51,15 @@ class _FakeController:
     def resume(self):
         self.resume_calls += 1
 
-    def enter_direct_mode(self):
-        self.enter_direct_calls += 1
+    def suspend_ik_output(self):
+        self.suspend_ik_output_calls += 1
 
-    def exit_direct_mode(self):
-        self.exit_direct_calls += 1
+    def resume_ik_output(self):
+        self.resume_ik_output_calls += 1
 
     def give_pose(self, position, rotation_y_deg):
         self.pose_log.append((tuple(float(v) for v in position), float(rotation_y_deg)))
         return self.next_pose_result
-
-    def give_direct_commands(self, commands):
-        self.direct_log.append(dict(commands))
 
     def reset_performance_stats(self):
         self.perf_resets += 1
@@ -92,6 +88,7 @@ class _FakeHardware:
         self.pump_log = []
         self.reset_log = []
         self.reload_log = 0
+        self.pwm_log = []
         self._ready = True
 
     def set_pump_enabled(self, enabled, flush=True):
@@ -101,15 +98,15 @@ class _FakeHardware:
     def reset(self, reset_pump=False):
         self.reset_log.append(bool(reset_pump))
 
+    def send_named_pwm_commands(self, commands):
+        self.pwm_log.append(dict(commands))
+
     def reload_config(self):
         self.reload_log += 1
         return True
 
     def is_hardware_ready(self):
         return self._ready
-
-    def read_base_imu(self):
-        return None
 
 
 class ServiceSubmitCommandTests(unittest.TestCase):
@@ -185,30 +182,30 @@ class ServiceSubmitCommandTests(unittest.TestCase):
         self.assertAlmostEqual(rot, 10.0, places=6)
 
     def test_mode_switch_ik_to_direct_and_back(self):
-        service, controller, _ = self._make_service()
+        service, controller, hardware = self._make_service()
         service.submit_command(ControlCommand(
             sequence=1, mode=ControlMode.DIRECT,
             direct=DirectCommand(0.1, 0.2, 0.3, 0.4),
         ))
-        self.assertEqual(controller.enter_direct_calls, 1)
-        self.assertEqual(len(controller.direct_log), 1)
-        self.assertEqual(controller.direct_log[-1],
-                         {"rotate": 0.1, "lift_boom": 0.2, "tilt_boom": 0.3, "scoop": 0.4})
+        self.assertEqual(controller.suspend_ik_output_calls, 1)
+        self.assertEqual(len(hardware.pwm_log), 1)
+        self.assertEqual(hardware.pwm_log[-1],
+                         {"slew": 0.1, "boom": 0.2, "arm": 0.3, "bucket": 0.4})
 
         service.submit_command(ControlCommand(
             sequence=2, mode=ControlMode.IK,
             pose=PoseTarget(0.5, 0.0, 0.0, 0.0),
         ))
-        self.assertEqual(controller.exit_direct_calls, 1)
+        self.assertEqual(controller.resume_ik_output_calls, 1)
 
     def test_direct_commands_blocked_while_paused(self):
-        service, controller, _ = self._make_service()
+        service, _, hardware = self._make_service()
         service.submit_command(ControlCommand(sequence=1, pause=True))
         service.submit_command(ControlCommand(
             sequence=2, mode=ControlMode.DIRECT,
             direct=DirectCommand(0.5, 0.5, 0.5, 0.5),
         ))
-        self.assertEqual(len(controller.direct_log), 0)
+        self.assertEqual(len(hardware.pwm_log), 0)
 
     def test_ik_commands_blocked_while_paused(self):
         service, controller, _ = self._make_service()

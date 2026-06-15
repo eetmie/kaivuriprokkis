@@ -14,8 +14,9 @@ Action mapping
 SmolVLA outputs an absolute end-effector pose target (xyz + rotation). On this
 robot that maps to ``ExcavatorController.give_pose(position, rotation_y_deg)``,
 the same surface ``run_hw_v2.py`` uses. If you later want joint-space control
-instead, switch to ``enter_direct_mode`` + ``give_direct_commands`` with the
-four normalized valve channels: rotate, lift_boom, tilt_boom, scoop.
+instead, switch to ``controller.suspend_ik_output()`` + a
+``DirectController`` (modules/direct_controller.py) driving the four
+normalized valve channels: slew, boom, arm, bucket.
 """
 
 from __future__ import annotations

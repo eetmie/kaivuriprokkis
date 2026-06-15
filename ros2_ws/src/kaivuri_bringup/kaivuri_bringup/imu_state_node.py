@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import rclpy
@@ -32,14 +33,10 @@ class ImuStateNode(Node):
         self.declare_parameter("config_file", "")
         self.declare_parameter("control_config_file", "")
         self.declare_parameter("publish_tool_pose", True)
-        # fd_only | gyro_only | fused — mirrors ExcavatorController.set_velocity_mode()
-        self.declare_parameter("velocity_mode", "gyro_only")
-
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
-        from modules.differential_ik import get_pose_from_joint_angles
-        from modules.differential_ik_cfg import load_excavator_robot_config
+        from modules.ik import get_pose_from_joint_angles, load_excavator_robot_config
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
         from modules.board import resolve_profile
@@ -76,17 +73,17 @@ class ImuStateNode(Node):
             control_config_file=str(control_config_path),
         )
         self._controller.start()
-        velocity_mode = str(self.get_parameter("velocity_mode").value).strip()
-        self._controller.set_velocity_mode(velocity_mode)
-        self._controller.enter_direct_mode()
+        # State-only node: suspend the IK loop's PWM output. The controller
+        # keeps reading sensors so joint angles / FK stay fresh.
+        self._controller.suspend_ik_output()
 
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
-        self.create_timer(1.0 / rate_hz, self._publish)
+        self.create_timer(1.0 / rate_hz, self._read_joint_angles)
         self.get_logger().info(
             f"Publishing IMU-derived joint_states from {self._project_root} "
-            f"(velocity_mode={velocity_mode})"
+            "(finite-difference velocities from Pico-fused joint angles)"
         )
 
     def _resolve_project_path(self, path_value: str) -> Path:
@@ -134,6 +131,8 @@ class ImuStateNode(Node):
             pose_msg.pose.orientation.y = float(ee_quat[2])
             pose_msg.pose.orientation.z = float(ee_quat[3])
             self._pose_pub.publish(pose_msg)
+
+        return joint_angles_rad
 
     def destroy_node(self) -> bool:
         try:

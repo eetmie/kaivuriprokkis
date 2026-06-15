@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
-"""VERY MESSY TEST SCRIPT, unify the usage some day!!!!
+"""Excavator driving and hydraulic data collection.
 
-Bench driving helper — same UDP/gamepad input as drive_logger.py, no recording.
+Merged from simple_drive.py (bench driving) and data_collection/drive_logger.py
+(sine-excitation recording). Uses the modern board-profile bringup system.
 
 Usage:
-    sudo python simple_drive.py
-    sudo python simple_drive.py --disable
-    sudo python simple_drive.py --linkage-rate-correction
-    sudo python simple_drive.py --robot jetson
+    python simple_drive.py
+    python simple_drive.py --record
+    python simple_drive.py --robot jetson --record --enable-slew
+    python simple_drive.py --comp vel-pid
+    python simple_drive.py --auto-pump
+    python simple_drive.py --sine-test          # drive with sine, no logging
 
-Jetson mode uses the Jetson PCA9685 profile and the same USB IMU stack as the
-Raspberry Pi profile. Use --disable-imu for PCA9685-only valve config tuning.
+Button Controls:
+    Button A (bit 0): Start / Stop data logging (saves segment on stop)
+    Button B (bit 1): Toggle sine excitation on / off (default: OFF)
+    Button X (bit 2): Toggle hydraulic pump
+    Button Y (bit 3): Cycle sine amplitude
 
-Buttons (remote gamepad, same wire format as drive_logger.py):
-    Button 0: toggle live mounting-corrected IMU and joint angle print
-    Button 1: reload PWM/servo config
-    Button 2: toggle hydraulic pump
-    Button 3: cycle compensation mode — OFF → raw summary → universal smooth → velocity PID
-
-Left paddle (bench mode): slowly trims pump auto-mode activity_gain_us base level while held.
-    Push forward = more gain, pull back = less. Prints current base value when it changes.
-    In mode 2 (pump gain), the base is further modulated each tick by the universal linkage
-    shape so slow positions get a boost and fast positions are reduced — valve commands stay
-    completely untouched. Also drives left track as normal — fine on the bench.
-
-The controller runs in DIRECT mode — joystick axes go straight to valves,
-IK/PID are bypassed. Useful for sanity-checking joint readouts (e.g., after
-removing the slew joint limit) without touching the data-logger codepath.
+Compensation modes (--comp flag, not button-toggled):
+    none         — raw joystick commands, no correction
+    raw          — per-joint valve scaling from linkage-rate table
+    universal    — pump-gain modulation from universal shape table
+    vel-pid      — closed-loop velocity PI (requires IMU)
 """
 
 from __future__ import annotations
@@ -35,6 +31,7 @@ import sys
 import time
 import argparse
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 
@@ -43,6 +40,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolve_board_profile
+from modules.bringup import wait_for_hardware_ready
+from modules.direct_controller import DirectController
 from modules.udp_socket import UDPSocket
 from tools.linkage_rate_compensation import (
     DEFAULT_TABLE,
@@ -52,540 +51,663 @@ from tools.linkage_rate_compensation import (
 )
 
 
-SAMPLING_FREQUENCY = 100              # main loop Hz
-PRINT_DECIMATION = 10                 # print every Nth iteration when enabled (~10Hz)
-PUMP_GAIN_ADJUST_RATE = 80.0         # µs/s per unit of paddle input for bench gain trim
-PUMP_GAIN_PRINT_THRESHOLD = 5.0      # µs change before printing updated gain
+# ── constants ────────────────────────────────────────────────────────────────
+
+SAMPLING_FREQUENCY         = 100    # Hz
+COMMAND_STALE_TIMEOUT_S    = 0.5
+STATUS_PRINT_INTERVAL_S    = 5.0
+PRINT_DECIMATION           = 10     # IMU print decimation (→ ~10 Hz)
+
+LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
+
+JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
+AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5]
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
-IMU_ROLE_ORDER = ['base', 'boom', 'arm', 'bucket']
+IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
 
 
-# Velocity PID: joystick command → desired deg/s → PI → valve command.
-# Slew (rotate) has no gyro so it stays open-loop; only boom/arm/bucket are controlled.
-_VEL_CTRL_JOINTS = {'lift_boom': 1, 'tilt_boom': 2, 'scoop': 3}
+# ── velocity PID ─────────────────────────────────────────────────────────────
+
+_VEL_CTRL_JOINTS = {'boom': 1, 'arm': 2, 'bucket': 3}
 
 
 class JointVelocityController:
-    def __init__(self, kp: float, ki: float, ki_max: float, deadband_degps: float, max_degps: float):
-        self.kp = kp
-        self.ki = ki
-        self.ki_max = ki_max
+    """Joystick → desired deg/s → PI → valve command for the three arm joints."""
+
+    def __init__(self, kp: float, ki: float, ki_max: float,
+                 deadband_degps: float, max_degps: float):
+        self.kp       = kp
+        self.ki       = ki
+        self.ki_max   = ki_max
         self.deadband = deadband_degps
         self.max_degps = max_degps
-        self._integral: dict[str, float] = {name: 0.0 for name in _VEL_CTRL_JOINTS}
+        self._integral: dict[str, float] = {n: 0.0 for n in _VEL_CTRL_JOINTS}
 
-    def apply(self, commands: dict, joint_vels_degps, dt: float) -> dict:
+    def apply(self, commands: dict, joint_vels, dt: float) -> dict:
         out = dict(commands)
         for name, vel_idx in _VEL_CTRL_JOINTS.items():
-            if name not in out or vel_idx >= len(joint_vels_degps):
+            if name not in out or vel_idx >= len(joint_vels):
                 continue
             desired = float(out[name]) * self.max_degps
             if abs(desired) < self.deadband:
                 self._integral[name] = 0.0
                 out[name] = 0.0
                 continue
-            actual = float(joint_vels_degps[vel_idx])
-            err = desired - actual
-            self._integral[name] = float(np.clip(
-                self._integral[name] + err * dt, -self.ki_max, self.ki_max,
-            ))
-            cmd = self.kp * err + self.ki * self._integral[name]
-            out[name] = float(np.clip(cmd, -1.0, 1.0))
+            err = desired - float(joint_vels[vel_idx])
+            self._integral[name] = float(
+                np.clip(self._integral[name] + err * dt, -self.ki_max, self.ki_max)
+            )
+            out[name] = float(np.clip(self.kp * err + self.ki * self._integral[name], -1.0, 1.0))
         return out
 
-    def reset(self) -> None:
+    def reset(self):
         for k in self._integral:
             self._integral[k] = 0.0
 
 
-def euler_pry_deg_from_quat(quat) -> tuple[float, float, float]:
-    """Euler pitch/roll/yaw from a [w, x, y, z] quaternion, in degrees."""
+# ── IMU helpers ───────────────────────────────────────────────────────────────
+
+def _euler_pry_deg(quat) -> tuple[float, float, float]:
     q = np.asarray(quat, dtype=np.float32)
     norm = np.linalg.norm(q)
     if norm > 1e-9:
-        q = q / norm
+        q /= norm
     w, x, y, z = q
-
-    sin_roll = 2.0 * (w * x + y * z)
-    cos_roll = 1.0 - 2.0 * (x * x + y * y)
-    roll = np.arctan2(sin_roll, cos_roll)
-
-    sin_pitch = 2.0 * (w * y - z * x)
-    if abs(sin_pitch) >= 1.0:
-        pitch = np.copysign(np.pi / 2.0, sin_pitch)
-    else:
-        pitch = np.arcsin(sin_pitch)
-
-    sin_yaw = 2.0 * (w * z + x * y)
-    cos_yaw = 1.0 - 2.0 * (y * y + z * z)
-    yaw = np.arctan2(sin_yaw, cos_yaw)
-
+    roll  = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+    sp    = 2*(w*y - z*x)
+    pitch = np.copysign(np.pi/2, sp) if abs(sp) >= 1 else np.arcsin(sp)
+    yaw   = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
     return tuple(float(v) for v in np.degrees([pitch, roll, yaw]))
 
 
-def get_control_joint_names(controller) -> list[str]:
-    """Return control-stack joint labels in get_joint_angles() output order."""
+def _get_control_joint_names(controller) -> list[str]:
     names = list(CONTROL_JOINT_NAMES)
     chain = getattr(getattr(controller, 'robot_config', None), 'imu_chain', None) or []
     for item in chain:
         if not isinstance(item, dict) or 'output_index' not in item:
             continue
-        output_index = int(item['output_index'])
-        if 0 <= output_index < len(names) and item.get('joint'):
-            names[output_index] = str(item['joint'])
+        i = int(item['output_index'])
+        if 0 <= i < len(names) and item.get('joint'):
+            names[i] = str(item['joint'])
     return names
 
 
-def get_imu_role_order(controller) -> list[str]:
-    """Return configured IMU role order for link-ordered debug output."""
-    robot_config = getattr(controller, 'robot_config', None)
-    roles = getattr(robot_config, 'imu_sensor_roles', None) if robot_config is not None else None
+def _get_imu_role_order(controller) -> list[str]:
+    rc = getattr(controller, 'robot_config', None)
+    roles = getattr(rc, 'imu_sensor_roles', None) if rc is not None else None
     return list(roles) if roles else list(IMU_ROLE_ORDER)
 
 
-def format_imu_debug_line(payload, joint_angles_deg=None, joint_names=None, imu_role_order=None) -> str:
-    """Format mounting-corrected IMU Euler angles and controller joint angles."""
+def _format_imu_line(payload, joint_angles=None, joint_names=None, imu_role_order=None) -> str:
     if not payload:
-        return "[IMU] waiting for raw IMU data"
+        return "[IMU] waiting"
+    quats    = payload.get('corrected_quats') or []
+    role_map = payload.get('role_by_index') or {}
+    idx_map  = {role: i for i, role in role_map.items()}
+    descs    = payload.get('descriptors') or []
 
-    corrected_quats = payload.get('corrected_quats') or []
-    role_by_index = payload.get('role_by_index') or {}
-    index_by_role = {role: idx for idx, role in role_by_index.items()}
-    descriptors = payload.get('descriptors') or []
+    ordered = []
+    for role in (imu_role_order or IMU_ROLE_ORDER):
+        i = idx_map.get(role)
+        if i is not None and i < len(quats) and i not in ordered:
+            ordered.append(i)
+    ordered += [i for i in range(len(quats)) if i not in ordered]
 
     parts = []
-    ordered_indices = []
-    for role in imu_role_order or IMU_ROLE_ORDER:
-        idx = index_by_role.get(role)
-        if idx is not None and idx < len(corrected_quats) and idx not in ordered_indices:
-            ordered_indices.append(idx)
-    ordered_indices.extend(i for i in range(len(corrected_quats)) if i not in ordered_indices)
+    for i in ordered:
+        role  = role_map.get(i, '-')
+        label = descs[i].get('label', '') if i < len(descs) else ''
+        p, r, y = _euler_pry_deg(quats[i])
+        parts.append(f"imu{i}({role}{' '+label if label else ''}) P/R/Y={p:+7.2f}/{r:+7.2f}/{y:+7.2f}")
 
-    for i in ordered_indices:
-        corr_q = corrected_quats[i]
-        role = role_by_index.get(i, '-')
-        label = descriptors[i].get('label', '') if i < len(descriptors) else ''
-        label_text = f" {label}" if label else ""
-        pitch, roll, yaw = euler_pry_deg_from_quat(corr_q)
-        parts.append(
-            f"imu{i}({role}{label_text}) P/R/Y={pitch:+7.2f}/{roll:+7.2f}/{yaw:+7.2f}"
-        )
-
-    joint_text = "joints waiting"
-    if joint_angles_deg is not None:
-        joint_names = joint_names or CONTROL_JOINT_NAMES
-        joint_text = " ".join(
-            f"{joint_names[i] if i < len(joint_names) else f'j{i}'}={float(angle):+7.2f}"
-            for i, angle in enumerate(joint_angles_deg)
-        )
-    return (
-        "[IMU mount-corrected P/R/Y] "
-        + " | ".join(parts)
-        + f" deg || [control joints] {joint_text} deg"
-    )
+    if joint_angles is not None:
+        names = joint_names or CONTROL_JOINT_NAMES
+        jt = " ".join(f"{names[i] if i < len(names) else f'j{i}'}={float(a):+7.2f}"
+                      for i, a in enumerate(joint_angles))
+    else:
+        jt = "joints waiting"
+    return "[IMU] " + " | ".join(parts) + f" deg || [joints] {jt} deg"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Bench driving helper with optional linkage-rate correction")
-    parser.add_argument(
-        "--robot",
-        choices=[*sorted(ROBOT_PROFILES), "auto"],
-        default="auto",
-        help="Robot profile. 'auto' detects only the board profile at startup (default).",
-    )
-    parser.add_argument(
-        "--ip",
-        default="192.168.0.132:8080",
-        metavar="HOST[:PORT]",
-        help="UDP remote IP and optional port (default: 192.168.0.132:8080).",
-    )
-    parser.add_argument(
-        "--config-file",
-        default=None,
-        help="Override PWM servo config path selected by --robot.",
-    )
-    parser.add_argument(
-        "--control-config-file",
-        default=None,
-        help="Override controller/IK/IMU config path selected by --robot.",
-    )
-    parser.add_argument(
-        "--pwm-i2c-bus",
-        type=int,
-        default=None,
-        help="Override PCA9685 Linux I2C bus selected by --robot.",
-    )
-    parser.add_argument(
-        "--pwm-i2c-addr",
-        type=lambda value: int(value, 0),
-        default=None,
-        help="Override PCA9685 I2C address selected by --robot, e.g. 0x40.",
-    )
-    parser.add_argument(
-        "--disable-imu",
-        action="store_true",
-        help="Disable IMU startup (both profiles enable IMU by default).",
-    )
-    parser.add_argument(
-        "--disable",
-        action="store_true",
-        help="Disable toggleable PWM channels so they are left out of control.",
-    )
-    parser.add_argument(
-        "--linkage-rate-correction",
-        action="store_true",
-        help="Start with prototype linkage-rate command correction enabled",
-    )
-    parser.add_argument(
-        "--linkage-rate-table",
-        default=str(DEFAULT_TABLE),
-        help="Path to processed linkage-rate *_summary.csv",
-    )
-    parser.add_argument(
-        "--linkage-rate-universal-table",
-        default=str(DEFAULT_UNIVERSAL_TABLE),
-        help="Path to processed linkage-rate *_universal_shape.csv",
-    )
-    parser.add_argument("--linkage-rate-min-factor", type=float, default=0.35)
-    parser.add_argument("--linkage-rate-max-factor", type=float, default=2.25)
-    parser.add_argument("--vel-kp",        type=float, default=0.04,  help="Velocity PI — proportional gain (cmd units / deg_s error)")
-    parser.add_argument("--vel-ki",        type=float, default=0.008, help="Velocity PI — integral gain")
-    parser.add_argument("--vel-ki-max",    type=float, default=0.4,   help="Velocity PI — I-term anti-windup clamp")
-    parser.add_argument("--vel-deadband",  type=float, default=2.0,   help="Velocity PI — error deadband (deg/s)")
-    parser.add_argument("--vel-max-degps", type=float, default=30.0,  help="Velocity PI — joystick full deflection = this many deg/s")
-    return parser.parse_args()
+# ── sine excitation ───────────────────────────────────────────────────────────
+
+class SineExcitationGenerator:
+    """Modulated sine excitation per Egli & Hutter (IROS 2020 / RA-L 2022).
+
+    s(t) = A·sin(2π·0.02·speed·t + φ₁) · sin(2π·(t + 0.99·sin(2π·0.1·t) + φ₂))
+
+    Different phase offsets per joint give uncorrelated excitation across axes.
+    Frequencies stay below ~2 Hz (above the M545 velocity control cutoff).
+    """
+
+    _PHASES = {
+        'slew':   (0.0,   0.0),
+        'boom':   (1.571, 0.785),
+        'arm':    (3.142, 1.571),
+        'bucket': (4.712, 2.356),
+    }
+
+    def __init__(self, enabled: bool = False):
+        self.enabled       = enabled
+        self.speed_scale   = 1.0
+        self._amp_idx      = 2
+        self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
+        self.start_time    = None
+
+    def toggle(self):
+        self.enabled = not self.enabled
+        if self.enabled:
+            self.start_time = time.perf_counter()
+
+    def cycle_amplitude(self):
+        self._amp_idx = (self._amp_idx + 1) % len(AMPLITUDE_PRESETS)
+        self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
+
+    def get_signal(self, joint: str, t: float) -> float:
+        if not self.enabled:
+            return 0.0
+        if self.start_time is None:
+            self.start_time = t
+        e  = t - self.start_time
+        s  = self.speed_scale
+        φ1, φ2 = self._PHASES[joint]
+        env = np.sin(2.0 * np.pi * 0.02 * s * e + φ1)
+        car = np.sin(2.0 * np.pi * (e + 0.99 * np.sin(2.0 * np.pi * 0.1 * e) + φ2))
+        return self.amplitude_scale * env * car
+
+    def get_all(self, t: float) -> dict:
+        return {n: self.get_signal(n, t) for n in JOINT_NAMES}
 
 
-def resolve_robot_profile(args) -> dict:
-    profile = _resolve_board_profile(args.robot)   # handles 'auto' detection
-    if args.config_file is not None:
-        profile['servo_config_file'] = args.config_file
-        profile['config_file'] = args.config_file
-    if args.control_config_file is not None:
-        profile['control_config_file'] = args.control_config_file
-    if args.pwm_i2c_bus is not None:
-        profile['pwm_i2c_bus'] = args.pwm_i2c_bus
-    if args.pwm_i2c_addr is not None:
-        profile['pwm_i2c_addr'] = args.pwm_i2c_addr
-    if args.disable_imu:
-        profile['enable_imu'] = False
-    return profile
+# ── data logger ───────────────────────────────────────────────────────────────
 
+class DataLogger:
+    """100 Hz hydraulic actuator data recorder for blackbox model training.
+
+    CSV schema matches data_collection/benchmark_actuator_models.py and the
+    IsaacLab training pipeline (sanitize_drive_logs → train_blackbox).
+    """
+
+    def __init__(self, output_dir: Path):
+        self.output_dir  = output_dir
+        self.is_logging  = False
+        self.segment_id  = 0
+        self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._clear()
+
+    def _clear(self):
+        self._t0_wall = None
+        self._t0_mono = None
+        self._ts:   list = []
+        self._idx:  list = []
+        self._seg:  list = []
+        self._man:  list = []
+        self._sin:  list = []
+        self._com:  list = []
+        self._pos:  list = []
+        self._vb:   list = []
+        self._va:   list = []
+        self._vbkt: list = []
+        self._gb:   list = []
+        self._ga:   list = []
+        self._gk:   list = []
+        self._stale: list = []
+        self._age:   list = []
+        self._sine_flag: list = []
+
+    def start(self):
+        self.segment_id = 0
+        self._clear()
+        self._t0_wall = time.time()
+        self._t0_mono = time.perf_counter()
+        self.is_logging = True
+        print(f"\n{'='*60}\n  DATA COLLECTION STARTED\n{'='*60}\n")
+
+    def _start_segment(self):
+        self.segment_id += 1
+        self._clear()
+        self._t0_wall = time.time()
+        self._t0_mono = time.perf_counter()
+        self.is_logging = True
+        print(f"[RESUME] Segment #{self.segment_id} started")
+
+    def log_sample(self, manual: dict, sine: dict, combined: dict,
+                   controller, hardware, cmd_age_s: float, cmd_stale: bool,
+                   sine_enabled: bool):
+        if not self.is_logging:
+            return
+
+        t = time.perf_counter() - self._t0_mono
+
+        pos = controller.get_joint_angles()
+        vels, vel_age = controller.get_joint_velocities_with_age()
+        if vels is not None and vel_age < 0.05:
+            vb, va, vbkt = float(vels[1]), float(vels[2]), float(vels[3])
+        else:
+            vb = va = vbkt = np.nan
+
+        gyro = hardware.try_read_imu_gyro()
+        if gyro is not None:
+            g  = gyro['gyro']
+            gb = list(g[0]) if len(g) > 0 else [np.nan]*3
+            ga = list(g[1]) if len(g) > 1 else [np.nan]*3
+            gk = list(g[2]) if len(g) > 2 else [np.nan]*3
+        else:
+            gb = ga = gk = [np.nan, np.nan, np.nan]
+
+        i = len(self._ts)
+        self._ts.append(t);         self._idx.append(i);           self._seg.append(self.segment_id)
+        self._man.append([manual.get(n, 0.0)   for n in JOINT_NAMES])
+        self._sin.append([sine.get(n, 0.0)     for n in JOINT_NAMES])
+        self._com.append([combined.get(n, 0.0) for n in JOINT_NAMES])
+        self._pos.append(list(pos))
+        self._vb.append(vb);  self._va.append(va);  self._vbkt.append(vbkt)
+        self._gb.append(gb);  self._ga.append(ga);  self._gk.append(gk)
+        self._stale.append(int(bool(cmd_stale)))
+        self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
+        self._sine_flag.append(int(bool(sine_enabled)))
+
+    def n_samples(self) -> int:
+        return len(self._ts)
+
+    def elapsed_min(self) -> float:
+        return (time.time() - self._t0_wall) / 60.0 if self._t0_wall else 0.0
+
+    def save(self) -> Path | None:
+        if not self._ts:
+            print("No data to save.")
+            return None
+
+        import pandas as pd
+
+        man = np.array(self._man);  sin = np.array(self._sin);  com = np.array(self._com)
+        pos = np.array(self._pos)
+        gb  = np.array(self._gb);   ga  = np.array(self._ga);   gk  = np.array(self._gk)
+
+        df = pd.DataFrame({
+            'timestamp': self._ts, 'sample_idx': self._idx, 'segment_id': self._seg,
+            'manual_cmd_slew': man[:,0], 'manual_cmd_boom': man[:,1],
+            'manual_cmd_arm':  man[:,2], 'manual_cmd_bucket': man[:,3],
+            'sine_cmd_slew':   sin[:,0], 'sine_cmd_boom':   sin[:,1],
+            'sine_cmd_arm':    sin[:,2], 'sine_cmd_bucket': sin[:,3],
+            'combined_cmd_slew': com[:,0], 'combined_cmd_boom': com[:,1],
+            'combined_cmd_arm':  com[:,2], 'combined_cmd_bucket': com[:,3],
+            'joint_pos_slew':   pos[:,0], 'joint_pos_boom': pos[:,1],
+            'joint_pos_arm':    pos[:,2], 'joint_pos_bucket': pos[:,3],
+            'joint_vel_boom': self._vb, 'joint_vel_arm': self._va, 'joint_vel_bucket': self._vbkt,
+            'imu_gx_boom': gb[:,0], 'imu_gy_boom': gb[:,1], 'imu_gz_boom': gb[:,2],
+            'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
+            'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
+            'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
+        })
+
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = self.output_dir / f"drive_log_{ts}_seg{self.segment_id:03d}.csv"
+        df.to_csv(out, index=False)
+        print(f"[SAVE] {len(df)} samples ({df['timestamp'].iloc[-1]/60:.2f} min) → {out}")
+        return out
+
+    def save_with_pause(self, direct) -> Path | None:
+        if not self._ts:
+            print("No data to save.")
+            return None
+        was = self.is_logging
+        self.is_logging = False
+        direct.clear()
+        direct.send_pending()
+        time.sleep(0.3)
+        path = self.save()
+        if was:
+            self._start_segment()
+        return path
+
+
+# ── stub controller ───────────────────────────────────────────────────────────
 
 class PWMOnlyController:
-    """Small direct-mode controller facade used when IMUs are disabled."""
+    """Stand-in when IMUs are disabled — no IK, joint state returns zeros."""
 
     def __init__(self, hardware):
         self.hardware = hardware
 
-    def start(self) -> None:
-        return
+    def start(self):                      pass
+    def stop(self):                       pass
+    def suspend_ik_output(self):          pass
+    def resume_ik_output(self):           pass
+    def get_joint_angles(self):           return np.zeros(4, dtype=np.float32)
+    def get_joint_velocities_with_age(self): return None, float('inf')
+    def emergency_stop(self, reset_pump=True): self.hardware.reset(reset_pump=reset_pump)
 
-    def stop(self) -> None:
-        return
 
-    def enter_direct_mode(self) -> None:
-        return
+# ── args / profile ────────────────────────────────────────────────────────────
 
-    def exit_direct_mode(self) -> None:
-        return
+def _parse_args():
+    p = argparse.ArgumentParser(description="Excavator driving + hydraulic data collection")
+    p.add_argument("--robot", choices=[*sorted(ROBOT_PROFILES), "auto"], default="auto")
+    p.add_argument("--ip", default="0.0.0.0:8080", metavar="HOST[:PORT]")
+    p.add_argument("--config-file",         default=None)
+    p.add_argument("--control-config-file", default=None)
+    p.add_argument("--pwm-i2c-bus",  type=int,              default=None)
+    p.add_argument("--pwm-i2c-addr", type=lambda v: int(v, 0), default=None)
+    p.add_argument("--disable-imu",  action="store_true")
+    p.add_argument("--disable",      action="store_true", help="Disable toggleable PWM channels")
+    p.add_argument("--auto-pump",    dest="auto_pump", action="store_true")
+    # data collection
+    p.add_argument("--record",       action="store_true", help="Enable data recording")
+    p.add_argument("--out",          default=str(LOG_OUTPUT_DIR), help="Output dir for drive logs")
+    p.add_argument("--enable-slew",  action="store_true", help="Allow slew in commands and sine")
+    p.add_argument("--sine-test",    action="store_true",
+                   help="Sine driving test mode: inject sine excitation even without logging (starts with sine ON)")
+    p.add_argument("--auto-save-min", type=float, default=10.0, help="Auto-save interval in min (0=off)")
+    # compensation (static, not button-toggled)
+    p.add_argument("--comp", choices=["none", "raw", "universal", "vel-pid"], default="none",
+                   help="Compensation mode (default: none — raw commands)")
+    p.add_argument("--linkage-rate-table",           default=str(DEFAULT_TABLE))
+    p.add_argument("--linkage-rate-universal-table", default=str(DEFAULT_UNIVERSAL_TABLE))
+    p.add_argument("--linkage-rate-min-factor", type=float, default=0.35)
+    p.add_argument("--linkage-rate-max-factor", type=float, default=2.25)
+    p.add_argument("--vel-kp",       type=float, default=0.04)
+    p.add_argument("--vel-ki",       type=float, default=0.008)
+    p.add_argument("--vel-ki-max",   type=float, default=0.4)
+    p.add_argument("--vel-deadband", type=float, default=2.0,  help="deg/s")
+    p.add_argument("--vel-max-degps",type=float, default=30.0, help="deg/s at full stick")
+    return p.parse_args()
 
-    def set_velocity_mode(self, _mode: str) -> None:
-        return
 
-    def get_joint_angles(self):
-        return np.zeros(4, dtype=np.float32)
+def _resolve_profile(args) -> dict:
+    profile = _resolve_board_profile(args.robot)
+    if args.config_file:
+        profile['servo_config_file'] = args.config_file
+        profile['config_file'] = args.config_file
+    if args.control_config_file:
+        profile['control_config_file'] = args.control_config_file
+    if args.pwm_i2c_bus  is not None: profile['pwm_i2c_bus']  = args.pwm_i2c_bus
+    if args.pwm_i2c_addr is not None: profile['pwm_i2c_addr'] = args.pwm_i2c_addr
+    if args.disable_imu:              profile['enable_imu']   = False
+    return profile
 
-    def get_joint_velocities_with_age(self) -> tuple:
-        return None, float('inf')
 
-    def give_direct_commands(self, commands: dict) -> None:
-        self.hardware.send_named_pwm_commands(commands)
+resolve_robot_profile = _resolve_profile
 
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
-    robot_profile = resolve_robot_profile(args)
-    imu_enabled = bool(robot_profile['enable_imu'])
+    args    = _parse_args()
+    profile = _resolve_profile(args)
+    imu_on  = bool(profile['enable_imu'])
 
-    # ---- UDP (mirror drive_logger.py wire format exactly) ----
-    _ip_arg = args.ip
-    if ":" in _ip_arg:
-        _host, _port_str = _ip_arg.rsplit(":", 1)
-        try:
-            _port = int(_port_str)
-        except ValueError:
-            print(f"Invalid port in --ip {_ip_arg!r}; using 8080", file=sys.stderr)
-            _host, _port = _ip_arg, 8080
-    else:
-        _host, _port = _ip_arg, 8080
+    out_dir = Path(args.out)
+    if args.record:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    server = UDPSocket(local_id=2)
-    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
+    ip_str = args.ip
+    _host, _port = (ip_str.rsplit(":", 1)[0], int(ip_str.rsplit(":", 1)[1])) \
+        if ":" in ip_str else (ip_str, 8080)
 
-    # ---- Hardware ----
-    _selected = args.robot
-    _resolved = robot_profile.get('_resolved_board', _selected)
-    _auto_note = f" (auto-detected as '{_resolved}')" if _selected == "auto" else ""
-    print("Initializing hardware...")
-    print(
-        f"Robot: {_selected}{_auto_note} | servo_config={robot_profile['servo_config_file']} | "
-        f"control_config={robot_profile['control_config_file']} | "
-        f"I2C bus={robot_profile['pwm_i2c_bus']} addr=0x{robot_profile['pwm_i2c_addr']:02X} | "
-        f"IMU={'on' if imu_enabled else 'off'} | "
-        f"UDP={_host}:{_port} | "
-        f"toggleable channels={'disabled' if args.disable else 'enabled'}"
-    )
+    # ── hardware ──────────────────────────────────────────────────────────────
     from modules.hardware_interface import HardwareFaultError, HardwareInterface
 
+    print("Initializing hardware...")
     hardware = HardwareInterface(
-        config_file=robot_profile['servo_config_file'],
-        control_config_file=robot_profile['control_config_file'],
-        pump_auto_mode=True,
+        config_file=profile['servo_config_file'],
+        control_config_file=profile['control_config_file'],
+        pump_auto_mode=args.auto_pump,
         toggle_channels=not args.disable,
         stale_timeout_s=0.5,
         enable_pwm=True,
-        enable_imu=imu_enabled,
-        enable_adc=False,           # not needed for plain driving
-        start_imu_reader=imu_enabled,
+        enable_imu=imu_on,
+        enable_adc=False,
+        start_imu_reader=imu_on,
         start_adc_reader=False,
         cleanup_disable_osc=False,
-        pwm_i2c_bus=robot_profile['pwm_i2c_bus'],
-        pwm_i2c_addr=robot_profile['pwm_i2c_addr'],
+        pwm_i2c_bus=profile['pwm_i2c_bus'],
+        pwm_i2c_addr=profile['pwm_i2c_addr'],
     )
 
-    print("Waiting for hardware to be ready...")
     try:
-        while not hardware.is_hardware_ready():
-            time.sleep(0.1)
-        print("Hardware ready.")
+        wait_for_hardware_ready(hardware)
     except HardwareFaultError as e:
-        subsystem = getattr(e, 'subsystem', 'hardware')
-        reason = getattr(e, 'reason', str(e))
-        print(f"\n*** HARDWARE FAULT ({subsystem}): {reason} ***")
-        hardware.shutdown()
-        raise SystemExit(1)
+        print(f"\n*** HARDWARE FAULT ({e.subsystem}): {e.reason} ***")
+        hardware.shutdown(); raise SystemExit(1)
+    except TimeoutError as e:
+        print(f"\n*** {e} ***")
+        hardware.shutdown(); raise SystemExit(1)
 
-    # ---- Controller (direct mode, IK/PID bypassed) ----
+    # ── controller ────────────────────────────────────────────────────────────
     print("Starting controller...")
-    if imu_enabled:
+    if imu_on:
         from modules.excavator_controller import ExcavatorController
-
         controller = ExcavatorController(
-            hardware,
-            config=None,
-            enable_perf_tracking=False,
-            control_config_file=robot_profile['control_config_file'],
+            hardware, config=None, enable_perf_tracking=False,
+            control_config_file=profile['control_config_file'],
         )
     else:
         controller = PWMOnlyController(hardware)
+
     controller.start()
-    if imu_enabled:
-        time.sleep(2.0)             # numba JIT warmup
-    controller.enter_direct_mode()
-    controller.set_velocity_mode('gyro_only')
-    control_joint_names = get_control_joint_names(controller)
-    imu_role_order = get_imu_role_order(controller)
-    print(
-        "Controller in DIRECT mode "
-        f"(velocity feedback: {'gyro_only' if imu_enabled else 'disabled, no IMU'})."
-    )
+    if imu_on:
+        time.sleep(2.0)      # numba JIT warmup
+    direct = DirectController(hardware)
+    controller.suspend_ik_output()
 
-    linkage_compensator = None
-    universal_compensator = None
-    # comp_mode: 0=OFF, 1=raw summary, 2=universal smooth, 3=velocity PID
-    comp_mode = 1 if args.linkage_rate_correction else 0
-    COMP_LABELS = ["OFF", "valve scale (raw)", "pump gain (universal shape)", "velocity PID"]
-    vel_controller = JointVelocityController(
-        kp=args.vel_kp,
-        ki=args.vel_ki,
-        ki_max=args.vel_ki_max,
-        deadband_degps=args.vel_deadband,
-        max_degps=args.vel_max_degps,
-    )
+    ctrl_joint_names = _get_control_joint_names(controller)
+    imu_role_order   = _get_imu_role_order(controller)
 
-    try:
-        linkage_compensator = LinkageRateCompensator(
-            args.linkage_rate_table,
-            min_factor=args.linkage_rate_min_factor,
-            max_factor=args.linkage_rate_max_factor,
-        )
-        print(f"Raw linkage-rate table loaded: {linkage_compensator.table_path}")
-    except Exception as e:
-        print(f"Raw linkage-rate correction unavailable: {e}")
+    # ── compensation setup ────────────────────────────────────────────────────
+    linkage_comp   = None
+    universal_comp = None
+    vel_ctrl       = None
 
-    try:
-        universal_compensator = UniversalShapeCompensator(
-            args.linkage_rate_universal_table,
-            min_factor=args.linkage_rate_min_factor,
-            max_factor=args.linkage_rate_max_factor,
-        )
-        print(f"Universal shape table loaded: {universal_compensator.table_path}")
-    except Exception as e:
-        print(f"Universal shape correction unavailable: {e}")
+    if args.comp in ("raw", "universal"):
+        try:
+            linkage_comp = LinkageRateCompensator(
+                args.linkage_rate_table,
+                min_factor=args.linkage_rate_min_factor,
+                max_factor=args.linkage_rate_max_factor,
+            )
+        except Exception as e:
+            print(f"[WARN] Linkage-rate table unavailable: {e}")
 
-    print(f"Compensation mode: {COMP_LABELS[comp_mode]}")
+    if args.comp == "universal":
+        try:
+            universal_comp = UniversalShapeCompensator(
+                args.linkage_rate_universal_table,
+                min_factor=args.linkage_rate_min_factor,
+                max_factor=args.linkage_rate_max_factor,
+            )
+        except Exception as e:
+            print(f"[WARN] Universal shape table unavailable: {e}")
 
-    # ---- Pump gain trim state ----
+    if args.comp == "vel-pid":
+        if not imu_on:
+            print("[WARN] --comp vel-pid requires IMU; falling back to none")
+            args.comp = "none"
+        else:
+            vel_ctrl = JointVelocityController(
+                kp=args.vel_kp, ki=args.vel_ki, ki_max=args.vel_ki_max,
+                deadband_degps=args.vel_deadband, max_degps=args.vel_max_degps,
+            )
+
     pwm = hardware.pwm_controller
-    pump_gain_available = pwm is not None and pwm.pump_config is not None and pwm.pump_auto_mode
-    pump_gain_us = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
-    pump_gain_last_printed = pump_gain_us
-    if pump_gain_available:
-        print(f"Pump auto gain trim enabled (left paddle). Initial activity_gain_us={pump_gain_us:.1f} µs")
-    else:
-        print("Pump gain trim unavailable (no pump config or auto mode off).")
+    pump_gain_available = pwm is not None and getattr(pwm, 'pump_config', None) and pwm.pump_auto_mode
+    pump_gain_base_us   = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
 
-    # ---- UDP handshake ----
+    print(f"Comp: {args.comp} | pump: {'auto' if args.auto_pump else 'static'}"
+          f" | slew: {'on' if args.enable_slew else 'off'}"
+          f" | record: {'on' if args.record else 'off'}"
+          f" | sine-test: {'on' if args.sine_test else 'off'}")
+
+    # ── RT scheduling (Linux only) ─────────────────────────────────────────────
+    try:
+        from modules.rt_utils import apply_rt_to_thread, SCHED_FIFO
+        apply_rt_to_thread(priority=75, policy=SCHED_FIFO, lock_memory=False)
+    except Exception:
+        pass
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    sine_gen = SineExcitationGenerator(enabled=args.sine_test)
+    logger   = DataLogger(out_dir) if args.record else None
+
+    # ── UDP handshake ─────────────────────────────────────────────────────────
     print("Waiting for remote controller...")
+    server = UDPSocket(local_id=2)
+    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
     if not server.handshake(timeout=30.0):
         print("UDP handshake failed.")
-        controller.exit_direct_mode()
-        controller.stop()
-        hardware.shutdown()
-        raise SystemExit(1)
+        direct.clear(); controller.resume_ik_output(); controller.stop()
+        hardware.shutdown(); raise SystemExit(1)
     server.start_receiving()
-    print(
-        "Connected. Drive with the gamepad. "
-        "Button 0 prints IMU/joint angles, Button 1 reloads config, "
-        "Button 3 cycles compensation mode (OFF / raw / universal smooth).\n"
-    )
+    print("Connected. A=log  B=sine  X=pump  Y=sine-amp\n")
 
-    # ---- Loop state ----
-    loop_period = 1.0 / SAMPLING_FREQUENCY
-    next_run_time = time.perf_counter()
-    prev_loop_time = time.perf_counter()
+    # ── loop state ────────────────────────────────────────────────────────────
+    loop_period     = 1.0 / SAMPLING_FREQUENCY
+    next_run_time   = time.perf_counter()
+    prev_loop_time  = time.perf_counter()
 
-    right_rl = right_ud = left_rl = left_ud = 0.0
-    right_paddle = left_paddle = 0.0
-    mask_prev = 0
+    right_rl = right_ud = left_rl = left_ud = right_paddle = left_paddle = 0.0
+    last_cmd_mono = None
+    mask_prev     = 0
 
-    print_angles = False
-    iter_count = 0
+    last_status_time    = time.time()
+    last_auto_save_time = time.time()
+    print_imu           = False
+    iter_count          = 0
 
     try:
         while True:
-            now = time.perf_counter()
-            actual_dt = now - prev_loop_time
-            prev_loop_time = now
+            now      = time.time()
+            loop_now = time.perf_counter()
+            actual_dt = loop_now - prev_loop_time
+            prev_loop_time = loop_now
 
+            # ── 1. receive ────────────────────────────────────────────────────
             raw = server.get_latest() or []
             if raw:
-                float_axes = UDPSocket.ints_to_floats(raw[:8])
+                fl   = UDPSocket.ints_to_floats(raw[:8])
                 mask = raw[8]
 
-                # Axes: <8bH wire format from MotionPlatform
-                right_rl    = float_axes[0]   # scoop
-                right_ud    = float_axes[1]   # lift
-                # float_axes[2] = right_rocker (unused)
-                left_rl     = float_axes[3]   # rotate (slew)
-                left_ud     = float_axes[4]   # tilt
-                # float_axes[5] = left_rocker (unused)
-                right_paddle = float_axes[6]  # trackR
-                left_paddle  = float_axes[7]  # trackL
+                right_rl     = fl[0]
+                right_ud     = fl[1]
+                left_rl      = fl[3]
+                left_ud      = fl[4]
+                right_paddle = fl[6]
+                left_paddle  = fl[7]
+                last_cmd_mono = time.monotonic()
 
-                def btn(bit):      return bool(mask & (1 << bit))
-                def btn_prev(bit): return bool(mask_prev & (1 << bit))
+                def btn(b):  return bool(mask & (1 << b))
+                def prev(b): return bool(mask_prev & (1 << b))
 
-                # Button A (bit 0): toggle mounting-corrected IMU + joint angle printing.
-                if btn(0) and not btn_prev(0):
-                    if imu_enabled:
-                        print_angles = not print_angles
-                        hardware.set_debug_telemetry_enabled(print_angles)
-                        state = "ON" if print_angles else "OFF"
-                        print(f"\n[Button A] IMU/joint angle print {state}")
+                # A: toggle logging
+                if btn(0) and not prev(0):
+                    if logger is None:
+                        print("\n[Button A] --record not set; logging disabled")
+                    elif not logger.is_logging:
+                        logger.start()
                     else:
-                        print("\n[Button A] IMU/joint angle print unavailable (IMU is disabled)")
+                        logger.save_with_pause(direct)
+                        logger.is_logging = False
 
-                # Button B (bit 1): reload PWM/servo config for live valve tuning.
-                if btn(1) and not btn_prev(1):
-                    ok = hardware.reload_config()
-                    state = "OK" if ok else "FAILED"
-                    print(f"\n[Button B] reload config {state}")
+                # B: toggle sine
+                if btn(1) and not prev(1):
+                    sine_gen.toggle()
+                    state = "ON" if sine_gen.enabled else "OFF"
+                    print(f"\n[Button B] Sine {state} (amp={sine_gen.amplitude_scale:.2f})")
 
-                # Button X (bit 2): pump toggle (handy on the bench).
-                if btn(2) and not btn_prev(2):
-                    if hardware.pwm_controller is not None:
-                        new_state = not hardware.pwm_controller.pump_enabled
-                        hardware.pwm_controller.set_pump_enabled(new_state)
-                        print(f"\n[Button X] pump {'ON' if new_state else 'OFF'}")
+                # X: pump toggle
+                if btn(2) and not prev(2):
+                    if pwm is not None:
+                        new_state = not pwm.pump_enabled
+                        hardware.set_pump_enabled(new_state)
+                        print(f"\n[Button X] Pump {'ON' if new_state else 'OFF'}")
 
-                # Button Y (bit 3): cycle compensation mode OFF → raw → universal smooth → velocity PID.
-                if btn(3) and not btn_prev(3):
-                    old_comp_mode = comp_mode
-                    comp_mode = (comp_mode + 1) % 4
-                    if comp_mode == 1 and linkage_compensator is None:
-                        comp_mode = (comp_mode + 1) % 4
-                    if comp_mode == 2 and universal_compensator is None:
-                        comp_mode = (comp_mode + 1) % 4
-                    if comp_mode == 3 and not imu_enabled:
-                        comp_mode = (comp_mode + 1) % 4
-                    # reset integrator when leaving velocity PID mode
-                    if old_comp_mode == 3 and comp_mode != 3:
-                        vel_controller.reset()
-                    print(f"\n[Button Y] compensation mode: {COMP_LABELS[comp_mode]}")
+                # Y: cycle sine amplitude
+                if btn(3) and not prev(3):
+                    sine_gen.cycle_amplitude()
+                    print(f"\n[Button Y] Sine amplitude → {sine_gen.amplitude_scale:.2f}")
 
                 mask_prev = mask
 
-            # Direct-mode commands straight from the joystick.
-            canonical_commands = {
-                'rotate':    left_rl,
-                'lift_boom': right_ud,
-                'tilt_boom': left_ud,
-                'scoop':     right_rl,
-                'trackR':    right_paddle,
-                'trackL':    left_paddle,
+            # ── 2. build commands ─────────────────────────────────────────────
+            is_logging = logger is not None and logger.is_logging
+
+            manual = {
+                'slew':   left_rl if args.enable_slew else 0.0,
+                'boom':   right_ud,
+                'arm':    left_ud,
+                'bucket': right_rl,
             }
+
+            t = time.perf_counter()
+            sine_active = is_logging or args.sine_test
+            sine = sine_gen.get_all(t) if sine_active else {n: 0.0 for n in JOINT_NAMES}
+            if not args.enable_slew:
+                sine['slew'] = 0.0
+
+            combined = {n: float(np.clip(manual[n] + sine[n], -1.0, 1.0)) for n in JOINT_NAMES}
+            combined['trackR'] = right_paddle
+            combined['trackL'] = left_paddle
+
+            # ── 3. compensation ───────────────────────────────────────────────
             joint_angles = controller.get_joint_angles()
 
-            # Mode 1: scale valve commands per-joint (valve curves are affected).
-            # Mode 2: valve commands untouched — correction goes to pump gain only.
-            # Mode 3: closed-loop velocity PI — joystick sets desired deg/s, gyro is feedback.
-            if comp_mode == 1 and linkage_compensator is not None:
-                canonical_commands = linkage_compensator.apply(canonical_commands, joint_angles)
-            elif comp_mode == 3 and imu_enabled:
-                # TODO: add linkage feed-forward — apply linkage_compensator to commands first,
-                # then run vel_controller on top. Reduces initial tracking error at positions
-                # where valve effectiveness drops (e.g. full arm extension), without relying
-                # solely on the integrator to catch up.
-                joint_vels, vel_age = controller.get_joint_velocities_with_age()
+            if args.comp == "raw" and linkage_comp is not None:
+                combined = linkage_comp.apply(combined, joint_angles)
+            elif args.comp == "vel-pid" and vel_ctrl is not None:
+                vels, vel_age = controller.get_joint_velocities_with_age()
                 if vel_age < 0.05:
-                    canonical_commands = vel_controller.apply(canonical_commands, joint_vels, actual_dt)
+                    combined = vel_ctrl.apply(combined, vels, actual_dt)
                 else:
-                    vel_controller.reset()
-            controller.give_direct_commands(canonical_commands)
+                    vel_ctrl.reset()
 
-            # Left paddle: trim the pump activity_gain_us base level.
-            # In mode 2 this base is then further modulated by linkage position below.
-            if pump_gain_available and abs(left_paddle) > 0.05:
-                raw = pump_gain_us + left_paddle * PUMP_GAIN_ADJUST_RATE * loop_period
-                pump_gain_us = float(np.clip(raw, 0.0, pwm.pump_config.pulse_max - pwm.pump_config.pulse_min))
-                if abs(pump_gain_us - pump_gain_last_printed) >= PUMP_GAIN_PRINT_THRESHOLD:
-                    print(f"\n[pump gain base] activity_gain_us={pump_gain_us:.1f} µs")
-                    pump_gain_last_printed = pump_gain_us
+            # ── 4. send ───────────────────────────────────────────────────────
+            direct.give_commands(combined)
+            direct.send_pending()
 
-            # Apply pump gain: base level, optionally modulated by linkage shape (mode 2).
+            # ── 5. pump gain (universal shape) ────────────────────────────────
             if pump_gain_available:
-                if comp_mode == 2 and universal_compensator is not None:
-                    factor = universal_compensator.pump_correction_factor(canonical_commands, joint_angles)
-                else:
-                    factor = 1.0
-                pwm.set_pump_activity_gain_us(pump_gain_us * factor)
+                factor = (universal_comp.pump_correction_factor(combined, joint_angles)
+                          if args.comp == "universal" and universal_comp is not None else 1.0)
+                pwm.set_pump_activity_gain_us(pump_gain_base_us * factor)
 
-            # Live IMU readout — only when toggled on, decimated to ~10Hz.
+            # ── 6. log ────────────────────────────────────────────────────────
+            if is_logging:
+                cmd_age_s = np.nan
+                cmd_stale = True
+                if last_cmd_mono is not None:
+                    cmd_age_s = max(0.0, time.monotonic() - last_cmd_mono)
+                    cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
+                logger.log_sample(manual, sine, combined, controller, hardware,
+                                  cmd_age_s, cmd_stale, sine_gen.enabled)
+
+            # ── 7. auto-save ──────────────────────────────────────────────────
+            if (is_logging and args.auto_save_min > 0
+                    and (now - last_auto_save_time) >= args.auto_save_min * 60):
+                last_auto_save_time = now
+                logger.save_with_pause(direct)
+
+            # ── 8. IMU print (decimated) ──────────────────────────────────────
             iter_count += 1
-            if print_angles and (iter_count % PRINT_DECIMATION == 0):
-                line = format_imu_debug_line(
+            if print_imu and imu_on and (iter_count % PRINT_DECIMATION == 0):
+                print(_format_imu_line(
                     hardware.read_imu_debug_quaternions(),
-                    controller.get_joint_angles(),
-                    control_joint_names,
-                    imu_role_order,
-                )
-                # \r keeps the readout on a single line; the toggle prints
-                # above use a leading newline so they don't get overwritten.
-                print(line, end="\r", flush=True)
+                    joint_angles, ctrl_joint_names, imu_role_order,
+                ), end="\r", flush=True)
 
-            # Tight 100Hz pacing.
+            # ── 9. status ─────────────────────────────────────────────────────
+            if now - last_status_time >= STATUS_PRINT_INTERVAL_S:
+                last_status_time = now
+                pump_on  = bool(pwm and pwm.pump_enabled)
+                sine_str = f"ON amp={sine_gen.amplitude_scale:.2f}" if sine_gen.enabled else "OFF"
+                print(
+                    f"[STATUS] pump={'ON' if pump_on else 'OFF'} | sine={sine_str} | "
+                    + (f"log=ON {logger.elapsed_min():.1f}min {logger.n_samples()} samples"
+                       if is_logging else "log=OFF")
+                )
+                print(f"[JOINTS] slew={joint_angles[0]:+.1f} boom={joint_angles[1]:+.1f} "
+                      f"arm={joint_angles[2]:+.1f} bucket={joint_angles[3]:+.1f} deg")
+
+            # ── 10. timing ────────────────────────────────────────────────────
             next_run_time += loop_period
             sleep_time = next_run_time - time.perf_counter()
             if sleep_time > 0:
@@ -594,18 +716,24 @@ def main():
                 next_run_time = time.perf_counter()
 
     except KeyboardInterrupt:
-        print("\n\nInterrupted (Ctrl+C).")
+        print("\nInterrupted (Ctrl+C).")
     finally:
         print("Shutting down...")
-        try:
-            controller.give_direct_commands({})       # zero outputs
+        if logger is not None and logger.n_samples() > 0:
+            logger.is_logging = False
+            direct.clear()
+            direct.send_pending()
             time.sleep(0.2)
-            controller.exit_direct_mode()
+            logger.save()
+        try:
+            controller.emergency_stop(reset_pump=True)
+        except Exception:
+            pass
+        try:
             controller.stop()
         except Exception:
             pass
         try:
-            hardware.reset(reset_pump=True)
             hardware.shutdown()
         except Exception:
             pass

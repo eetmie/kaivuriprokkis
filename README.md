@@ -111,11 +111,11 @@ a thin Tk client shows the ideal X line vs. the measured EE travel and the
 tracking-error stats per stroke.
 
 ```bash
-# robot side (default binds 192.168.0.132:8091)
-sudo .venv/bin/python tools/pid_tuner_ee.py
+# robot side — starts both per-joint (port 8090) and EE-plane (port 8091) handlers
+sudo .venv/bin/python -m tools.pid_tuner.robot
 
-# operator laptop
-python tools/pid_tuner_ee_client.py 192.168.0.132 8091
+# operator laptop — tabbed GUI with Per-Joint and EE Tracking tabs
+python -m tools.pid_tuner.client 192.168.0.132
 ```
 
 What it does:
@@ -158,8 +158,8 @@ target):
   the operating point you care about most.
 
 The tuner runs paused until the client sends `START`, and PIDs zero outputs
-when paused. See the file docstrings in `tools/pid_tuner_ee.py` and
-`tools/pid_tuner_ee_client.py` for the full CLI, wire format, and algorithm
+when paused. See the docstrings in `tools/pid_tuner/robot.py` and
+`tools/pid_tuner/client.py` for the full CLI, wire format, and algorithm
 notes.
 
 ## Sim Replay Flow
@@ -188,7 +188,7 @@ To compare sim and IRL against the same obstacle layout:
 | `pathing/` | Shared planner package, identical to the sim pathing package. |
 | `configuration_files/` | Task, environment, and execution settings. |
 | `modules/` | Hardware interface, controller, math, and realtime helpers. |
-| `tools/` | Developer/diagnostic tools. `pid_tuner_ee.py` + client for EE-plane PID tuning. |
+| `tools/pid_tuner/` | PID tuner package: `robot.py` (robot server) + `client.py` (PC GUI) + `common.py` (shared protocol). |
 | `logs_hw/` | Hardware logs when `--log` is enabled. Created at runtime. |
 
 The other folders and scripts are mostly for prototypes, hardware bring-up,

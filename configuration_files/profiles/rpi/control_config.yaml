@@ -12,7 +12,7 @@ imu:
   # Startup gyro-bias calibration is automatic in Pico firmware: 30 s stationary
   # measurement, firmware-owned thresholds, and a host calibration report.
   # Named IMU mapping: logical role -> physical sensor index
-  # Joint roles (boom, arm, bucket) feed the IK pipeline; base is supplementary
+  # The base IMU is the slew/yaw source; all joints are IMU-only.
   # The mapping length defines the expected IMU count from firmware
   imu_mapping:
     base: 1
@@ -21,8 +21,7 @@ imu:
     bucket: 3
   # IMU role chain and extraction rules for canonical controller joints.
   # imu_mapping above can be changed when sensors are wired/enumerated differently.
-  # Use parent_role: null for a gravity/level parent. If base is omitted from
-  # imu_mapping, lift falls back to that same level-gravity parent.
+  # Use parent_role: null for a gravity/level parent.
   chain:
     - joint: slew
       output_index: 0
@@ -69,47 +68,52 @@ imu:
     bucket: [1.0, 0.0, 0.0, 0.0]
 
 robot:
-  frame:
-    # Ground to slew/cabin rotation origin
-    origin_height_m: 0.07 #0.075
-  links:
-    # Vector from slew origin to first boom pivot in slew-local coordinates
-    boom_mount_offset_m: [0.0165, 0.0, 0.0645]
-    boom_length_m: 0.468
-    arm_length_m: 0.250
-    # Link from arm joint to tool coupler center
-    coupler_length_m: 0.031
-  tools:
-    active: default_bucket_tip
-    presets:
-      default_bucket_tip:
-        # Local-frame offset from coupler center to tool tip / working point
-        tip_offset_m: [0.0, 0.0, -0.142]
+  # URDF-style chain. Each joint has a fixed translation from its parent's
+  # rotated frame (parent_to_joint_xyz) and a unit rotation axis. The tool
+  # has a single rigid offset from the last joint's rotated frame to the
+  # working point. Adding a joint = one extra entry below.
+  joints:
+    - name: slew
+      axis: [0.0, 0.0, 1.0]
+      parent_to_joint_xyz: [0.0, 0.0, 0.07]      # ground -> slew origin
+    - name: boom
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.0165, 0.0, 0.0645] # slew -> boom pivot
+    - name: arm
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.468, 0.0, 0.0]     # boom -> arm pivot
+    - name: bucket
+      axis: [0.0, 1.0, 0.0]
+      parent_to_joint_xyz: [0.250, 0.0, 0.0]     # arm  -> bucket pivot
+  tool:
+    # Bucket pivot -> tool tip. Combines coupler length (0.031 along bucket x)
+    # with bucket tip drop (-0.142 along bucket z).
+    parent_to_tip_xyz: [0.031, 0.0, -0.142]
 
 pid:
   # PID controller gains for each joint
   # Joint 0: Slew (base rotation)
   joint0:
-    kp: 5.500 #6
-    ki: 0.200
-    kd: 0.250 # try to increase?
+    kp: 7.000
+    ki: 0.000
+    kd: 0.200
 
-  # Joint 1: Boom (lift arm)
+  # Joint 1: Boom
   joint1:
     kp: 10.000
-    ki: 0.400
+    ki: 1.000
     kd: 0.000
 
-  # Joint 2: Arm (tilt)
+  # Joint 2: Arm
   joint2:
     kp: 10.000
-    ki: 0.400
+    ki: 1.000
     kd: 0.000
 
-  # Joint 3: Bucket (scoop)
+  # Joint 3: Bucket
   joint3:
-    kp: 5.000
-    ki: 0.250
+    kp: 10.000
+    ki: 1.000
     kd: 0.000
 
 controller:
@@ -124,31 +128,6 @@ controller:
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
   per_joint_max_velocity: [0.10, 0.12, 0.12, 0.12]
-
-  # Joint velocity estimation mode for controller telemetry/velocity-aware IK
-  # - fd_only: stock behavior (finite-difference from joint angles)
-  # - gyro_only: use IMU gyro rates for boom/arm/bucket (slew remains FD)
-  # - fused: blend gyro + FD for boom/arm/bucket (slew remains FD)
-  gyro_velocity_mode: "fd_only"
-
-  # Blend factor for fused mode: v = alpha*gyro + (1-alpha)*fd
-  # Only used when gyro_velocity_mode: "fused"
-  gyro_blend_alpha: 0.30
-
-  # Gyro data freshness timeout (seconds)
-  # If gyro sample is stale longer than this, controller falls back to FD
-  gyro_timeout_s: 0.08
-
-  # Sanity clamp for gyro-derived joint speed magnitude (deg/s)
-  gyro_max_abs_degps: 180.0
-
-  # Slow online bias compensation for gyro-derived joint velocity
-  gyro_bias_comp:
-    enabled: False
-    # Consider near-stationary below this magnitude (deg/s)
-    stationarity_degps: 1.5
-    # Bias adaptation gain per control update (0..1)
-    adaptation_rate: 0.01
 
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController
@@ -217,5 +196,5 @@ ik:
 reachability:
   enabled: true
   pos_tol_m: 0.005          # Convergence tolerance (m)
-  max_iters: 80             # Hard iteration cap per check
+  max_iters: 20             # Hard iteration cap per check
   min_target_delta_m: 0.002 # Skip re-check when joystick moves less than this

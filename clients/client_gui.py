@@ -44,6 +44,7 @@ class ExcavatorGUI3D:
     DEFAULT_X = 0.6
     DEFAULT_Y = 0.0
     DEFAULT_Z = 0.0
+    ORIGIN_HEIGHT_M = 0.07
 
     UDP_HOST = "192.168.0.132"
     UDP_PORT = 8080
@@ -172,7 +173,7 @@ class ExcavatorGUI3D:
         title.grid(row=0, column=0, columnspan=3, pady=(0, 8))
 
         # 3D Visualizer
-        self.visualizer = ArmVisualizer(main, self.WORKSPACE_LIMITS)
+        self.visualizer = ArmVisualizer(main, self.WORKSPACE_LIMITS, origin_height_m=self.ORIGIN_HEIGHT_M)
         canvas_widget = self.visualizer.get_canvas_widget()
         canvas_widget.grid(row=1, column=0, columnspan=3, sticky=(tk.N, tk.S, tk.E, tk.W))
 
@@ -543,10 +544,9 @@ class ExcavatorGUI3D:
         self.measured_rot_y = telemetry.measured_pose.rot_y_deg
         self._has_telemetry = True
         mode_name = "DIRECT" if telemetry.mode == ControlMode.DIRECT else "IK"
-        fusion = "fused" if telemetry.slew_fusion_active else ("enc" if telemetry.slew_fusion_enabled else "off")
-        self.root.after(0, self._apply_telemetry_to_view, self.joint_positions, mode_name, fusion)
+        self.root.after(0, self._apply_telemetry_to_view, self.joint_positions, mode_name)
 
-    def _apply_telemetry_to_view(self, joint_positions, mode_name: str, fusion: str):
+    def _apply_telemetry_to_view(self, joint_positions, mode_name: str):
         if self._sync_target_from_telemetry and not self.direct_mode:
             if self._sync_target_from_measured():
                 self._sync_target_from_telemetry = False
@@ -555,7 +555,7 @@ class ExcavatorGUI3D:
             joint_positions=joint_positions,
         )
         self.visualizer.request_redraw(self.root)
-        self.recv_label.config(text=f"Recv: {mode_name} {fusion}")
+        self.recv_label.config(text=f"Recv: {mode_name}")
 
     def _update_hz(self, hz: float):
         self.hz_label.config(text=f"Send Hz: {hz:4.1f}")

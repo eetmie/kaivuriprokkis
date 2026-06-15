@@ -19,12 +19,12 @@ from pathlib import Path
 import threading
 import yaml
 
-from .PCA9685_controller import PWMController
+from .pwm import PWMController
 try:
     from .usb_serial_reader import USBSerialReader
 except Exception:
     USBSerialReader = None  # type: ignore
-from .quaternion_math import (
+from .ik import (
     quat_normalize,
     quat_multiply,
     quat_conjugate,
@@ -529,17 +529,17 @@ class HardwareInterface:
                         for i in range(self._expected_imu_count)
                     ]
                     capture_debug = self._debug_telemetry_enabled
-                    gyro_only = [
+                    corrected_gyro = [
                         self._correct_imu_gyro(np.array(pkt[4:7], dtype=np.float32), i)
                         for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
                     ]
                     # Build all derived values before acquiring the lock so the
                     # lock hold time is just a burst of reference assignments.
-                    new_imu_gyro = [gyro_only[i] for i in self._imu_joint_indices] if gyro_only is not None else None
+                    new_imu_gyro = [corrected_gyro[i] for i in self._imu_joint_indices]
                     new_device_ts = getattr(self.usb_reader, 'last_timestamp_us', None)
                     new_base_imu_gyro = (
-                        gyro_only[self._base_imu_index].copy()
-                        if gyro_only is not None and self._base_imu_index is not None else None
+                        corrected_gyro[self._base_imu_index].copy()
+                        if self._base_imu_index is not None else None
                     )
 
                     # Validate quaternion magnitudes for all configured IMUs (should be ~1.0).
@@ -993,7 +993,6 @@ class HardwareInterface:
         if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
             return False
         try:
-            print(commands)
             self.pwm_controller.update_named(commands,
                                              unset_to_zero=unset_to_zero,
                                              command_ts=command_ts)
@@ -1001,6 +1000,43 @@ class HardwareInterface:
         except Exception as e:
             self.logger.error(f"PWM named command error: {e}")
             return False
+
+    def send_named_pwm_pulse_us(self, commands: Dict[str, float], *,
+                                unset_to_center: Optional[bool] = None,
+                                command_ts: Optional[float] = None) -> bool:
+        """Send name-based direct PWM pulse-width commands in microseconds.
+
+        Unknown names are ignored. Values are clamped to each channel's configured
+        pulse_min/pulse_max range by the PWM controller.
+        """
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return False
+        try:
+            self.pwm_controller.update_named_us(commands,
+                                                unset_to_center=unset_to_center,
+                                                command_ts=command_ts)
+            return True
+        except Exception as e:
+            self.logger.error(f"PWM direct pulse command error: {e}")
+            return False
+
+    def set_named_pwm_pulse_us(self, commands: Dict[str, float], *,
+                               unset_to_center: Optional[bool] = None,
+                               command_ts: Optional[float] = None) -> bool:
+        """Alias for send_named_pwm_pulse_us() with explicit direct-set naming."""
+        return self.send_named_pwm_pulse_us(commands,
+                                            unset_to_center=unset_to_center,
+                                            command_ts=command_ts)
+
+    def get_current_pwm_pulses_us(self) -> Dict[str, float]:
+        """Return last commanded pulse widths by PWM channel name, in microseconds."""
+        if self._pwm_state != ReadyState.READY or self.pwm_controller is None:
+            return {}
+        try:
+            return self.pwm_controller.get_current_pulses_us()
+        except Exception as e:
+            self.logger.error(f"PWM pulse readback error: {e}")
+            return {}
 
     def set_pump_enabled(self, enabled: bool, *, flush: bool = True) -> bool:
         """Enable or disable the hydraulic pump immediately."""

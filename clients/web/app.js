@@ -15,11 +15,10 @@ import URDFLoader from '/vendor/urdf-loader/URDFLoader.js';
 // The URDF is authored Z-up; tell Three.js to treat Z as the world up vector.
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
-// TODO: read from server config once exposed over SSE.
 // Matches robot.frame.origin_height_m in control_config.yaml.
 // IK world origin is this many metres below the slew joint (URDF world origin),
 // so all IK coordinates must be shifted down by this amount before rendering.
-const IK_ORIGIN_Z_OFFSET = 0.075;
+const IK_ORIGIN_Z_OFFSET = 0.07;
 
 const viewport = document.getElementById('viewport');
 
@@ -47,7 +46,7 @@ scene.add(fill);
 // Ground plane — a faint checker for depth perception
 const grid = new THREE.GridHelper(4, 20, 0x304050, 0x243040);
 grid.rotation.x = Math.PI / 2;
-grid.position.z = -0.075;
+grid.position.z = -IK_ORIGIN_Z_OFFSET;
 scene.add(grid);
 
 // World-origin axis helper (X red / Y green / Z blue)

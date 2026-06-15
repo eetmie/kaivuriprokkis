@@ -1,0 +1,230 @@
+IK rewrite TODO
+===============
+
+Goal
+----
+Build a smaller, excavator-focused kinematics module that is easy to reason
+about from the bottom up. Internal math should use quaternions and radians.
+Degrees and UI-friendly units should exist only at config, logging, UI, or
+external API boundaries.
+
+Core direction
+--------------
+- Convert corrected IMU readings to canonical joint angles as early as possible.
+- Treat canonical joint angles in radians as the main internal state:
+  [slew, boom, arm, bucket, ...]
+- Avoid exposing absolute link quaternions to ordinary callers.
+- Prefer one rich state calculation over many small wrappers. It is cheaper and
+  clearer to calculate FK/Jacobian/metrics once and return more data than each
+  caller currently needs.
+- It is acceptable for top-level scripts/tools to break during this rewrite.
+  Rebuild from the IK bottom upward.
+
+Robot model config target
+-------------------------
+Use a fixed but extendable joint list. Static offsets are modeled as transforms
+from the parent frame to the next joint frame. Revolute joints are one-DOF with
+an explicit local axis vector.
+
+Preferred YAML shape:
+
+robot:
+  joints:
+    - name: slew
+      axis: [0, 0, 1]
+      parent_to_joint_xyz: [0.0, 0.0, 0.07]
+    - name: boom
+      axis: [0, 1, 0]
+      parent_to_joint_xyz: [0.0165, 0.0, 0.0645]
+    - name: arm
+      axis: [0, 1, 0]
+      parent_to_joint_xyz: [0.468, 0.0, 0.0]
+    - name: bucket
+      axis: [0, 1, 0]
+      parent_to_joint_xyz: [0.250, 0.0, 0.0]
+
+  tool:
+    parent_to_tip_xyz: [0.031, 0.0, -0.142]
+
+Notes:
+- This mirrors URDF semantics enough for our use: fixed transforms plus
+  revolute joint axes.
+- Adding one extra robot link should mean appending one joint entry.
+- Axis should be accepted as a vector, not stiff strings like "y".
+- Keep the model excavator-specific in naming and assumptions, but avoid hard
+  coding exactly four links in the math if a fifth wrist/tool joint is easy.
+
+Main data objects
+-----------------
+Define one main state object returned by a single calculation, e.g.
+get_state(q_rad, model) or evaluate_state(q_rad, model).
+
+It should return at least:
+- joint_names
+- joint_angles_rad
+- joint_origins_world
+- joint_axes_world
+- link_poses / link_positions / link_orientations
+- ee_position
+- ee_orientation
+- jacobian
+- condition_number
+- singular_values
+- yoshikawa_index
+
+Rationale:
+- Reachability, safety, GUI, telemetry, and IK all need overlapping pieces.
+- The current code has many wrappers that recompute FK/quats/Jacobian from the
+  same input. Collapse that into one pass.
+- Perf logging becomes simpler when the pipeline has fewer repeated calls.
+
+Core functions target
+---------------------
+Keep public IK/FK functions minimal. Candidate final surface:
+
+- joint_angles_from_imus(imu_quats, sensor_config, model) -> q_rad
+- get_state(q_rad, model, include_jacobian=True) -> RobotKinematicState
+- solve_ik_step(q_rad, target, model, ik_config, dt, state=None) -> IKResult
+- rad_to_deg(...), deg_to_rad(...) only if useful at boundaries
+
+Avoid keeping several public variants like:
+- get_pose_from_joint_angles
+- get_all_poses_from_joint_angles
+- compute_jacobian
+- compute_jacobian_from_joint_angles
+- get_joint_positions
+- joint_angles_to_absolute_quaternions
+
+Those can be temporary compatibility wrappers during migration, but the final
+API should not expose many partial views of the same calculation.
+
+IK solve result
+---------------
+solve_ik_step(...) should return a rich result, not just target joint angles:
+
+- q_next_rad
+- dq_rad
+- task_error
+- rejected / clamped flags
+- reason string when rejected
+- jacobian
+- condition_number
+- singular_values
+- yoshikawa_index
+- maybe the RobotKinematicState used for the solve
+
+This lets the main controller, reachability check, safety gates, and telemetry
+share the same computed diagnostics.
+
+Reachability
+------------
+Keep reachability in mind while designing the new state API.
+
+Current reachability simulates IK rollouts and checks condition number. It
+should use the same get_state()/solve_ik_step() path as live control so it does
+not drift from runtime behavior.
+
+Reachability should not recompute independent FK/Jacobian/metrics if the IK
+step result already contains them.
+
+Command semantics
+-----------------
+Update give_pose / command APIs after the kinematics base is clean.
+
+Absolute pose command:
+- Input should be explicit real values, not normalized values.
+- Target shape: XYZ + pitch + roll + yaw, likely in meters + radians inside the
+  controller boundary.
+- UI/external callers may use degrees, but convert at the boundary.
+- If user requests a DOF the excavator cannot produce, warn clearly and skip or
+  project it out. Example: roll command on a no-roll machine.
+
+Relative command:
+- Decide and document whether relative commands are real deltas or normalized
+  "string pulling" commands.
+- Preferred split:
+  - relative real pose delta: dx, dy, dz, dpitch, droll, dyaw
+  - normalized jog command: separate API/name, e.g. jog_pose(...) or
+    give_normalized_twist(...)
+- Avoid one API where "relative" sometimes means physical delta and sometimes
+  means normalized joystick intent.
+
+Mode behavior:
+- give_pose(...) can use absolute or relative behavior depending on the current
+  toggled mode, but the mode and units must be explicit in logs/docs.
+- Consider accepting an explicit mode argument later to avoid hidden state.
+
+IMU / slew yaw follow-up
+------------------------
+Test base-only vs averaged slew yaw before changing behavior.
+
+Current open question:
+- source=all averages Z twist from corrected IMUs.
+- source=base would simplify the IMU structure and avoid downstream yaw drift
+  leaking into slew.
+
+Test with real logs:
+- Static machine for drift comparison.
+- Move boom/arm/bucket while not slewing; yaw should stay stable.
+- Slew while holding arm pose; yaw should follow smoothly.
+- Compare base-only, all-average, and robust median/trimmed circular yaw.
+
+If base-only wins, simplify sensor config toward:
+
+imu:
+  yaw_source: base
+  joints:
+    boom: gravity_pitch_delta(base, boom)
+    arm: gravity_pitch_delta(boom, arm)
+    bucket: gravity_pitch_delta(arm, bucket)
+
+Migration plan
+--------------
+1. Add new excavator model dataclasses and YAML loader for robot.joints/tool.
+2. Implement get_state(q_rad, model) using the new fixed-transform chain.
+3. Validate new FK/Jacobian against current tests before deleting old math.
+4. Implement solve_ik_step(...) returning IKResult with metrics.
+5. Move IMU extraction to a small sensing/excavator module that outputs q_rad.
+6. Port reachability to use get_state()/solve_ik_step().
+7. Port ExcavatorController state update and IK loop.
+8. Port ROS nodes, GUI telemetry, tuning tools, and debug scripts.
+9. Delete compatibility wrappers and old RobotConfig fields.
+10. Simplify control_config.yaml after all call sites use the new model.
+
+Deletion candidates after migration
+-----------------------------------
+- get_pose_from_joint_angles
+- get_all_poses_from_joint_angles
+- compute_jacobian
+- compute_jacobian_from_joint_angles
+- get_joint_positions
+- joint_angles_to_absolute_quaternions
+- generic link_lengths/link_directions/origin_offset/ee_offset RobotConfig model
+- unused IK methods/config options if no real profile selects them
+- small legacy tests that only protect removed flexibility, e.g. optional/missing
+  IMU layouts, generic chain behavior, or one-off compatibility wrappers
+
+Test cleanup direction
+----------------------
+The final stack should assume one configured IMU role per physical link/joint
+unless a real robot variant proves otherwise. Remove tests that preserve old
+generic behavior for its own sake, such as "can run without base IMU" or other
+partial-IMU layouts, once the new sensor model is explicit.
+
+Keep tests that validate real behavior:
+- IMU readings convert to canonical q_rad in the configured role order.
+- Slew yaw source behavior is tested against real logs (base-only vs averaged).
+- FK state from q_rad matches expected excavator geometry.
+- Jacobian and metrics are produced by get_state()/solve_ik_step().
+- Reachability uses the same state/IK path as live control.
+
+Design reminders
+----------------
+- Prefer explicit names over generic wrappers.
+- Prefer one rich return object over many small calls.
+- Keep radians internally.
+- Keep quaternions internally for orientation math, but do not make ordinary
+  callers pass absolute link quats around.
+- Make warnings actionable when commands ask for impossible DOFs.
+- Keep the module understandable enough that reading the control stack does not
+  require remembering every historical helper function.

@@ -34,23 +34,22 @@ class VisualizationIkController:
 
     def __init__(self, control_config_file: str, initial_joint_deg: List[float]) -> None:
         from modules.ik import (
-            IKControllerConfig,
-            IKController,
-            get_pose_from_joint_angles,
-            joint_angles_to_absolute_quaternions,
-            load_excavator_robot_config,
+            IKConfig,
+            get_state,
+            load_excavator_model,
             quat_from_axis_angle,
             quat_multiply,
             quat_normalize,
+            solve_ik_step,
         )
 
-        self._get_pose_from_joint_angles = get_pose_from_joint_angles
-        self._joint_angles_to_absolute_quaternions = joint_angles_to_absolute_quaternions
+        self._get_state = get_state
         self._quat_from_axis_angle = quat_from_axis_angle
         self._quat_multiply = quat_multiply
         self._quat_normalize = quat_normalize
+        self._solve_ik_step = solve_ik_step
 
-        self.robot_config = load_excavator_robot_config(control_config_file)
+        self.robot_config = load_excavator_model(control_config_file)
         control_config = self._load_control_config(control_config_file)
         rates_cfg = control_config.get("rates", {})
         self._dt = 1.0 / max(1.0, float(rates_cfg.get("control_hz", 100.0)))
@@ -66,27 +65,22 @@ class VisualizationIkController:
         if isinstance(per_joint_max, (list, tuple)) and len(per_joint_max) == _N_ACTIVE:
             max_joint_velocities = [float(v) for v in per_joint_max]
 
-        self._ik = IKController(
-            IKControllerConfig(
-                command_type=ik_cfg["command_type"],
-                ik_method=ik_cfg["method"],
-                use_relative_mode=bool(ik_cfg.get("use_relative_mode", False)),
-                ik_params=ik_cfg.get("params", {}),
-                enable_velocity_limiting=bool(True), # ik_cfg.get("enable_velocity_limiting", False) is ignored to ensure smooth visualization
-                max_joint_velocities=max_joint_velocities,
-                joint_limits=joint_limits,
-                velocity_mode=bool(ik_cfg.get("velocity_mode", False)),
-                velocity_error_gain=float(ik_cfg.get("velocity_error_gain", 1.0)),
-                use_rotational_velocity=bool(ik_cfg.get("use_rotational_velocity", True)),
-                enable_adaptive_damping=bool(ik_cfg.get("enable_adaptive_damping", True)),
-                adaptive_damping_max_multiplier=float(
-                    ik_cfg.get("adaptive_damping_max_multiplier", 2.0)
-                ),
-                condition_number_threshold=float(ik_cfg.get("condition_number_threshold", 40.0)),
+        params = ik_cfg.get("params", {})
+        self._command_type = str(ik_cfg.get("command_type", "pose"))
+        self._ik_cfg = IKConfig(
+            method=str(ik_cfg.get("method", "dls")),
+            k_val=float(params.get("k_val", 1.0)),
+            lambda_val=float(params.get("lambda_val", 1e-3)),
+            min_singular_value=float(params.get("min_singular_value", 1e-5)),
+            joint_limits_rad=tuple(joint_limits) if joint_limits is not None else None,
+            max_joint_velocity_rad_per_step=(
+                tuple(max_joint_velocities) if max_joint_velocities is not None else None
             ),
-            self.robot_config,
-            verbose=False,
-            default_dt=self._dt,
+            enable_velocity_limiting=True,
+            enable_joint_limit_avoidance=True,
+            enable_adaptive_damping=bool(ik_cfg.get("enable_adaptive_damping", True)),
+            adaptive_damping_max_multiplier=float(ik_cfg.get("adaptive_damping_max_multiplier", 2.0)),
+            condition_number_threshold=float(ik_cfg.get("condition_number_threshold", 40.0)),
         )
 
         initial = np.asarray(initial_joint_deg[:_N_ACTIVE], dtype=np.float32)
@@ -149,22 +143,20 @@ class VisualizationIkController:
             return
 
         prev = self._joint_angles.copy()
-        ee_pos, ee_quat = self._get_pose_from_joint_angles(self._joint_angles, self.robot_config)
-        joint_quats = self._joint_angles_to_absolute_quaternions(self._joint_angles, self.robot_config)
         slew_angle = float(self._joint_angles[0])
         slew_quat = self._quat_from_axis_angle(_Z_AXIS, np.float32(slew_angle))
         pitch_quat = self._quat_from_axis_angle(_Y_AXIS, np.radians(self._target_rot_y_deg))
         target_quat = self._quat_normalize(self._quat_multiply(slew_quat, pitch_quat))
 
-        command = np.concatenate([self._target_position, target_quat]).astype(np.float32)
-        self._ik.set_command(command)
-        self._joint_angles = self._ik.compute(
-            ee_pos,
-            ee_quat,
+        ik_result = self._solve_ik_step(
             self._joint_angles,
-            joint_quats=joint_quats,
+            self._target_position,
+            target_quat if self._command_type == "pose" else None,
+            self.robot_config,
+            self._ik_cfg,
             dt=self._dt,
         )
+        self._joint_angles = ik_result.q_next_rad.astype(np.float32)
 
         now = time.perf_counter()
         self._last_joint_vel_radps = (self._joint_angles - prev) / self._dt
@@ -221,14 +213,14 @@ class IkPoseControlNode(Node):
         from modules.board import resolve_profile
         from modules.ik import (
             extract_axis_rotation,
-            get_pose_from_joint_angles,
-            load_excavator_robot_config,
+            get_state,
+            load_excavator_model,
         )
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
 
         self._extract_axis_rotation = extract_axis_rotation
-        self._get_pose_from_joint_angles = get_pose_from_joint_angles
+        self._get_state = get_state
 
         robot_profile = resolve_profile(str(self.get_parameter("robot").value))
         config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
@@ -237,7 +229,7 @@ class IkPoseControlNode(Node):
         pwm_i2c_addr = self._int_param_or_profile("pwm_i2c_addr", int(robot_profile["pwm_i2c_addr"]), unset=-1)
 
         control_config_path = self._resolve_project_path(control_config_file)
-        self._robot_config = load_excavator_robot_config(str(control_config_path))
+        self._robot_config = load_excavator_model(str(control_config_path))
         config_path = self._resolve_project_path(config_file)
 
         self.get_logger().info(
@@ -414,7 +406,9 @@ class IkPoseControlNode(Node):
         self._joint_pub.publish(joint_msg)
 
         if bool(self.get_parameter("publish_tool_pose").value):
-            ee_pos, ee_quat = self._get_pose_from_joint_angles(joint_angles_rad[:_N_ACTIVE], self._robot_config)
+            state = self._get_state(joint_angles_rad[:_N_ACTIVE], self._robot_config, include_jacobian=False)
+            ee_pos = state.ee_position
+            ee_quat = state.ee_orientation
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
             pose_msg.header.frame_id = "excavator"

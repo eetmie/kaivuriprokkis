@@ -53,7 +53,17 @@ def generate_launch_description():
                 "input_topic": joystick_topic,
                 "output_topic": direct_pwm_topic,
                 "raw_max": raw_max,
-                "deadband": deadband,
+            }],
+        ),
+        Node(
+            package="kaivuri_bringup",
+            executable="imu_state_node", # Reads IMU's and publishes
+            name="kaivuri_imu_state_node",
+            output="screen",
+            parameters=[{
+                "project_root": project_root,
+                "robot": robot,
+                "rate_hz": ParameterValue(state_rate_hz, value_type=float),
             }],
         ),
         Node(

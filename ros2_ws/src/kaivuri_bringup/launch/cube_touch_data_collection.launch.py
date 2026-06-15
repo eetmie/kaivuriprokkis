@@ -12,7 +12,6 @@ def generate_launch_description():
         DeclareLaunchArgument("rate_hz", default_value="50.0"),
         DeclareLaunchArgument("speed_mps", default_value="0.08"),
         DeclareLaunchArgument("position_tolerance_m", default_value="0.02"),
-        DeclareLaunchArgument("target_tracking_tolerance_m", default_value="0.003"),
         Node(
             package="kaivuri_bringup",
             executable="cube_touch_expert_node",
@@ -23,7 +22,6 @@ def generate_launch_description():
                 "rate_hz": LaunchConfiguration("rate_hz"),
                 "speed_mps": LaunchConfiguration("speed_mps"),
                 "position_tolerance_m": LaunchConfiguration("position_tolerance_m"),
-                "target_tracking_tolerance_m": LaunchConfiguration("target_tracking_tolerance_m"),
             }],
         ),
         Node(

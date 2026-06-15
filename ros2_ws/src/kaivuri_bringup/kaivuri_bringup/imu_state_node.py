@@ -36,18 +36,18 @@ class ImuStateNode(Node):
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
         add_project_import_path(self._project_root)
 
-        from modules.ik import get_pose_from_joint_angles, load_excavator_robot_config
+        from modules.ik import get_state, load_excavator_model
         from modules.excavator_controller import ExcavatorController
         from modules.hardware_interface import HardwareInterface
         from modules.board import resolve_profile
 
-        self._get_pose_from_joint_angles = get_pose_from_joint_angles
+        self._get_state = get_state
 
         robot_profile = resolve_profile(str(self.get_parameter("robot").value))
         config_file = self._param_or_profile("config_file", robot_profile["servo_config_file"])
         control_config_file = self._param_or_profile("control_config_file", robot_profile["control_config_file"])
         control_config_path = self._resolve_project_path(control_config_file)
-        self._robot_config = load_excavator_robot_config(str(control_config_path))
+        self._robot_config = load_excavator_model(str(control_config_path))
 
         config_path = self._resolve_project_path(config_file)
         self.get_logger().info(
@@ -119,7 +119,9 @@ class ImuStateNode(Node):
         self._joint_pub.publish(joint_msg)
 
         if bool(self.get_parameter("publish_tool_pose").value):
-            ee_pos, ee_quat = self._get_pose_from_joint_angles(joint_angles_rad, self._robot_config)
+            state = self._get_state(joint_angles_rad[:_N_ACTIVE], self._robot_config, include_jacobian=False)
+            ee_pos = state.ee_position
+            ee_quat = state.ee_orientation
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
             pose_msg.header.frame_id = "excavator"

@@ -49,8 +49,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("instruction", "touch the top of the red cube")
         self.declare_parameter("wait_for_target_subscriber", True)
         self.declare_parameter("tool_pose_timeout_s", 0.5)
-        self.declare_parameter("target_tracking_tolerance_m", 0.003)
-        self.declare_parameter("startup_tool_pose_samples", 5)
+        self.declare_parameter("startup_tool_pose_samples", 0)
         self.declare_parameter("startup_hold_s", 1.0)
         self.declare_parameter("cube_restart_distance_m", 0.01)
 
@@ -58,7 +57,6 @@ class CubeTouchExpertNode(Node):
         self._dt = 1.0 / rate_hz
         self._stage = Stage.IDLE
         self._episode_id = 0
-        self._stage_started = self.get_clock().now()
         self._episode_started = self.get_clock().now()
         self._hold_started: Optional[object] = None
         self._tool_position: Optional[np.ndarray] = None
@@ -157,8 +155,6 @@ class CubeTouchExpertNode(Node):
             return
 
         if not self._tool_pose_is_fresh():
-
-
             self._waiting_for_tool_pose = True
             self.get_logger().warn(
                 "Waiting for fresh /kaivuri/tool_pose before advancing expert target",
@@ -181,11 +177,9 @@ class CubeTouchExpertNode(Node):
             self._waiting_for_target_subscriber = False
             self._waiting_for_tool_pose = False
             self._episode_started = now
-            self._stage_started = now
             self._startup_ready_time = now
             self._try_seed_current_target_from_tool_pose()
             if self._current_target is None:
-
                 return
 
         if self._startup_ready_time is not None:
@@ -198,7 +192,6 @@ class CubeTouchExpertNode(Node):
             self._startup_ready_time = None
 
         if self._timed_out():
-
             self._publish_event("failure_timeout")
             self._publish_event("episode_end")
             self._set_stage(Stage.DONE)
@@ -222,16 +215,9 @@ class CubeTouchExpertNode(Node):
         if goal is None:
             return
 
-        self._publish_target()
-
-        if not self._tool_reached_current_target():
-            return
-
         self._current_target = self._step_toward(self._current_target, goal)
         self._publish_target()
-
         if self._target_reached(goal):
-
             if self._stage == Stage.APPROACH:
                 self._set_stage(Stage.DESCEND)
             elif self._stage == Stage.DESCEND:
@@ -297,12 +283,6 @@ class CubeTouchExpertNode(Node):
         observed = self._tool_pose_sample_count - self._episode_tool_pose_start_count
         return observed >= required
 
-    def _tool_reached_current_target(self) -> bool:
-        if self._tool_position is None or self._current_target is None:
-            return False
-        tolerance = max(0.0, float(self.get_parameter("target_tracking_tolerance_m").value))
-        return float(np.linalg.norm(self._tool_position - self._current_target)) <= tolerance
-
     def _target_reached(self, goal: np.ndarray) -> bool:
         reference = self._tool_position if self._tool_position is not None else self._current_target
         if reference is None:
@@ -312,7 +292,6 @@ class CubeTouchExpertNode(Node):
 
     def _set_stage(self, stage: Stage) -> None:
         self._stage = stage
-        self._stage_started = self.get_clock().now()
         self._hold_started = None
         if stage == Stage.APPROACH:
             self._publish_event("episode_start")
@@ -346,7 +325,6 @@ class CubeTouchExpertNode(Node):
         return timeout_s > 0.0 and self._elapsed(self._episode_started) > timeout_s
 
     def _elapsed(self, start_time) -> float:
-        print((self.get_clock().now() - start_time).nanoseconds * 1e-9,flush=True)
         return (self.get_clock().now() - start_time).nanoseconds * 1e-9
 
 

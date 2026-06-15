@@ -153,7 +153,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-
 # pytype static type analyzer
 .pytype/
 
@@ -225,3 +224,5 @@ data_collection/test_results/
 
 
 xbox_target_pose_y_node.py
+
+.vscode

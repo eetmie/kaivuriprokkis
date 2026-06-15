@@ -91,7 +91,6 @@ class CubeTouchExpertNode(Node):
 
     """Published by ik_control_node.py to command the end-effector pose. """
     def _on_tool_pose(self, msg: PoseStamped) -> None:
-        print(f"Received tool pose", flush=True)
         self._tool_position = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
@@ -150,20 +149,15 @@ class CubeTouchExpertNode(Node):
     def _tick(self) -> None:
 
         if self._stage == Stage.IDLE or self._current_target is None:
-            print("1",flush=True)
             if self._stage != Stage.IDLE and self._pending_start_from_tool_pose:
-                print("2",flush=True)
                 self._try_seed_current_target_from_tool_pose()
             return
 
         if self._should_wait_for_target_subscriber():
-            print("3",flush=True)
-
             return
 
         if not self._tool_pose_is_fresh():
 
-            print("4",flush=True)
 
             self._waiting_for_tool_pose = True
             self.get_logger().warn(
@@ -174,7 +168,6 @@ class CubeTouchExpertNode(Node):
 
         if not self._has_startup_tool_pose_samples():
 
-            print("5",flush=True)
             self._waiting_for_tool_pose = True
             self.get_logger().warn(
                 "Waiting for startup /kaivuri/tool_pose samples before advancing expert target",
@@ -183,7 +176,6 @@ class CubeTouchExpertNode(Node):
             return
 
         if self._waiting_for_target_subscriber or self._waiting_for_tool_pose:
-            print("6",flush=True)
 
             now = self.get_clock().now()
             self._waiting_for_target_subscriber = False
@@ -193,23 +185,19 @@ class CubeTouchExpertNode(Node):
             self._startup_ready_time = now
             self._try_seed_current_target_from_tool_pose()
             if self._current_target is None:
-                print("7",flush=True)
 
                 return
 
         if self._startup_ready_time is not None:
-            print("8",flush=True)
 
             startup_hold_s = max(0.0, float(self.get_parameter("startup_hold_s").value))
             if self._elapsed(self._startup_ready_time) < startup_hold_s:
-                print("9",flush=True)
 
                 self._publish_target()
                 return
             self._startup_ready_time = None
 
         if self._timed_out():
-            print("10",flush=True)
 
             self._publish_event("failure_timeout")
             self._publish_event("episode_end")
@@ -217,7 +205,6 @@ class CubeTouchExpertNode(Node):
             return
 
         if self._stage == Stage.HOLD:
-            print("11",flush=True)
 
             self._publish_target()
             if self._hold_started is None:
@@ -228,24 +215,20 @@ class CubeTouchExpertNode(Node):
             return
 
         if self._stage == Stage.DONE:
-            print("12",flush=True)
             self._publish_target()
             return
 
         goal = self._goals.get(self._stage)
         if goal is None:
-            print("13",flush=True)
             return
 
         self._publish_target()
 
         if not self._tool_reached_current_target():
-            print("14",flush=True)
             return
 
         self._current_target = self._step_toward(self._current_target, goal)
         self._publish_target()
-        print("15",flush=True)
 
         if self._target_reached(goal):
 
@@ -280,12 +263,10 @@ class CubeTouchExpertNode(Node):
 
     def _should_start_episode_for_cube(self, center: np.ndarray) -> bool:
         if self._stage not in (Stage.IDLE, Stage.DONE):
-            print("16",flush=True)
             return False
         if self._last_episode_cube_center is None:
             return True
         restart_distance = max(0.0, float(self.get_parameter("cube_restart_distance_m").value))
-        print("17",flush=True)
 
         moved = float(np.linalg.norm(center - self._last_episode_cube_center))
 
@@ -365,6 +346,7 @@ class CubeTouchExpertNode(Node):
         return timeout_s > 0.0 and self._elapsed(self._episode_started) > timeout_s
 
     def _elapsed(self, start_time) -> float:
+        print((self.get_clock().now() - start_time).nanoseconds * 1e-9,flush=True)
         return (self.get_clock().now() - start_time).nanoseconds * 1e-9
 
 

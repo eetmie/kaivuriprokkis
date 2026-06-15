@@ -273,3 +273,68 @@ ros2 bag record /joint_states /tf /tf_static /kaivuri/tool_pose
 ```
 
 Bag replay is safe with this initial stack because there is no ROS actuation node.
+
+## Red Cube Expert Data Collection
+
+Use this as the first Isaac Sim data-collection loop for VLA/behavior-cloning
+experiments. Isaac Sim should spawn a red cube and publish its pose:
+
+```text
+/kaivuri/cube_pose
+geometry_msgs/msg/PoseStamped
+```
+
+`cube_touch_expert_node` turns that cube pose into a smooth expert trajectory:
+
+```text
+approach above cube -> descend to top -> hold -> retract
+```
+
+It publishes:
+
+```text
+/kaivuri/target_pose_y        std_msgs/msg/Float32MultiArray  [x, y, z, rot_y_deg]
+/kaivuri/episode_event        std_msgs/msg/String             "<episode_id>:<event>"
+/kaivuri/task_instruction     std_msgs/msg/String
+```
+
+Start the IK node first:
+
+```bash
+source /work/ros2_ws/install/setup.bash
+ros2 run kaivuri_bringup ik_pose_control_node --ros-args \
+  -p visualization_only:=true \
+  -p project_root:=/work
+```
+
+Then start the cube-touch expert:
+
+```bash
+ros2 run kaivuri_bringup cube_touch_expert_node
+```
+
+For a ROS-only smoke test without Isaac, publish random cube poses:
+
+```bash
+ros2 run kaivuri_bringup random_cube_pose_node
+```
+
+Or launch both helper nodes together:
+
+```bash
+ros2 launch kaivuri_bringup cube_touch_data_collection.launch.py use_random_cube:=true
+```
+
+Recommended rosbag command for the first dataset:
+
+```bash
+ros2 bag record \
+  /camera/camera/color/image_raw \
+  /camera/camera/color/camera_info \
+  /joint_states \
+  /kaivuri/tool_pose \
+  /kaivuri/target_pose_y \
+  /kaivuri/cube_pose \
+  /kaivuri/episode_event \
+  /kaivuri/task_instruction
+```

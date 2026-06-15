@@ -204,7 +204,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("target_pose_topic", "/kaivuri/target_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
-        self.declare_parameter("state_rate_hz", 30.0)
+        self.declare_parameter("state_rate_hz", 50.0)
         self.declare_parameter("command_timeout_s", 1.0)
         self.declare_parameter("ready_timeout_s", 30.0)
         self.declare_parameter("pump_auto_mode", False)
@@ -360,6 +360,7 @@ class IkPoseControlNode(Node):
         return out
 
     def _send_target(self, position: np.ndarray, rot_y_deg: float) -> None:
+        print("pos:", position)
         result = self._controller.give_pose(position, rot_y_deg)
         rejected = result is not None and not result.reachable
         if rejected:

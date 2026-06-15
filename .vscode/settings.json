@@ -1,0 +1,121 @@
+{
+  "highlight.regexes": {
+    "\\bself\\._stage_started\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#ef444455",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._episode_started\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#f9731655",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._hold_started\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#eab30855",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._tool_position\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#22c55e55",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._last_tool_pose_time\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#14b8a655",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._current_target\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#3b82f655",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._pending_start_from_tool_pose\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#8b5cf655",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._waiting_for_target_subscriber\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#ec489955",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._waiting_for_tool_pose\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#06b6d455",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._tool_pose_sample_count\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#84cc1655",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._episode_tool_pose_start_count\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#f59e0b55",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._startup_ready_time\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#6366f155",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    },
+    "\\bself\\._last_episode_cube_center\\b": {
+      "decorations": [
+        {
+          "backgroundColor": "#10b98155",
+          "color": "#ffffff",
+          "fontWeight": "bold"
+        }
+      ]
+    }
+  }
+}

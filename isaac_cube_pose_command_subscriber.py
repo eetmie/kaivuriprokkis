@@ -56,7 +56,7 @@ def _on_cube_pose_cmd(
 
     # The publisher sends:
     #   top_center_ik = top_center_excavator - IK_ORIGIN_IN_EXCAVATOR_FRAME
-    # Invert that here, then move the cube by its current bbox top-center delta.
+    # Invert that here. Then move the cube by bbox-top-center delta.
     desired_top_center_ik = gf.Vec3d(
         float(msg.pose.position.x),
         float(msg.pose.position.y),

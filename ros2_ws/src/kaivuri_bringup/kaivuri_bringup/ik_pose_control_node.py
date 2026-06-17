@@ -27,6 +27,7 @@ JOINT_NAMES = [
 _N_ACTIVE = 4
 _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 _Z_AXIS = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+IK_ORIGIN_IN_EXCAVATOR_FRAME = np.array([0.0, 0.0, -0.05042], dtype=np.float32)
 
 
 class VisualizationIkController:
@@ -176,10 +177,12 @@ class IkPoseControlNode(Node):
 
     Inputs:
       - /kaivuri/target_pose: geometry_msgs/PoseStamped
-        position is the desired tool tip position in the excavator frame.
+        position is the desired tool tip position in the IK frame. The IK
+        origin is at (0, 0, -0.05042) in the excavator prim frame.
         orientation is reduced to the controller's supported body-frame pitch.
       - /kaivuri/target_pose_y: std_msgs/Float32MultiArray
-        data order [x, y, z, rot_y_deg].
+        data order [x, y, z, rot_y_deg], using the same IK-frame position
+        convention.
 
     Outputs:
       - /joint_states
@@ -196,6 +199,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("target_pose_topic", "/kaivuri/target_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
+        self.declare_parameter("frame_id", "excavator")
         self.declare_parameter("state_rate_hz", 50.0)
         self.declare_parameter("command_timeout_s", 1.0)
         self.declare_parameter("ready_timeout_s", 30.0)
@@ -280,6 +284,7 @@ class IkPoseControlNode(Node):
 
         self._last_command_time: Optional[float] = None
         self._target_active = False
+        self._frame_id = str(self.get_parameter("frame_id").value)
 
         target_pose_topic = str(self.get_parameter("target_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
@@ -292,7 +297,8 @@ class IkPoseControlNode(Node):
         state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
         self.create_timer(1.0 / state_rate_hz, self._state_tick)
         self.get_logger().info(
-            f"IK pose control ready; subscribe {target_pose_topic} or {target_pose_y_topic}"
+            f"IK pose control ready; subscribe {target_pose_topic} or {target_pose_y_topic}; "
+            f"IK origin in excavator frame={np.round(IK_ORIGIN_IN_EXCAVATOR_FRAME, 5)}"
         )
 
     def _resolve_project_path(self, path_value: str) -> Path:
@@ -319,6 +325,12 @@ class IkPoseControlNode(Node):
             time.sleep(0.1)
 
     def _on_target_pose(self, msg: PoseStamped) -> None:
+        if msg.header.frame_id and msg.header.frame_id != self._frame_id:
+            self.get_logger().warn(
+                f"Ignoring target pose in frame {msg.header.frame_id}; expected {self._frame_id}",
+                throttle_duration_sec=1.0,
+            )
+            return
         q = msg.pose.orientation
         quat_wxyz = np.array([q.w, q.x, q.y, q.z], dtype=np.float32)
         if float(np.linalg.norm(quat_wxyz)) < 1e-6:
@@ -352,7 +364,6 @@ class IkPoseControlNode(Node):
         return out
 
     def _send_target(self, position: np.ndarray, rot_y_deg: float) -> None:
-        print("pos:", position)
         result = self._controller.give_pose(position, rot_y_deg)
         rejected = result is not None and not result.reachable
         if rejected:
@@ -411,7 +422,7 @@ class IkPoseControlNode(Node):
             ee_quat = state.ee_orientation
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
-            pose_msg.header.frame_id = "excavator"
+            pose_msg.header.frame_id = self._frame_id
             pose_msg.pose.position.x = float(ee_pos[0])
             pose_msg.pose.position.y = float(ee_pos[1])
             pose_msg.pose.position.z = float(ee_pos[2])

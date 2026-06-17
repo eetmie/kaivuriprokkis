@@ -32,6 +32,7 @@ setup(
             "joystick_to_direct_pwm_node = kaivuri_bringup.joystick_to_direct_pwm_node:main",
             "random_cube_pose_node = kaivuri_bringup.random_cube_pose_node:main",
             "raw_direct_drive_node = kaivuri_bringup.raw_direct_drive_node:main",
+            "success_cube_relocator_node = kaivuri_bringup.success_cube_relocator_node:main",
             "target_pose_y_test_publisher = kaivuri_bringup.target_pose_y_test_publisher:main",
             "udp_joystick_values_node = kaivuri_bringup.udp_joystick_values_node:main",
             "xbox_target_pose_y_node = kaivuri_bringup.xbox_target_pose_y_node:main",

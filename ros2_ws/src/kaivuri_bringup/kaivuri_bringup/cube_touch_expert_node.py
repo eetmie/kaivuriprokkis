@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from rclpy.duration import Duration
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
 
@@ -37,12 +38,12 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("speed_mps", 0.08)
         self.declare_parameter("rot_speed_degps", 30.0)
-        self.declare_parameter("position_tolerance_m", 0.02)
+        self.declare_parameter("position_tolerance_m", 0.01)
         self.declare_parameter("hold_s", 0.25)
         self.declare_parameter("timeout_s", 60)
         self.declare_parameter("approach_height_m", 0.05)
         self.declare_parameter("retract_height_m", 0.05)
-        self.declare_parameter("touch_clearance_m", 0.005)
+        self.declare_parameter("touch_clearance_m", 0.01)
         self.declare_parameter("cube_size_m", 0.05)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("rot_y_deg", 0.0)
@@ -52,6 +53,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("startup_tool_pose_samples", 0)
         self.declare_parameter("startup_hold_s", 1.0)
         self.declare_parameter("cube_restart_distance_m", 0.01)
+        self.declare_parameter("post_episode_cube_ignore_s", 1.0)
 
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self._dt = 1.0 / rate_hz
@@ -71,6 +73,7 @@ class CubeTouchExpertNode(Node):
         self._episode_tool_pose_start_count = 0
         self._startup_ready_time: Optional[object] = None
         self._last_episode_cube_center: Optional[np.ndarray] = None
+        self._ignore_cube_pose_until: Optional[object] = None
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
@@ -100,6 +103,11 @@ class CubeTouchExpertNode(Node):
 
     """Published by Isaac Sim to provide the current pose of the cube. """
     def _on_cube_pose(self, msg: PoseStamped) -> None:
+        if self._ignore_cube_pose_until is not None:
+            if self.get_clock().now() < self._ignore_cube_pose_until:
+                return
+            self._ignore_cube_pose_until = None
+
         center = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
@@ -117,6 +125,7 @@ class CubeTouchExpertNode(Node):
             [0.0, 0.0, float(self.get_parameter("touch_clearance_m").value)],
             dtype=np.float32,
         )
+        print(f"New episode: cube center  {touch}")
         approach = touch + np.array(
             [0.0, 0.0, float(self.get_parameter("approach_height_m").value)],
             dtype=np.float32,
@@ -224,6 +233,9 @@ class CubeTouchExpertNode(Node):
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
                 self._publish_event("episode_end")
+                self._ignore_cube_pose_until = self.get_clock().now() + Duration(
+                    seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
+                )
                 self._set_stage(Stage.DONE)
 
     def _step_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:

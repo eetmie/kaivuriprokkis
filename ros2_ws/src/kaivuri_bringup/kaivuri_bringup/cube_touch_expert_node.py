@@ -37,8 +37,9 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
         self.declare_parameter("rate_hz", 50.0)
         self.declare_parameter("speed_mps", 0.08)
-        self.declare_parameter("rot_speed_degps", 30.0)
         self.declare_parameter("position_tolerance_m", 0.01)
+        self.declare_parameter("approach_xy_tolerance_m", 0.005)
+        self.declare_parameter("approach_z_tolerance_m", 0.01)
         self.declare_parameter("hold_s", 0.25)
         self.declare_parameter("timeout_s", 60)
         self.declare_parameter("approach_height_m", 0.05)
@@ -125,7 +126,6 @@ class CubeTouchExpertNode(Node):
             [0.0, 0.0, float(self.get_parameter("touch_clearance_m").value)],
             dtype=np.float32,
         )
-        print(f"New episode: cube center  {touch}")
         approach = touch + np.array(
             [0.0, 0.0, float(self.get_parameter("approach_height_m").value)],
             dtype=np.float32,
@@ -146,7 +146,7 @@ class CubeTouchExpertNode(Node):
         self._episode_started = self.get_clock().now()
         self._episode_tool_pose_start_count = self._tool_pose_sample_count
         self._startup_ready_time = None
-        
+
         self._current_target = None
         self._pending_start_from_tool_pose = True
         self._set_stage(Stage.APPROACH)
@@ -226,8 +226,10 @@ class CubeTouchExpertNode(Node):
 
         self._current_target = self._step_toward(self._current_target, goal)
         self._publish_target()
-        if self._target_reached(goal):
+
+        if self._target_reached(goal, self._stage):
             if self._stage == Stage.APPROACH:
+                print("Descededing",flush=True)
                 self._set_stage(Stage.DESCEND)
             elif self._stage == Stage.DESCEND:
                 self._set_stage(Stage.HOLD)
@@ -295,10 +297,18 @@ class CubeTouchExpertNode(Node):
         observed = self._tool_pose_sample_count - self._episode_tool_pose_start_count
         return observed >= required
 
-    def _target_reached(self, goal: np.ndarray) -> bool:
+    def _target_reached(self, goal: np.ndarray, stage: Stage) -> bool:
         reference = self._tool_position if self._tool_position is not None else self._current_target
         if reference is None:
             return False
+
+        if stage == Stage.APPROACH:
+            xy_error = float(np.linalg.norm(reference[:2] - goal[:2]))
+            z_error = abs(float(reference[2] - goal[2]))
+            xy_tolerance = max(0.0, float(self.get_parameter("approach_xy_tolerance_m").value))
+            z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
+            return xy_error <= xy_tolerance and z_error <= z_tolerance
+
         tolerance = max(0.0, float(self.get_parameter("position_tolerance_m").value))
         return float(np.linalg.norm(reference - goal)) <= tolerance
 

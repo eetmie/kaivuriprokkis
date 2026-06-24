@@ -1,4 +1,5 @@
 import os
+import math
 import random
 from typing import Optional
 
@@ -41,7 +42,13 @@ class SuccessCubeRelocatorNode(Node):
         self.declare_parameter("use_ik_reachability", False)
 
         # Conservative fixed-base workspace. These are cube top-center
-        # positions in the IK frame, not track-drive targets.
+        # positions in the IK frame, not track-drive targets. Polar sampling is
+        # limited to the front half-plane: -90 to +90 degrees around +X.
+        self.declare_parameter("use_polar_workspace", True)
+        self.declare_parameter("radius_min", 0.35)
+        self.declare_parameter("radius_max", 0.68)
+        self.declare_parameter("angle_min_deg", -90.0)
+        self.declare_parameter("angle_max_deg", 90.0)
         self.declare_parameter("x_min", 0.35)
         self.declare_parameter("x_max", 0.68)
         self.declare_parameter("y_min", -0.15)
@@ -83,8 +90,8 @@ class SuccessCubeRelocatorNode(Node):
 
         self.get_logger().info(
             f"Relocating cube top-center on touch_success within fixed-base IK workspace "
-            f"x=[{self.get_parameter('x_min').value}, {self.get_parameter('x_max').value}] "
-            f"y=[{self.get_parameter('y_min').value}, {self.get_parameter('y_max').value}]"
+            f"r=[{self.get_parameter('radius_min').value}, {self.get_parameter('radius_max').value}] "
+            f"angle=[{self.get_parameter('angle_min_deg').value}, {self.get_parameter('angle_max_deg').value}] deg"
         )
 
     def _try_enable_ik_reachability(self) -> None:
@@ -161,6 +168,9 @@ class SuccessCubeRelocatorNode(Node):
                 return
             self._success_episodes.add(episode_id)
             self._pending_success_episode = episode_id
+            delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
+            self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
+            self.get_logger().info(f"Scheduled cube relocation after touch_success episode={episode_id}")
             return
 
         if (
@@ -179,16 +189,16 @@ class SuccessCubeRelocatorNode(Node):
             return
 
         episode_id = self._pending_success_episode
-        self._pending_success_episode = None
-        self._relocate_after_time = None
-        self._relocated_episodes.add(episode_id)
-        self._publish_new_cube_pose(f"touch_success episode={episode_id}")
+        if self._publish_new_cube_pose(f"touch_success episode={episode_id}"):
+            self._pending_success_episode = None
+            self._relocate_after_time = None
+            self._relocated_episodes.add(episode_id)
 
-    def _publish_new_cube_pose(self, reason: str) -> None:
+    def _publish_new_cube_pose(self, reason: str) -> bool:
         top_center_ik = self._sample_reachable_cube_top_center_ik()
         if top_center_ik is None:
             self.get_logger().error("Could not find a reachable cube pose inside configured workspace")
-            return
+            return False
 
         self._last_cube_top_center_ik = top_center_ik.copy()
         msg = PoseStamped()
@@ -200,6 +210,7 @@ class SuccessCubeRelocatorNode(Node):
         msg.pose.orientation.w = 1.0
         self._cube_pub.publish(msg)
         self.get_logger().info(f"Published cube top-center IK pose after {reason}: {np.round(top_center_ik, 4)}")
+        return True
 
     def _sample_reachable_cube_top_center_ik(self) -> Optional[np.ndarray]:
         max_attempts = max(1, int(self.get_parameter("max_attempts").value))
@@ -207,10 +218,11 @@ class SuccessCubeRelocatorNode(Node):
         q_seed = self._joint_seed() if self._reachability_enabled else None
 
         for _ in range(max_attempts):
+            x, y = self._sample_xy()
             top_center_ik = np.array(
                 [
-                    random.uniform(float(self.get_parameter("x_min").value), float(self.get_parameter("x_max").value)),
-                    random.uniform(float(self.get_parameter("y_min").value), float(self.get_parameter("y_max").value)),
+                    x,
+                    y,
                     self._command_z(),
                 ],
                 dtype=np.float32,
@@ -223,6 +235,34 @@ class SuccessCubeRelocatorNode(Node):
             if self._touch_pose_is_reachable(top_center_ik, q_seed):
                 return top_center_ik
         return None
+
+    def _sample_xy(self) -> tuple[float, float]:
+        if not bool(self.get_parameter("use_polar_workspace").value):
+            return (
+                random.uniform(
+                    float(self.get_parameter("x_min").value),
+                    float(self.get_parameter("x_max").value),
+                ),
+                random.uniform(
+                    float(self.get_parameter("y_min").value),
+                    float(self.get_parameter("y_max").value),
+                ),
+            )
+
+        radius_min = max(0.0, float(self.get_parameter("radius_min").value))
+        radius_max = max(radius_min, float(self.get_parameter("radius_max").value))
+        angle_min, angle_max = self._front_angle_bounds()
+
+        radius = math.sqrt(random.uniform(radius_min * radius_min, radius_max * radius_max))
+        angle = math.radians(random.uniform(angle_min, angle_max))
+        return radius * math.cos(angle), radius * math.sin(angle)
+
+    def _front_angle_bounds(self) -> tuple[float, float]:
+        angle_min = max(-90.0, float(self.get_parameter("angle_min_deg").value))
+        angle_max = min(90.0, float(self.get_parameter("angle_max_deg").value))
+        if angle_min > angle_max:
+            return -90.0, 90.0
+        return angle_min, angle_max
 
     def _command_z(self) -> float:
         if (
@@ -268,6 +308,14 @@ class SuccessCubeRelocatorNode(Node):
         return bool(result.reachable)
 
     def _inside_configured_workspace(self, cube_top_center_ik: np.ndarray) -> bool:
+        if bool(self.get_parameter("use_polar_workspace").value):
+            radius = float(np.linalg.norm(cube_top_center_ik[:2]))
+            angle_deg = math.degrees(math.atan2(float(cube_top_center_ik[1]), float(cube_top_center_ik[0])))
+            angle_min, angle_max = self._front_angle_bounds()
+            return (
+                float(self.get_parameter("radius_min").value) <= radius <= float(self.get_parameter("radius_max").value)
+                and angle_min <= angle_deg <= angle_max
+            )
         return (
             float(self.get_parameter("x_min").value) <= float(cube_top_center_ik[0]) <= float(self.get_parameter("x_max").value)
             and float(self.get_parameter("y_min").value) <= float(cube_top_center_ik[1]) <= float(self.get_parameter("y_max").value)

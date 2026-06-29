@@ -15,8 +15,10 @@ from kaivuri_bringup.project_paths import add_project_import_path, resolve_proje
 
 _N_ACTIVE = 4
 IK_ORIGIN_Z_IN_EXCAVATOR_FRAME = -0.05042
-CUBE_TOP_Z_IN_EXCAVATOR_FRAME = 0.05
+CUBE_TOP_Z_IN_EXCAVATOR_FRAME = 0.025000000372529023
 DEFAULT_CUBE_TOP_Z_IN_IK_FRAME = CUBE_TOP_Z_IN_EXCAVATOR_FRAME - IK_ORIGIN_Z_IN_EXCAVATOR_FRAME
+FRONT_ANGLE_MIN_DEG = -80.0
+FRONT_ANGLE_MAX_DEG = 80.0
 
 
 class SuccessCubeRelocatorNode(Node):
@@ -40,16 +42,17 @@ class SuccessCubeRelocatorNode(Node):
         self.declare_parameter("max_attempts", 200)
         self.declare_parameter("relocate_delay_s", 0.5)
         self.declare_parameter("use_ik_reachability", False)
+        self.declare_parameter("relocate_invalid_cube_pose", True)
 
         # Conservative fixed-base workspace. These are cube top-center
         # positions in the IK frame, not track-drive targets. Polar sampling is
-        # limited to the front half-plane: -90 to +90 degrees around +X.
+        # limited to the front workspace: -80 to +80 degrees around +X.
         self.declare_parameter("use_polar_workspace", True)
-        self.declare_parameter("radius_min", 0.35)
+        self.declare_parameter("radius_min", 0.45)
         self.declare_parameter("radius_max", 0.68)
-        self.declare_parameter("angle_min_deg", -90.0)
-        self.declare_parameter("angle_max_deg", 90.0)
-        self.declare_parameter("x_min", 0.35)
+        self.declare_parameter("angle_min_deg", FRONT_ANGLE_MIN_DEG)
+        self.declare_parameter("angle_max_deg", FRONT_ANGLE_MAX_DEG)
+        self.declare_parameter("x_min", 0.45)
         self.declare_parameter("x_max", 0.68)
         self.declare_parameter("y_min", -0.15)
         self.declare_parameter("y_max", 0.15)
@@ -71,6 +74,7 @@ class SuccessCubeRelocatorNode(Node):
         self._success_episodes: set[int] = set()
         self._relocated_episodes: set[int] = set()
         self._pending_success_episode: Optional[int] = None
+        self._pending_relocation_reason: Optional[str] = None
         self._relocate_after_time = None
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
@@ -155,6 +159,19 @@ class SuccessCubeRelocatorNode(Node):
         )
         if self._last_cube_top_center_ik is None:
             self._last_cube_top_center_ik = self._last_measured_cube_pose.copy()
+        if (
+            bool(self.get_parameter("relocate_invalid_cube_pose").value)
+            and self._pending_relocation_reason is None
+            and not self._inside_configured_workspace(self._last_measured_cube_pose)
+        ):
+            delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
+            self._pending_relocation_reason = "invalid_cube_pose"
+            self._pending_success_episode = None
+            self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
+            self.get_logger().warn(
+                f"Scheduled cube relocation for invalid pose outside workspace: {np.round(self._last_measured_cube_pose, 4)}",
+                throttle_duration_sec=2.0,
+            )
 
     def _on_episode_event(self, msg: String) -> None:
         try:
@@ -168,6 +185,7 @@ class SuccessCubeRelocatorNode(Node):
                 return
             self._success_episodes.add(episode_id)
             self._pending_success_episode = episode_id
+            self._pending_relocation_reason = f"touch_success episode={episode_id}"
             delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
             self.get_logger().info(f"Scheduled cube relocation after touch_success episode={episode_id}")
@@ -183,16 +201,19 @@ class SuccessCubeRelocatorNode(Node):
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
 
     def _relocation_tick(self) -> None:
-        if self._relocate_after_time is None or self._pending_success_episode is None:
+        if self._relocate_after_time is None or self._pending_relocation_reason is None:
             return
         if self.get_clock().now() < self._relocate_after_time:
             return
 
         episode_id = self._pending_success_episode
-        if self._publish_new_cube_pose(f"touch_success episode={episode_id}"):
+        reason = self._pending_relocation_reason
+        if self._publish_new_cube_pose(reason):
             self._pending_success_episode = None
+            self._pending_relocation_reason = None
             self._relocate_after_time = None
-            self._relocated_episodes.add(episode_id)
+            if episode_id is not None:
+                self._relocated_episodes.add(episode_id)
 
     def _publish_new_cube_pose(self, reason: str) -> bool:
         top_center_ik = self._sample_reachable_cube_top_center_ik()
@@ -258,10 +279,10 @@ class SuccessCubeRelocatorNode(Node):
         return radius * math.cos(angle), radius * math.sin(angle)
 
     def _front_angle_bounds(self) -> tuple[float, float]:
-        angle_min = max(-90.0, float(self.get_parameter("angle_min_deg").value))
-        angle_max = min(90.0, float(self.get_parameter("angle_max_deg").value))
+        angle_min = max(FRONT_ANGLE_MIN_DEG, float(self.get_parameter("angle_min_deg").value))
+        angle_max = min(FRONT_ANGLE_MAX_DEG, float(self.get_parameter("angle_max_deg").value))
         if angle_min > angle_max:
-            return -90.0, 90.0
+            return FRONT_ANGLE_MIN_DEG, FRONT_ANGLE_MAX_DEG
         return angle_min, angle_max
 
     def _command_z(self) -> float:

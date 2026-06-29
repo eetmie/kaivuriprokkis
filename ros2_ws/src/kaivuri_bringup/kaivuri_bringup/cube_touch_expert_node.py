@@ -39,12 +39,13 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("speed_mps", 0.08)
         self.declare_parameter("position_tolerance_m", 0.01)
         self.declare_parameter("approach_xy_tolerance_m", 0.005)
-        self.declare_parameter("approach_z_tolerance_m", 0.01)
+        self.declare_parameter("approach_z_tolerance_m", 0.02)
+        self.declare_parameter("approach_settle_s", 1.5)
         self.declare_parameter("hold_s", 0.25)
         self.declare_parameter("timeout_s", 60)
         self.declare_parameter("approach_height_m", 0.05)
         self.declare_parameter("retract_height_m", 0.05)
-        self.declare_parameter("touch_clearance_m", 0.01)
+        self.declare_parameter("touch_clearance_m", 0.02)
         self.declare_parameter("cube_size_m", 0.05)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("rot_y_deg", 0.0)
@@ -55,6 +56,15 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("startup_hold_s", 1.0)
         self.declare_parameter("cube_restart_distance_m", 0.01)
         self.declare_parameter("post_episode_cube_ignore_s", 1.0)
+        self.declare_parameter("use_polar_workspace", True)
+        self.declare_parameter("radius_min", 0.45)
+        self.declare_parameter("radius_max", 0.68)
+        self.declare_parameter("angle_min_deg", -90.0)
+        self.declare_parameter("angle_max_deg", 90.0)
+        self.declare_parameter("x_min", 0.45)
+        self.declare_parameter("x_max", 0.68)
+        self.declare_parameter("y_min", -0.15)
+        self.declare_parameter("y_max", 0.15)
 
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self._dt = 1.0 / rate_hz
@@ -73,6 +83,7 @@ class CubeTouchExpertNode(Node):
         self._tool_pose_sample_count = 0
         self._episode_tool_pose_start_count = 0
         self._startup_ready_time: Optional[object] = None
+        self._approach_reached_since: Optional[object] = None
         self._last_episode_cube_center: Optional[np.ndarray] = None
         self._ignore_cube_pose_until: Optional[object] = None
 
@@ -115,7 +126,12 @@ class CubeTouchExpertNode(Node):
         )
         if not self._should_start_episode_for_cube(center):
             return
-
+        if not self._inside_configured_workspace(center):
+            self.get_logger().warn(
+                f"Ignoring cube pose outside fixed-base workspace: {np.round(center, 4)}",
+                throttle_duration_sec=2.0,
+            )
+            return
         if bool(self.get_parameter("cube_pose_is_top_center").value):
             top = center
         else:
@@ -195,7 +211,6 @@ class CubeTouchExpertNode(Node):
 
             startup_hold_s = max(0.0, float(self.get_parameter("startup_hold_s").value))
             if self._elapsed(self._startup_ready_time) < startup_hold_s:
-
                 self._publish_target()
                 return
             self._startup_ready_time = None
@@ -207,7 +222,6 @@ class CubeTouchExpertNode(Node):
             return
 
         if self._stage == Stage.HOLD:
-
             self._publish_target()
             if self._hold_started is None:
                 self._hold_started = self.get_clock().now()
@@ -224,21 +238,31 @@ class CubeTouchExpertNode(Node):
         if goal is None:
             return
 
-        self._current_target = self._step_toward(self._current_target, goal)
-        self._publish_target()
+        if self._stage == Stage.APPROACH:
+            self._current_target = self._step_approach_toward(self._current_target, goal)
+        else:
+            self._current_target = self._step_toward(self._current_target, goal)
 
+
+        self._publish_target()
         if self._target_reached(goal, self._stage):
             if self._stage == Stage.APPROACH:
-                print("Descededing",flush=True)
+                if not self._approach_settled():
+                    return
+                print("approach reached",flush=True)
                 self._set_stage(Stage.DESCEND)
             elif self._stage == Stage.DESCEND:
+                print("descend reached",flush=True)
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
+                print("retract reached",flush=True)
                 self._publish_event("episode_end")
                 self._ignore_cube_pose_until = self.get_clock().now() + Duration(
                     seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
                 )
                 self._set_stage(Stage.DONE)
+        elif self._stage == Stage.APPROACH:
+            self._approach_reached_since = None
 
     def _step_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
         delta = goal - current
@@ -247,6 +271,18 @@ class CubeTouchExpertNode(Node):
         if distance <= max_step or distance < 1e-9:
             return goal.copy()
         return current + delta * (max_step / distance)
+
+    def _step_approach_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
+        safe_z = float(goal[2])
+        if float(current[2]) < safe_z - z_tolerance:
+            lift_goal = current.copy()
+            lift_goal[2] = safe_z
+            return self._step_toward(current, lift_goal)
+
+        horizontal_goal = goal.copy()
+        horizontal_goal[2] = safe_z
+        return self._step_toward(current, horizontal_goal)
 
     def _try_seed_current_target_from_tool_pose(self) -> None:
         if not self._pending_start_from_tool_pose:
@@ -269,8 +305,28 @@ class CubeTouchExpertNode(Node):
         restart_distance = max(0.0, float(self.get_parameter("cube_restart_distance_m").value))
 
         moved = float(np.linalg.norm(center - self._last_episode_cube_center))
-
         return moved >= restart_distance
+
+    def _inside_configured_workspace(self, cube_top_center_ik: np.ndarray) -> bool:
+        if bool(self.get_parameter("use_polar_workspace").value):
+            radius = float(np.linalg.norm(cube_top_center_ik[:2]))
+            angle_deg = math.degrees(math.atan2(float(cube_top_center_ik[1]), float(cube_top_center_ik[0])))
+            angle_min, angle_max = self._front_angle_bounds()
+            return (
+                float(self.get_parameter("radius_min").value) <= radius <= float(self.get_parameter("radius_max").value)
+                and angle_min <= angle_deg <= angle_max
+            )
+        return (
+            float(self.get_parameter("x_min").value) <= float(cube_top_center_ik[0]) <= float(self.get_parameter("x_max").value)
+            and float(self.get_parameter("y_min").value) <= float(cube_top_center_ik[1]) <= float(self.get_parameter("y_max").value)
+        )
+
+    def _front_angle_bounds(self) -> tuple[float, float]:
+        angle_min = max(-90.0, float(self.get_parameter("angle_min_deg").value))
+        angle_max = min(90.0, float(self.get_parameter("angle_max_deg").value))
+        if angle_min > angle_max:
+            return -90.0, 90.0
+        return angle_min, angle_max
 
     def _should_wait_for_target_subscriber(self) -> bool:
         if not bool(self.get_parameter("wait_for_target_subscriber").value):
@@ -303,18 +359,39 @@ class CubeTouchExpertNode(Node):
             return False
 
         if stage == Stage.APPROACH:
-            xy_error = float(np.linalg.norm(reference[:2] - goal[:2]))
-            z_error = abs(float(reference[2] - goal[2]))
+            if self._current_target is None:
+                
+                return False
             xy_tolerance = max(0.0, float(self.get_parameter("approach_xy_tolerance_m").value))
             z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
-            return xy_error <= xy_tolerance and z_error <= z_tolerance
+
+            measured_xy_error = float(np.linalg.norm(reference[:2] - goal[:2]))
+            measured_z_error = abs(float(reference[2] - goal[2]))
+            target_xy_error = float(np.linalg.norm(self._current_target[:2] - goal[:2]))
+            target_z_error = abs(float(self._current_target[2] - goal[2]))
+            return (
+                measured_xy_error <= xy_tolerance
+                and measured_z_error <= z_tolerance
+                and target_xy_error <= xy_tolerance
+                and target_z_error <= z_tolerance
+            )
 
         tolerance = max(0.0, float(self.get_parameter("position_tolerance_m").value))
+        print(float(np.linalg.norm(reference - goal)), flush=True)
+
         return float(np.linalg.norm(reference - goal)) <= tolerance
+
+    def _approach_settled(self) -> bool:
+        settle_s = max(0.0, float(self.get_parameter("approach_settle_s").value))
+        if self._approach_reached_since is None:
+            self._approach_reached_since = self.get_clock().now()
+            return settle_s <= 0.0
+        return self._elapsed(self._approach_reached_since) >= settle_s
 
     def _set_stage(self, stage: Stage) -> None:
         self._stage = stage
         self._hold_started = None
+        self._approach_reached_since = None
         if stage == Stage.APPROACH:
             self._publish_event("episode_start")
         if stage != Stage.DONE:

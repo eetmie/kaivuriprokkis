@@ -142,7 +142,6 @@ class VisualizationIkController:
     def update(self) -> None:
         if self._target_position is None:
             return
-
         prev = self._joint_angles.copy()
         slew_angle = float(self._joint_angles[0])
         slew_quat = self._quat_from_axis_angle(_Z_AXIS, np.float32(slew_angle))
@@ -162,6 +161,7 @@ class VisualizationIkController:
         now = time.perf_counter()
         self._last_joint_vel_radps = (self._joint_angles - prev) / self._dt
         self._last_joint_vel_time = now
+
 
     def get_joint_angles(self) -> np.ndarray:
         return np.degrees(self._joint_angles.copy())
@@ -212,15 +212,17 @@ class IkPoseControlNode(Node):
         self.declare_parameter("visual_initial_joint_deg", [0.0, -31.5, 71.5, -43.3])
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
-        add_project_import_path(self._project_root)
 
+        add_project_import_path(self._project_root)
         from modules.board import resolve_profile
         from modules.ik import (
             extract_axis_rotation,
             get_state,
             load_excavator_model,
         )
+
         from modules.excavator_controller import ExcavatorController
+
         from modules.hardware_interface import HardwareInterface
 
         self._extract_axis_rotation = extract_axis_rotation

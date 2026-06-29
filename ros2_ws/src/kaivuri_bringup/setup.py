@@ -32,6 +32,7 @@ setup(
             "random_cube_pose_node = kaivuri_bringup.random_cube_pose_node:main",
             "raw_direct_drive_node = kaivuri_bringup.raw_direct_drive_node:main",
             "success_cube_relocator_node = kaivuri_bringup.success_cube_relocator_node:main",
+            "smolvla_policy_node = kaivuri_bringup.smolvla_policy_node:main",
             "udp_joystick_values_node = kaivuri_bringup.udp_joystick_values_node:main",
             "xbox_target_pose_y_node = kaivuri_bringup.xbox_target_pose_y_node:main",
         ],

@@ -8,10 +8,15 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
+from std_srvs.srv import Trigger
+
+
+_LOCAL_Z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
 
 class Stage(str, Enum):
     IDLE = "idle"
+    HOME = "home"
     APPROACH = "approach"
     DESCEND = "descend"
     HOLD = "hold"
@@ -36,16 +41,20 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("episode_event_topic", "/kaivuri/episode_event")
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
         self.declare_parameter("rate_hz", 50.0)
-        self.declare_parameter("speed_mps", 0.08)
-        self.declare_parameter("position_tolerance_m", 0.01)
+        self.declare_parameter("speed_mps", 0.04)
+        self.declare_parameter("position_tolerance_m", 0.02)
         self.declare_parameter("approach_xy_tolerance_m", 0.005)
-        self.declare_parameter("approach_z_tolerance_m", 0.02)
+        self.declare_parameter("approach_z_tolerance_m", 0.05)
+        self.declare_parameter("touch_xy_tolerance_m", 0.02)
+        self.declare_parameter("touch_z_tolerance_m", 0.01)
+        self.declare_parameter("retract_xy_tolerance_m", 0.02)
+        self.declare_parameter("retract_z_tolerance_m", 0.05)
         self.declare_parameter("approach_settle_s", 1.5)
         self.declare_parameter("hold_s", 0.25)
         self.declare_parameter("timeout_s", 60)
         self.declare_parameter("approach_height_m", 0.05)
         self.declare_parameter("retract_height_m", 0.05)
-        self.declare_parameter("touch_clearance_m", 0.02)
+        self.declare_parameter("touch_clearance_m", 0.01)
         self.declare_parameter("cube_size_m", 0.05)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("rot_y_deg", 0.0)
@@ -56,6 +65,12 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("startup_hold_s", 1.0)
         self.declare_parameter("cube_restart_distance_m", 0.01)
         self.declare_parameter("post_episode_cube_ignore_s", 1.0)
+        self.declare_parameter("home_before_episode", True)
+        self.declare_parameter("default_tool_x", 0.45)
+        self.declare_parameter("default_tool_y", 0.0)
+        self.declare_parameter("default_tool_z", 0.20)
+        self.declare_parameter("home_tolerance_m", 0.02)
+        self.declare_parameter("home_settle_s", 0.5)
         self.declare_parameter("use_polar_workspace", True)
         self.declare_parameter("radius_min", 0.45)
         self.declare_parameter("radius_max", 0.68)
@@ -65,6 +80,9 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("x_max", 0.68)
         self.declare_parameter("y_min", -0.15)
         self.declare_parameter("y_max", 0.15)
+        self.declare_parameter("call_recorder_services", True)
+        self.declare_parameter("recorder_start_service", "/lerobot_ros2_recorder_node/start_episode")
+        self.declare_parameter("recorder_stop_service", "/lerobot_ros2_recorder_node/stop_episode")
 
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self._dt = 1.0 / rate_hz
@@ -84,6 +102,7 @@ class CubeTouchExpertNode(Node):
         self._episode_tool_pose_start_count = 0
         self._startup_ready_time: Optional[object] = None
         self._approach_reached_since: Optional[object] = None
+        self._home_reached_since: Optional[object] = None
         self._last_episode_cube_center: Optional[np.ndarray] = None
         self._ignore_cube_pose_until: Optional[object] = None
 
@@ -98,6 +117,14 @@ class CubeTouchExpertNode(Node):
         self._target_pub = self.create_publisher(Float32MultiArray, target_pose_y_topic, 10)
         self._event_pub = self.create_publisher(String, episode_event_topic, 10)
         self._instruction_pub = self.create_publisher(String, task_instruction_topic, 10)
+        self._recorder_start_client = self.create_client(
+            Trigger,
+            str(self.get_parameter("recorder_start_service").value),
+        )
+        self._recorder_stop_client = self.create_client(
+            Trigger,
+            str(self.get_parameter("recorder_stop_service").value),
+        )
         self.create_timer(self._dt, self._tick)
 
         self._publish_instruction()
@@ -136,22 +163,15 @@ class CubeTouchExpertNode(Node):
             top = center
         else:
             cube_size = float(self.get_parameter("cube_size_m").value)
-            top = center + np.array([0.0, 0.0, cube_size * 0.5], dtype=np.float32)
+            top = center + self._pose_up_axis(msg) * cube_size * 0.5
 
-        touch = top + np.array(
-            [0.0, 0.0, float(self.get_parameter("touch_clearance_m").value)],
-            dtype=np.float32,
-        )
-        approach = touch + np.array(
-            [0.0, 0.0, float(self.get_parameter("approach_height_m").value)],
-            dtype=np.float32,
-        )
-        retract = touch + np.array(
-            [0.0, 0.0, float(self.get_parameter("retract_height_m").value)],
-            dtype=np.float32,
-        )
+        up_axis = self._pose_up_axis(msg)
+        touch = top + up_axis * float(self.get_parameter("touch_clearance_m").value)
+        approach = touch + up_axis * float(self.get_parameter("approach_height_m").value)
+        retract = touch + up_axis * float(self.get_parameter("retract_height_m").value)
 
         self._goals = {
+            Stage.HOME: self._default_tool_pose(),
             Stage.APPROACH: approach,
             Stage.DESCEND: touch,
             Stage.HOLD: touch,
@@ -165,7 +185,10 @@ class CubeTouchExpertNode(Node):
 
         self._current_target = None
         self._pending_start_from_tool_pose = True
-        self._set_stage(Stage.APPROACH)
+        if bool(self.get_parameter("home_before_episode").value):
+            self._set_stage(Stage.HOME)
+        else:
+            self._set_stage(Stage.APPROACH)
         self._publish_instruction()
 
 
@@ -215,7 +238,7 @@ class CubeTouchExpertNode(Node):
                 return
             self._startup_ready_time = None
 
-        if self._timed_out():
+        if self._stage != Stage.HOME and self._timed_out():
             self._publish_event("failure_timeout")
             self._publish_event("episode_end")
             self._set_stage(Stage.DONE)
@@ -238,31 +261,33 @@ class CubeTouchExpertNode(Node):
         if goal is None:
             return
 
-        if self._stage == Stage.APPROACH:
+        if self._stage in (Stage.HOME, Stage.APPROACH):
             self._current_target = self._step_approach_toward(self._current_target, goal)
         else:
             self._current_target = self._step_toward(self._current_target, goal)
 
-
         self._publish_target()
         if self._target_reached(goal, self._stage):
-            if self._stage == Stage.APPROACH:
+            if self._stage == Stage.HOME:
+                if not self._home_settled():
+                    return
+                self._episode_started = self.get_clock().now()
+                self._set_stage(Stage.APPROACH)
+            elif self._stage == Stage.APPROACH:
                 if not self._approach_settled():
                     return
-                print("approach reached",flush=True)
                 self._set_stage(Stage.DESCEND)
             elif self._stage == Stage.DESCEND:
-                print("descend reached",flush=True)
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
-                print("retract reached",flush=True)
                 self._publish_event("episode_end")
                 self._ignore_cube_pose_until = self.get_clock().now() + Duration(
                     seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
                 )
                 self._set_stage(Stage.DONE)
-        elif self._stage == Stage.APPROACH:
+        elif self._stage in (Stage.HOME, Stage.APPROACH):
             self._approach_reached_since = None
+            self._home_reached_since = None
 
     def _step_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
         delta = goal - current
@@ -284,6 +309,26 @@ class CubeTouchExpertNode(Node):
         horizontal_goal[2] = safe_z
         return self._step_toward(current, horizontal_goal)
 
+    def _pose_up_axis(self, msg: PoseStamped) -> np.ndarray:
+        q = msg.pose.orientation
+        quat = np.array([q.w, q.x, q.y, q.z], dtype=np.float32)
+        norm = float(np.linalg.norm(quat))
+        if norm < 1e-6:
+            return _LOCAL_Z.copy()
+        w, x, y, z = quat / norm
+        up = np.array(
+            [
+                2.0 * (x * z + w * y),
+                2.0 * (y * z - w * x),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+            dtype=np.float32,
+        )
+        up_norm = float(np.linalg.norm(up))
+        if up_norm < 1e-6:
+            return _LOCAL_Z.copy()
+        return up / up_norm
+
     def _try_seed_current_target_from_tool_pose(self) -> None:
         if not self._pending_start_from_tool_pose:
             return
@@ -296,6 +341,21 @@ class CubeTouchExpertNode(Node):
             return
         self._current_target = self._tool_position.copy()
         self._pending_start_from_tool_pose = False
+
+    def _default_tool_pose(self) -> np.ndarray:
+        values = [
+            self.get_parameter("default_tool_x").value,
+            self.get_parameter("default_tool_y").value,
+            self.get_parameter("default_tool_z").value,
+        ]
+        out = []
+        for value in values:
+            try:
+                f = float(value)
+            except Exception:
+                f = 0.0
+            out.append(f if np.isfinite(f) else 0.0)
+        return np.asarray(out, dtype=np.float32)
 
     def _should_start_episode_for_cube(self, center: np.ndarray) -> bool:
         if self._stage not in (Stage.IDLE, Stage.DONE):
@@ -358,28 +418,50 @@ class CubeTouchExpertNode(Node):
         if reference is None:
             return False
 
+        if stage == Stage.HOME:
+            tolerance = max(0.0, float(self.get_parameter("home_tolerance_m").value))
+            return float(np.linalg.norm(reference - goal)) <= tolerance
+        if self._current_target is None:
+            
+            return False
+        xy_tolerance, z_tolerance = self._stage_tolerances(stage)
+
+        measured_xy_error = float(np.linalg.norm(reference[:2] - goal[:2]))
+        measured_z_error = abs(float(reference[2] - goal[2]))
+        target_xy_error = float(np.linalg.norm(self._current_target[:2] - goal[:2]))
+        target_z_error = abs(float(self._current_target[2] - goal[2]))
+        print(
+            f"{stage.value} tolerance xy={xy_tolerance}, z={z_tolerance}; "
+            f"Measured: {measured_xy_error}, {measured_z_error}; "
+            f"Target: {target_xy_error}, {target_z_error}",
+            flush=True,
+        )
+        return (
+            measured_xy_error <= xy_tolerance
+            and measured_z_error <= z_tolerance
+            and target_xy_error <= xy_tolerance
+            and target_z_error <= z_tolerance
+        )
+
+    def _stage_tolerances(self, stage: Stage) -> tuple[float, float]:
         if stage == Stage.APPROACH:
-            if self._current_target is None:
-                
-                return False
-            xy_tolerance = max(0.0, float(self.get_parameter("approach_xy_tolerance_m").value))
-            z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
-
-            measured_xy_error = float(np.linalg.norm(reference[:2] - goal[:2]))
-            measured_z_error = abs(float(reference[2] - goal[2]))
-            target_xy_error = float(np.linalg.norm(self._current_target[:2] - goal[:2]))
-            target_z_error = abs(float(self._current_target[2] - goal[2]))
             return (
-                measured_xy_error <= xy_tolerance
-                and measured_z_error <= z_tolerance
-                and target_xy_error <= xy_tolerance
-                and target_z_error <= z_tolerance
+                max(0.0, float(self.get_parameter("approach_xy_tolerance_m").value)),
+                max(0.0, float(self.get_parameter("approach_z_tolerance_m").value)),
             )
-
+        if stage == Stage.DESCEND:
+            return (
+                max(0.0, float(self.get_parameter("touch_xy_tolerance_m").value)),
+                max(0.0, float(self.get_parameter("touch_z_tolerance_m").value)),
+            )
+        if stage == Stage.RETRACT:
+            return (
+                max(0.0, float(self.get_parameter("retract_xy_tolerance_m").value)),
+                max(0.0, float(self.get_parameter("retract_z_tolerance_m").value)),
+            )
         tolerance = max(0.0, float(self.get_parameter("position_tolerance_m").value))
-        print(float(np.linalg.norm(reference - goal)), flush=True)
+        return tolerance, tolerance
 
-        return float(np.linalg.norm(reference - goal)) <= tolerance
 
     def _approach_settled(self) -> bool:
         settle_s = max(0.0, float(self.get_parameter("approach_settle_s").value))
@@ -388,13 +470,21 @@ class CubeTouchExpertNode(Node):
             return settle_s <= 0.0
         return self._elapsed(self._approach_reached_since) >= settle_s
 
+    def _home_settled(self) -> bool:
+        settle_s = max(0.0, float(self.get_parameter("home_settle_s").value))
+        if self._home_reached_since is None:
+            self._home_reached_since = self.get_clock().now()
+            return settle_s <= 0.0
+        return self._elapsed(self._home_reached_since) >= settle_s
+
     def _set_stage(self, stage: Stage) -> None:
         self._stage = stage
         self._hold_started = None
         self._approach_reached_since = None
+        self._home_reached_since = None
         if stage == Stage.APPROACH:
             self._publish_event("episode_start")
-        if stage != Stage.DONE:
+        if stage not in (Stage.HOME, Stage.DONE):
             self._publish_event(stage.value)
 
     def _publish_target(self) -> None:
@@ -413,6 +503,31 @@ class CubeTouchExpertNode(Node):
         msg = String()
         msg.data = f"{self._episode_id}:{event}"
         self._event_pub.publish(msg)
+        if event == "episode_start":
+            self._call_recorder_service(self._recorder_start_client, "start_episode")
+        elif event == "episode_end":
+            self._call_recorder_service(self._recorder_stop_client, "stop_episode")
+
+    def _call_recorder_service(self, client, label: str) -> None:
+        if not bool(self.get_parameter("call_recorder_services").value):
+            return
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.0):
+            self.get_logger().warn(
+                f"Recorder service for {label} is not available",
+                throttle_duration_sec=2.0,
+            )
+            return
+        future = client.call_async(Trigger.Request())
+        future.add_done_callback(lambda done: self._log_recorder_service_result(done, label))
+
+    def _log_recorder_service_result(self, future, label: str) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f"Recorder service {label} failed: {exc}")
+            return
+        if not response.success:
+            self.get_logger().warn(f"Recorder service {label} returned failure: {response.message}")
 
     def _publish_instruction(self) -> None:
         msg = String()

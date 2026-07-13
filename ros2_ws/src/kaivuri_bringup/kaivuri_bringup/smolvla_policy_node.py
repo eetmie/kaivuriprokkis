@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional
+import importlib
+from typing import Any, Optional
 
 import numpy as np
 import rclpy
-import torch
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32MultiArray, String
@@ -21,11 +21,25 @@ DEFAULT_JOINT_ORDER = [
 ]
 
 
+def _import_required(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise
+        raise RuntimeError(
+            f"{module_name} is required for smolvla_policy_node. "
+            "Run it with the Python environment that has the SmolVLA/Lerobot "
+            "dependencies installed, or install the missing package there."
+        ) from exc
+
+
 class SmolVLAPolicyNode(Node):
     """Run a fine-tuned SmolVLA policy and publish IK end-effector targets."""
 
     def __init__(self) -> None:
         super().__init__("smolvla_policy_node")
+        self._torch = _import_required("torch")
 
         self.declare_parameter(
             "checkpoint",
@@ -51,8 +65,8 @@ class SmolVLAPolicyNode(Node):
         self.declare_parameter("rot_y_min_deg", -90.0)
         self.declare_parameter("rot_y_max_deg", 90.0)
 
-        self._image_tensor: Optional[torch.Tensor] = None
-        self._state_tensor: Optional[torch.Tensor] = None
+        self._image_tensor: Optional[Any] = None
+        self._state_tensor: Optional[Any] = None
         self._last_action: Optional[np.ndarray] = None
         self._instruction = str(self.get_parameter("instruction").value)
 
@@ -78,14 +92,22 @@ class SmolVLAPolicyNode(Node):
 
     def _resolve_device(self, configured: str) -> str:
         if configured == "auto":
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            return "cuda" if self._torch.cuda.is_available() else "cpu"
         return configured
 
     def _load_policy(self) -> None:
-        from lerobot.configs.train import TrainPipelineConfig
-        from lerobot.datasets.factory import make_dataset
-        from lerobot.policies import make_policy, make_pre_post_processors
-        from lerobot.policies.pretrained import PreTrainedConfig
+        try:
+            from lerobot.configs.train import TrainPipelineConfig
+            from lerobot.datasets.factory import make_dataset
+            from lerobot.policies import make_policy, make_pre_post_processors
+            from lerobot.policies.pretrained import PreTrainedConfig
+        except ModuleNotFoundError as exc:
+            if exc.name != "lerobot" and not str(exc.name).startswith("lerobot."):
+                raise
+            raise RuntimeError(
+                "lerobot is required for smolvla_policy_node. Run it with the "
+                "Python environment that contains the trained-policy dependencies."
+            ) from exc
 
         checkpoint = str(self.get_parameter("checkpoint").value)
         cfg = TrainPipelineConfig.from_pretrained(checkpoint)
@@ -128,7 +150,11 @@ class SmolVLAPolicyNode(Node):
             positions.append(float(msg.position[idx]) if idx < len(msg.position) else 0.0)
             velocities.append(float(msg.velocity[idx]) if idx < len(msg.velocity) else 0.0)
 
-        state = torch.tensor(positions + velocities, dtype=torch.float32, device=self._device)
+        state = self._torch.tensor(
+            positions + velocities,
+            dtype=self._torch.float32,
+            device=self._device,
+        )
         self._state_tensor = state
 
     def _on_image(self, msg: Image) -> None:
@@ -138,8 +164,8 @@ class SmolVLAPolicyNode(Node):
             self.get_logger().warn(f"Failed to decode image: {exc}", throttle_duration_sec=2.0)
             return
 
-        tensor = torch.from_numpy(image).permute(2, 0, 1).contiguous()
-        self._image_tensor = tensor.to(self._device, dtype=torch.float32) / 255.0
+        tensor = self._torch.from_numpy(image).permute(2, 0, 1).contiguous()
+        self._image_tensor = tensor.to(self._device, dtype=self._torch.float32) / 255.0
 
     def _decode_image(self, msg: Image) -> np.ndarray:
         height = int(msg.height)
@@ -180,7 +206,7 @@ class SmolVLAPolicyNode(Node):
         }
 
         try:
-            with torch.no_grad():
+            with self._torch.no_grad():
                 processed = self._preprocessor(batch)
                 action = self._policy.select_action(processed)
                 action = self._postprocessor(action)

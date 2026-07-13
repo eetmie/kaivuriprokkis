@@ -127,7 +127,8 @@ controller:
 
   # Per-joint velocity limits in rad/iter [slew, boom, arm, bucket]
   # Formula: rad/iter = degrees/sec / (57.3 * control_hz)
-  per_joint_max_velocity: [0.0035, 0.0035, 0.0035, 0.0035]
+  # per_joint_max_velocity: [0.0035, 0.0035, 0.0035, 0.0035]
+  per_joint_max_velocity: [0.012, 0.012, 0.012, 0.012]
 
 # Inverse Kinematics configuration
 # Used by: ExcavatorController, IKController

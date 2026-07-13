@@ -280,6 +280,48 @@ ros2 topic list | grep camera
 ros2 topic hz /camera/camera/imu
 ```
 
+## LeRobot ROS 2 Recording
+
+Use this when actions and observations are already ROS topics. The recorder writes
+directly to a LeRobot dataset instead of adapting the topics through LeRobot's
+interactive `record_loop`.
+
+```bash
+cd /home/joel/kaivuriprokkis
+ros2-jazzy bash -lc 'cd /work/ros2_ws && source install/setup.bash && ros2 launch kaivuri_bringup lerobot_ros2_recorder.launch.py'
+```
+
+Recorded features:
+
+```text
+observation.images.hut   <- /camera/camera/color/image_raw
+observation.images.top   <- /camera/camera1/color/image_raw
+observation.tool_pose    <- /kaivuri/tool_pose [x, y, z, qw, qx, qy, qz]
+action                   <- /kaivuri/target_pose_y [x, y, z, rot_y_deg]
+task                     <- launch task parameter or /kaivuri/task_instruction
+```
+
+Common overrides:
+
+```bash
+ros2 launch kaivuri_bringup lerobot_ros2_recorder.launch.py \
+  root:=/work/data/kaivuri_lerobot_live \
+  repo_id:=kaivuri/kaivuri_lerobot_live \
+  fps:=3.0 \
+  episode_time_s:=60.0 \
+  num_episodes:=5 \
+  auto_start:=false \
+  task:="touch the top of the red cube"
+```
+
+
+When `cube_touch_expert_node` is running, it calls these services automatically on `episode_start` and `episode_end`. Manual episode control is also available when `auto_start:=false`:
+
+```bash
+ros2 service call /lerobot_ros2_recorder_node/start_episode std_srvs/srv/Trigger
+ros2 service call /lerobot_ros2_recorder_node/stop_episode std_srvs/srv/Trigger
+```
+
 ## RViz and MoveIt on a Laptop
 
 The current Pi image is headless and does not include RViz/MoveIt. Run RViz and

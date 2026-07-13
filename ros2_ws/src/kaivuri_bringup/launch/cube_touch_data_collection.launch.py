@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -12,11 +12,22 @@ def generate_launch_description():
         DeclareLaunchArgument("cube_size_m", default_value="0.05"),
         DeclareLaunchArgument("cube_command_topic", default_value="/kaivuri/cube_pose_cmd"),
         DeclareLaunchArgument("rate_hz", default_value="50.0"),
-        DeclareLaunchArgument("speed_mps", default_value="0.08"),
+        DeclareLaunchArgument("speed_mps", default_value="0.01"),
         DeclareLaunchArgument("position_tolerance_m", default_value="0.02"),
-        DeclareLaunchArgument("approach_xy_tolerance_m", default_value="0.005"),
-        DeclareLaunchArgument("approach_z_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument("approach_xy_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument("approach_z_tolerance_m", default_value="0.05"),
+        DeclareLaunchArgument("touch_xy_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument("touch_z_tolerance_m", default_value="0.01"),
+        DeclareLaunchArgument("retract_xy_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument("retract_z_tolerance_m", default_value="0.05"),
         DeclareLaunchArgument("approach_settle_s", default_value="1.5"),
+        DeclareLaunchArgument(
+            "python_executable",
+            default_value=EnvironmentVariable(
+                "KAIVURI_PYTHON_EXECUTABLE",
+                default_value="/mnt/c/Users/sh25016/Documents/kaivuriprokkis/.venv/bin/python",
+            ),
+        ),
         DeclareLaunchArgument("use_polar_workspace", default_value="true"),
         DeclareLaunchArgument("cube_radius_min", default_value="0.45"),
         DeclareLaunchArgument("cube_radius_max", default_value="0.68"),
@@ -28,12 +39,22 @@ def generate_launch_description():
         DeclareLaunchArgument("cube_y_max", default_value="0.15"),
         DeclareLaunchArgument("cube_relocate_delay_s", default_value="1.2"),
         DeclareLaunchArgument("post_episode_cube_ignore_s", default_value="1.0"),
-        DeclareLaunchArgument("use_ik_reachability", default_value="true"),
+        DeclareLaunchArgument("use_ik_reachability", default_value="false"),
+        DeclareLaunchArgument("home_before_episode", default_value="true"),
+        DeclareLaunchArgument("default_tool_x", default_value="0.6461694240570068"),
+        DeclareLaunchArgument("default_tool_y", default_value="0.0"),
+        DeclareLaunchArgument("default_tool_z", default_value="0.09068"),
+        DeclareLaunchArgument("home_tolerance_m", default_value="0.02"),
+        DeclareLaunchArgument("home_settle_s", default_value="2.0"),
+        DeclareLaunchArgument("call_recorder_services", default_value="true"),
+        DeclareLaunchArgument("recorder_start_service", default_value="/lerobot_ros2_recorder_node/start_episode"),
+        DeclareLaunchArgument("recorder_stop_service", default_value="/lerobot_ros2_recorder_node/stop_episode"),
         Node(
             package="kaivuri_bringup",
             executable="cube_touch_expert_node",
             name="cube_touch_expert_node",
             output="screen",
+            prefix=[LaunchConfiguration("python_executable"), " "],
             parameters=[{
                 "cube_size_m": LaunchConfiguration("cube_size_m"),
                 "rate_hz": LaunchConfiguration("rate_hz"),
@@ -41,8 +62,18 @@ def generate_launch_description():
                 "position_tolerance_m": LaunchConfiguration("position_tolerance_m"),
                 "approach_xy_tolerance_m": LaunchConfiguration("approach_xy_tolerance_m"),
                 "approach_z_tolerance_m": LaunchConfiguration("approach_z_tolerance_m"),
+                "touch_xy_tolerance_m": LaunchConfiguration("touch_xy_tolerance_m"),
+                "touch_z_tolerance_m": LaunchConfiguration("touch_z_tolerance_m"),
+                "retract_xy_tolerance_m": LaunchConfiguration("retract_xy_tolerance_m"),
+                "retract_z_tolerance_m": LaunchConfiguration("retract_z_tolerance_m"),
                 "approach_settle_s": LaunchConfiguration("approach_settle_s"),
                 "post_episode_cube_ignore_s": LaunchConfiguration("post_episode_cube_ignore_s"),
+                "home_before_episode": LaunchConfiguration("home_before_episode"),
+                "default_tool_x": LaunchConfiguration("default_tool_x"),
+                "default_tool_y": LaunchConfiguration("default_tool_y"),
+                "default_tool_z": LaunchConfiguration("default_tool_z"),
+                "home_tolerance_m": LaunchConfiguration("home_tolerance_m"),
+                "home_settle_s": LaunchConfiguration("home_settle_s"),
                 "use_polar_workspace": LaunchConfiguration("use_polar_workspace"),
                 "radius_min": LaunchConfiguration("cube_radius_min"),
                 "radius_max": LaunchConfiguration("cube_radius_max"),
@@ -52,6 +83,9 @@ def generate_launch_description():
                 "x_max": LaunchConfiguration("cube_x_max"),
                 "y_min": LaunchConfiguration("cube_y_min"),
                 "y_max": LaunchConfiguration("cube_y_max"),
+                "call_recorder_services": LaunchConfiguration("call_recorder_services"),
+                "recorder_start_service": LaunchConfiguration("recorder_start_service"),
+                "recorder_stop_service": LaunchConfiguration("recorder_stop_service"),
             }],
         ),
         Node(
@@ -59,6 +93,7 @@ def generate_launch_description():
             executable="success_cube_relocator_node",
             name="success_cube_relocator_node",
             output="screen",
+            prefix=[LaunchConfiguration("python_executable"), " "],
             condition=IfCondition(LaunchConfiguration("use_success_cube_relocator")),
             parameters=[{
                 "cube_command_topic": LaunchConfiguration("cube_command_topic"),
@@ -81,6 +116,7 @@ def generate_launch_description():
             executable="random_cube_pose_node",
             name="random_cube_pose_node",
             output="screen",
+            prefix=[LaunchConfiguration("python_executable"), " "],
             condition=IfCondition(LaunchConfiguration("use_random_cube")),
             parameters=[{
                 "period_s": 8.0,

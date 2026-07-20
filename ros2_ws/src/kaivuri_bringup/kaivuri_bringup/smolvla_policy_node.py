@@ -3,14 +3,17 @@ from __future__ import annotations
 import importlib
 from typing import Any, Optional
 
+import av
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CompressedImage, Image, JointState
 from std_msgs.msg import Float32MultiArray, String
 
+
+av.logging.set_level(av.logging.ERROR)
 
 DEFAULT_JOINT_ORDER = [
     "revolute_carriage",
@@ -59,8 +62,8 @@ class SmolVLAPolicyNode(Node):
         )
         self.declare_parameter("dataset_root", "/mnt/c/users/sh25016/kaivuri_lerobot_live_014")
         self.declare_parameter("dataset_repo_id", "kaivuri/ros2_recording_2")
-        self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_decoded")
-        self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_decoded")
+        self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_compressed")
+        self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_compressed")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
         self.declare_parameter("observation_state_source", "tool_pose")
         self.declare_parameter("joint_states_topic", "/joint_states")
@@ -86,6 +89,12 @@ class SmolVLAPolicyNode(Node):
 
         self._obs_image_1_tensor: Optional[Any] = None
         self._obs_image_2_tensor: Optional[Any] = None
+        self._obs_image_1_compressed_msg: Optional[CompressedImage] = None
+        self._obs_image_2_compressed_msg: Optional[CompressedImage] = None
+        self._obs_image_1_decoded_stamp: Optional[tuple[int, int]] = None
+        self._obs_image_2_decoded_stamp: Optional[tuple[int, int]] = None
+        self._obs_image_1_h264_decoder = av.CodecContext.create("h264", "r")
+        self._obs_image_2_h264_decoder = av.CodecContext.create("h264", "r")
         self._state_tensor: Optional[Any] = None
         self._state_input_key = TOOL_POSE_KEY
         self._last_action: Optional[np.ndarray] = None
@@ -128,8 +137,16 @@ class SmolVLAPolicyNode(Node):
             depth=1,
         )
 
-        self.create_subscription(Image, obs_image_1_topic, self._on_obs_image_1, image_qos)
-        self.create_subscription(Image, obs_image_2_topic, self._on_obs_image_2, image_qos)
+        self._obs_image_1_compressed = self._is_compressed_topic(obs_image_1_topic)
+        self._obs_image_2_compressed = self._is_compressed_topic(obs_image_2_topic)
+        if self._obs_image_1_compressed:
+            self.create_subscription(CompressedImage, obs_image_1_topic, self._on_obs_image_1_compressed, image_qos)
+        else:
+            self.create_subscription(Image, obs_image_1_topic, self._on_obs_image_1, image_qos)
+        if self._obs_image_2_compressed:
+            self.create_subscription(CompressedImage, obs_image_2_topic, self._on_obs_image_2_compressed, image_qos)
+        else:
+            self.create_subscription(Image, obs_image_2_topic, self._on_obs_image_2, image_qos)
         if self._observation_state_source == "tool_pose":
             self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
             state_topic = tool_pose_topic
@@ -207,6 +224,10 @@ class SmolVLAPolicyNode(Node):
                 return source_key
         return STATE_KEY
 
+    def _is_compressed_topic(self, topic: str) -> bool:
+        topic = topic.rstrip("/")
+        return topic.endswith("_compressed") or topic.endswith("/compressed")
+
     def _on_instruction(self, msg: String) -> None:
         if msg.data.strip():
             self._instruction = msg.data.strip()
@@ -249,9 +270,17 @@ class SmolVLAPolicyNode(Node):
 
     def _on_obs_image_1(self, msg: Image) -> None:
         self._obs_image_1_tensor = self._image_msg_to_tensor(msg)
+        self._obs_image_1_compressed_msg = None
 
     def _on_obs_image_2(self, msg: Image) -> None:
         self._obs_image_2_tensor = self._image_msg_to_tensor(msg)
+        self._obs_image_2_compressed_msg = None
+
+    def _on_obs_image_1_compressed(self, msg: CompressedImage) -> None:
+        self._obs_image_1_compressed_msg = msg
+
+    def _on_obs_image_2_compressed(self, msg: CompressedImage) -> None:
+        self._obs_image_2_compressed_msg = msg
 
     def _image_msg_to_tensor(self, msg: Image):
         try:
@@ -287,8 +316,68 @@ class SmolVLAPolicyNode(Node):
 
         raise ValueError(f"unsupported image encoding {msg.encoding!r}")
 
+    def _compressed_image_msg_to_tensor(
+        self,
+        msg: CompressedImage,
+        codec: av.CodecContext,
+    ):
+        try:
+            image = self._decode_compressed_image(msg, codec)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to decode compressed image: {exc}", throttle_duration_sec=2.0)
+            return None
+
+        tensor = self._torch.from_numpy(image).permute(2, 0, 1).contiguous()
+        return tensor.to(self._device, dtype=self._torch.float32) / 255.0
+
+    def _decode_compressed_image(self, msg: CompressedImage, codec: av.CodecContext) -> np.ndarray:
+        fmt = str(msg.format).lower()
+        if "h264" not in fmt:
+            raise ValueError(f"unsupported compressed image format {msg.format!r}")
+
+        packet = av.Packet(bytes(msg.data))
+        frames = codec.decode(packet)
+        if not frames:
+            raise ValueError("H264 packet did not produce a frame")
+        return np.ascontiguousarray(frames[-1].to_ndarray(format="rgb24"))
+
+    def _stamp_key(self, msg: CompressedImage) -> tuple[int, int]:
+        return (int(msg.header.stamp.sec), int(msg.header.stamp.nanosec))
+
+    def _latest_obs_image_1_tensor(self):
+        if not self._obs_image_1_compressed:
+            return self._obs_image_1_tensor
+        if self._obs_image_1_compressed_msg is None:
+            return None
+        stamp = self._stamp_key(self._obs_image_1_compressed_msg)
+        if self._obs_image_1_tensor is not None and self._obs_image_1_decoded_stamp == stamp:
+            return self._obs_image_1_tensor
+        self._obs_image_1_tensor = self._compressed_image_msg_to_tensor(
+            self._obs_image_1_compressed_msg,
+            self._obs_image_1_h264_decoder,
+        )
+        self._obs_image_1_decoded_stamp = stamp if self._obs_image_1_tensor is not None else None
+        return self._obs_image_1_tensor
+
+    def _latest_obs_image_2_tensor(self):
+        if not self._obs_image_2_compressed:
+            return self._obs_image_2_tensor
+        if self._obs_image_2_compressed_msg is None:
+            return None
+        stamp = self._stamp_key(self._obs_image_2_compressed_msg)
+        if self._obs_image_2_tensor is not None and self._obs_image_2_decoded_stamp == stamp:
+            return self._obs_image_2_tensor
+        self._obs_image_2_tensor = self._compressed_image_msg_to_tensor(
+            self._obs_image_2_compressed_msg,
+            self._obs_image_2_h264_decoder,
+        )
+        self._obs_image_2_decoded_stamp = stamp if self._obs_image_2_tensor is not None else None
+        return self._obs_image_2_tensor
+
     def _tick(self) -> None:
-        if self._obs_image_1_tensor is None or self._obs_image_2_tensor is None or self._state_tensor is None:
+        obs_image_1_tensor = self._latest_obs_image_1_tensor()
+        obs_image_2_tensor = self._latest_obs_image_2_tensor()
+        if obs_image_1_tensor is None or obs_image_2_tensor is None or self._state_tensor is None:
             self.get_logger().warn(
                 "Waiting for OBS_IMAGE_1, OBS_IMAGE_2, and observation state before running SmolVLA",
                 throttle_duration_sec=2.0,
@@ -296,8 +385,8 @@ class SmolVLAPolicyNode(Node):
             return
 
         batch = {
-            OBS_IMAGE_1_KEY: self._obs_image_1_tensor.unsqueeze(0),
-            OBS_IMAGE_2_KEY: self._obs_image_2_tensor.unsqueeze(0),
+            OBS_IMAGE_1_KEY: obs_image_1_tensor.unsqueeze(0),
+            OBS_IMAGE_2_KEY: obs_image_2_tensor.unsqueeze(0),
             self._state_input_key: self._state_tensor.unsqueeze(0),
             "task": self._instruction,
         }

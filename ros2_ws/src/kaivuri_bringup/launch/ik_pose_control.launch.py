@@ -57,7 +57,7 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
             prefix=[python_executable, " "],
             parameters=[{
-                "project_root": project_root,
+                "projtouch_clearance_mect_root": project_root,
                 "robot": robot,
                 "state_rate_hz": state_rate_hz,
                 "command_timeout_s": command_timeout_s,

@@ -5,15 +5,18 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
+import av
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Float32MultiArray, String
 from std_srvs.srv import Trigger
 
+
+av.logging.set_level(av.logging.ERROR)
 
 OBS_IMAGE_1_KEY = "observation.images.OBS_IMAGE_1"  # top view
 OBS_IMAGE_2_KEY = "observation.images.OBS_IMAGE_2"  # wrist/front view
@@ -37,11 +40,11 @@ class LeRobotRos2RecorderNode(Node):
         self.declare_parameter("robot_type", "kaivuri")
         self.declare_parameter("task", "touch the top of the red cube")
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
-        self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_decoded")
-        self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_decoded")
+        self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_compressed")
+        self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_compressed")
         # Legacy aliases kept so older launch commands still work.
-        self.declare_parameter("hut_image_topic", "/camera/camera/color/rgb_decoded")
-        self.declare_parameter("top_image_topic", "/camera/camera1/color/rgb_decoded")
+        self.declare_parameter("hut_image_topic", "/camera/camera/color/rgb_compressed")
+        self.declare_parameter("top_image_topic", "/camera/camera1/color/rgb_compressed")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
         self.declare_parameter("action_topic", "/kaivuri/target_pose_delta_y")
         self.declare_parameter("max_sample_age_s", 1.0)
@@ -57,6 +60,12 @@ class LeRobotRos2RecorderNode(Node):
         self._episodes_saved = 0
         self._latest_obs_image_1: Optional[np.ndarray] = None
         self._latest_obs_image_2: Optional[np.ndarray] = None
+        self._latest_obs_image_1_compressed_msg: Optional[CompressedImage] = None
+        self._latest_obs_image_2_compressed_msg: Optional[CompressedImage] = None
+        self._latest_obs_image_1_decoded_stamp: Optional[tuple[int, int]] = None
+        self._latest_obs_image_2_decoded_stamp: Optional[tuple[int, int]] = None
+        self._obs_image_1_h264_decoder = av.CodecContext.create("h264", "r")
+        self._obs_image_2_h264_decoder = av.CodecContext.create("h264", "r")
         self._latest_tool_pose: Optional[np.ndarray] = None
         self._latest_action: Optional[np.ndarray] = None
         self._latest_obs_image_1_time: Optional[Any] = None
@@ -73,8 +82,16 @@ class LeRobotRos2RecorderNode(Node):
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        self.create_subscription(Image, obs_image_1_topic, self._on_obs_image_1, image_qos)
-        self.create_subscription(Image, obs_image_2_topic, self._on_obs_image_2, image_qos)
+        self._obs_image_1_compressed = self._is_compressed_topic(obs_image_1_topic)
+        self._obs_image_2_compressed = self._is_compressed_topic(obs_image_2_topic)
+        if self._obs_image_1_compressed:
+            self.create_subscription(CompressedImage, obs_image_1_topic, self._on_obs_image_1_compressed, image_qos)
+        else:
+            self.create_subscription(Image, obs_image_1_topic, self._on_obs_image_1, image_qos)
+        if self._obs_image_2_compressed:
+            self.create_subscription(CompressedImage, obs_image_2_topic, self._on_obs_image_2_compressed, image_qos)
+        else:
+            self.create_subscription(Image, obs_image_2_topic, self._on_obs_image_2, image_qos)
         self.create_subscription(PoseStamped, str(self.get_parameter("tool_pose_topic").value), self._on_tool_pose, 10)
         self.create_subscription(Float32MultiArray, str(self.get_parameter("action_topic").value), self._on_action, 10)
         self.create_subscription(
@@ -105,6 +122,10 @@ class LeRobotRos2RecorderNode(Node):
         if preferred:
             return preferred
         return str(self.get_parameter(fallback_name).value).strip()
+
+    def _is_compressed_topic(self, topic: str) -> bool:
+        topic = topic.rstrip("/")
+        return topic.endswith("_compressed") or topic.endswith("/compressed")
 
     def _import_lerobot_dataset(self):
         try:
@@ -228,9 +249,19 @@ class LeRobotRos2RecorderNode(Node):
     def _on_obs_image_1(self, msg: Image) -> None:
         self._latest_obs_image_1 = self._decode_image(msg)
         self._latest_obs_image_1_time = self.get_clock().now()
+        self._latest_obs_image_1_compressed_msg = None
 
     def _on_obs_image_2(self, msg: Image) -> None:
         self._latest_obs_image_2 = self._decode_image(msg)
+        self._latest_obs_image_2_time = self.get_clock().now()
+        self._latest_obs_image_2_compressed_msg = None
+
+    def _on_obs_image_1_compressed(self, msg: CompressedImage) -> None:
+        self._latest_obs_image_1_compressed_msg = msg
+        self._latest_obs_image_1_time = self.get_clock().now()
+
+    def _on_obs_image_2_compressed(self, msg: CompressedImage) -> None:
+        self._latest_obs_image_2_compressed_msg = msg
         self._latest_obs_image_2_time = self.get_clock().now()
 
     def _on_tool_pose(self, msg: PoseStamped) -> None:
@@ -284,7 +315,48 @@ class LeRobotRos2RecorderNode(Node):
 
         raise ValueError(f"unsupported image encoding {msg.encoding!r}")
 
+    def _decode_compressed_image(self, msg: CompressedImage, codec: av.CodecContext) -> np.ndarray:
+        fmt = str(msg.format).lower()
+        if "h264" not in fmt:
+            raise ValueError(f"unsupported compressed image format {msg.format!r}")
+
+        packet = av.Packet(bytes(msg.data))
+        frames = codec.decode(packet)
+        if not frames:
+            raise ValueError("H264 packet did not produce a frame")
+        return np.ascontiguousarray(frames[-1].to_ndarray(format="rgb24"))
+
+    def _stamp_key(self, msg: CompressedImage) -> tuple[int, int]:
+        return (int(msg.header.stamp.sec), int(msg.header.stamp.nanosec))
+
+    def _refresh_latest_images(self) -> None:
+        if self._obs_image_1_compressed and self._latest_obs_image_1_compressed_msg is not None:
+            stamp = self._stamp_key(self._latest_obs_image_1_compressed_msg)
+            if self._latest_obs_image_1 is None or self._latest_obs_image_1_decoded_stamp != stamp:
+                try:
+                    self._latest_obs_image_1 = self._decode_compressed_image(
+                        self._latest_obs_image_1_compressed_msg,
+                        self._obs_image_1_h264_decoder,
+                    )
+                    self._latest_obs_image_1_decoded_stamp = stamp
+                except Exception as exc:
+                    self.get_logger().warn(f"Failed to decode OBS_IMAGE_1: {exc}", throttle_duration_sec=2.0)
+
+        if self._obs_image_2_compressed and self._latest_obs_image_2_compressed_msg is not None:
+            stamp = self._stamp_key(self._latest_obs_image_2_compressed_msg)
+            if self._latest_obs_image_2 is None or self._latest_obs_image_2_decoded_stamp != stamp:
+                try:
+                    self._latest_obs_image_2 = self._decode_compressed_image(
+                        self._latest_obs_image_2_compressed_msg,
+                        self._obs_image_2_h264_decoder,
+                    )
+                    self._latest_obs_image_2_decoded_stamp = stamp
+                except Exception as exc:
+                    self.get_logger().warn(f"Failed to decode OBS_IMAGE_2: {exc}", throttle_duration_sec=2.0)
+
     def _record_tick(self) -> None:
+        self._refresh_latest_images()
+
         if not self._recording:
             if self._pending_save_episode:
                 if self._dataset_ready():

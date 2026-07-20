@@ -13,6 +13,7 @@ from std_srvs.srv import Trigger
 
 _LOCAL_Z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+DEFAULT_CUBE_POSE_Z_OFFSET_M = 0.0
 
 
 class Stage(str, Enum):
@@ -61,7 +62,8 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("timeout_s", 180.0)
         self.declare_parameter("approach_height_m", 0.05)
         self.declare_parameter("retract_height_m", 0.05)
-        self.declare_parameter("touch_clearance_m", 0.01)
+        self.declare_parameter("cube_pose_z_offset_m", DEFAULT_CUBE_POSE_Z_OFFSET_M)
+        self.declare_parameter("touch_clearance_m", 0.0)
         self.declare_parameter("cube_size_m", 0.05)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("rot_y_deg", 0.0)
@@ -196,6 +198,7 @@ class CubeTouchExpertNode(Node):
             top = center + self._pose_up_axis(msg) * cube_size * 0.5
 
         up_axis = self._pose_up_axis(msg)
+        top = top + up_axis * float(self.get_parameter("cube_pose_z_offset_m").value)
         touch = top + up_axis * float(self.get_parameter("touch_clearance_m").value)
         approach = touch + up_axis * float(self.get_parameter("approach_height_m").value)
         retract = touch + up_axis * float(self.get_parameter("retract_height_m").value)

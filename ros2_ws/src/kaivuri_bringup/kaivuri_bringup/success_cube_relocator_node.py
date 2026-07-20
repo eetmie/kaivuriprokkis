@@ -36,7 +36,8 @@ class SuccessCubeRelocatorNode(Node):
         self.declare_parameter("publish_initial_pose", False)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("cube_size_m", 0.05)
-        self.declare_parameter("touch_clearance_m", 0.01)
+        self.declare_parameter("cube_pose_z_offset_m", 0.0)
+        self.declare_parameter("touch_clearance_m", 0.0)
         self.declare_parameter("rot_y_deg", 0.0)
         self.declare_parameter("min_move_distance_m", 0.08)
         self.declare_parameter("max_attempts", 200)
@@ -301,7 +302,7 @@ class SuccessCubeRelocatorNode(Node):
             bool(self.get_parameter("use_measured_cube_z").value)
             and self._last_measured_cube_pose is not None
         ):
-            return float(self._last_measured_cube_pose[2])
+            return float(self._last_measured_cube_pose[2]) + float(self.get_parameter("cube_pose_z_offset_m").value)
         return float(self.get_parameter("z").value)
 
     def _joint_seed(self) -> np.ndarray:

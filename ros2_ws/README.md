@@ -294,8 +294,8 @@ ros2-jazzy bash -lc 'cd /work/ros2_ws && source install/setup.bash && ros2 launc
 Recorded features:
 
 ```text
-observation.images.OBS_IMAGE_1  <- top view, /camera/camera1/color/rgb_decoded
-observation.images.OBS_IMAGE_2  <- wrist/front view, /camera/camera/color/rgb_decoded
+observation.images.OBS_IMAGE_1  <- top view, /camera/camera1/color/rgb_compressed
+observation.images.OBS_IMAGE_2  <- wrist/front view, /camera/camera/color/rgb_compressed
 observation.tool_pose           <- /kaivuri/tool_pose [x, y, z, qw, qx, qy, qz]
 action                          <- /kaivuri/target_pose_delta_y [dx, dy, dz, d_rot_y_deg]
 task                            <- launch task parameter or /kaivuri/task_instruction
@@ -311,8 +311,8 @@ ros2 launch kaivuri_bringup lerobot_ros2_recorder.launch.py \
   episode_time_s:=60.0 \
   num_episodes:=5 \
   auto_start:=false \
-  obs_image_1_topic:=/camera/camera1/color/rgb_decoded \
-  obs_image_2_topic:=/camera/camera/color/rgb_decoded \
+  obs_image_1_topic:=/camera/camera1/color/rgb_compressed \
+  obs_image_2_topic:=/camera/camera/color/rgb_compressed \
   task:="touch the top of the red cube"
 ```
 

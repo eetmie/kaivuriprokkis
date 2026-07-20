@@ -10,6 +10,8 @@ def generate_launch_description():
         DeclareLaunchArgument("use_success_cube_relocator", default_value="true"),
         DeclareLaunchArgument("use_random_cube", default_value="false"),
         DeclareLaunchArgument("cube_size_m", default_value="0.05"),
+        DeclareLaunchArgument("cube_pose_z_offset_m", default_value="0.0"),
+        DeclareLaunchArgument("touch_clearance_m", default_value="0.0"),
         DeclareLaunchArgument("cube_command_topic", default_value="/kaivuri/cube_pose_cmd"),
         DeclareLaunchArgument("target_command_mode", default_value="delta"),
         DeclareLaunchArgument("target_pose_y_topic", default_value="/kaivuri/target_pose_y"),
@@ -64,6 +66,8 @@ def generate_launch_description():
             prefix=[LaunchConfiguration("python_executable"), " "],
             parameters=[{
                 "cube_size_m": LaunchConfiguration("cube_size_m"),
+                "cube_pose_z_offset_m": LaunchConfiguration("cube_pose_z_offset_m"),
+                "touch_clearance_m": LaunchConfiguration("touch_clearance_m"),
                 "target_command_mode": LaunchConfiguration("target_command_mode"),
                 "target_pose_y_topic": LaunchConfiguration("target_pose_y_topic"),
                 "target_pose_delta_y_topic": LaunchConfiguration("target_pose_delta_y_topic"),
@@ -112,6 +116,8 @@ def generate_launch_description():
             parameters=[{
                 "cube_command_topic": LaunchConfiguration("cube_command_topic"),
                 "cube_size_m": LaunchConfiguration("cube_size_m"),
+                "cube_pose_z_offset_m": LaunchConfiguration("cube_pose_z_offset_m"),
+                "touch_clearance_m": LaunchConfiguration("touch_clearance_m"),
                 "use_polar_workspace": LaunchConfiguration("use_polar_workspace"),
                 "radius_min": LaunchConfiguration("cube_radius_min"),
                 "radius_max": LaunchConfiguration("cube_radius_max"),

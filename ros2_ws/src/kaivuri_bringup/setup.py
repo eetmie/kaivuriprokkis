@@ -16,7 +16,7 @@ setup(
             "launch/lerobot_ros2_recorder.launch.py",
         ]),
     ],
-    install_requires=["setuptools", "inputs"],
+    install_requires=["setuptools", "inputs", "av"],
     zip_safe=True,
     maintainer="joel",
     maintainer_email="joel@example.com",

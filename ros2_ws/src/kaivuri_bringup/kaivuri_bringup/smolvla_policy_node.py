@@ -5,7 +5,9 @@ from typing import Any, Optional
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32MultiArray, String
 
@@ -19,6 +21,11 @@ DEFAULT_JOINT_ORDER = [
     "revolute_claw_1",
     "revolute_claw_2",
 ]
+
+OBS_IMAGE_1_KEY = "observation.images.OBS_IMAGE_1"  # top view
+OBS_IMAGE_2_KEY = "observation.images.OBS_IMAGE_2"  # wrist/front view
+TOOL_POSE_KEY = "observation.tool_pose"
+STATE_KEY = "observation.state"
 
 
 def _import_required(module_name: str):
@@ -35,7 +42,12 @@ def _import_required(module_name: str):
 
 
 class SmolVLAPolicyNode(Node):
-    """Run a fine-tuned SmolVLA policy and publish IK end-effector targets."""
+    """Run a fine-tuned SmolVLA policy and publish IK end-effector targets.
+
+    By default the policy output is interpreted as an end-effector delta:
+    [dx, dy, dz, d_rot_y_deg]. The IK controller subscribes to that delta
+    topic and turns it into an absolute target from the live tool pose.
+    """
 
     def __init__(self) -> None:
         super().__init__("smolvla_policy_node")
@@ -43,49 +55,100 @@ class SmolVLAPolicyNode(Node):
 
         self.declare_parameter(
             "checkpoint",
-            "/mnt/c/users/sh25016/kaivuri_smolvla_test/checkpoints/000020/pretrained_model",
+            "/mnt/c/Users/sh25016/kaivuri_smolvla_run_002/checkpoints/010000/pretrained_model",
         )
-        self.declare_parameter("dataset_root", "/mnt/c/users/sh25016/kaivuri_lerobot_dataset")
-        self.declare_parameter("dataset_repo_id", "kaivuri_lerobot_dataset")
-        self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
+        self.declare_parameter("dataset_root", "/mnt/c/users/sh25016/kaivuri_lerobot_live_014")
+        self.declare_parameter("dataset_repo_id", "kaivuri/ros2_recording_2")
+        self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_decoded")
+        self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_decoded")
+        self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
+        self.declare_parameter("observation_state_source", "tool_pose")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("instruction_topic", "/kaivuri/task_instruction")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
-        self.declare_parameter("rate_hz", 3.0)
+        self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
+        self.declare_parameter("action_mode", "delta")
+        self.declare_parameter("rate_hz", 5.0)
         self.declare_parameter("device", "auto")
         self.declare_parameter("instruction", "touch the top of the red cube")
         self.declare_parameter("joint_order", DEFAULT_JOINT_ORDER)
         self.declare_parameter("max_action_jump_m", 0.05)
+        self.declare_parameter("max_delta_translation_m", 0.05)
+        self.declare_parameter("max_delta_rot_y_deg", 5.0)
         self.declare_parameter("x_min", 0.35)
         self.declare_parameter("x_max", 0.75)
         self.declare_parameter("y_min", -0.25)
         self.declare_parameter("y_max", 0.25)
         self.declare_parameter("z_min", 0.02)
         self.declare_parameter("z_max", 0.35)
-        self.declare_parameter("rot_y_min_deg", -90.0)
-        self.declare_parameter("rot_y_max_deg", 90.0)
+        self.declare_parameter("rot_y_min_deg", -80.0)
+        self.declare_parameter("rot_y_max_deg", 80.0)
 
-        self._image_tensor: Optional[Any] = None
+        self._obs_image_1_tensor: Optional[Any] = None
+        self._obs_image_2_tensor: Optional[Any] = None
         self._state_tensor: Optional[Any] = None
+        self._state_input_key = TOOL_POSE_KEY
         self._last_action: Optional[np.ndarray] = None
         self._instruction = str(self.get_parameter("instruction").value)
 
         self._device = self._resolve_device(str(self.get_parameter("device").value))
         self._joint_order = [str(v) for v in list(self.get_parameter("joint_order").value)]
+        self._observation_state_source = str(
+            self.get_parameter("observation_state_source").value
+        ).strip().lower()
+        if self._observation_state_source not in ("tool_pose", "joint_states"):
+            self.get_logger().warn(
+                "Unsupported observation_state_source="
+                f"{self._observation_state_source!r}; falling back to 'tool_pose'"
+            )
+            self._observation_state_source = "tool_pose"
+        self._action_mode = str(self.get_parameter("action_mode").value).strip().lower()
+        if self._action_mode not in ("delta", "absolute"):
+            self.get_logger().warn(
+                f"Unsupported action_mode={self._action_mode!r}; falling back to 'delta'"
+            )
+            self._action_mode = "delta"
 
         self.get_logger().info(f"Loading SmolVLA checkpoint on {self._device}")
         self._load_policy()
         self.get_logger().info("SmolVLA policy ready")
 
-        image_topic = str(self.get_parameter("image_topic").value)
+        obs_image_1_topic = str(self.get_parameter("obs_image_1_topic").value).strip()
+        obs_image_2_topic = str(self.get_parameter("obs_image_2_topic").value).strip()
+        tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
         joint_states_topic = str(self.get_parameter("joint_states_topic").value)
         instruction_topic = str(self.get_parameter("instruction_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
+        target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
+        target_topic = target_pose_delta_y_topic if self._action_mode == "delta" else target_pose_y_topic
+        image_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
-        self.create_subscription(Image, image_topic, self._on_image, 10)
-        self.create_subscription(JointState, joint_states_topic, self._on_joint_state, 10)
+        self.create_subscription(Image, obs_image_1_topic, self._on_obs_image_1, image_qos)
+        self.create_subscription(Image, obs_image_2_topic, self._on_obs_image_2, image_qos)
+        if self._observation_state_source == "tool_pose":
+            self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
+            state_topic = tool_pose_topic
+        else:
+            self.create_subscription(JointState, joint_states_topic, self._on_joint_state, 10)
+            state_topic = joint_states_topic
         self.create_subscription(String, instruction_topic, self._on_instruction, 10)
-        self._target_pub = self.create_publisher(Float32MultiArray, target_pose_y_topic, 10)
+        self._target_pub = self.create_publisher(Float32MultiArray, target_topic, 10)
+        self.get_logger().info(
+            f"SmolVLA action_mode={self._action_mode}; publishing actions to {target_topic}"
+        )
+        self.get_logger().info(
+            f"Camera normalization: {OBS_IMAGE_1_KEY} <- {obs_image_1_topic}; "
+            f"{OBS_IMAGE_2_KEY} <- {obs_image_2_topic}"
+        )
+        self.get_logger().info(
+            f"Observation state: {self._state_input_key} <- {state_topic} "
+            f"({self._observation_state_source})"
+        )
 
         rate_hz = max(0.1, float(self.get_parameter("rate_hz").value))
         self.create_timer(1.0 / rate_hz, self._tick)
@@ -116,7 +179,12 @@ class SmolVLAPolicyNode(Node):
         cfg.dataset.video_backend = "torchcodec"
         cfg.batch_size = 1
         cfg.policy.device = self._device
-        cfg.rename_map = {"observation.images.front": "observation.images.camera1"}
+        cfg.rename_map = dict(getattr(cfg, "rename_map", {}) or {})
+        if self._observation_state_source == "tool_pose":
+            cfg.rename_map.setdefault(TOOL_POSE_KEY, STATE_KEY)
+        self._state_input_key = self._input_key_for_policy_state(cfg.rename_map)
+        if self._observation_state_source == "joint_states":
+            self._state_input_key = STATE_KEY
 
         dataset = make_dataset(cfg)
         policy_cfg = PreTrainedConfig.from_pretrained(checkpoint)
@@ -133,9 +201,31 @@ class SmolVLAPolicyNode(Node):
             },
         )
 
+    def _input_key_for_policy_state(self, rename_map: dict[str, str]) -> str:
+        for source_key, target_key in rename_map.items():
+            if target_key == STATE_KEY:
+                return source_key
+        return STATE_KEY
+
     def _on_instruction(self, msg: String) -> None:
         if msg.data.strip():
             self._instruction = msg.data.strip()
+
+    def _on_tool_pose(self, msg: PoseStamped) -> None:
+        pose = msg.pose
+        self._state_tensor = self._torch.tensor(
+            [
+                pose.position.x,
+                pose.position.y,
+                pose.position.z,
+                pose.orientation.w,
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+            ],
+            dtype=self._torch.float32,
+            device=self._device,
+        )
 
     def _on_joint_state(self, msg: JointState) -> None:
         name_to_index = {name: idx for idx, name in enumerate(msg.name)}
@@ -157,15 +247,21 @@ class SmolVLAPolicyNode(Node):
         )
         self._state_tensor = state
 
-    def _on_image(self, msg: Image) -> None:
+    def _on_obs_image_1(self, msg: Image) -> None:
+        self._obs_image_1_tensor = self._image_msg_to_tensor(msg)
+
+    def _on_obs_image_2(self, msg: Image) -> None:
+        self._obs_image_2_tensor = self._image_msg_to_tensor(msg)
+
+    def _image_msg_to_tensor(self, msg: Image):
         try:
             image = self._decode_image(msg)
         except Exception as exc:
             self.get_logger().warn(f"Failed to decode image: {exc}", throttle_duration_sec=2.0)
-            return
+            return None
 
         tensor = self._torch.from_numpy(image).permute(2, 0, 1).contiguous()
-        self._image_tensor = tensor.to(self._device, dtype=self._torch.float32) / 255.0
+        return tensor.to(self._device, dtype=self._torch.float32) / 255.0
 
     def _decode_image(self, msg: Image) -> np.ndarray:
         height = int(msg.height)
@@ -192,16 +288,17 @@ class SmolVLAPolicyNode(Node):
         raise ValueError(f"unsupported image encoding {msg.encoding!r}")
 
     def _tick(self) -> None:
-        if self._image_tensor is None or self._state_tensor is None:
+        if self._obs_image_1_tensor is None or self._obs_image_2_tensor is None or self._state_tensor is None:
             self.get_logger().warn(
-                "Waiting for image and joint state before running SmolVLA",
+                "Waiting for OBS_IMAGE_1, OBS_IMAGE_2, and observation state before running SmolVLA",
                 throttle_duration_sec=2.0,
             )
             return
 
         batch = {
-            "observation.images.front": self._image_tensor.unsqueeze(0),
-            "observation.state": self._state_tensor.unsqueeze(0),
+            OBS_IMAGE_1_KEY: self._obs_image_1_tensor.unsqueeze(0),
+            OBS_IMAGE_2_KEY: self._obs_image_2_tensor.unsqueeze(0),
+            self._state_input_key: self._state_tensor.unsqueeze(0),
             "task": self._instruction,
         }
 
@@ -219,14 +316,30 @@ class SmolVLAPolicyNode(Node):
             self.get_logger().error(f"Policy returned too few action values: {action_np}")
             return
 
-        command = self._clamp_action(action_np[:4].astype(np.float32))
+        if self._action_mode == "delta":
+            command = self._clamp_delta_action(action_np[:4].astype(np.float32))
+        else:
+            command = self._clamp_absolute_action(action_np[:4].astype(np.float32))
         self._last_action = command.copy()
 
         msg = Float32MultiArray()
         msg.data = [float(v) for v in command]
         self._target_pub.publish(msg)
 
-    def _clamp_action(self, action: np.ndarray) -> np.ndarray:
+    def _clamp_delta_action(self, action: np.ndarray) -> np.ndarray:
+        max_translation = max(0.0, float(self.get_parameter("max_delta_translation_m").value))
+        if max_translation > 0.0:
+            distance = float(np.linalg.norm(action[:3]))
+            if distance > max_translation:
+                action[:3] = action[:3] * (max_translation / distance)
+
+        max_rot = max(0.0, float(self.get_parameter("max_delta_rot_y_deg").value))
+        if max_rot > 0.0:
+            action[3] = np.clip(action[3], -max_rot, max_rot)
+
+        return action
+
+    def _clamp_absolute_action(self, action: np.ndarray) -> np.ndarray:
         action[0] = np.clip(
             action[0],
             float(self.get_parameter("x_min").value),

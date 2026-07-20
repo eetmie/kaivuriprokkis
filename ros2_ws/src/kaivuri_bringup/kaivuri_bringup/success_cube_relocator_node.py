@@ -43,6 +43,7 @@ class SuccessCubeRelocatorNode(Node):
         self.declare_parameter("relocate_delay_s", 0.5)
         self.declare_parameter("use_ik_reachability", False)
         self.declare_parameter("relocate_invalid_cube_pose", True)
+        self.declare_parameter("relocate_on_failure", True)
 
         # Conservative fixed-base workspace. These are cube top-center
         # positions in the IK frame, not track-drive targets. Polar sampling is
@@ -189,6 +190,16 @@ class SuccessCubeRelocatorNode(Node):
             delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
             self.get_logger().info(f"Scheduled cube relocation after touch_success episode={episode_id}")
+            return
+
+        if event.startswith("failure") and bool(self.get_parameter("relocate_on_failure").value):
+            if episode_id in self._relocated_episodes:
+                return
+            self._pending_success_episode = episode_id
+            self._pending_relocation_reason = f"{event} episode={episode_id}"
+            delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
+            self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
+            self.get_logger().warn(f"Scheduled cube relocation after {event} episode={episode_id}")
             return
 
         if (

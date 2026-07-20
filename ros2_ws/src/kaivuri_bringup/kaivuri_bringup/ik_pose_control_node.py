@@ -1,5 +1,6 @@
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -134,6 +135,15 @@ class VisualizationIkController:
     def clear_target(self) -> None:
         self._target_position = None
 
+    def set_ik_command_type(self, command_type: str) -> None:
+        command_type = str(command_type).strip().lower()
+        if command_type not in ("position", "pose"):
+            raise ValueError(f"Invalid IK command_type {command_type!r}; expected 'position' or 'pose'")
+        self._command_type = command_type
+
+    def set_condition_number_threshold(self, threshold: float) -> None:
+        self._ik_cfg = replace(self._ik_cfg, condition_number_threshold=float(threshold))
+
     def give_pose(self, position: np.ndarray, rotation_y_deg: float):
         self._target_position = np.asarray(position, dtype=np.float32)
         self._target_rot_y_deg = float(rotation_y_deg)
@@ -183,6 +193,10 @@ class IkPoseControlNode(Node):
       - /kaivuri/target_pose_y: std_msgs/Float32MultiArray
         data order [x, y, z, rot_y_deg], using the same IK-frame position
         convention.
+      - /kaivuri/target_pose_delta_y: std_msgs/Float32MultiArray
+        data order [dx, dy, dz, d_rot_y_deg]. The delta is added to the
+        current tool pose before sending the absolute target to the IK
+        controller.
 
     Outputs:
       - /joint_states
@@ -199,6 +213,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("pwm_i2c_addr", -1)
         self.declare_parameter("target_pose_topic", "/kaivuri/target_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
+        self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
         self.declare_parameter("frame_id", "excavator")
         self.declare_parameter("state_rate_hz", 50.0)
         self.declare_parameter("command_timeout_s", 1.0)
@@ -210,6 +225,8 @@ class IkPoseControlNode(Node):
         self.declare_parameter("log_reachability_rejections", True)
         self.declare_parameter("visualization_only", False)
         self.declare_parameter("visual_initial_joint_deg", [0.0, -31.5, 71.5, -43.3])
+        self.declare_parameter("ik_command_type", "")
+        self.declare_parameter("ik_condition_number_threshold", -1.0)
 
         self._project_root = resolve_project_root(str(self.get_parameter("project_root").value))
 
@@ -282,6 +299,7 @@ class IkPoseControlNode(Node):
                 enable_perf_tracking=False,
                 control_config_file=str(control_config_path),
             )
+        self._apply_ik_runtime_overrides()
         self._controller.start()
 
         self._last_command_time: Optional[float] = None
@@ -290,8 +308,10 @@ class IkPoseControlNode(Node):
 
         target_pose_topic = str(self.get_parameter("target_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
+        target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
         self.create_subscription(PoseStamped, target_pose_topic, self._on_target_pose, 10)
         self.create_subscription(Float32MultiArray, target_pose_y_topic, self._on_target_pose_y, 10)
+        self.create_subscription(Float32MultiArray, target_pose_delta_y_topic, self._on_target_pose_delta_y, 10)
 
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
@@ -299,9 +319,29 @@ class IkPoseControlNode(Node):
         state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
         self.create_timer(1.0 / state_rate_hz, self._state_tick)
         self.get_logger().info(
-            f"IK pose control ready; subscribe {target_pose_topic} or {target_pose_y_topic}; "
+            f"IK pose control ready; subscribe {target_pose_topic}, {target_pose_y_topic}, "
+            f"or {target_pose_delta_y_topic}; "
             f"IK origin in excavator frame={np.round(IK_ORIGIN_IN_EXCAVATOR_FRAME, 5)}"
         )
+
+    def _apply_ik_runtime_overrides(self) -> None:
+        command_type = str(self.get_parameter("ik_command_type").value).strip().lower()
+        if command_type:
+            try:
+                self._controller.set_ik_command_type(command_type)
+                self.get_logger().info(f"IK command_type override: {command_type}")
+            except Exception as exc:
+                self.get_logger().warn(f"Ignoring ik_command_type override {command_type!r}: {exc}")
+
+        threshold = float(self.get_parameter("ik_condition_number_threshold").value)
+        if threshold >= 0.0:
+            try:
+                self._controller.set_condition_number_threshold(threshold)
+                self.get_logger().info(f"IK condition_number_threshold override: {threshold:.3f}")
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"Ignoring ik_condition_number_threshold override {threshold}: {exc}"
+                )
 
     def _resolve_project_path(self, path_value: str) -> Path:
         path = Path(path_value)
@@ -354,6 +394,43 @@ class IkPoseControlNode(Node):
             return
         rot_y_deg = values[3] if len(values) >= 4 else 0.0
         self._send_target(np.array(values[:3], dtype=np.float32), rot_y_deg)
+
+    def _on_target_pose_delta_y(self, msg: Float32MultiArray) -> None:
+        values = self._finite_values(list(msg.data))
+        if len(values) < 3:
+            self.get_logger().warn(
+                "Ignoring /kaivuri/target_pose_delta_y: expected at least [dx, dy, dz]",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        current = self._current_tool_pose_y()
+        if current is None:
+            self.get_logger().warn(
+                "Ignoring /kaivuri/target_pose_delta_y: current tool pose is unavailable",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        current_position, current_rot_y_deg = current
+        delta_position = np.array(values[:3], dtype=np.float32)
+        delta_rot_y_deg = values[3] if len(values) >= 4 else 0.0
+        self._send_target(current_position + delta_position, current_rot_y_deg + delta_rot_y_deg)
+
+    def _current_tool_pose_y(self) -> Optional[tuple[np.ndarray, float]]:
+        try:
+            joint_angles_deg = self._controller.get_joint_angles()
+            joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
+            state = self._get_state(joint_angles_rad[:_N_ACTIVE], self._robot_config, include_jacobian=False)
+        except Exception as exc:
+            self.get_logger().warn(f"Current tool pose unavailable: {exc}", throttle_duration_sec=2.0)
+            return None
+
+        ee_quat = np.asarray(state.ee_orientation, dtype=np.float32)
+        if float(np.linalg.norm(ee_quat)) < 1e-6:
+            ee_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        rot_y_deg = float(np.degrees(self._extract_axis_rotation(ee_quat, _Y_AXIS)))
+        return np.asarray(state.ee_position, dtype=np.float32), rot_y_deg
 
     def _finite_values(self, values: List[float]) -> List[float]:
         out = []

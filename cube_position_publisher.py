@@ -49,7 +49,6 @@ if cube_prim.IsValid() and excavator_prim.IsValid():
     msg.header.frame_id = FRAME_ID
     IK_ORIGIN_IN_EXCAVATOR_FRAME = Gf.Vec3d(0.0, 0.0, -0.05042)
     top_center_ik = top_center_excavator - IK_ORIGIN_IN_EXCAVATOR_FRAME
-    print(top_center_excavator)
     msg.pose.position.x  = float(top_center_ik[0])
     msg.pose.position.y  = float(top_center_ik[1])
     msg.pose.position.z  = float(top_center_ik[2])

@@ -34,6 +34,10 @@ def _launch_setup(context, *args, **kwargs):
     command_timeout_s = LaunchConfiguration("command_timeout_s")
     visualization_only = LaunchConfiguration("visualization_only")
     python_executable = LaunchConfiguration("python_executable")
+    target_pose_y_topic = LaunchConfiguration("target_pose_y_topic")
+    target_pose_delta_y_topic = LaunchConfiguration("target_pose_delta_y_topic")
+    ik_command_type = LaunchConfiguration("ik_command_type")
+    ik_condition_number_threshold = LaunchConfiguration("ik_condition_number_threshold")
 
     return [
         Node(
@@ -58,6 +62,10 @@ def _launch_setup(context, *args, **kwargs):
                 "state_rate_hz": state_rate_hz,
                 "command_timeout_s": command_timeout_s,
                 "visualization_only": visualization_only,
+                "target_pose_y_topic": target_pose_y_topic,
+                "target_pose_delta_y_topic": target_pose_delta_y_topic,
+                "ik_command_type": ik_command_type,
+                "ik_condition_number_threshold": ik_condition_number_threshold,
             }],
         ),
     ]
@@ -84,7 +92,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("robot", default_value="auto"),
         DeclareLaunchArgument("state_rate_hz", default_value="30.0"),
-        DeclareLaunchArgument("command_timeout_s", default_value="1.0"),
+        DeclareLaunchArgument("command_timeout_s", default_value="0.0"),
+        DeclareLaunchArgument("target_pose_y_topic", default_value="/kaivuri/target_pose_y"),
+        DeclareLaunchArgument("target_pose_delta_y_topic", default_value="/kaivuri/target_pose_delta_y"),
+        DeclareLaunchArgument("ik_command_type", default_value="position"),
+        DeclareLaunchArgument("ik_condition_number_threshold", default_value="0.0"),
         DeclareLaunchArgument("visualization_only", default_value="false"),
         DeclareLaunchArgument(
             "python_executable",

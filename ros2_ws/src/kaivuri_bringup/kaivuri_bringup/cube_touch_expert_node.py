@@ -12,6 +12,7 @@ from std_srvs.srv import Trigger
 
 
 _LOCAL_Z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+_Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
 class Stage(str, Enum):
@@ -29,8 +30,11 @@ class CubeTouchExpertNode(Node):
 
     The node expects Isaac Sim, or another task generator, to publish a cube pose.
     It then publishes a smooth approach -> descend -> hold -> retract trajectory
-    to /kaivuri/target_pose_y and emits episode events suitable for rosbag
-    segmentation.
+    as end-effector deltas on /kaivuri/target_pose_delta_y and emits episode
+    events suitable for recorder segmentation. By default, recording ends while
+    the tool is still holding the touch pose; retract happens outside the
+    episode. Set target_command_mode=absolute to use the legacy
+    /kaivuri/target_pose_y output.
     """
 
     def __init__(self) -> None:
@@ -38,6 +42,8 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("cube_pose_topic", "/kaivuri/cube_pose")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
+        self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
+        self.declare_parameter("target_command_mode", "delta")
         self.declare_parameter("episode_event_topic", "/kaivuri/episode_event")
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
         self.declare_parameter("rate_hz", 50.0)
@@ -50,8 +56,9 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("retract_xy_tolerance_m", 0.02)
         self.declare_parameter("retract_z_tolerance_m", 0.05)
         self.declare_parameter("approach_settle_s", 1.5)
-        self.declare_parameter("hold_s", 0.25)
-        self.declare_parameter("timeout_s", 60)
+        self.declare_parameter("hold_s", 0.5)
+        self.declare_parameter("record_retract", False)
+        self.declare_parameter("timeout_s", 180.0)
         self.declare_parameter("approach_height_m", 0.05)
         self.declare_parameter("retract_height_m", 0.05)
         self.declare_parameter("touch_clearance_m", 0.01)
@@ -83,6 +90,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("call_recorder_services", True)
         self.declare_parameter("recorder_start_service", "/lerobot_ros2_recorder_node/start_episode")
         self.declare_parameter("recorder_stop_service", "/lerobot_ros2_recorder_node/stop_episode")
+        self.declare_parameter("log_target_errors", False)
 
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
         self._dt = 1.0 / rate_hz
@@ -91,6 +99,7 @@ class CubeTouchExpertNode(Node):
         self._episode_started = self.get_clock().now()
         self._hold_started: Optional[object] = None
         self._tool_position: Optional[np.ndarray] = None
+        self._tool_rot_y_deg: Optional[float] = None
         self._last_tool_pose_time: Optional[object] = None
         self._current_target: Optional[np.ndarray] = None
         self._target_rot_y_deg = float(self.get_parameter("rot_y_deg").value)
@@ -105,16 +114,28 @@ class CubeTouchExpertNode(Node):
         self._home_reached_since: Optional[object] = None
         self._last_episode_cube_center: Optional[np.ndarray] = None
         self._ignore_cube_pose_until: Optional[object] = None
+        self._missing_recorder_service_warnings: set[str] = set()
+        self._episode_recording_stopped = False
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
+        target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
+        self._target_command_mode = str(self.get_parameter("target_command_mode").value).strip().lower()
+        if self._target_command_mode not in ("delta", "absolute"):
+            self.get_logger().warn(
+                f"Unsupported target_command_mode={self._target_command_mode!r}; falling back to 'delta'"
+            )
+            self._target_command_mode = "delta"
+        self._target_topic = (
+            target_pose_delta_y_topic if self._target_command_mode == "delta" else target_pose_y_topic
+        )
         episode_event_topic = str(self.get_parameter("episode_event_topic").value)
         task_instruction_topic = str(self.get_parameter("task_instruction_topic").value)
 
         self.create_subscription(PoseStamped, cube_pose_topic, self._on_cube_pose, 10)
         self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
-        self._target_pub = self.create_publisher(Float32MultiArray, target_pose_y_topic, 10)
+        self._target_pub = self.create_publisher(Float32MultiArray, self._target_topic, 10)
         self._event_pub = self.create_publisher(String, episode_event_topic, 10)
         self._instruction_pub = self.create_publisher(String, task_instruction_topic, 10)
         self._recorder_start_client = self.create_client(
@@ -126,6 +147,10 @@ class CubeTouchExpertNode(Node):
             str(self.get_parameter("recorder_stop_service").value),
         )
         self.create_timer(self._dt, self._tick)
+        self.get_logger().info(
+            f"Cube touch expert target_command_mode={self._target_command_mode}; "
+            f"publishing targets to {self._target_topic}"
+        )
 
         self._publish_instruction()
 
@@ -134,6 +159,11 @@ class CubeTouchExpertNode(Node):
         self._tool_position = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
+        )
+        q = msg.pose.orientation
+        self._tool_rot_y_deg = self._axis_rotation_deg(
+            np.array([q.w, q.x, q.y, q.z], dtype=np.float32),
+            _Y_AXIS,
         )
         self._last_tool_pose_time = self.get_clock().now()
         self._tool_pose_sample_count += 1
@@ -182,6 +212,7 @@ class CubeTouchExpertNode(Node):
         self._episode_started = self.get_clock().now()
         self._episode_tool_pose_start_count = self._tool_pose_sample_count
         self._startup_ready_time = None
+        self._episode_recording_stopped = False
 
         self._current_target = None
         self._pending_start_from_tool_pose = True
@@ -250,6 +281,8 @@ class CubeTouchExpertNode(Node):
                 self._hold_started = self.get_clock().now()
             if self._elapsed(self._hold_started) >= float(self.get_parameter("hold_s").value):
                 self._publish_event("touch_success")
+                if not bool(self.get_parameter("record_retract").value):
+                    self._end_episode_recording()
                 self._set_stage(Stage.RETRACT)
             return
 
@@ -280,10 +313,7 @@ class CubeTouchExpertNode(Node):
             elif self._stage == Stage.DESCEND:
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
-                self._publish_event("episode_end")
-                self._ignore_cube_pose_until = self.get_clock().now() + Duration(
-                    seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
-                )
+                self._end_episode_recording()
                 self._set_stage(Stage.DONE)
         elif self._stage in (Stage.HOME, Stage.APPROACH):
             self._approach_reached_since = None
@@ -395,7 +425,7 @@ class CubeTouchExpertNode(Node):
             return False
         self._waiting_for_target_subscriber = True
         self.get_logger().warn(
-            "Waiting for a subscriber on /kaivuri/target_pose_y before advancing expert target",
+            f"Waiting for a subscriber on {self._target_topic} before advancing expert target",
             throttle_duration_sec=2.0,
         )
         return True
@@ -430,12 +460,13 @@ class CubeTouchExpertNode(Node):
         measured_z_error = abs(float(reference[2] - goal[2]))
         target_xy_error = float(np.linalg.norm(self._current_target[:2] - goal[:2]))
         target_z_error = abs(float(self._current_target[2] - goal[2]))
-        print(
-            f"{stage.value} tolerance xy={xy_tolerance}, z={z_tolerance}; "
-            f"Measured: {measured_xy_error}, {measured_z_error}; "
-            f"Target: {target_xy_error}, {target_z_error}",
-            flush=True,
-        )
+        if bool(self.get_parameter("log_target_errors").value):
+            self.get_logger().info(
+                f"{stage.value} tolerance xy={xy_tolerance}, z={z_tolerance}; "
+                f"measured=({measured_xy_error:.4f}, {measured_z_error:.4f}); "
+                f"target=({target_xy_error:.4f}, {target_z_error:.4f})",
+                throttle_duration_sec=0.5,
+            )
         return (
             measured_xy_error <= xy_tolerance
             and measured_z_error <= z_tolerance
@@ -478,6 +509,8 @@ class CubeTouchExpertNode(Node):
         return self._elapsed(self._home_reached_since) >= settle_s
 
     def _set_stage(self, stage: Stage) -> None:
+        if stage != self._stage:
+            self.get_logger().info(f"Episode {self._episode_id} stage: {self._stage.value} -> {stage.value}")
         self._stage = stage
         self._hold_started = None
         self._approach_reached_since = None
@@ -487,15 +520,35 @@ class CubeTouchExpertNode(Node):
         if stage not in (Stage.HOME, Stage.DONE):
             self._publish_event(stage.value)
 
+    def _end_episode_recording(self) -> None:
+        if self._episode_recording_stopped:
+            return
+        self._episode_recording_stopped = True
+        self._publish_event("episode_end")
+        self._ignore_cube_pose_until = self.get_clock().now() + Duration(
+            seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
+        )
+
     def _publish_target(self) -> None:
         if self._current_target is None:
             return
+        if self._target_command_mode == "delta":
+            if self._tool_position is None:
+                return
+            delta_position = self._current_target - self._tool_position
+            current_rot_y_deg = self._tool_rot_y_deg if self._tool_rot_y_deg is not None else self._target_rot_y_deg
+            rot_y_value = self._angle_delta_deg(self._target_rot_y_deg, current_rot_y_deg)
+            position_values = delta_position
+        else:
+            position_values = self._current_target
+            rot_y_value = self._target_rot_y_deg
+
         msg = Float32MultiArray()
         msg.data = [
-            float(self._current_target[0]),
-            float(self._current_target[1]),
-            float(self._current_target[2]),
-            float(self._target_rot_y_deg),
+            float(position_values[0]),
+            float(position_values[1]),
+            float(position_values[2]),
+            float(rot_y_value),
         ]
         self._target_pub.publish(msg)
 
@@ -503,6 +556,7 @@ class CubeTouchExpertNode(Node):
         msg = String()
         msg.data = f"{self._episode_id}:{event}"
         self._event_pub.publish(msg)
+        self.get_logger().info(f"Episode event: {msg.data}")
         if event == "episode_start":
             self._call_recorder_service(self._recorder_start_client, "start_episode")
         elif event == "episode_end":
@@ -512,11 +566,14 @@ class CubeTouchExpertNode(Node):
         if not bool(self.get_parameter("call_recorder_services").value):
             return
         if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.0):
-            self.get_logger().warn(
-                f"Recorder service for {label} is not available",
-                throttle_duration_sec=2.0,
-            )
+            if label not in self._missing_recorder_service_warnings:
+                self._missing_recorder_service_warnings.add(label)
+                self.get_logger().warn(
+                    f"Recorder service for {label} is not available; "
+                    "launch lerobot_ros2_recorder_node or set call_recorder_services:=false"
+                )
             return
+        self._missing_recorder_service_warnings.discard(label)
         future = client.call_async(Trigger.Request())
         future.add_done_callback(lambda done: self._log_recorder_service_result(done, label))
 
@@ -540,6 +597,32 @@ class CubeTouchExpertNode(Node):
 
     def _elapsed(self, start_time) -> float:
         return (self.get_clock().now() - start_time).nanoseconds * 1e-9
+
+    @staticmethod
+    def _axis_rotation_deg(quat_wxyz: np.ndarray, axis: np.ndarray) -> float:
+        norm = float(np.linalg.norm(quat_wxyz))
+        if norm < 1e-6:
+            return 0.0
+
+        quat = quat_wxyz / norm
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-6:
+            return 0.0
+        unit_axis = axis / axis_norm
+
+        twist_vec = unit_axis * float(np.dot(quat[1:], unit_axis))
+        twist = np.array([quat[0], twist_vec[0], twist_vec[1], twist_vec[2]], dtype=np.float32)
+        twist_norm = float(np.linalg.norm(twist))
+        if twist_norm < 1e-6:
+            return 0.0
+        twist /= twist_norm
+
+        signed = float(np.dot(twist[1:], unit_axis))
+        return math.degrees(2.0 * math.atan2(signed, float(twist[0])))
+
+    @staticmethod
+    def _angle_delta_deg(target_deg: float, current_deg: float) -> float:
+        return ((float(target_deg) - float(current_deg) + 180.0) % 360.0) - 180.0
 
 
 def main(args=None) -> None:

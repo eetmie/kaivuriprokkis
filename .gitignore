@@ -230,4 +230,4 @@ xbox_target_pose_y_node.py
 
 metadata.yaml
 
-/lerobot_ros
+ros2_ws/lerobot_ros

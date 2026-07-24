@@ -21,7 +21,7 @@ def generate_launch_description():
         DeclareLaunchArgument("hut_image_topic", default_value="/camera/camera/color/rgb_compressed"),
         DeclareLaunchArgument("top_image_topic", default_value="/camera/camera1/color/rgb_compressed"),
         DeclareLaunchArgument("tool_pose_topic", default_value="/kaivuri/tool_pose"),
-        DeclareLaunchArgument("action_topic", default_value="/kaivuri/target_pose_delta_y"),
+        DeclareLaunchArgument("action_topic", default_value="/kaivuri/policy_action_y"),
         DeclareLaunchArgument("task_instruction_topic", default_value="/kaivuri/task_instruction"),
         DeclareLaunchArgument("max_sample_age_s", default_value="0.0"),
         DeclareLaunchArgument(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import math
+from pathlib import Path
 from typing import Any, Optional
 
 import av
@@ -25,10 +27,10 @@ DEFAULT_JOINT_ORDER = [
     "revolute_claw_2",
 ]
 
-OBS_IMAGE_1_KEY = "observation.images.OBS_IMAGE_1"  # top view
-OBS_IMAGE_2_KEY = "observation.images.OBS_IMAGE_2"  # wrist/front view
-TOOL_POSE_KEY = "observation.tool_pose"
+OBS_IMAGE_1_KEY = "observation.images.camera1"  # top view
+OBS_IMAGE_2_KEY = "observation.images.camera2"  # wrist/front view
 STATE_KEY = "observation.state"
+_Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
 def _import_required(module_name: str):
@@ -47,9 +49,9 @@ def _import_required(module_name: str):
 class SmolVLAPolicyNode(Node):
     """Run a fine-tuned SmolVLA policy and publish IK end-effector targets.
 
-    By default the policy output is interpreted as an end-effector delta:
-    [dx, dy, dz, d_rot_y_deg]. The IK controller subscribes to that delta
-    topic and turns it into an absolute target from the live tool pose.
+    By default the policy output is interpreted as an absolute end-effector
+    target [x, y, z, rot_y_deg]. Older delta-action checkpoints can still be
+    run with action_mode=delta.
     """
 
     def __init__(self) -> None:
@@ -58,10 +60,10 @@ class SmolVLAPolicyNode(Node):
 
         self.declare_parameter(
             "checkpoint",
-            "/mnt/c/Users/sh25016/kaivuri_smolvla_run_002/checkpoints/010000/pretrained_model",
+            "/mnt/c/Users/sh25016/kaivuri_smolvla_run_024/checkpoints/015000/pretrained_model",
         )
-        self.declare_parameter("dataset_root", "/mnt/c/users/sh25016/kaivuri_lerobot_live_014")
-        self.declare_parameter("dataset_repo_id", "kaivuri/ros2_recording_2")
+        self.declare_parameter("dataset_root", "/mnt/c/users/sh25016/kaivuri_lerobot_live_024")
+        self.declare_parameter("dataset_repo_id", "kaivuri/ros2_recording_024")
         self.declare_parameter("obs_image_1_topic", "/camera/camera1/color/rgb_compressed")
         self.declare_parameter("obs_image_2_topic", "/camera/camera/color/rgb_compressed")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
@@ -70,19 +72,24 @@ class SmolVLAPolicyNode(Node):
         self.declare_parameter("instruction_topic", "/kaivuri/task_instruction")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
         self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
-        self.declare_parameter("action_mode", "delta")
+        self.declare_parameter("raw_action_topic", "/kaivuri/smolvla_raw_action")
+        self.declare_parameter("action_mode", "absolute")
         self.declare_parameter("rate_hz", 5.0)
         self.declare_parameter("device", "auto")
         self.declare_parameter("instruction", "touch the top of the red cube")
         self.declare_parameter("joint_order", DEFAULT_JOINT_ORDER)
+        self.declare_parameter("reset_policy_each_tick", True)
+        self.declare_parameter("debug_log_inputs", True)
+        self.declare_parameter("debug_log_period_s", 2.0)
         self.declare_parameter("max_action_jump_m", 0.05)
+        self.declare_parameter("max_absolute_rot_y_jump_deg", 5.0)
         self.declare_parameter("max_delta_translation_m", 0.05)
         self.declare_parameter("max_delta_rot_y_deg", 5.0)
         self.declare_parameter("x_min", 0.35)
         self.declare_parameter("x_max", 0.75)
         self.declare_parameter("y_min", -0.25)
         self.declare_parameter("y_max", 0.25)
-        self.declare_parameter("z_min", 0.02)
+        self.declare_parameter("z_min", 0.05)
         self.declare_parameter("z_max", 0.35)
         self.declare_parameter("rot_y_min_deg", -80.0)
         self.declare_parameter("rot_y_max_deg", 80.0)
@@ -96,9 +103,10 @@ class SmolVLAPolicyNode(Node):
         self._obs_image_1_h264_decoder = av.CodecContext.create("h264", "r")
         self._obs_image_2_h264_decoder = av.CodecContext.create("h264", "r")
         self._state_tensor: Optional[Any] = None
-        self._state_input_key = TOOL_POSE_KEY
+        self._state_input_key = STATE_KEY
         self._last_action: Optional[np.ndarray] = None
         self._instruction = str(self.get_parameter("instruction").value)
+        self._next_debug_log_ns = 0
 
         self._device = self._resolve_device(str(self.get_parameter("device").value))
         self._joint_order = [str(v) for v in list(self.get_parameter("joint_order").value)]
@@ -114,9 +122,9 @@ class SmolVLAPolicyNode(Node):
         self._action_mode = str(self.get_parameter("action_mode").value).strip().lower()
         if self._action_mode not in ("delta", "absolute"):
             self.get_logger().warn(
-                f"Unsupported action_mode={self._action_mode!r}; falling back to 'delta'"
+                f"Unsupported action_mode={self._action_mode!r}; falling back to 'absolute'"
             )
-            self._action_mode = "delta"
+            self._action_mode = "absolute"
 
         self.get_logger().info(f"Loading SmolVLA checkpoint on {self._device}")
         self._load_policy()
@@ -129,6 +137,7 @@ class SmolVLAPolicyNode(Node):
         instruction_topic = str(self.get_parameter("instruction_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
         target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
+        raw_action_topic = str(self.get_parameter("raw_action_topic").value)
         target_topic = target_pose_delta_y_topic if self._action_mode == "delta" else target_pose_y_topic
         image_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -155,6 +164,7 @@ class SmolVLAPolicyNode(Node):
             state_topic = joint_states_topic
         self.create_subscription(String, instruction_topic, self._on_instruction, 10)
         self._target_pub = self.create_publisher(Float32MultiArray, target_topic, 10)
+        self._raw_action_pub = self.create_publisher(Float32MultiArray, raw_action_topic, 10)
         self.get_logger().info(
             f"SmolVLA action_mode={self._action_mode}; publishing actions to {target_topic}"
         )
@@ -190,15 +200,20 @@ class SmolVLAPolicyNode(Node):
             ) from exc
 
         checkpoint = str(self.get_parameter("checkpoint").value)
+        dataset_root = str(self.get_parameter("dataset_root").value)
+        dataset_repo_id = str(self.get_parameter("dataset_repo_id").value)
+        self.get_logger().info(
+            "SmolVLA config: "
+            f"checkpoint={checkpoint} dataset_root={dataset_root} "
+            f"dataset_repo_id={dataset_repo_id}"
+        )
         cfg = TrainPipelineConfig.from_pretrained(checkpoint)
-        cfg.dataset.root = str(self.get_parameter("dataset_root").value)
-        cfg.dataset.repo_id = str(self.get_parameter("dataset_repo_id").value)
+        cfg.dataset.root = dataset_root
+        cfg.dataset.repo_id = dataset_repo_id
         cfg.dataset.video_backend = "torchcodec"
         cfg.batch_size = 1
         cfg.policy.device = self._device
         cfg.rename_map = dict(getattr(cfg, "rename_map", {}) or {})
-        if self._observation_state_source == "tool_pose":
-            cfg.rename_map.setdefault(TOOL_POSE_KEY, STATE_KEY)
         self._state_input_key = self._input_key_for_policy_state(cfg.rename_map)
         if self._observation_state_source == "joint_states":
             self._state_input_key = STATE_KEY
@@ -206,6 +221,7 @@ class SmolVLAPolicyNode(Node):
         dataset = make_dataset(cfg)
         policy_cfg = PreTrainedConfig.from_pretrained(checkpoint)
         policy_cfg.device = self._device
+        policy_cfg.pretrained_path = Path(checkpoint)
 
         self._policy = make_policy(policy_cfg, ds_meta=dataset.meta, rename_map=cfg.rename_map)
         self._policy.eval()
@@ -234,15 +250,21 @@ class SmolVLAPolicyNode(Node):
 
     def _on_tool_pose(self, msg: PoseStamped) -> None:
         pose = msg.pose
+        quat_wxyz = np.array(
+            [
+                pose.orientation.w,
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+            ],
+            dtype=np.float32,
+        )
         self._state_tensor = self._torch.tensor(
             [
                 pose.position.x,
                 pose.position.y,
                 pose.position.z,
-                pose.orientation.w,
-                pose.orientation.x,
-                pose.orientation.y,
-                pose.orientation.z,
+                self._axis_rotation_deg(quat_wxyz, _Y_AXIS),
             ],
             dtype=self._torch.float32,
             device=self._device,
@@ -379,7 +401,7 @@ class SmolVLAPolicyNode(Node):
         obs_image_2_tensor = self._latest_obs_image_2_tensor()
         if obs_image_1_tensor is None or obs_image_2_tensor is None or self._state_tensor is None:
             self.get_logger().warn(
-                "Waiting for OBS_IMAGE_1, OBS_IMAGE_2, and observation state before running SmolVLA",
+                "Waiting for camera1, camera2, and observation state before running SmolVLA",
                 throttle_duration_sec=2.0,
             )
             return
@@ -390,10 +412,13 @@ class SmolVLAPolicyNode(Node):
             self._state_input_key: self._state_tensor.unsqueeze(0),
             "task": self._instruction,
         }
+        self._log_inference_inputs(obs_image_1_tensor, obs_image_2_tensor)
 
         try:
             with self._torch.no_grad():
                 processed = self._preprocessor(batch)
+                if bool(self.get_parameter("reset_policy_each_tick").value):
+                    self._policy.reset()
                 action = self._policy.select_action(processed)
                 action = self._postprocessor(action)
         except Exception as exc:
@@ -404,16 +429,67 @@ class SmolVLAPolicyNode(Node):
         if action_np.size < 4:
             self.get_logger().error(f"Policy returned too few action values: {action_np}")
             return
+        self._publish_raw_action(action_np[:4])
 
         if self._action_mode == "delta":
             command = self._clamp_delta_action(action_np[:4].astype(np.float32))
         else:
             command = self._clamp_absolute_action(action_np[:4].astype(np.float32))
         self._last_action = command.copy()
+        self._log_inference_output(action_np[:4], command)
 
         msg = Float32MultiArray()
         msg.data = [float(v) for v in command]
         self._target_pub.publish(msg)
+
+    def _publish_raw_action(self, action: np.ndarray) -> None:
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in action]
+        self._raw_action_pub.publish(msg)
+
+    def _debug_log_due(self) -> bool:
+        if not bool(self.get_parameter("debug_log_inputs").value):
+            return False
+        period_s = max(0.1, float(self.get_parameter("debug_log_period_s").value))
+        now_ns = int(self.get_clock().now().nanoseconds)
+        if now_ns < self._next_debug_log_ns:
+            return False
+        self._next_debug_log_ns = now_ns + int(period_s * 1_000_000_000)
+        return True
+
+    def _tensor_stats(self, name: str, tensor: Any) -> str:
+        stats = tensor.detach()
+        shape = tuple(int(v) for v in stats.shape)
+        dtype = str(stats.dtype)
+        device = str(stats.device)
+        stats_cpu = stats.float().cpu()
+        return (
+            f"{name}: shape={shape} dtype={dtype} device={device} "
+            f"min={float(stats_cpu.min()):.6f} "
+            f"max={float(stats_cpu.max()):.6f} "
+            f"mean={float(stats_cpu.mean()):.6f}"
+        )
+
+    def _log_inference_inputs(self, obs_image_1_tensor: Any, obs_image_2_tensor: Any) -> None:
+        if not self._debug_log_due():
+            return
+        state = self._state_tensor.detach().cpu().numpy().reshape(-1).tolist()
+        self.get_logger().info(
+            "SmolVLA live input stats: "
+            f"{self._tensor_stats(OBS_IMAGE_1_KEY, obs_image_1_tensor)}; "
+            f"{self._tensor_stats(OBS_IMAGE_2_KEY, obs_image_2_tensor)}; "
+            f"{self._state_input_key}={state}; task={self._instruction!r}"
+        )
+
+    def _log_inference_output(self, raw_action: np.ndarray, command: np.ndarray) -> None:
+        if not bool(self.get_parameter("debug_log_inputs").value):
+            return
+        self.get_logger().info(
+            "SmolVLA live output: "
+            f"raw_action={raw_action.astype(float).tolist()} "
+            f"published_command={command.astype(float).tolist()}",
+            throttle_duration_sec=max(0.1, float(self.get_parameter("debug_log_period_s").value)),
+        )
 
     def _clamp_delta_action(self, action: np.ndarray) -> np.ndarray:
         max_translation = max(0.0, float(self.get_parameter("max_delta_translation_m").value))
@@ -450,14 +526,50 @@ class SmolVLAPolicyNode(Node):
             float(self.get_parameter("rot_y_max_deg").value),
         )
 
-        if self._last_action is not None:
+        reference = self._last_action
+        if reference is None and self._state_tensor is not None and int(self._state_tensor.numel()) >= 4:
+            reference = self._state_tensor.detach().cpu().numpy().reshape(-1)[:4].astype(np.float32)
+
+        if reference is not None:
             max_jump = max(0.0, float(self.get_parameter("max_action_jump_m").value))
-            delta = action[:3] - self._last_action[:3]
+            delta = action[:3] - reference[:3]
             distance = float(np.linalg.norm(delta))
             if max_jump > 0.0 and distance > max_jump:
-                action[:3] = self._last_action[:3] + delta * (max_jump / distance)
+                action[:3] = reference[:3] + delta * (max_jump / distance)
+
+            max_rot_jump = max(0.0, float(self.get_parameter("max_absolute_rot_y_jump_deg").value))
+            rot_delta = self._angle_delta_deg(float(action[3]), float(reference[3]))
+            if max_rot_jump > 0.0:
+                rot_delta = float(np.clip(rot_delta, -max_rot_jump, max_rot_jump))
+                action[3] = float(reference[3]) + rot_delta
 
         return action
+
+    @staticmethod
+    def _angle_delta_deg(target_deg: float, current_deg: float) -> float:
+        return (float(target_deg) - float(current_deg) + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _axis_rotation_deg(quat_wxyz: np.ndarray, axis: np.ndarray) -> float:
+        norm = float(np.linalg.norm(quat_wxyz))
+        if norm < 1e-6:
+            return 0.0
+
+        quat = quat_wxyz / norm
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-6:
+            return 0.0
+        unit_axis = axis / axis_norm
+
+        twist_vec = unit_axis * float(np.dot(quat[1:], unit_axis))
+        twist = np.array([quat[0], twist_vec[0], twist_vec[1], twist_vec[2]], dtype=np.float32)
+        twist_norm = float(np.linalg.norm(twist))
+        if twist_norm < 1e-6:
+            return 0.0
+        twist /= twist_norm
+
+        signed = float(np.dot(twist[1:], unit_axis))
+        return math.degrees(2.0 * math.atan2(signed, float(twist[0])))
 
 
 def main(args=None) -> None:

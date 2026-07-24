@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -18,8 +19,10 @@ from std_srvs.srv import Trigger
 
 av.logging.set_level(av.logging.ERROR)
 
-OBS_IMAGE_1_KEY = "observation.images.OBS_IMAGE_1"  # top view
-OBS_IMAGE_2_KEY = "observation.images.OBS_IMAGE_2"  # wrist/front view
+OBS_IMAGE_1_KEY = "observation.images.camera1"  # top view
+OBS_IMAGE_2_KEY = "observation.images.camera2"  # wrist/front view
+OBS_STATE_KEY = "observation.state"
+_Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
 class LeRobotRos2RecorderNode(Node):
@@ -46,7 +49,7 @@ class LeRobotRos2RecorderNode(Node):
         self.declare_parameter("hut_image_topic", "/camera/camera/color/rgb_compressed")
         self.declare_parameter("top_image_topic", "/camera/camera1/color/rgb_compressed")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
-        self.declare_parameter("action_topic", "/kaivuri/target_pose_delta_y")
+        self.declare_parameter("action_topic", "/kaivuri/policy_action_y")
         self.declare_parameter("max_sample_age_s", 1.0)
 
         self._dataset: Optional[Any] = None
@@ -216,15 +219,15 @@ class LeRobotRos2RecorderNode(Node):
                 "shape": obs_image_2_shape,
                 "names": ["height", "width", "channel"],
             },
-            "observation.tool_pose": {
+            OBS_STATE_KEY: {
                 "dtype": "float32",
-                "shape": (7,),
-                "names": ["x", "y", "z", "qw", "qx", "qy", "qz"],
+                "shape": (4,),
+                "names": ["x", "y", "z", "rot_y_deg"],
             },
             "action": {
                 "dtype": "float32",
                 "shape": (4,),
-                "names": ["dx", "dy", "dz", "d_rot_y_deg"],
+                "names": ["x", "y", "z", "rot_y_deg"],
             },
         }
 
@@ -266,11 +269,8 @@ class LeRobotRos2RecorderNode(Node):
 
     def _on_tool_pose(self, msg: PoseStamped) -> None:
         pose = msg.pose
-        self._latest_tool_pose = np.array(
+        quat_wxyz = np.array(
             [
-                pose.position.x,
-                pose.position.y,
-                pose.position.z,
                 pose.orientation.w,
                 pose.orientation.x,
                 pose.orientation.y,
@@ -278,11 +278,20 @@ class LeRobotRos2RecorderNode(Node):
             ],
             dtype=np.float32,
         )
+        self._latest_tool_pose = np.array(
+            [
+                pose.position.x,
+                pose.position.y,
+                pose.position.z,
+                self._axis_rotation_deg(quat_wxyz, _Y_AXIS),
+            ],
+            dtype=np.float32,
+        )
         self._latest_tool_pose_time = self.get_clock().now()
 
     def _on_action(self, msg: Float32MultiArray) -> None:
         if len(msg.data) < 4:
-            self.get_logger().warn("Ignoring action: expected [dx, dy, dz, d_rot_y_deg]", throttle_duration_sec=2.0)
+            self.get_logger().warn("Ignoring action: expected [x, y, z, rot_y_deg]", throttle_duration_sec=2.0)
             return
         self._latest_action = np.array(msg.data[:4], dtype=np.float32)
         self._latest_action_time = self.get_clock().now()
@@ -407,7 +416,7 @@ class LeRobotRos2RecorderNode(Node):
         return {
             OBS_IMAGE_1_KEY: self._latest_obs_image_1.copy(),
             OBS_IMAGE_2_KEY: self._latest_obs_image_2.copy(),
-            "observation.tool_pose": self._latest_tool_pose.copy(),
+            OBS_STATE_KEY: self._latest_tool_pose.copy(),
             "action": self._latest_action.copy(),
             "task": self._task,
         }
@@ -497,6 +506,28 @@ class LeRobotRos2RecorderNode(Node):
             self._dataset.push_to_hub()
 
         return super().destroy_node()
+
+    @staticmethod
+    def _axis_rotation_deg(quat_wxyz: np.ndarray, axis: np.ndarray) -> float:
+        norm = float(np.linalg.norm(quat_wxyz))
+        if norm < 1e-6:
+            return 0.0
+
+        quat = quat_wxyz / norm
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm < 1e-6:
+            return 0.0
+        unit_axis = axis / axis_norm
+
+        twist_vec = unit_axis * float(np.dot(quat[1:], unit_axis))
+        twist = np.array([quat[0], twist_vec[0], twist_vec[1], twist_vec[2]], dtype=np.float32)
+        twist_norm = float(np.linalg.norm(twist))
+        if twist_norm < 1e-6:
+            return 0.0
+        twist /= twist_norm
+
+        signed = float(np.dot(twist[1:], unit_axis))
+        return math.degrees(2.0 * math.atan2(signed, float(twist[0])))
 
 
 def main(args=None) -> None:

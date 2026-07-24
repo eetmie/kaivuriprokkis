@@ -201,6 +201,7 @@ class IkPoseControlNode(Node):
     Outputs:
       - /joint_states
       - /kaivuri/tool_pose
+      - /kaivuri/tool_pose_y: std_msgs/Float32MultiArray [x, y, z, rot_y_deg]
     """
 
     def __init__(self) -> None:
@@ -214,6 +215,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("target_pose_topic", "/kaivuri/target_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
         self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
+        self.declare_parameter("tool_pose_y_topic", "/kaivuri/tool_pose_y")
         self.declare_parameter("frame_id", "excavator")
         self.declare_parameter("state_rate_hz", 50.0)
         self.declare_parameter("command_timeout_s", 1.0)
@@ -309,12 +311,14 @@ class IkPoseControlNode(Node):
         target_pose_topic = str(self.get_parameter("target_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
         target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
+        tool_pose_y_topic = str(self.get_parameter("tool_pose_y_topic").value)
         self.create_subscription(PoseStamped, target_pose_topic, self._on_target_pose, 10)
         self.create_subscription(Float32MultiArray, target_pose_y_topic, self._on_target_pose_y, 10)
         self.create_subscription(Float32MultiArray, target_pose_delta_y_topic, self._on_target_pose_delta_y, 10)
 
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
+        self._pose_y_pub = self.create_publisher(Float32MultiArray, tool_pose_y_topic, 10)
 
         state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
         self.create_timer(1.0 / state_rate_hz, self._state_tick)
@@ -510,6 +514,16 @@ class IkPoseControlNode(Node):
             pose_msg.pose.orientation.y = float(ee_quat[2])
             pose_msg.pose.orientation.z = float(ee_quat[3])
             self._pose_pub.publish(pose_msg)
+
+            rot_y_deg = float(np.degrees(self._extract_axis_rotation(ee_quat, _Y_AXIS)))
+            pose_y_msg = Float32MultiArray()
+            pose_y_msg.data = [
+                float(ee_pos[0]),
+                float(ee_pos[1]),
+                float(ee_pos[2]),
+                rot_y_deg,
+            ]
+            self._pose_y_pub.publish(pose_y_msg)
 
     def destroy_node(self) -> bool:
         try:

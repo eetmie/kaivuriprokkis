@@ -5,10 +5,10 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from lerobot_interfaces.srv import EndEpisode, StartEpisode
 from rclpy.duration import Duration
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
-from std_srvs.srv import Trigger
 
 
 _LOCAL_Z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
@@ -31,11 +31,11 @@ class CubeTouchExpertNode(Node):
 
     The node expects Isaac Sim, or another task generator, to publish a cube pose.
     It then publishes a smooth approach -> descend -> hold -> retract trajectory
-    as end-effector deltas on /kaivuri/target_pose_delta_y and emits episode
-    events suitable for recorder segmentation. By default, recording ends while
-    the tool is still holding the touch pose; retract happens outside the
-    episode. Set target_command_mode=absolute to use the legacy
-    /kaivuri/target_pose_y output.
+    to the IK controller and emits episode events suitable for recorder
+    segmentation. The training action topic publishes an absolute end-effector
+    target pose [x, y, z, rot_y_deg], matching the EE-control dataset pattern.
+    By default, recording ends while the tool is still holding the touch pose;
+    retract happens outside the episode.
     """
 
     def __init__(self) -> None:
@@ -44,6 +44,10 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
         self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
+        self.declare_parameter("policy_action_topic", "/kaivuri/target_pose_y")
+        self.declare_parameter("publish_policy_action", True)
+        self.declare_parameter("policy_action_max_translation_m", 0.03)
+        self.declare_parameter("policy_action_max_rot_y_deg", 5.0)
         self.declare_parameter("target_command_mode", "delta")
         self.declare_parameter("episode_event_topic", "/kaivuri/episode_event")
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
@@ -65,7 +69,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("cube_pose_z_offset_m", DEFAULT_CUBE_POSE_Z_OFFSET_M)
         self.declare_parameter("touch_clearance_m", 0.0)
         self.declare_parameter("cube_size_m", 0.05)
-        self.declare_parameter("cube_pose_is_top_center", True)
+        self.declare_parameter("cube_pose_is_top_center", False)
         self.declare_parameter("rot_y_deg", 0.0)
         self.declare_parameter("instruction", "touch the top of the red cube")
         self.declare_parameter("wait_for_target_subscriber", True)
@@ -90,8 +94,8 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("y_min", -0.15)
         self.declare_parameter("y_max", 0.15)
         self.declare_parameter("call_recorder_services", True)
-        self.declare_parameter("recorder_start_service", "/lerobot_ros2_recorder_node/start_episode")
-        self.declare_parameter("recorder_stop_service", "/lerobot_ros2_recorder_node/stop_episode")
+        self.declare_parameter("recorder_start_service", "/start_episode")
+        self.declare_parameter("recorder_stop_service", "/end_episode")
         self.declare_parameter("log_target_errors", False)
 
         rate_hz = max(1.0, float(self.get_parameter("rate_hz").value))
@@ -123,6 +127,7 @@ class CubeTouchExpertNode(Node):
         tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
         target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
+        policy_action_topic = str(self.get_parameter("policy_action_topic").value)
         self._target_command_mode = str(self.get_parameter("target_command_mode").value).strip().lower()
         if self._target_command_mode not in ("delta", "absolute"):
             self.get_logger().warn(
@@ -132,27 +137,34 @@ class CubeTouchExpertNode(Node):
         self._target_topic = (
             target_pose_delta_y_topic if self._target_command_mode == "delta" else target_pose_y_topic
         )
+        self._policy_action_drives_target = self._same_topic(policy_action_topic, target_pose_y_topic)
         episode_event_topic = str(self.get_parameter("episode_event_topic").value)
         task_instruction_topic = str(self.get_parameter("task_instruction_topic").value)
 
         self.create_subscription(PoseStamped, cube_pose_topic, self._on_cube_pose, 10)
         self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
         self._target_pub = self.create_publisher(Float32MultiArray, self._target_topic, 10)
+        self._policy_action_pub = self.create_publisher(Float32MultiArray, policy_action_topic, 10)
         self._event_pub = self.create_publisher(String, episode_event_topic, 10)
         self._instruction_pub = self.create_publisher(String, task_instruction_topic, 10)
         self._recorder_start_client = self.create_client(
-            Trigger,
+            StartEpisode,
             str(self.get_parameter("recorder_start_service").value),
         )
         self._recorder_stop_client = self.create_client(
-            Trigger,
+            EndEpisode,
             str(self.get_parameter("recorder_stop_service").value),
         )
         self.create_timer(self._dt, self._tick)
         self.get_logger().info(
             f"Cube touch expert target_command_mode={self._target_command_mode}; "
-            f"publishing targets to {self._target_topic}"
+            f"publishing targets to {self._target_topic}; policy actions to {policy_action_topic}"
         )
+        if self._policy_action_drives_target:
+            self.get_logger().info(
+                "Policy action topic matches the absolute IK target topic; "
+                "expert will publish the policy action as the IK command and skip the separate target command"
+            )
 
         self._publish_instruction()
 
@@ -268,7 +280,7 @@ class CubeTouchExpertNode(Node):
 
             startup_hold_s = max(0.0, float(self.get_parameter("startup_hold_s").value))
             if self._elapsed(self._startup_ready_time) < startup_hold_s:
-                self._publish_target()
+                self._publish_target(self._current_target)
                 return
             self._startup_ready_time = None
 
@@ -279,7 +291,12 @@ class CubeTouchExpertNode(Node):
             return
 
         if self._stage == Stage.HOLD:
-            self._publish_target()
+            hold_goal = self._goals.get(Stage.HOLD)
+            if hold_goal is not None:
+                self._current_target = hold_goal.copy()
+                self._publish_target(hold_goal)
+            else:
+                self._publish_target()
             if self._hold_started is None:
                 self._hold_started = self.get_clock().now()
             if self._elapsed(self._hold_started) >= float(self.get_parameter("hold_s").value):
@@ -301,8 +318,8 @@ class CubeTouchExpertNode(Node):
             self._current_target = self._step_approach_toward(self._current_target, goal)
         else:
             self._current_target = self._step_toward(self._current_target, goal)
-
-        self._publish_target()
+        
+        self._publish_target(goal)
         if self._target_reached(goal, self._stage):
             if self._stage == Stage.HOME:
                 if not self._home_settled():
@@ -314,6 +331,9 @@ class CubeTouchExpertNode(Node):
                     return
                 self._set_stage(Stage.DESCEND)
             elif self._stage == Stage.DESCEND:
+                hold_goal = self._goals.get(Stage.HOLD)
+                if hold_goal is not None:
+                    self._current_target = hold_goal.copy()
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
                 self._end_episode_recording()
@@ -424,11 +444,18 @@ class CubeTouchExpertNode(Node):
     def _should_wait_for_target_subscriber(self) -> bool:
         if not bool(self.get_parameter("wait_for_target_subscriber").value):
             return False
+        if self._policy_action_drives_target and self._policy_action_pub.get_subscription_count() > 0:
+            return False
         if self._target_pub.get_subscription_count() > 0:
             return False
         self._waiting_for_target_subscriber = True
+        wait_topic = (
+            str(self.get_parameter("policy_action_topic").value)
+            if self._policy_action_drives_target
+            else self._target_topic
+        )
         self.get_logger().warn(
-            f"Waiting for a subscriber on {self._target_topic} before advancing expert target",
+            f"Waiting for a subscriber on {wait_topic} before advancing expert target",
             throttle_duration_sec=2.0,
         )
         return True
@@ -532,7 +559,7 @@ class CubeTouchExpertNode(Node):
             seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
         )
 
-    def _publish_target(self) -> None:
+    def _publish_target(self, policy_goal: Optional[np.ndarray] = None) -> None:
         if self._current_target is None:
             return
         if self._target_command_mode == "delta":
@@ -553,7 +580,41 @@ class CubeTouchExpertNode(Node):
             float(position_values[2]),
             float(rot_y_value),
         ]
-        self._target_pub.publish(msg)
+        if not self._policy_action_drives_target:
+            self._target_pub.publish(msg)
+        self._publish_policy_action(policy_goal if policy_goal is not None else self._current_target)
+
+    @staticmethod
+    def _same_topic(a: str, b: str) -> bool:
+        return str(a).rstrip("/") == str(b).rstrip("/")
+
+    def _publish_policy_action(self, goal: Optional[np.ndarray]) -> None:
+        if not bool(self.get_parameter("publish_policy_action").value):
+            return
+        if goal is None or self._tool_position is None:
+            return
+        delta_position = np.asarray(goal, dtype=np.float32) - self._tool_position
+        max_translation = max(0.0, float(self.get_parameter("policy_action_max_translation_m").value))
+        distance = float(np.linalg.norm(delta_position))
+        if max_translation > 0.0 and distance > max_translation:
+            delta_position = delta_position * (max_translation / distance)
+        target_position = self._tool_position + delta_position
+
+        current_rot_y_deg = self._tool_rot_y_deg if self._tool_rot_y_deg is not None else self._target_rot_y_deg
+        delta_rot_y_deg = self._angle_delta_deg(self._target_rot_y_deg, current_rot_y_deg)
+        max_rot = max(0.0, float(self.get_parameter("policy_action_max_rot_y_deg").value))
+        if max_rot > 0.0:
+            delta_rot_y_deg = float(np.clip(delta_rot_y_deg, -max_rot, max_rot))
+        target_rot_y_deg = current_rot_y_deg + delta_rot_y_deg
+
+        msg = Float32MultiArray()
+        msg.data = [
+            float(target_position[0]),
+            float(target_position[1]),
+            float(target_position[2]),
+            float(target_rot_y_deg),
+        ]
+        self._policy_action_pub.publish(msg)
 
     def _publish_event(self, event: str) -> None:
         msg = String()
@@ -561,33 +622,58 @@ class CubeTouchExpertNode(Node):
         self._event_pub.publish(msg)
         self.get_logger().info(f"Episode event: {msg.data}")
         if event == "episode_start":
-            self._call_recorder_service(self._recorder_start_client, "start_episode")
+            self._call_recorder_start()
         elif event == "episode_end":
-            self._call_recorder_service(self._recorder_stop_client, "stop_episode")
+            self._call_recorder_end()
 
-    def _call_recorder_service(self, client, label: str) -> None:
+    def _recorder_service_ready(self, client, label: str) -> bool:
         if not bool(self.get_parameter("call_recorder_services").value):
-            return
+            return False
         if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.0):
             if label not in self._missing_recorder_service_warnings:
                 self._missing_recorder_service_warnings.add(label)
                 self.get_logger().warn(
                     f"Recorder service for {label} is not available; "
-                    "launch lerobot_ros2_recorder_node or set call_recorder_services:=false"
+                    "launch lerobot_ros dataset_recorder or set call_recorder_services:=false"
                 )
-            return
+            return False
         self._missing_recorder_service_warnings.discard(label)
-        future = client.call_async(Trigger.Request())
-        future.add_done_callback(lambda done: self._log_recorder_service_result(done, label))
+        return True
 
-    def _log_recorder_service_result(self, future, label: str) -> None:
+    def _call_recorder_start(self) -> None:
+        label = "start_episode"
+        if not self._recorder_service_ready(self._recorder_start_client, label):
+            return
+        request = StartEpisode.Request()
+        request.task = str(self.get_parameter("instruction").value)
+        future = self._recorder_start_client.call_async(request)
+        future.add_done_callback(lambda done: self._log_recorder_start_result(done, label))
+
+    def _call_recorder_end(self) -> None:
+        label = "end_episode"
+        if not self._recorder_service_ready(self._recorder_stop_client, label):
+            return
+        request = EndEpisode.Request()
+        request.discard = False
+        request.episde_id = int(self._episode_id)
+        future = self._recorder_stop_client.call_async(request)
+        future.add_done_callback(lambda done: self._log_recorder_end_result(done, label))
+
+    def _log_recorder_start_result(self, future, label: str) -> None:
         try:
             response = future.result()
         except Exception as exc:
             self.get_logger().warn(f"Recorder service {label} failed: {exc}")
             return
-        if not response.success:
-            self.get_logger().warn(f"Recorder service {label} returned failure: {response.message}")
+        self.get_logger().info(f"Recorder service {label} started episode_id={response.episode_id}")
+
+    def _log_recorder_end_result(self, future, label: str) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().warn(f"Recorder service {label} failed: {exc}")
+            return
+        self.get_logger().info(f"Recorder service {label} ended episode with {response.frames} frames")
 
     def _publish_instruction(self) -> None:
         msg = String()

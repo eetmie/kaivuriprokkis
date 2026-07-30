@@ -30,10 +30,9 @@ class CubeTouchExpertNode(Node):
     """Generate expert end-effector targets from a cube pose.
 
     The node expects Isaac Sim, or another task generator, to publish a cube pose.
-    It then publishes a smooth approach -> descend -> hold -> retract trajectory
-    to the IK controller and emits episode events suitable for recorder
-    segmentation. The training action topic publishes an absolute end-effector
-    target pose [x, y, z, rot_y_deg], matching the EE-control dataset pattern.
+    It samples the current tool pose at the policy/data rate, publishes that
+    synced observation state, and publishes the next absolute end-effector target
+    [x, y, z, rot_y_deg] to the IK controller.
     By default, recording ends while the tool is still holding the touch pose;
     retract happens outside the episode.
     """
@@ -42,16 +41,12 @@ class CubeTouchExpertNode(Node):
         super().__init__("cube_touch_expert_node")
         self.declare_parameter("cube_pose_topic", "/kaivuri/cube_pose")
         self.declare_parameter("tool_pose_topic", "/kaivuri/tool_pose")
+        self.declare_parameter("expert_observation_state_topic", "/kaivuri/expert_observation_state")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
-        self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
-        self.declare_parameter("policy_action_topic", "/kaivuri/target_pose_y")
-        self.declare_parameter("publish_policy_action", True)
-        self.declare_parameter("policy_action_max_translation_m", 0.03)
-        self.declare_parameter("policy_action_max_rot_y_deg", 5.0)
-        self.declare_parameter("target_command_mode", "delta")
+        self.declare_parameter("max_rot_y_deg_per_step", 5.0)
         self.declare_parameter("episode_event_topic", "/kaivuri/episode_event")
         self.declare_parameter("task_instruction_topic", "/kaivuri/task_instruction")
-        self.declare_parameter("rate_hz", 50.0)
+        self.declare_parameter("rate_hz", 5.0)
         self.declare_parameter("speed_mps", 0.04)
         self.declare_parameter("position_tolerance_m", 0.02)
         self.declare_parameter("approach_xy_tolerance_m", 0.005)
@@ -61,7 +56,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("retract_xy_tolerance_m", 0.02)
         self.declare_parameter("retract_z_tolerance_m", 0.05)
         self.declare_parameter("approach_settle_s", 1.5)
-        self.declare_parameter("hold_s", 0.5)
+        self.declare_parameter("hold_s", 2.0)
         self.declare_parameter("record_retract", False)
         self.declare_parameter("timeout_s", 180.0)
         self.declare_parameter("approach_height_m", 0.05)
@@ -125,26 +120,19 @@ class CubeTouchExpertNode(Node):
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
+        expert_observation_state_topic = str(self.get_parameter("expert_observation_state_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
-        target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
-        policy_action_topic = str(self.get_parameter("policy_action_topic").value)
-        self._target_command_mode = str(self.get_parameter("target_command_mode").value).strip().lower()
-        if self._target_command_mode not in ("delta", "absolute"):
-            self.get_logger().warn(
-                f"Unsupported target_command_mode={self._target_command_mode!r}; falling back to 'delta'"
-            )
-            self._target_command_mode = "delta"
-        self._target_topic = (
-            target_pose_delta_y_topic if self._target_command_mode == "delta" else target_pose_y_topic
-        )
-        self._policy_action_drives_target = self._same_topic(policy_action_topic, target_pose_y_topic)
         episode_event_topic = str(self.get_parameter("episode_event_topic").value)
         task_instruction_topic = str(self.get_parameter("task_instruction_topic").value)
 
         self.create_subscription(PoseStamped, cube_pose_topic, self._on_cube_pose, 10)
         self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
-        self._target_pub = self.create_publisher(Float32MultiArray, self._target_topic, 10)
-        self._policy_action_pub = self.create_publisher(Float32MultiArray, policy_action_topic, 10)
+        self._expert_observation_state_pub = self.create_publisher(
+            Float32MultiArray,
+            expert_observation_state_topic,
+            10,
+        )
+        self._target_pub = self.create_publisher(Float32MultiArray, target_pose_y_topic, 10)
         self._event_pub = self.create_publisher(String, episode_event_topic, 10)
         self._instruction_pub = self.create_publisher(String, task_instruction_topic, 10)
         self._recorder_start_client = self.create_client(
@@ -157,14 +145,10 @@ class CubeTouchExpertNode(Node):
         )
         self.create_timer(self._dt, self._tick)
         self.get_logger().info(
-            f"Cube touch expert target_command_mode={self._target_command_mode}; "
-            f"publishing targets to {self._target_topic}; policy actions to {policy_action_topic}"
+            "Cube touch expert publishes synced observation/action at "
+            f"{rate_hz:.2f} Hz: state to {expert_observation_state_topic}; "
+            f"absolute targets to {target_pose_y_topic}"
         )
-        if self._policy_action_drives_target:
-            self.get_logger().info(
-                "Policy action topic matches the absolute IK target topic; "
-                "expert will publish the policy action as the IK command and skip the separate target command"
-            )
 
         self._publish_instruction()
 
@@ -314,12 +298,13 @@ class CubeTouchExpertNode(Node):
         if goal is None:
             return
 
+        current_position = self._tool_position.copy()
         if self._stage in (Stage.HOME, Stage.APPROACH):
-            self._current_target = self._step_approach_toward(self._current_target, goal)
+            self._current_target = self._step_approach_toward(current_position, goal)
         else:
-            self._current_target = self._step_toward(self._current_target, goal)
+            self._current_target = self._step_toward(current_position, goal)
         
-        self._publish_target(goal)
+        self._publish_target()
         if self._target_reached(goal, self._stage):
             if self._stage == Stage.HOME:
                 if not self._home_settled():
@@ -444,18 +429,12 @@ class CubeTouchExpertNode(Node):
     def _should_wait_for_target_subscriber(self) -> bool:
         if not bool(self.get_parameter("wait_for_target_subscriber").value):
             return False
-        if self._policy_action_drives_target and self._policy_action_pub.get_subscription_count() > 0:
-            return False
         if self._target_pub.get_subscription_count() > 0:
             return False
         self._waiting_for_target_subscriber = True
-        wait_topic = (
-            str(self.get_parameter("policy_action_topic").value)
-            if self._policy_action_drives_target
-            else self._target_topic
-        )
         self.get_logger().warn(
-            f"Waiting for a subscriber on {wait_topic} before advancing expert target",
+            f"Waiting for a subscriber on {self.get_parameter('target_pose_y_topic').value} "
+            "before advancing expert target",
             throttle_duration_sec=2.0,
         )
         return True
@@ -559,62 +538,41 @@ class CubeTouchExpertNode(Node):
             seconds=max(0.0, float(self.get_parameter("post_episode_cube_ignore_s").value))
         )
 
-    def _publish_target(self, policy_goal: Optional[np.ndarray] = None) -> None:
-        if self._current_target is None:
+    def _publish_target(self, target_position: Optional[np.ndarray] = None) -> None:
+        if self._tool_position is None:
             return
-        if self._target_command_mode == "delta":
-            if self._tool_position is None:
-                return
-            delta_position = self._current_target - self._tool_position
-            current_rot_y_deg = self._tool_rot_y_deg if self._tool_rot_y_deg is not None else self._target_rot_y_deg
-            rot_y_value = self._angle_delta_deg(self._target_rot_y_deg, current_rot_y_deg)
-            position_values = delta_position
-        else:
-            position_values = self._current_target
-            rot_y_value = self._target_rot_y_deg
-
-        msg = Float32MultiArray()
-        msg.data = [
-            float(position_values[0]),
-            float(position_values[1]),
-            float(position_values[2]),
-            float(rot_y_value),
-        ]
-        if not self._policy_action_drives_target:
-            self._target_pub.publish(msg)
-        self._publish_policy_action(policy_goal if policy_goal is not None else self._current_target)
-
-    @staticmethod
-    def _same_topic(a: str, b: str) -> bool:
-        return str(a).rstrip("/") == str(b).rstrip("/")
-
-    def _publish_policy_action(self, goal: Optional[np.ndarray]) -> None:
-        if not bool(self.get_parameter("publish_policy_action").value):
-            return
-        if goal is None or self._tool_position is None:
-            return
-        delta_position = np.asarray(goal, dtype=np.float32) - self._tool_position
-        max_translation = max(0.0, float(self.get_parameter("policy_action_max_translation_m").value))
-        distance = float(np.linalg.norm(delta_position))
-        if max_translation > 0.0 and distance > max_translation:
-            delta_position = delta_position * (max_translation / distance)
-        target_position = self._tool_position + delta_position
-
         current_rot_y_deg = self._tool_rot_y_deg if self._tool_rot_y_deg is not None else self._target_rot_y_deg
-        delta_rot_y_deg = self._angle_delta_deg(self._target_rot_y_deg, current_rot_y_deg)
-        max_rot = max(0.0, float(self.get_parameter("policy_action_max_rot_y_deg").value))
-        if max_rot > 0.0:
-            delta_rot_y_deg = float(np.clip(delta_rot_y_deg, -max_rot, max_rot))
-        target_rot_y_deg = current_rot_y_deg + delta_rot_y_deg
 
-        msg = Float32MultiArray()
-        msg.data = [
+        state_msg = Float32MultiArray()
+        state_msg.data = [
+            float(self._tool_position[0]),
+            float(self._tool_position[1]),
+            float(self._tool_position[2]),
+            float(current_rot_y_deg),
+        ]
+        self._expert_observation_state_pub.publish(state_msg)
+
+        if target_position is None:
+            target_position = self._current_target
+        if target_position is None:
+            return
+
+        target_rot_y_deg = self._step_rot_y_toward(current_rot_y_deg, self._target_rot_y_deg)
+        target_msg = Float32MultiArray()
+        target_msg.data = [
             float(target_position[0]),
             float(target_position[1]),
             float(target_position[2]),
             float(target_rot_y_deg),
         ]
-        self._policy_action_pub.publish(msg)
+        self._target_pub.publish(target_msg)
+
+    def _step_rot_y_toward(self, current_rot_y_deg: float, target_rot_y_deg: float) -> float:
+        delta_rot_y_deg = self._angle_delta_deg(target_rot_y_deg, current_rot_y_deg)
+        max_rot = max(0.0, float(self.get_parameter("max_rot_y_deg_per_step").value))
+        if max_rot > 0.0:
+            delta_rot_y_deg = float(np.clip(delta_rot_y_deg, -max_rot, max_rot))
+        return float(current_rot_y_deg + delta_rot_y_deg)
 
     def _publish_event(self, event: str) -> None:
         msg = String()

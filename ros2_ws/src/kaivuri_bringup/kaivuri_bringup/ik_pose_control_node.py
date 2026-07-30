@@ -186,17 +186,9 @@ class IkPoseControlNode(Node):
     """ROS 2 bridge from end-effector targets to the existing IK controller.
 
     Inputs:
-      - /kaivuri/target_pose: geometry_msgs/PoseStamped
-        position is the desired tool tip position in the IK frame. The IK
-        origin is at (0, 0, -0.05042) in the excavator prim frame.
-        orientation is reduced to the controller's supported body-frame pitch.
       - /kaivuri/target_pose_y: std_msgs/Float32MultiArray
         data order [x, y, z, rot_y_deg], using the same IK-frame position
         convention.
-      - /kaivuri/target_pose_delta_y: std_msgs/Float32MultiArray
-        data order [dx, dy, dz, d_rot_y_deg]. The delta is added to the
-        current tool pose before sending the absolute target to the IK
-        controller.
 
     Outputs:
       - /joint_states
@@ -212,9 +204,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("control_config_file", "")
         self.declare_parameter("pwm_i2c_bus", -1)
         self.declare_parameter("pwm_i2c_addr", -1)
-        self.declare_parameter("target_pose_topic", "/kaivuri/target_pose")
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
-        self.declare_parameter("target_pose_delta_y_topic", "/kaivuri/target_pose_delta_y")
         self.declare_parameter("tool_pose_y_topic", "/kaivuri/tool_pose_y")
         self.declare_parameter("frame_id", "excavator")
         self.declare_parameter("state_rate_hz", 50.0)
@@ -308,13 +298,9 @@ class IkPoseControlNode(Node):
         self._target_active = False
         self._frame_id = str(self.get_parameter("frame_id").value)
 
-        target_pose_topic = str(self.get_parameter("target_pose_topic").value)
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
-        target_pose_delta_y_topic = str(self.get_parameter("target_pose_delta_y_topic").value)
         tool_pose_y_topic = str(self.get_parameter("tool_pose_y_topic").value)
-        self.create_subscription(PoseStamped, target_pose_topic, self._on_target_pose, 10)
         self.create_subscription(Float32MultiArray, target_pose_y_topic, self._on_target_pose_y, 10)
-        self.create_subscription(Float32MultiArray, target_pose_delta_y_topic, self._on_target_pose_delta_y, 10)
 
         self._joint_pub = self.create_publisher(JointState, "joint_states", 10)
         self._pose_pub = self.create_publisher(PoseStamped, "kaivuri/tool_pose", 10)
@@ -323,8 +309,7 @@ class IkPoseControlNode(Node):
         state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
         self.create_timer(1.0 / state_rate_hz, self._state_tick)
         self.get_logger().info(
-            f"IK pose control ready; subscribe {target_pose_topic}, {target_pose_y_topic}, "
-            f"or {target_pose_delta_y_topic}; "
+            f"IK pose control ready; subscribe {target_pose_y_topic}; "
             f"IK origin in excavator frame={np.round(IK_ORIGIN_IN_EXCAVATOR_FRAME, 5)}"
         )
 
@@ -370,24 +355,6 @@ class IkPoseControlNode(Node):
                 raise TimeoutError("Hardware did not become ready before timeout")
             time.sleep(0.1)
 
-    def _on_target_pose(self, msg: PoseStamped) -> None:
-        if msg.header.frame_id and msg.header.frame_id != self._frame_id:
-            self.get_logger().warn(
-                f"Ignoring target pose in frame {msg.header.frame_id}; expected {self._frame_id}",
-                throttle_duration_sec=1.0,
-            )
-            return
-        q = msg.pose.orientation
-        quat_wxyz = np.array([q.w, q.x, q.y, q.z], dtype=np.float32)
-        if float(np.linalg.norm(quat_wxyz)) < 1e-6:
-            quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        rot_y_deg = float(np.degrees(self._extract_axis_rotation(quat_wxyz, _Y_AXIS)))
-        position = np.array(
-            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
-            dtype=np.float32,
-        )
-        self._send_target(position, rot_y_deg)
-
     def _on_target_pose_y(self, msg: Float32MultiArray) -> None:
         values = self._finite_values(list(msg.data))
         if len(values) < 3:
@@ -398,43 +365,6 @@ class IkPoseControlNode(Node):
             return
         rot_y_deg = values[3] if len(values) >= 4 else 0.0
         self._send_target(np.array(values[:3], dtype=np.float32), rot_y_deg)
-
-    def _on_target_pose_delta_y(self, msg: Float32MultiArray) -> None:
-        values = self._finite_values(list(msg.data))
-        if len(values) < 3:
-            self.get_logger().warn(
-                "Ignoring /kaivuri/target_pose_delta_y: expected at least [dx, dy, dz]",
-                throttle_duration_sec=1.0,
-            )
-            return
-
-        current = self._current_tool_pose_y()
-        if current is None:
-            self.get_logger().warn(
-                "Ignoring /kaivuri/target_pose_delta_y: current tool pose is unavailable",
-                throttle_duration_sec=1.0,
-            )
-            return
-
-        current_position, current_rot_y_deg = current
-        delta_position = np.array(values[:3], dtype=np.float32)
-        delta_rot_y_deg = values[3] if len(values) >= 4 else 0.0
-        self._send_target(current_position + delta_position, current_rot_y_deg + delta_rot_y_deg)
-
-    def _current_tool_pose_y(self) -> Optional[tuple[np.ndarray, float]]:
-        try:
-            joint_angles_deg = self._controller.get_joint_angles()
-            joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
-            state = self._get_state(joint_angles_rad[:_N_ACTIVE], self._robot_config, include_jacobian=False)
-        except Exception as exc:
-            self.get_logger().warn(f"Current tool pose unavailable: {exc}", throttle_duration_sec=2.0)
-            return None
-
-        ee_quat = np.asarray(state.ee_orientation, dtype=np.float32)
-        if float(np.linalg.norm(ee_quat)) < 1e-6:
-            ee_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        rot_y_deg = float(np.degrees(self._extract_axis_rotation(ee_quat, _Y_AXIS)))
-        return np.asarray(state.ee_position, dtype=np.float32), rot_y_deg
 
     def _finite_values(self, values: List[float]) -> List[float]:
         out = []

@@ -121,7 +121,7 @@ class RawDirectDriveNode(Node):
     def _on_direct_pwm(self, msg: Float32MultiArray) -> None:
         values = self._clamped_values(list(msg.data))
         if len(values) < 4:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Ignoring /kaivuri/direct_pwm: expected at least 4 values",
                 throttle_duration_sec=1.0,
             )

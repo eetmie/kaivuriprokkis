@@ -101,7 +101,7 @@ class ImuStateNode(Node):
             joint_angles_deg = self._controller.get_joint_angles()
             joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
         except Exception as exc:
-            self.get_logger().warn(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().warning(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
             return
 
         joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()

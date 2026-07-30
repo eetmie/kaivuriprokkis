@@ -143,7 +143,7 @@ class LeRobotRos2RecorderNode(Node):
                     "lerobot or opentau is required for lerobot_ros2_recorder_node. Run this node with the "
                     "Python environment that contains LeRobot/OpenTau dataset dependencies."
                 ) from exc
-            self.get_logger().warn("Using opentau.datasets.lerobot_dataset because upstream lerobot was not found")
+            self.get_logger().warning("Using opentau.datasets.lerobot_dataset because upstream lerobot was not found")
         return module.LeRobotDataset
 
     def _dataset_ready(self) -> bool:
@@ -291,7 +291,7 @@ class LeRobotRos2RecorderNode(Node):
 
     def _on_action(self, msg: Float32MultiArray) -> None:
         if len(msg.data) < 4:
-            self.get_logger().warn("Ignoring action: expected [x, y, z, rot_y_deg]", throttle_duration_sec=2.0)
+            self.get_logger().warning("Ignoring action: expected [x, y, z, rot_y_deg]", throttle_duration_sec=2.0)
             return
         self._latest_action = np.array(msg.data[:4], dtype=np.float32)
         self._latest_action_time = self.get_clock().now()
@@ -349,7 +349,7 @@ class LeRobotRos2RecorderNode(Node):
                     )
                     self._latest_obs_image_1_decoded_stamp = stamp
                 except Exception as exc:
-                    self.get_logger().warn(f"Failed to decode OBS_IMAGE_1: {exc}", throttle_duration_sec=2.0)
+                    self.get_logger().warning(f"Failed to decode OBS_IMAGE_1: {exc}", throttle_duration_sec=2.0)
 
         if self._obs_image_2_compressed and self._latest_obs_image_2_compressed_msg is not None:
             stamp = self._stamp_key(self._latest_obs_image_2_compressed_msg)
@@ -361,7 +361,7 @@ class LeRobotRos2RecorderNode(Node):
                     )
                     self._latest_obs_image_2_decoded_stamp = stamp
                 except Exception as exc:
-                    self.get_logger().warn(f"Failed to decode OBS_IMAGE_2: {exc}", throttle_duration_sec=2.0)
+                    self.get_logger().warning(f"Failed to decode OBS_IMAGE_2: {exc}", throttle_duration_sec=2.0)
 
     def _record_tick(self) -> None:
         self._refresh_latest_images()
@@ -384,7 +384,7 @@ class LeRobotRos2RecorderNode(Node):
 
         missing = self._missing_or_stale_inputs()
         if missing:
-            self.get_logger().warn(f"Waiting for fresh recorder inputs: {', '.join(missing)}", throttle_duration_sec=2.0)
+            self.get_logger().warning(f"Waiting for fresh recorder inputs: {', '.join(missing)}", throttle_duration_sec=2.0)
             return
 
         frame = self._make_frame()
@@ -394,7 +394,7 @@ class LeRobotRos2RecorderNode(Node):
         else:
             self._start_dataset_creation()
             self._pending_frames.append(frame)
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Buffering recorder frames while LeRobot dataset is still being created",
                 throttle_duration_sec=2.0,
             )
@@ -454,7 +454,7 @@ class LeRobotRos2RecorderNode(Node):
         if not self._dataset_ready():
             self._pending_save_episode = True
             self._start_dataset_creation()
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Episode ended before LeRobot dataset was ready; it will be saved after dataset creation finishes",
                 throttle_duration_sec=2.0,
             )
@@ -495,7 +495,7 @@ class LeRobotRos2RecorderNode(Node):
             if self._dataset_ready():
                 self._save_episode()
             elif self._episode_frames > 0:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "Shutdown before LeRobot dataset was ready; buffered episode frames were not saved"
                 )
 

@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -31,13 +31,6 @@ def generate_launch_description():
         DeclareLaunchArgument("hold_s", default_value="1.5"),
         DeclareLaunchArgument("post_touch_record_s", default_value="1.0"),
         DeclareLaunchArgument("record_retract", default_value="true"),
-        DeclareLaunchArgument(
-            "python_executable",
-            default_value=EnvironmentVariable(
-                "KAIVURI_PYTHON_EXECUTABLE",
-                default_value="/mnt/c/Users/sh25016/Documents/kaivuriprokkis/.venv/bin/python",
-            ),
-        ),
         DeclareLaunchArgument("use_polar_workspace", default_value="true"),
         DeclareLaunchArgument("cube_radius_min", default_value="0.45"),
         DeclareLaunchArgument("cube_radius_max", default_value="0.68"),
@@ -65,7 +58,6 @@ def generate_launch_description():
             executable="cube_touch_expert_node",
             name="cube_touch_expert_node",
             output="screen",
-            prefix=[LaunchConfiguration("python_executable"), " "],
             parameters=[{
                 "cube_size_m": LaunchConfiguration("cube_size_m"),
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
@@ -115,7 +107,6 @@ def generate_launch_description():
             executable="success_cube_relocator_node",
             name="success_cube_relocator_node",
             output="screen",
-            prefix=[LaunchConfiguration("python_executable"), " "],
             condition=IfCondition(LaunchConfiguration("use_success_cube_relocator")),
             parameters=[{
                 "cube_command_topic": LaunchConfiguration("cube_command_topic"),
@@ -140,7 +131,6 @@ def generate_launch_description():
             executable="random_cube_pose_node",
             name="random_cube_pose_node",
             output="screen",
-            prefix=[LaunchConfiguration("python_executable"), " "],
             condition=IfCondition(LaunchConfiguration("use_random_cube")),
             parameters=[{
                 "period_s": 8.0,

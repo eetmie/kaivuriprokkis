@@ -77,7 +77,7 @@ class JoystickToDirectPwmNode(Node):
                 direct_pwm.append(0.0)
                 continue
             if axis_index >= len(raw_values):
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"Joystick message missing axis {axis_index} for {command_name}; sending 0.0",
                     throttle_duration_sec=2.0,
                 )

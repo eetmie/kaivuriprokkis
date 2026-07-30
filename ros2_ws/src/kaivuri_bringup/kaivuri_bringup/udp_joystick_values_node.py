@@ -186,7 +186,7 @@ class UdpJoystickValuesNode(Node):
 
         values = self._udp.get_latest()
         if values is None:
-            self.get_logger().warn("No fresh UDP joystick values available", throttle_duration_sec=2.0)
+            self.get_logger().warning("No fresh UDP joystick values available", throttle_duration_sec=2.0)
             return
 
         msg = Float32MultiArray()

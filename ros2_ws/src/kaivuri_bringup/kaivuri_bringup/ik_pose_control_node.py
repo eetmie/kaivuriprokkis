@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional
@@ -264,7 +266,7 @@ class IkPoseControlNode(Node):
                 str(control_config_path),
                 initial_joint_deg,
             )
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "IK pose control running in visualization_only mode; no PWM or IMU hardware is used"
             )
         else:
@@ -320,7 +322,7 @@ class IkPoseControlNode(Node):
                 self._controller.set_ik_command_type(command_type)
                 self.get_logger().info(f"IK command_type override: {command_type}")
             except Exception as exc:
-                self.get_logger().warn(f"Ignoring ik_command_type override {command_type!r}: {exc}")
+                self.get_logger().warning(f"Ignoring ik_command_type override {command_type!r}: {exc}")
 
         threshold = float(self.get_parameter("ik_condition_number_threshold").value)
         if threshold >= 0.0:
@@ -328,7 +330,7 @@ class IkPoseControlNode(Node):
                 self._controller.set_condition_number_threshold(threshold)
                 self.get_logger().info(f"IK condition_number_threshold override: {threshold:.3f}")
             except Exception as exc:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"Ignoring ik_condition_number_threshold override {threshold}: {exc}"
                 )
 
@@ -358,7 +360,7 @@ class IkPoseControlNode(Node):
     def _on_target_pose_y(self, msg: Float32MultiArray) -> None:
         values = self._finite_values(list(msg.data))
         if len(values) < 3:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Ignoring /kaivuri/target_pose_y: expected at least [x, y, z]",
                 throttle_duration_sec=1.0,
             )
@@ -381,7 +383,7 @@ class IkPoseControlNode(Node):
         rejected = result is not None and not result.reachable
         if rejected:
             if bool(self.get_parameter("log_reachability_rejections").value):
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"Rejected unreachable target pos={np.round(position, 4)} "
                     f"rot_y={rot_y_deg:.2f} closest={np.round(result.closest_position, 4)} "
                     f"err={result.pos_error_m:.4f}m",
@@ -405,14 +407,14 @@ class IkPoseControlNode(Node):
         if timeout_s > 0.0 and (time.monotonic() - self._last_command_time) > timeout_s:
             self._controller.clear_target()
             self._target_active = False
-            self.get_logger().warn("IK target timed out; cleared active target")
+            self.get_logger().warning("IK target timed out; cleared active target")
 
     def _publish_state(self) -> None:
         try:
             joint_angles_deg = self._controller.get_joint_angles()
             joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
         except Exception as exc:
-            self.get_logger().warn(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().warning(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
             return
 
         joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()
@@ -470,10 +472,25 @@ class IkPoseControlNode(Node):
 
 
 def main(args=None) -> None:
+    node = None
     rclpy.init(args=args)
-    node = IkPoseControlNode()
     try:
+        node = IkPoseControlNode()
         rclpy.spin(node)
+    except Exception:
+        traceback.print_exc()
+        try:
+            log_dir = Path.home() / ".ros"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            crash_log = log_dir / "kaivuri_ik_pose_control_crash.log"
+            with crash_log.open("w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+            print(f"Wrote IK pose control crash traceback to {crash_log}", file=sys.stderr)
+        except Exception:
+            pass
+        raise
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

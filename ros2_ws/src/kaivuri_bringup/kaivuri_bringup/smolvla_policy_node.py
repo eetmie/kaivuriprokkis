@@ -114,14 +114,14 @@ class SmolVLAPolicyNode(Node):
             self.get_parameter("observation_state_source").value
         ).strip().lower()
         if self._observation_state_source not in ("tool_pose", "joint_states"):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Unsupported observation_state_source="
                 f"{self._observation_state_source!r}; falling back to 'tool_pose'"
             )
             self._observation_state_source = "tool_pose"
         self._action_mode = str(self.get_parameter("action_mode").value).strip().lower()
         if self._action_mode not in ("delta", "absolute"):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Unsupported action_mode={self._action_mode!r}; falling back to 'absolute'"
             )
             self._action_mode = "absolute"
@@ -308,7 +308,7 @@ class SmolVLAPolicyNode(Node):
         try:
             image = self._decode_image(msg)
         except Exception as exc:
-            self.get_logger().warn(f"Failed to decode image: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().warning(f"Failed to decode image: {exc}", throttle_duration_sec=2.0)
             return None
 
         tensor = self._torch.from_numpy(image).permute(2, 0, 1).contiguous()
@@ -346,7 +346,7 @@ class SmolVLAPolicyNode(Node):
         try:
             image = self._decode_compressed_image(msg, codec)
         except Exception as exc:
-            self.get_logger().warn(f"Failed to decode compressed image: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().warning(f"Failed to decode compressed image: {exc}", throttle_duration_sec=2.0)
             return None
 
         tensor = self._torch.from_numpy(image).permute(2, 0, 1).contiguous()
@@ -400,7 +400,7 @@ class SmolVLAPolicyNode(Node):
         obs_image_1_tensor = self._latest_obs_image_1_tensor()
         obs_image_2_tensor = self._latest_obs_image_2_tensor()
         if obs_image_1_tensor is None or obs_image_2_tensor is None or self._state_tensor is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Waiting for camera1, camera2, and observation state before running SmolVLA",
                 throttle_duration_sec=2.0,
             )

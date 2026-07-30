@@ -105,7 +105,7 @@ class SuccessCubeRelocatorNode(Node):
             from modules.ik import IKConfig, load_excavator_model
             from modules.reachability import check_reachability
         except Exception as exc:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"IK reachability disabled because modules.ik could not be imported: {exc}"
             )
             return
@@ -121,7 +121,7 @@ class SuccessCubeRelocatorNode(Node):
             self._reachability_enabled = True
             self.get_logger().info("IK reachability filtering enabled")
         except Exception as exc:
-            self.get_logger().warn(f"IK reachability disabled: {exc}")
+            self.get_logger().warning(f"IK reachability disabled: {exc}")
 
     def _load_ik_config(self, ik_config_cls, yaml_module, control_config_path):
         with control_config_path.open("r", encoding="utf-8") as f:
@@ -170,7 +170,7 @@ class SuccessCubeRelocatorNode(Node):
             self._pending_relocation_reason = "invalid_cube_pose"
             self._pending_success_episode = None
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Scheduled cube relocation for invalid pose outside workspace: {np.round(self._last_measured_cube_pose, 4)}",
                 throttle_duration_sec=2.0,
             )
@@ -200,7 +200,7 @@ class SuccessCubeRelocatorNode(Node):
             self._pending_relocation_reason = f"{event} episode={episode_id}"
             delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
-            self.get_logger().warn(f"Scheduled cube relocation after {event} episode={episode_id}")
+            self.get_logger().warning(f"Scheduled cube relocation after {event} episode={episode_id}")
             return
 
         if (

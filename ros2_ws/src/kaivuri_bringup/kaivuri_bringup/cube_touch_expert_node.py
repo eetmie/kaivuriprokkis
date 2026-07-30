@@ -182,7 +182,7 @@ class CubeTouchExpertNode(Node):
         if not self._should_start_episode_for_cube(center):
             return
         if not self._inside_configured_workspace(center):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Ignoring cube pose outside fixed-base workspace: {np.round(center, 4)}",
                 throttle_duration_sec=2.0,
             )
@@ -234,7 +234,7 @@ class CubeTouchExpertNode(Node):
 
         if not self._tool_pose_is_fresh():
             self._waiting_for_tool_pose = True
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Waiting for fresh /kaivuri/tool_pose before advancing expert target",
                 throttle_duration_sec=2.0,
             )
@@ -243,7 +243,7 @@ class CubeTouchExpertNode(Node):
         if not self._has_startup_tool_pose_samples():
 
             self._waiting_for_tool_pose = True
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Waiting for startup /kaivuri/tool_pose samples before advancing expert target",
                 throttle_duration_sec=2.0,
             )
@@ -372,7 +372,7 @@ class CubeTouchExpertNode(Node):
             return
         if not self._tool_pose_is_fresh():
             self._waiting_for_tool_pose = True
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Waiting for fresh /kaivuri/tool_pose to seed expert start target",
                 throttle_duration_sec=2.0,
             )
@@ -432,7 +432,7 @@ class CubeTouchExpertNode(Node):
         if self._target_pub.get_subscription_count() > 0:
             return False
         self._waiting_for_target_subscriber = True
-        self.get_logger().warn(
+        self.get_logger().warning(
             f"Waiting for a subscriber on {self.get_parameter('target_pose_y_topic').value} "
             "before advancing expert target",
             throttle_duration_sec=2.0,
@@ -590,7 +590,7 @@ class CubeTouchExpertNode(Node):
         if not client.service_is_ready() and not client.wait_for_service(timeout_sec=0.0):
             if label not in self._missing_recorder_service_warnings:
                 self._missing_recorder_service_warnings.add(label)
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"Recorder service for {label} is not available; "
                     "launch lerobot_ros dataset_recorder or set call_recorder_services:=false"
                 )
@@ -621,7 +621,7 @@ class CubeTouchExpertNode(Node):
         try:
             response = future.result()
         except Exception as exc:
-            self.get_logger().warn(f"Recorder service {label} failed: {exc}")
+            self.get_logger().warning(f"Recorder service {label} failed: {exc}")
             return
         self.get_logger().info(f"Recorder service {label} started episode_id={response.episode_id}")
 
@@ -629,7 +629,7 @@ class CubeTouchExpertNode(Node):
         try:
             response = future.result()
         except Exception as exc:
-            self.get_logger().warn(f"Recorder service {label} failed: {exc}")
+            self.get_logger().warning(f"Recorder service {label} failed: {exc}")
             return
         self.get_logger().info(f"Recorder service {label} ended episode with {response.frames} frames")
 

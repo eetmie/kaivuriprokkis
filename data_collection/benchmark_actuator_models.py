@@ -99,10 +99,10 @@ def _normalize_drive_log_schema(df: pd.DataFrame) -> pd.DataFrame:
         }
         df = df.rename(columns=rename_map)
 
-        # The legacy sample log stores radians and rad/s; convert to degrees so
-        # the benchmark uses one consistent unit system.
+        # Legacy sample logs already store radians and rad/s, which is the unit
+        # system the benchmark and the Isaac training pipeline both use.
         for col in POS_COLS + VEL_COLS:
-            df[col] = np.degrees(pd.to_numeric(df[col], errors="coerce"))
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         if SEGMENT_COL not in df.columns:
             df[SEGMENT_COL] = 0
@@ -726,8 +726,8 @@ def main() -> None:
             "pressure_min_valid_frac": float(args.pressure_min_valid_frac),
             "hammerstein_min_active": int(args.hammerstein_min_active),
             "units": {
-                "joint_position": "deg",
-                "joint_velocity": "deg/s",
+                "joint_position": "rad",
+                "joint_velocity": "rad/s",
                 "command": "normalized_-1_to_1",
             },
         },

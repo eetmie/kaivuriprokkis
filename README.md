@@ -59,8 +59,9 @@ lightweight project `.venv`, and adds the user to device groups such as
 `dialout`, `i2c`, and `gpio` when those groups exist. This robot's Jetson
 profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
 7, plus USB serial for IMU reading. The Raspberry Pi virtual I2C channels, OLED
-service, OLED/display Python packages, and analysis-only `scipy`/`pandas`
-packages are not part of the Jetson setup.
+service, and OLED/display Python packages are not part of the Jetson setup.
+`pandas` is installed: it is a runtime dependency, not analysis-only, because
+`simple_drive.py --record` writes drive logs through it.
 
 Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz on the Orin
 Nano Super, and it needs a Jetson-specific device-tree or kernel configuration

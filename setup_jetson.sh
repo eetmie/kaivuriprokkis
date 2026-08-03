@@ -76,11 +76,15 @@ sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install \
     numpy \
     scipy \
     numba \
+    pandas \
     pyyaml \
     pyserial \
     smbus2
 echo "  OK: Python packages installed into ${VENV_DIR}"
-echo "  NOTE: Skipped Raspberry Pi OLED/display packages and analysis-only pandas."
+echo "  NOTE: Skipped Raspberry Pi OLED/display packages."
+# pandas is NOT analysis-only on this robot: simple_drive.py --record buffers
+# samples in memory and writes the CSV via pandas in DataLogger.save(). Without
+# it, stopping a recording raises ModuleNotFoundError and the segment is lost.
 
 echo ""
 echo "[3/6] Granting device group access..."

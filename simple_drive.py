@@ -225,7 +225,18 @@ class DataLogger:
     """100 Hz hydraulic actuator data recorder for blackbox model training.
 
     CSV schema matches data_collection/benchmark_actuator_models.py and the
-    IsaacLab training pipeline (sanitize_drive_logs → train_blackbox).
+    IsaacLab training pipeline (Isaac-hydraulic-actuator/train.py).
+
+    Units are the Isaac convention, not the controller convention:
+      timestamp  seconds since segment start (monotonic)
+      joint_pos  radians          (controller API returns degrees)
+      joint_vel  rad/s            (controller API returns deg/s)
+      imu_g*     rad/s            (hardware API returns deg/s)
+      *_cmd_*    normalized [-1, 1]
+
+    Command channels use hydraulic names (rotate/lift/tilt/scoop), not joint
+    names (slew/boom/arm/bucket), because that is what the training and
+    benchmark scripts read.
     """
 
     def __init__(self, output_dir: Path):
@@ -279,19 +290,22 @@ class DataLogger:
 
         t = time.perf_counter() - self._t0_mono
 
-        pos = controller.get_joint_angles()
+        # Controller/hardware APIs speak degrees; the dataset is radians.
+        pos = np.radians(controller.get_joint_angles())
         vels, vel_age = controller.get_joint_velocities_with_age()
         if vels is not None and vel_age < 0.05:
-            vb, va, vbkt = float(vels[1]), float(vels[2]), float(vels[3])
+            vb, va, vbkt = (float(np.radians(vels[1])),
+                            float(np.radians(vels[2])),
+                            float(np.radians(vels[3])))
         else:
             vb = va = vbkt = np.nan
 
         gyro = hardware.try_read_imu_gyro()
         if gyro is not None:
             g  = gyro['gyro']
-            gb = list(g[0]) if len(g) > 0 else [np.nan]*3
-            ga = list(g[1]) if len(g) > 1 else [np.nan]*3
-            gk = list(g[2]) if len(g) > 2 else [np.nan]*3
+            gb = list(np.radians(g[0])) if len(g) > 0 else [np.nan]*3
+            ga = list(np.radians(g[1])) if len(g) > 1 else [np.nan]*3
+            gk = list(np.radians(g[2])) if len(g) > 2 else [np.nan]*3
         else:
             gb = ga = gk = [np.nan, np.nan, np.nan]
 
@@ -326,12 +340,13 @@ class DataLogger:
 
         df = pd.DataFrame({
             'timestamp': self._ts, 'sample_idx': self._idx, 'segment_id': self._seg,
-            'manual_cmd_slew': man[:,0], 'manual_cmd_boom': man[:,1],
-            'manual_cmd_arm':  man[:,2], 'manual_cmd_bucket': man[:,3],
-            'sine_cmd_slew':   sin[:,0], 'sine_cmd_boom':   sin[:,1],
-            'sine_cmd_arm':    sin[:,2], 'sine_cmd_bucket': sin[:,3],
-            'combined_cmd_slew': com[:,0], 'combined_cmd_boom': com[:,1],
-            'combined_cmd_arm':  com[:,2], 'combined_cmd_bucket': com[:,3],
+            # JOINT_NAMES order (slew, boom, arm, bucket) → hydraulic channel names
+            'manual_cmd_rotate': man[:,0], 'manual_cmd_lift':  man[:,1],
+            'manual_cmd_tilt':   man[:,2], 'manual_cmd_scoop': man[:,3],
+            'sine_cmd_rotate':   sin[:,0], 'sine_cmd_lift':    sin[:,1],
+            'sine_cmd_tilt':     sin[:,2], 'sine_cmd_scoop':   sin[:,3],
+            'combined_cmd_rotate': com[:,0], 'combined_cmd_lift':  com[:,1],
+            'combined_cmd_tilt':   com[:,2], 'combined_cmd_scoop': com[:,3],
             'joint_pos_slew':   pos[:,0], 'joint_pos_boom': pos[:,1],
             'joint_pos_arm':    pos[:,2], 'joint_pos_bucket': pos[:,3],
             'joint_vel_boom': self._vb, 'joint_vel_arm': self._va, 'joint_vel_bucket': self._vbkt,

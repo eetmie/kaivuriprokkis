@@ -5,8 +5,9 @@ import os
 import struct
 import threading
 import time
+
 import inputs
-from inputs import get_gamepad, UnpluggedError
+from inputs import get_gamepad, UnpluggedError, UnknownEventType
 
 try:
     import fcntl  # Linux only; absent on Windows, where the ioctl probe is skipped.
@@ -38,23 +39,36 @@ MAPPING (this is the index read() function returns):
 19: 'DownDPad'
 """
 
+# inputs 0.5 builds DeviceManager.codes from EVENT_MAP, in which 'type_codes' is
+# a *generator* (inputs.py:1302), not a tuple. The manager built at import time
+# consumes it, so every DeviceManager() created afterwards ends up with an empty
+# type_codes and then raises UnknownEventType for every event it decodes.
+# Spotting a replugged pad needs a fresh manager, so rebuild that one table from
+# the source tuple by hand. Without this, reconnecting kills the pad for the
+# rest of the process.
+_TYPE_CODES = {name: code for code, name in inputs.EVENT_TYPES}
+
 
 class XboxController:
-    # Fallbacks only. The real full-scale value per axis is read from the
-    # driver at connect time (see _refresh_axis_scales); these are what the
+    # Fallbacks only. On Linux the real full-scale value per axis is read from
+    # the driver at connect time (see _refresh_axis_scales); these are what the
     # XInput backend on Windows reports, where that probe is unavailable.
     MAX_TRIG_VAL = math.pow(2, 8)
     MAX_JOY_VAL = math.pow(2, 15)
 
-    # inputs names buttons after raw evdev codes, where BTN_NORTH is an alias
-    # of BTN_X (0x133) and BTN_WEST of BTN_Y (0x134) - a historical Linux
-    # naming mismatch. The kernel pad drivers emit those for the buttons
-    # physically labelled X and Y, so on Linux north is X. The Windows XInput
-    # backend reuses the same names but assigns them the other way round
-    # (inputs.XINPUT_MAPPING: X -> 0x134/BTN_WEST, Y -> 0x133/BTN_NORTH), so
-    # the mapping has to follow the platform.
+    # inputs names buttons after raw evdev codes, where BTN_NORTH is an alias of
+    # BTN_X (0x133) and BTN_WEST of BTN_Y (0x134) - a historical Linux naming
+    # mismatch. The kernel pad drivers emit those for the buttons physically
+    # labelled X and Y, so on Linux north is X. The Windows XInput backend
+    # reuses the same names but assigns them the other way round
+    # (inputs.XINPUT_MAPPING: X -> 0x134/BTN_WEST, Y -> 0x133/BTN_NORTH), so the
+    # mapping has to follow the platform.
     _NORTH_BUTTON = 'Y' if inputs.WIN else 'X'
     _WEST_BUTTON = 'X' if inputs.WIN else 'Y'
+
+    # evdev reports stick Y with up as negative; XInput reports up as positive.
+    # Callers were written against the Windows sense, so flip Linux to match.
+    _Y_SIGN = 1.0 if inputs.WIN else -1.0
 
     # evdev ABS_* codes, for the EVIOCGABS ioctl.
     _ABS_CODES = {
@@ -72,6 +86,9 @@ class XboxController:
         self._stop_event = threading.Event()
         self._connected = False
         self._reconnect_count = 0
+        self._first_scan = True
+        self._ever_connected = False
+        self._warned = set()
         self.start_monitoring()
 
     def reset_values(self):
@@ -109,9 +126,14 @@ class XboxController:
         self.reset_values()
         if self._monitor_thread:
             # get_gamepad() blocks until the next pad event, so an idle
-            # controller would make a plain join() wait forever. The thread is
-            # a daemon, so leaving it parked in that read is harmless.
+            # controller would make a plain join() wait forever. The thread is a
+            # daemon, so leaving it parked in that read is harmless.
             self._monitor_thread.join(timeout=1.0)
+
+    def is_connected(self):
+        return self._connected
+
+    # --- value conditioning -------------------------------------------------
 
     def _apply_deadzone(self, x):
         ax = abs(x)
@@ -155,6 +177,8 @@ class XboxController:
             'DownDPad': self.DownDPad
         }
 
+    # --- axis ranges --------------------------------------------------------
+
     def _default_axis_scales(self):
         return {
             'ABS_X': self.MAX_JOY_VAL, 'ABS_Y': self.MAX_JOY_VAL,
@@ -163,11 +187,13 @@ class XboxController:
         }
 
     def _refresh_axis_scales(self):
-        """Ask the driver for each axis' real range.
+        """Ask the driver for each axis' real range (Linux only).
 
         Trigger full scale is not universal: the Xbox Series pad on the USB
         kernel driver reports 0..1023, not the 0..255 the XInput backend gives,
-        so a hardcoded divisor makes read() return values well above 1.0.
+        so a hardcoded divisor would peg the trigger at 1.0 a quarter of the way
+        through its travel. On Windows there is no ioctl and the defaults are
+        already correct.
         """
         scales = self._default_axis_scales()
         path = self._device_path()
@@ -217,62 +243,130 @@ class XboxController:
         except (IndexError, AttributeError):
             return None
 
-    def _gamepad_present(self):
+    # --- device discovery ---------------------------------------------------
+
+    def _pad_present(self):
         return bool(inputs.devices.gamepads)
 
     def _rescan_devices(self):
-        # inputs builds its device list once at import, so a controller plugged
-        # in later is never seen unless the manager is rebuilt.
+        """Rebuild the device list so a replugged pad is seen.
+
+        inputs enumerates once at import, and on Linux a replugged pad usually
+        lands on a new event node, so the cached list points at a dead path.
+        """
         try:
-            inputs.devices = inputs.DeviceManager()
+            manager = inputs.DeviceManager()
         except Exception:
             return False
-        return self._gamepad_present()
+        # See _TYPE_CODES: a second DeviceManager decodes nothing without this.
+        manager.codes['type_codes'] = dict(_TYPE_CODES)
+        inputs.devices = manager
+        return self._pad_present()
+
+    def _warn_once(self, key, message):
+        if key not in self._warned:
+            self._warned.add(key)
+            print(f"[JOYSTICK] {message}")
+
+    # --- monitor loop -------------------------------------------------------
 
     def _monitor_controller(self):
         while not self._stop_event.is_set():
-            try:
-                # get_gamepad() blocks until the pad is actually moved, so
-                # connection state comes from the device list, not from traffic.
-                if not self._connected and self._gamepad_present():
-                    self._refresh_axis_scales()
-                    self._connected = True
-                    self._reconnect_count = 0
-                events = get_gamepad()
+            if not self._acquire_pad():
+                break
+            self._pump_events()
+        self._connected = False
+        self.reset_values()
+
+    def _acquire_pad(self):
+        """Wait until a pad is listed. False if we stopped or gave up."""
+        wait_delay = 3
+
+        while not self._stop_event.is_set():
+            # Trust the import-time device list on the first pass. After that
+            # the cached list still names the unplugged node, so always rescan.
+            if self._first_scan:
+                self._first_scan = False
+                found = self._pad_present()
+            else:
+                found = self._rescan_devices()
+
+            if found:
+                # A different pad may have been plugged in; re-read its ranges.
+                self._refresh_axis_scales()
+                if self._ever_connected:
+                    print("[JOYSTICK] Controller reconnected successfully!")
                 self._connected = True
-                self._reconnect_count = 0  # Reset reconnection counter on successful connection
-                for event in events:
-                    self._process_event(event)
-            except PermissionError:
-                print("[ERROR] No read access to /dev/input/event*. Add this user to "
-                      "the 'input' group (setup_jetson.sh does this) and log back in.")
-                self._connected = False
-                self.reset_values()
-                self._stop_event.set()
+                self._ever_connected = True
+                self._reconnect_count = 0
+                return True
+
+            self._reconnect_count += 1
+            if self.max_reconnect is not None and self._reconnect_count >= self.max_reconnect:
+                print("[ERROR] Maximum reconnection attempts reached. "
+                      "Stopping controller monitoring.")
+                return False
+
+            if self.max_reconnect is not None:
+                remaining = self.max_reconnect - self._reconnect_count
+                print(f"[JOYSTICK] Reconnection attempt {self._reconnect_count}/{self.max_reconnect} "
+                      f"failed. {remaining} attempts remaining. "
+                      f"Retrying in {wait_delay} seconds...")
+            else:
+                print(f"[JOYSTICK] Reconnection attempt {self._reconnect_count} "
+                      f"failed. Retrying in {wait_delay} seconds...")
+            # wait() instead of sleep() so stop_monitoring() is not stuck behind
+            # a retry delay.
+            if self._stop_event.wait(wait_delay):
+                break
+
+        return False
+
+    def _pump_events(self):
+        """Read events until the pad goes away, then return to re-acquire."""
+        while not self._stop_event.is_set():
+            try:
+                events = get_gamepad()
             except UnpluggedError:
                 # The pad was already gone when get_gamepad() looked it up.
-                self._handle_disconnect()
+                self._on_lost("Controller disconnected.")
+                return
+            except PermissionError:
+                # Must precede OSError - PermissionError is a subclass.
+                print("[ERROR] No read access to /dev/input/event*. Add this user to "
+                      "the 'input' group (setup_jetson.sh does this) and log back in.")
+                self._stop_event.set()
+                return
             except OSError as err:
                 # The pad vanished *during* the blocking read: the kernel drops
                 # the event node and read() fails with ENODEV/EIO instead of
                 # raising UnpluggedError.
-                print(f"[JOYSTICK] Read from controller failed ({err}).")
-                self._handle_disconnect()
-            except Exception as err:  # noqa: BLE001 - the monitor must never die silently
-                print(f"[JOYSTICK] Unexpected controller error ({type(err).__name__}: {err}).")
-                self._handle_disconnect()
+                self._on_lost(f"Read from controller failed ({err}).")
+                return
+            except UnknownEventType as err:
+                # Should not happen now that type_codes is repaired, but skip
+                # the event rather than treating it as a disconnect. The sleep
+                # keeps a persistent decode failure from spinning a core.
+                self._warn_once('unknown_event', f"Ignoring unknown event type ({err}).")
+                time.sleep(0.01)
+                continue
 
-    def _handle_disconnect(self):
-        """Drop to a safe state, then block until the pad is back."""
-        if self._connected:
-            print("[JOYSTICK] Controller disconnected. Attempting to reconnect...")
+            try:
+                for event in events:
+                    self._process_event(event)
+            except Exception as err:  # noqa: BLE001 - the monitor must not die
+                self._warn_once('process', f"Error handling event ({type(err).__name__}: {err}).")
+
+    def _on_lost(self, message):
+        print(f"[JOYSTICK] {message} Attempting to reconnect...")
         self._connected = False
         self.reset_values()
-        if not self._attempt_reconnect():
-            if not self._stop_event.is_set():
-                print("[ERROR] Maximum reconnection attempts reached. "
-                      "Stopping controller monitoring.")
-            self._stop_event.set()
+        # Give the OS a moment to tear the node down. Rescanning too early can
+        # still list the dead device, sending us straight back into a failing
+        # read and spinning this loop.
+        self._stop_event.wait(0.5)
+
+    # --- event decoding -----------------------------------------------------
 
     def _normalize(self, code, state):
         scale = self._axis_scale.get(code) or 1.0
@@ -280,11 +374,11 @@ class XboxController:
 
     def _process_event(self, event):
         if event.code == 'ABS_Y':
-            self.LeftJoystickY = self._normalize(event.code, event.state)
+            self.LeftJoystickY = self._Y_SIGN * self._normalize(event.code, event.state)
         elif event.code == 'ABS_X':
             self.LeftJoystickX = self._normalize(event.code, event.state)
         elif event.code == 'ABS_RY':
-            self.RightJoystickY = self._normalize(event.code, event.state)
+            self.RightJoystickY = self._Y_SIGN * self._normalize(event.code, event.state)
         elif event.code == 'ABS_RX':
             self.RightJoystickX = self._normalize(event.code, event.state)
         elif event.code == 'ABS_Z':
@@ -315,7 +409,8 @@ class XboxController:
             # Most pads (this Xbox Series controller included) report the D-pad
             # as a hat axis rather than as buttons: -1 left, +1 right, 0
             # released. The Windows XInput backend emulates the same two axes
-            # with the same signs, so one branch covers both platforms.
+            # with the same signs (inputs.XINPUT_MAPPING -> 0x10/0x11), so one
+            # branch covers both platforms.
             self.LeftDPad = 1 if event.state < 0 else 0
             self.RightDPad = 1 if event.state > 0 else 0
         elif event.code == 'ABS_HAT0Y':
@@ -331,48 +426,6 @@ class XboxController:
         elif event.code == 'BTN_TRIGGER_HAPPY4':
             self.DownDPad = event.state
 
-    def _attempt_reconnect(self):
-        wait_delay = 3
-
-        # Give the kernel a moment to tear the event node down. Probing too
-        # early can still list the dead device, which would send us straight
-        # back into a failing read and spin this loop.
-        if self._stop_event.wait(0.5):
-            return False
-
-        while not self._stop_event.is_set():
-            if self.max_reconnect is not None and self._reconnect_count >= self.max_reconnect:
-                return False
-            # Probe the device list rather than get_gamepad(): a present-but-idle
-            # pad would block that call until someone moved a stick.
-            if self._rescan_devices():
-                print("[JOYSTICK] Controller reconnected successfully!")
-                # A different pad may have been plugged in; re-read its ranges.
-                self._refresh_axis_scales()
-                self._connected = True
-                self._reconnect_count = 0
-                return True
-
-            self._reconnect_count += 1
-            if self.max_reconnect is not None:
-                remaining = self.max_reconnect - self._reconnect_count
-                print(f"[JOYSTICK] Reconnection attempt {self._reconnect_count}/{self.max_reconnect} "
-                      f"failed. {remaining} attempts remaining. "
-                      f"Retrying in {wait_delay} seconds...")
-            else:
-                print(f"[JOYSTICK] Reconnection attempt {self._reconnect_count} "
-                      f"failed. Retrying in {wait_delay} seconds...")
-            # wait() instead of sleep() so stop_monitoring() is not stuck
-            # behind a retry delay.
-            if self._stop_event.wait(wait_delay):
-                break
-
-        return False
-
-
-    def is_connected(self):
-        return self._connected
-
     def __del__(self):
         # May run on a half-built object if __init__ raised, and during
         # interpreter shutdown; neither is worth a traceback.
@@ -380,6 +433,7 @@ class XboxController:
             self.stop_monitoring()
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     # initialize the controller

@@ -1,8 +1,9 @@
 """Tests for velocity-control additions to ExcavatorController and JointVelocityController.
 
 ExcavatorController methods are tested via a thin proxy (avoiding full hardware/numba init).
-JointVelocityController is imported from simple_drive (the older velocity controller there,
-not the root test_vel_ctrl.py hardware prototype) with hardware deps pre-mocked.
+JointVelocityController is imported from control_prototype/drive_compensated.py (the older
+velocity controller, not the root test_vel_ctrl.py hardware prototype) with hardware deps
+pre-mocked. It used to live in simple_drive.py, which is now strictly open-loop.
 """
 
 import math
@@ -164,25 +165,25 @@ class TestFiniteDifferenceJointVelocity(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# JointVelocityController (from simple_drive)
-# Pre-mock hardware imports so simple_drive can be loaded on non-RPi hosts.
+# JointVelocityController (from control_prototype/drive_compensated.py)
+# Pre-mock hardware imports so the module can be loaded on non-RPi hosts.
 # ---------------------------------------------------------------------------
 
 _MOCK = MagicMock()
 _mocked_modules = ('modules.udp_socket', 'modules.hardware_interface',
                    'tools.linkage_rate_compensation')
 _previous_modules = {name: sys.modules.get(name) for name in _mocked_modules}
-for _mod in ('modules.udp_socket', 'modules.hardware_interface',
-             'tools.linkage_rate_compensation'):
+for _mod in _mocked_modules:
     sys.modules.setdefault(_mod, _MOCK)
 
 _jvc_import_err = None
 try:
     import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location('simple_drive', ROOT_DIR / 'simple_drive.py')
-    _sd = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_sd)
-    JointVelocityController = _sd.JointVelocityController
+    _spec = _ilu.spec_from_file_location(
+        'drive_compensated', ROOT_DIR / 'control_prototype' / 'drive_compensated.py')
+    _dc = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_dc)
+    JointVelocityController = _dc.JointVelocityController
 except Exception as _e:
     _jvc_import_err = _e
 finally:
@@ -193,7 +194,7 @@ finally:
             sys.modules[_name] = _previous
 
 
-@unittest.skipIf(_jvc_import_err, f'simple_drive import failed: {_jvc_import_err}')
+@unittest.skipIf(_jvc_import_err, f'drive_compensated import failed: {_jvc_import_err}')
 class TestJointVelocityController(unittest.TestCase):
 
     def _make(self, kp=0.1, ki=0.01, ki_max=0.5, deadband=2.0, max_degps=20.0):

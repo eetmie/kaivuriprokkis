@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
-"""Excavator driving and hydraulic data collection.
+"""Excavator open-loop driving and hydraulic data collection.
 
-Merged from simple_drive.py (bench driving) and data_collection/drive_logger.py
-(sine-excitation recording). Uses the modern board-profile bringup system.
+Drives the valves straight from the stick — no compensation, no closed loop —
+and records 10-minute strips for blackbox model training. Closed-loop and
+compensated driving live in control_prototype/drive_compensated.py.
 
 Usage:
-    python simple_drive.py
-    python simple_drive.py --record
-    python simple_drive.py --robot jetson --record --enable-slew
-    python simple_drive.py --comp vel-pid
-    python simple_drive.py --auto-pump
-    python simple_drive.py --sine-test          # drive with sine, no logging
+    python simple_drive.py                        # local gamepad
+    python simple_drive.py --robot jetson
+    python simple_drive.py --ip 0.0.0.0:8080      # remote UDP client instead
+    python simple_drive.py --enable-slew --enable-tracks
+
+Input source:
+    Default is a gamepad wired straight into this machine. Passing --ip
+    switches to a remote client over UDP (clients/client_gui.py).
 
 Button Controls:
-    Button A (bit 0): Start / Stop data logging (saves segment on stop)
+    Button A (bit 0): Start / Stop data logging (saves strip on stop)
     Button B (bit 1): Toggle sine excitation on / off (default: OFF)
     Button X (bit 2): Toggle hydraulic pump
-    Button Y (bit 3): Cycle sine amplitude
+    Button Y (bit 3): Reload servo config from disk
+    D-pad Up/Down (bits 4/5): Step sine amplitude (local pad only)
 
-Compensation modes (--comp flag, not button-toggled):
-    none         — raw joystick commands, no correction
-    raw          — per-joint valve scaling from linkage-rate table
-    universal    — pump-gain modulation from universal shape table
-    vel-pid      — closed-loop velocity PI (requires IMU)
+Amplitude is the only sine knob: every other parameter is randomized per joint
+on each enable, which explores the input space better than stepping presets by
+hand did. The seed for a run is printed and written to every logged sample.
+
+Recording runs in 10-minute strips: a strip is auto-saved and a new one
+started while logging stays on, so a long session lands as a series of files
+rather than one unbounded CSV.
 """
 
 from __future__ import annotations
@@ -43,12 +49,6 @@ from modules.board import PROFILES as ROBOT_PROFILES, resolve_profile as _resolv
 from modules.bringup import wait_for_hardware_ready
 from modules.direct_controller import DirectController
 from modules.udp_socket import UDPSocket
-from tools.linkage_rate_compensation import (
-    DEFAULT_TABLE,
-    DEFAULT_UNIVERSAL_TABLE,
-    LinkageRateCompensator,
-    UniversalShapeCompensator,
-)
 
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -57,52 +57,14 @@ SAMPLING_FREQUENCY         = 100    # Hz
 COMMAND_STALE_TIMEOUT_S    = 0.5
 STATUS_PRINT_INTERVAL_S    = 5.0
 PRINT_DECIMATION           = 10     # IMU print decimation (→ ~10 Hz)
+STRIP_MINUTES              = 10.0   # auto-save cadence while logging
 
 LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
 
 JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
-AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5]
+AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
-
-
-# ── velocity PID ─────────────────────────────────────────────────────────────
-
-_VEL_CTRL_JOINTS = {'boom': 1, 'arm': 2, 'bucket': 3}
-
-
-class JointVelocityController:
-    """Joystick → desired deg/s → PI → valve command for the three arm joints."""
-
-    def __init__(self, kp: float, ki: float, ki_max: float,
-                 deadband_degps: float, max_degps: float):
-        self.kp       = kp
-        self.ki       = ki
-        self.ki_max   = ki_max
-        self.deadband = deadband_degps
-        self.max_degps = max_degps
-        self._integral: dict[str, float] = {n: 0.0 for n in _VEL_CTRL_JOINTS}
-
-    def apply(self, commands: dict, joint_vels, dt: float) -> dict:
-        out = dict(commands)
-        for name, vel_idx in _VEL_CTRL_JOINTS.items():
-            if name not in out or vel_idx >= len(joint_vels):
-                continue
-            desired = float(out[name]) * self.max_degps
-            if abs(desired) < self.deadband:
-                self._integral[name] = 0.0
-                out[name] = 0.0
-                continue
-            err = desired - float(joint_vels[vel_idx])
-            self._integral[name] = float(
-                np.clip(self._integral[name] + err * dt, -self.ki_max, self.ki_max)
-            )
-            out[name] = float(np.clip(self.kp * err + self.ki * self._integral[name], -1.0, 1.0))
-        return out
-
-    def reset(self):
-        for k in self._integral:
-            self._integral[k] = 0.0
 
 
 # ── IMU helpers ───────────────────────────────────────────────────────────────
@@ -172,50 +134,167 @@ def _format_imu_line(payload, joint_angles=None, joint_names=None, imu_role_orde
 # ── sine excitation ───────────────────────────────────────────────────────────
 
 class SineExcitationGenerator:
-    """Modulated sine excitation per Egli & Hutter (IROS 2020 / RA-L 2022).
+    """Randomized modulated sine excitation, after Egli & Hutter (IROS 2020 / RA-L 2022).
 
-    s(t) = A·sin(2π·0.02·speed·t + φ₁) · sin(2π·(t + 0.99·sin(2π·0.1·t) + φ₂))
+    Per joint:
 
-    Different phase offsets per joint give uncorrelated excitation across axes.
-    Frequencies stay below ~2 Hz (above the M545 velocity control cutoff).
+        s(t) = A·amp · [ sin(2π·f_env·e + φ₁)
+                         · sin(2π·f_car·(e + depth·sin(2π·f_rate·e)) + φ₂)
+                         + noise·n(t) ]
+
+    The published formulation fixes f_env, f_car, depth and f_rate and varies
+    only φ₁/φ₂ per joint, which makes every channel the same signal at a
+    different phase — and makes every recording session replay the identical
+    trajectory. For training data that is the wrong kind of repeatable, so
+    every parameter is drawn per joint from the ranges below, and re-drawn
+    each time the excitation is switched on. Channels decorrelate, and
+    successive strips explore different regions.
+
+    The randomization is bounded, not free: the carrier is frequency-modulated,
+    so its peak instantaneous frequency is f_car·(1 + depth·2π·f_rate), and
+    depth is clamped to hold that under MAX_INSTANT_FREQ_HZ. Above ~2 Hz the
+    excitation is past the M545 velocity-control cutoff and the valves stop
+    tracking it, which would put noise rather than signal in the dataset.
+
+    On top of the deterministic term each joint carries band-limited noise, so
+    the excitation is not a pure sum of tones and the recording sees frequency
+    content between the carrier harmonics. The noise is a low-pass-filtered
+    Gaussian process, not white: white noise at the 100 Hz sample rate is far
+    above the valve bandwidth, so it would be filtered out mechanically while
+    still chattering the solenoids.
+
+    The only operator setting left is overall amplitude — everything else is
+    drawn per joint, which covers more of the input space than hand-stepping
+    ever did.
+
+    Pass ``seed`` to reproduce a session; otherwise one is drawn and recorded
+    in ``self.seed``.
     """
 
-    _PHASES = {
-        'slew':   (0.0,   0.0),
-        'boom':   (1.571, 0.785),
-        'arm':    (3.142, 1.571),
-        'bucket': (4.712, 2.356),
+    ENV_FREQ_HZ         = 0.02      # envelope (slow amplitude sweep)
+    CARRIER_FREQ_HZ     = 1.0       # carrier centre frequency
+    FM_DEPTH            = 0.99      # carrier frequency-modulation depth
+    FM_RATE_HZ          = 0.1       # carrier frequency-modulation rate
+    MAX_INSTANT_FREQ_HZ = 2.0       # hard ceiling on peak carrier frequency
+    NOISE_CUTOFF_HZ     = 1.2       # noise low-pass corner
+    NOISE_FRACTION      = 0.15      # noise std as a fraction of joint amplitude
+    NOISE_CLIP_SIGMA    = 3.0       # bound on the unit-variance noise state
+
+    # Multiplicative jitter applied to each nominal value above.
+    _JITTER = {
+        'f_env':   (0.80, 1.25),
+        'f_car':   (0.85, 1.15),
+        'f_rate':  (0.70, 1.10),
+        'depth':   (0.70, 1.20),
+        'f_noise': (0.70, 1.30),
+        'noise':   (0.70, 1.30),
+        'amp':     (0.75, 1.00),    # per-joint amplitude trim, never above 1
     }
 
-    def __init__(self, enabled: bool = False):
+    def __init__(self, enabled: bool = False, seed: int | None = None):
+        if seed is None:
+            # Draw an explicit seed rather than passing None through, so the
+            # session can be reproduced from what gets printed/stored.
+            seed = int(np.random.SeedSequence().entropy % (2**32))
+        self.seed  = int(seed)
+        self._rng  = np.random.default_rng(self.seed)
+
         self.enabled       = enabled
-        self.speed_scale   = 1.0
-        self._amp_idx      = 2
+        self._amp_idx      = AMPLITUDE_PRESETS.index(0.3)
         self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
         self.start_time    = None
+        self._params: dict[str, dict[str, float]] = {}
+        self._noise:  dict[str, float] = {}
+        self._last_t: float | None = None
+        self.randomize()
+
+    def _draw_params(self) -> dict[str, float]:
+        j = self._JITTER
+        f_env   = self.ENV_FREQ_HZ     * self._rng.uniform(*j['f_env'])
+        f_car   = self.CARRIER_FREQ_HZ * self._rng.uniform(*j['f_car'])
+        f_rate  = self.FM_RATE_HZ      * self._rng.uniform(*j['f_rate'])
+        depth   = self.FM_DEPTH        * self._rng.uniform(*j['depth'])
+        f_noise = self.NOISE_CUTOFF_HZ * self._rng.uniform(*j['f_noise'])
+
+        # Peak instantaneous carrier frequency is f_car·(1 + depth·2π·f_rate).
+        # Clamp depth so the drawn combination cannot exceed the ceiling.
+        headroom = (self.MAX_INSTANT_FREQ_HZ / f_car) - 1.0
+        depth = min(depth, max(0.0, headroom / (2.0 * np.pi * f_rate)))
+
+        return {
+            'f_env':   f_env,
+            'f_car':   f_car,
+            'f_rate':  f_rate,
+            'depth':   depth,
+            'f_noise': min(f_noise, self.MAX_INSTANT_FREQ_HZ),
+            'noise':   self.NOISE_FRACTION * self._rng.uniform(*j['noise']),
+            'amp':     float(self._rng.uniform(*j['amp'])),
+            'phi1':    float(self._rng.uniform(0.0, 2.0 * np.pi)),
+            'phi2':    float(self._rng.uniform(0.0, 2.0 * np.pi)),
+        }
+
+    def randomize(self):
+        """Draw a fresh independent parameter set for every joint."""
+        self._params = {n: self._draw_params() for n in JOINT_NAMES}
+        self._noise  = {n: 0.0 for n in JOINT_NAMES}
+        self._last_t = None
+
+    def peak_freq_hz(self, joint: str) -> float:
+        """Peak instantaneous carrier frequency for a joint, for verification."""
+        p = self._params[joint]
+        return p['f_car'] * (1.0 + p['depth'] * 2.0 * np.pi * p['f_rate'])
 
     def toggle(self):
         self.enabled = not self.enabled
         if self.enabled:
             self.start_time = time.perf_counter()
+            self.randomize()
 
-    def cycle_amplitude(self):
-        self._amp_idx = (self._amp_idx + 1) % len(AMPLITUDE_PRESETS)
+    def step_amplitude(self, direction: int):
+        """Move one amplitude preset up or down, clamped at the ends."""
+        self._amp_idx = int(np.clip(self._amp_idx + direction, 0, len(AMPLITUDE_PRESETS) - 1))
         self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
 
+    def _advance_noise(self, t: float):
+        """Step each joint's noise state to time t.
+
+        Exact-discretization OU: with alpha = exp(-dt/tau) and a
+        sqrt(1-alpha²) innovation, the state is unit-variance regardless of
+        dt, so loop jitter changes the noise timing but not its level.
+        """
+        if self._last_t is None:
+            self._last_t = t
+            return
+        dt = float(np.clip(t - self._last_t, 1e-4, 0.1))
+        self._last_t = t
+        for name, p in self._params.items():
+            tau   = 1.0 / (2.0 * np.pi * p['f_noise'])
+            alpha = float(np.exp(-dt / tau))
+            x = alpha * self._noise[name] + np.sqrt(1.0 - alpha * alpha) * self._rng.standard_normal()
+            self._noise[name] = float(np.clip(x, -self.NOISE_CLIP_SIGMA, self.NOISE_CLIP_SIGMA))
+
     def get_signal(self, joint: str, t: float) -> float:
+        """Deterministic term plus the current noise sample.
+
+        Does not advance the noise state — get_all() does that once per tick,
+        so every joint sees a consistent timebase.
+        """
         if not self.enabled:
             return 0.0
         if self.start_time is None:
             self.start_time = t
-        e  = t - self.start_time
-        s  = self.speed_scale
-        φ1, φ2 = self._PHASES[joint]
-        env = np.sin(2.0 * np.pi * 0.02 * s * e + φ1)
-        car = np.sin(2.0 * np.pi * (e + 0.99 * np.sin(2.0 * np.pi * 0.1 * e) + φ2))
-        return self.amplitude_scale * env * car
+        e = t - self.start_time
+        p = self._params[joint]
+        env = np.sin(2.0 * np.pi * p['f_env'] * e + p['phi1'])
+        car = np.sin(2.0 * np.pi * p['f_car']
+                     * (e + p['depth'] * np.sin(2.0 * np.pi * p['f_rate'] * e))
+                     + p['phi2'])
+        amp = self.amplitude_scale * p['amp']
+        return float(np.clip(amp * (env * car + p['noise'] * self._noise[joint]), -1.0, 1.0))
 
     def get_all(self, t: float) -> dict:
+        if self.enabled:
+            self._advance_noise(t)
         return {n: self.get_signal(n, t) for n in JOINT_NAMES}
 
 
@@ -265,6 +344,8 @@ class DataLogger:
         self._stale: list = []
         self._age:   list = []
         self._sine_flag: list = []
+        self._sine_amp:  list = []
+        self._sine_seed: list = []
 
     def start(self):
         self.segment_id = 0
@@ -284,7 +365,8 @@ class DataLogger:
 
     def log_sample(self, manual: dict, sine: dict, combined: dict,
                    controller, hardware, cmd_age_s: float, cmd_stale: bool,
-                   sine_enabled: bool):
+                   sine_enabled: bool,
+                   sine_amp: float = np.nan, sine_seed: int = -1):
         if not self.is_logging:
             return
 
@@ -320,6 +402,8 @@ class DataLogger:
         self._stale.append(int(bool(cmd_stale)))
         self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
         self._sine_flag.append(int(bool(sine_enabled)))
+        self._sine_amp.append(float(sine_amp))
+        self._sine_seed.append(int(sine_seed))
 
     def n_samples(self) -> int:
         return len(self._ts)
@@ -354,6 +438,10 @@ class DataLogger:
             'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
             'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
             'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
+            # Amplitude is D-pad adjustable and the seed is re-drawn on every
+            # sine enable, so both are per-sample rather than per-file. The seed
+            # is what lets a row's exact excitation parameters be reconstructed.
+            'sine_amplitude': self._sine_amp, 'sine_seed': self._sine_seed,
         })
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -394,52 +482,168 @@ class PWMOnlyController:
     def emergency_stop(self, reset_pump=True): self.hardware.reset(reset_pump=reset_pump)
 
 
+# ── input sources ─────────────────────────────────────────────────────────────
+
+# Button bits. 0-3 are the mask the UDP client already sends; 4-7 are the D-pad
+# and are only ever set by the local pad, so a UDP run just reads them as 0.
+BTN_A, BTN_B, BTN_X, BTN_Y = 0, 1, 2, 3
+BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT = 4, 5, 6, 7
+
+GAMEPAD_DEADZONE_PCT = 15.0
+GAMEPAD_PADDING_PCT  = 0.0
+
+
+class UDPInput:
+    """Axes + button mask from a remote client over the network."""
+
+    name = "udp"
+
+    def __init__(self, host: str, port: int):
+        self._host = host
+        self._port = port
+        self._sock = None
+
+    def open(self) -> bool:
+        print("Waiting for remote controller...")
+        self._sock = UDPSocket(local_id=2)
+        self._sock.setup(self._host, self._port, inputs='<8bH', outputs='', is_server=True)
+        if not self._sock.handshake(timeout=30.0):
+            print("UDP handshake failed.")
+            return False
+        self._sock.start_receiving()
+        print("Connected.")
+        return True
+
+    def poll(self):
+        """-> (axes, mask). axes is None when no new packet has arrived."""
+        raw = self._sock.get_latest() or []
+        if not raw:
+            return None, 0
+        fl = UDPSocket.ints_to_floats(raw[:8])
+        axes = {
+            'right_rl': fl[0], 'right_ud': fl[1],
+            'left_rl':  fl[3], 'left_ud':  fl[4],
+            'right_paddle': fl[6], 'left_paddle': fl[7],
+        }
+        return axes, int(raw[8])
+
+    def is_live(self) -> bool:
+        return True     # a packet arriving *is* the liveness signal
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.stop_receiving()
+                self._sock.close()
+            except Exception:
+                pass
+
+
+class LocalGamepadInput:
+    """Axes + button mask from a pad wired straight into this machine.
+
+    Axis signs follow clients.input_handler.InputHandler.GAMEPAD_DIRECT, which
+    is what the UDP client applies before encoding, so both sources drive the
+    machine the same direction.
+
+    Tracks are on the triggers, which only read 0..1 — a local run drives them
+    forward only, unlike the paddles on the remote client.
+    """
+
+    name = "local"
+
+    def __init__(self, deadzone: float = GAMEPAD_DEADZONE_PCT,
+                 padding: float = GAMEPAD_PADDING_PCT,
+                 connect_timeout_s: float = 10.0):
+        self._deadzone = deadzone
+        self._padding  = padding
+        self._timeout  = connect_timeout_s
+        self._pad      = None
+
+    def open(self) -> bool:
+        try:
+            from modules.gamepad import XboxController
+        except Exception as e:
+            print(f"Gamepad import failed: {e}")
+            return False
+        try:
+            self._pad = XboxController(max_reconnect=None,
+                                       deadzone=self._deadzone, padding=self._padding)
+        except Exception as e:
+            print(f"Gamepad open failed: {e}")
+            return False
+
+        print("Waiting for gamepad...")
+        deadline = time.perf_counter() + self._timeout
+        while not self._pad.is_connected():
+            if time.perf_counter() >= deadline:
+                print(f"No gamepad within {self._timeout:.0f}s. Is it plugged in, "
+                      f"and is this user in the 'input' group?")
+                return False
+            time.sleep(0.1)
+        print("Gamepad connected.")
+        return True
+
+    def poll(self):
+        s = self._pad.read()
+        axes = {
+            'right_rl': -float(s['RightJoystickX']),   # bucket
+            'right_ud':  float(s['RightJoystickY']),   # boom
+            'left_rl':  -float(s['LeftJoystickX']),    # slew
+            'left_ud':  -float(s['LeftJoystickY']),    # arm
+            'right_paddle': float(s['RightTrigger']),
+            'left_paddle':  float(s['LeftTrigger']),
+        }
+        mask = 0
+        for bit, key in ((BTN_A, 'A'), (BTN_B, 'B'), (BTN_X, 'X'), (BTN_Y, 'Y'),
+                         (BTN_DPAD_UP,   'UpDPad'),   (BTN_DPAD_DOWN,  'DownDPad'),
+                         (BTN_DPAD_LEFT, 'LeftDPad'), (BTN_DPAD_RIGHT, 'RightDPad')):
+            if int(s.get(key, 0)):
+                mask |= 1 << bit
+        return axes, mask
+
+    def is_live(self) -> bool:
+        # read() already zeroes every axis while disconnected, so the commands
+        # stay safe; reporting not-live marks those samples stale in the log.
+        return self._pad.is_connected()
+
+    def close(self):
+        if self._pad is not None:
+            try:
+                self._pad.stop_monitoring()
+            except Exception:
+                pass
+
+
+def make_input_source(args) -> "UDPInput | LocalGamepadInput":
+    """--ip selects the remote client; without it the local pad is used."""
+    if not args.ip:
+        return LocalGamepadInput()
+    host, port = (args.ip.rsplit(":", 1)[0], int(args.ip.rsplit(":", 1)[1])) \
+        if ":" in args.ip else (args.ip, 8080)
+    return UDPInput(host, port)
+
+
 # ── args / profile ────────────────────────────────────────────────────────────
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Excavator driving + hydraulic data collection")
-    p.add_argument("--robot", choices=[*sorted(ROBOT_PROFILES), "auto"], default="auto")
-    p.add_argument("--ip", default="0.0.0.0:8080", metavar="HOST[:PORT]")
-    p.add_argument("--config-file",         default=None)
-    p.add_argument("--control-config-file", default=None)
-    p.add_argument("--pwm-i2c-bus",  type=int,              default=None)
-    p.add_argument("--pwm-i2c-addr", type=lambda v: int(v, 0), default=None)
-    p.add_argument("--disable-imu",  action="store_true")
-    p.add_argument("--disable",      action="store_true", help="Disable toggleable PWM channels")
-    p.add_argument("--auto-pump",    dest="auto_pump", action="store_true")
-    # data collection
-    p.add_argument("--record",       action="store_true", help="Enable data recording")
-    p.add_argument("--out",          default=str(LOG_OUTPUT_DIR), help="Output dir for drive logs")
-    p.add_argument("--enable-slew",  action="store_true", help="Allow slew in commands and sine")
-    p.add_argument("--sine-test",    action="store_true",
-                   help="Sine driving test mode: inject sine excitation even without logging (starts with sine ON)")
-    p.add_argument("--auto-save-min", type=float, default=10.0, help="Auto-save interval in min (0=off)")
-    # compensation (static, not button-toggled)
-    p.add_argument("--comp", choices=["none", "raw", "universal", "vel-pid"], default="none",
-                   help="Compensation mode (default: none — raw commands)")
-    p.add_argument("--linkage-rate-table",           default=str(DEFAULT_TABLE))
-    p.add_argument("--linkage-rate-universal-table", default=str(DEFAULT_UNIVERSAL_TABLE))
-    p.add_argument("--linkage-rate-min-factor", type=float, default=0.35)
-    p.add_argument("--linkage-rate-max-factor", type=float, default=2.25)
-    p.add_argument("--vel-kp",       type=float, default=0.04)
-    p.add_argument("--vel-ki",       type=float, default=0.008)
-    p.add_argument("--vel-ki-max",   type=float, default=0.4)
-    p.add_argument("--vel-deadband", type=float, default=2.0,  help="deg/s")
-    p.add_argument("--vel-max-degps",type=float, default=30.0, help="deg/s at full stick")
+    p = argparse.ArgumentParser(
+        description="Excavator open-loop driving + hydraulic data collection. "
+                    "For compensated / closed-loop driving see "
+                    "control_prototype/drive_compensated.py.")
+    p.add_argument("--robot", choices=[*sorted(ROBOT_PROFILES), "auto"], default="auto",
+                   help="Board profile (default: auto-detect)")
+    p.add_argument("--ip", default=None, metavar="HOST[:PORT]",
+                   help="Listen for a remote UDP client instead of using the local gamepad")
+    p.add_argument("--enable-slew",   action="store_true",
+                   help="Allow slew in manual commands and sine (default: off)")
+    p.add_argument("--enable-tracks", action="store_true",
+                   help="Allow track drive from the triggers/paddles (default: off)")
     return p.parse_args()
 
 
 def _resolve_profile(args) -> dict:
-    profile = _resolve_board_profile(args.robot)
-    if args.config_file:
-        profile['servo_config_file'] = args.config_file
-        profile['config_file'] = args.config_file
-    if args.control_config_file:
-        profile['control_config_file'] = args.control_config_file
-    if args.pwm_i2c_bus  is not None: profile['pwm_i2c_bus']  = args.pwm_i2c_bus
-    if args.pwm_i2c_addr is not None: profile['pwm_i2c_addr'] = args.pwm_i2c_addr
-    if args.disable_imu:              profile['enable_imu']   = False
-    return profile
+    return _resolve_board_profile(args.robot)
 
 
 resolve_robot_profile = _resolve_profile
@@ -452,13 +656,8 @@ def main():
     profile = _resolve_profile(args)
     imu_on  = bool(profile['enable_imu'])
 
-    out_dir = Path(args.out)
-    if args.record:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    ip_str = args.ip
-    _host, _port = (ip_str.rsplit(":", 1)[0], int(ip_str.rsplit(":", 1)[1])) \
-        if ":" in ip_str else (ip_str, 8080)
+    out_dir = LOG_OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── hardware ──────────────────────────────────────────────────────────────
     from modules.hardware_interface import HardwareFaultError, HardwareInterface
@@ -467,8 +666,8 @@ def main():
     hardware = HardwareInterface(
         config_file=profile['servo_config_file'],
         control_config_file=profile['control_config_file'],
-        pump_auto_mode=args.auto_pump,
-        toggle_channels=not args.disable,
+        pump_auto_mode=False,          # fixed pump; button X toggles it on/off
+        toggle_channels=True,
         stale_timeout_s=0.5,
         enable_pwm=True,
         enable_imu=imu_on,
@@ -509,49 +708,11 @@ def main():
     ctrl_joint_names = _get_control_joint_names(controller)
     imu_role_order   = _get_imu_role_order(controller)
 
-    # ── compensation setup ────────────────────────────────────────────────────
-    linkage_comp   = None
-    universal_comp = None
-    vel_ctrl       = None
-
-    if args.comp in ("raw", "universal"):
-        try:
-            linkage_comp = LinkageRateCompensator(
-                args.linkage_rate_table,
-                min_factor=args.linkage_rate_min_factor,
-                max_factor=args.linkage_rate_max_factor,
-            )
-        except Exception as e:
-            print(f"[WARN] Linkage-rate table unavailable: {e}")
-
-    if args.comp == "universal":
-        try:
-            universal_comp = UniversalShapeCompensator(
-                args.linkage_rate_universal_table,
-                min_factor=args.linkage_rate_min_factor,
-                max_factor=args.linkage_rate_max_factor,
-            )
-        except Exception as e:
-            print(f"[WARN] Universal shape table unavailable: {e}")
-
-    if args.comp == "vel-pid":
-        if not imu_on:
-            print("[WARN] --comp vel-pid requires IMU; falling back to none")
-            args.comp = "none"
-        else:
-            vel_ctrl = JointVelocityController(
-                kp=args.vel_kp, ki=args.vel_ki, ki_max=args.vel_ki_max,
-                deadband_degps=args.vel_deadband, max_degps=args.vel_max_degps,
-            )
-
     pwm = hardware.pwm_controller
-    pump_gain_available = pwm is not None and getattr(pwm, 'pump_config', None) and pwm.pump_auto_mode
-    pump_gain_base_us   = pwm.get_pump_activity_gain_us() if pump_gain_available else 0.0
 
-    print(f"Comp: {args.comp} | pump: {'auto' if args.auto_pump else 'static'}"
+    print(f"Profile: {profile['profile_name']} | pump: fixed"
           f" | slew: {'on' if args.enable_slew else 'off'}"
-          f" | record: {'on' if args.record else 'off'}"
-          f" | sine-test: {'on' if args.sine_test else 'off'}")
+          f" | tracks: {'on' if args.enable_tracks else 'off'}")
 
     # ── RT scheduling (Linux only) ─────────────────────────────────────────────
     try:
@@ -561,90 +722,97 @@ def main():
         pass
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    sine_gen = SineExcitationGenerator(enabled=args.sine_test)
-    logger   = DataLogger(out_dir) if args.record else None
+    sine_gen = SineExcitationGenerator()
+    logger   = DataLogger(out_dir)
 
-    # ── UDP handshake ─────────────────────────────────────────────────────────
-    print("Waiting for remote controller...")
-    server = UDPSocket(local_id=2)
-    server.setup(_host, _port, inputs='<8bH', outputs='', is_server=True)
-    if not server.handshake(timeout=30.0):
-        print("UDP handshake failed.")
+    # ── input source ──────────────────────────────────────────────────────────
+    source = make_input_source(args)
+    if not source.open():
+        source.close()
         direct.clear(); controller.resume_ik_output(); controller.stop()
         hardware.shutdown(); raise SystemExit(1)
-    server.start_receiving()
-    print("Connected. A=log  B=sine  X=pump  Y=sine-amp\n")
+    print("A=log  B=sine  X=pump  Y=reload-config"
+          + ("  Dpad U/D=sine-amp\n" if source.name == "local" else "\n"))
 
     # ── loop state ────────────────────────────────────────────────────────────
     loop_period     = 1.0 / SAMPLING_FREQUENCY
     next_run_time   = time.perf_counter()
-    prev_loop_time  = time.perf_counter()
 
     right_rl = right_ud = left_rl = left_ud = right_paddle = left_paddle = 0.0
     last_cmd_mono = None
     mask_prev     = 0
 
     last_status_time    = time.time()
-    last_auto_save_time = time.time()
+    last_strip_time     = time.time()
     print_imu           = False
     iter_count          = 0
 
     try:
         while True:
-            now      = time.time()
-            loop_now = time.perf_counter()
-            actual_dt = loop_now - prev_loop_time
-            prev_loop_time = loop_now
+            now = time.time()
 
             # ── 1. receive ────────────────────────────────────────────────────
-            raw = server.get_latest() or []
-            if raw:
-                fl   = UDPSocket.ints_to_floats(raw[:8])
-                mask = raw[8]
-
-                right_rl     = fl[0]
-                right_ud     = fl[1]
-                left_rl      = fl[3]
-                left_ud      = fl[4]
-                right_paddle = fl[6]
-                left_paddle  = fl[7]
-                last_cmd_mono = time.monotonic()
+            axes, mask = source.poll()
+            if axes is not None:
+                right_rl     = axes['right_rl']
+                right_ud     = axes['right_ud']
+                left_rl      = axes['left_rl']
+                left_ud      = axes['left_ud']
+                right_paddle = axes['right_paddle']
+                left_paddle  = axes['left_paddle']
+                if source.is_live():
+                    last_cmd_mono = time.monotonic()
 
                 def btn(b):  return bool(mask & (1 << b))
                 def prev(b): return bool(mask_prev & (1 << b))
 
                 # A: toggle logging
-                if btn(0) and not prev(0):
-                    if logger is None:
-                        print("\n[Button A] --record not set; logging disabled")
-                    elif not logger.is_logging:
+                if btn(BTN_A) and not prev(BTN_A):
+                    if not logger.is_logging:
                         logger.start()
+                        last_strip_time = now
                     else:
                         logger.save_with_pause(direct)
                         logger.is_logging = False
 
                 # B: toggle sine
-                if btn(1) and not prev(1):
+                if btn(BTN_B) and not prev(BTN_B):
                     sine_gen.toggle()
-                    state = "ON" if sine_gen.enabled else "OFF"
-                    print(f"\n[Button B] Sine {state} (amp={sine_gen.amplitude_scale:.2f})")
+                    if sine_gen.enabled:
+                        # Params are re-drawn on every enable, so note the seed:
+                        # it is what makes a strip's excitation reproducible.
+                        print(f"\n[Button B] Sine ON (amp={sine_gen.amplitude_scale:.2f} "
+                              f"seed={sine_gen.seed})")
+                    else:
+                        print("\n[Button B] Sine OFF")
 
                 # X: pump toggle
-                if btn(2) and not prev(2):
+                if btn(BTN_X) and not prev(BTN_X):
                     if pwm is not None:
                         new_state = not pwm.pump_enabled
                         hardware.set_pump_enabled(new_state)
                         print(f"\n[Button X] Pump {'ON' if new_state else 'OFF'}")
 
-                # Y: cycle sine amplitude
-                if btn(3) and not prev(3):
-                    sine_gen.cycle_amplitude()
-                    print(f"\n[Button Y] Sine amplitude → {sine_gen.amplitude_scale:.2f}")
+                # Y: reload servo config from disk. Outputs are neutralised
+                # first — a valve calibration swap while a channel is commanded
+                # open would step that valve as the new mapping takes effect.
+                if btn(BTN_Y) and not prev(BTN_Y):
+                    direct.clear()
+                    direct.send_pending()
+                    time.sleep(0.1)
+                    ok = hardware.reload_config()
+                    print(f"\n[Button Y] Config reload {'OK' if ok else 'FAILED'}")
+
+                # D-pad up/down: step sine amplitude
+                for bit, step in ((BTN_DPAD_UP, +1), (BTN_DPAD_DOWN, -1)):
+                    if btn(bit) and not prev(bit):
+                        sine_gen.step_amplitude(step)
+                        print(f"\n[D-pad] Sine amplitude → {sine_gen.amplitude_scale:.2f}")
 
                 mask_prev = mask
 
             # ── 2. build commands ─────────────────────────────────────────────
-            is_logging = logger is not None and logger.is_logging
+            is_logging = logger.is_logging
 
             manual = {
                 'slew':   left_rl if args.enable_slew else 0.0,
@@ -654,38 +822,22 @@ def main():
             }
 
             t = time.perf_counter()
-            sine_active = is_logging or args.sine_test
-            sine = sine_gen.get_all(t) if sine_active else {n: 0.0 for n in JOINT_NAMES}
+            sine = sine_gen.get_all(t)
             if not args.enable_slew:
                 sine['slew'] = 0.0
 
             combined = {n: float(np.clip(manual[n] + sine[n], -1.0, 1.0)) for n in JOINT_NAMES}
-            combined['trackR'] = right_paddle
-            combined['trackL'] = left_paddle
+            if args.enable_tracks:
+                combined['trackR'] = right_paddle
+                combined['trackL'] = left_paddle
 
-            # ── 3. compensation ───────────────────────────────────────────────
-            joint_angles = controller.get_joint_angles()
-
-            if args.comp == "raw" and linkage_comp is not None:
-                combined = linkage_comp.apply(combined, joint_angles)
-            elif args.comp == "vel-pid" and vel_ctrl is not None:
-                vels, vel_age = controller.get_joint_velocities_with_age()
-                if vel_age < 0.05:
-                    combined = vel_ctrl.apply(combined, vels, actual_dt)
-                else:
-                    vel_ctrl.reset()
-
-            # ── 4. send ───────────────────────────────────────────────────────
+            # ── 3. send ───────────────────────────────────────────────────────
             direct.give_commands(combined)
             direct.send_pending()
 
-            # ── 5. pump gain (universal shape) ────────────────────────────────
-            if pump_gain_available:
-                factor = (universal_comp.pump_correction_factor(combined, joint_angles)
-                          if args.comp == "universal" and universal_comp is not None else 1.0)
-                pwm.set_pump_activity_gain_us(pump_gain_base_us * factor)
+            # ── 4. log ────────────────────────────────────────────────────────
+            joint_angles = controller.get_joint_angles()
 
-            # ── 6. log ────────────────────────────────────────────────────────
             if is_logging:
                 cmd_age_s = np.nan
                 cmd_stale = True
@@ -693,15 +845,15 @@ def main():
                     cmd_age_s = max(0.0, time.monotonic() - last_cmd_mono)
                     cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
                 logger.log_sample(manual, sine, combined, controller, hardware,
-                                  cmd_age_s, cmd_stale, sine_gen.enabled)
+                                  cmd_age_s, cmd_stale, sine_gen.enabled,
+                                  sine_gen.amplitude_scale, sine_gen.seed)
 
-            # ── 7. auto-save ──────────────────────────────────────────────────
-            if (is_logging and args.auto_save_min > 0
-                    and (now - last_auto_save_time) >= args.auto_save_min * 60):
-                last_auto_save_time = now
+            # ── 5. strip rollover ─────────────────────────────────────────────
+            if is_logging and (now - last_strip_time) >= STRIP_MINUTES * 60:
+                last_strip_time = now
                 logger.save_with_pause(direct)
 
-            # ── 8. IMU print (decimated) ──────────────────────────────────────
+            # ── 6. IMU print (decimated) ──────────────────────────────────────
             iter_count += 1
             if print_imu and imu_on and (iter_count % PRINT_DECIMATION == 0):
                 print(_format_imu_line(
@@ -709,20 +861,22 @@ def main():
                     joint_angles, ctrl_joint_names, imu_role_order,
                 ), end="\r", flush=True)
 
-            # ── 9. status ─────────────────────────────────────────────────────
+            # ── 7. status ─────────────────────────────────────────────────────
             if now - last_status_time >= STATUS_PRINT_INTERVAL_S:
                 last_status_time = now
                 pump_on  = bool(pwm and pwm.pump_enabled)
-                sine_str = f"ON amp={sine_gen.amplitude_scale:.2f}" if sine_gen.enabled else "OFF"
+                sine_str = (f"ON amp={sine_gen.amplitude_scale:.2f} seed={sine_gen.seed}"
+                            if sine_gen.enabled else "OFF")
                 print(
                     f"[STATUS] pump={'ON' if pump_on else 'OFF'} | sine={sine_str} | "
                     + (f"log=ON {logger.elapsed_min():.1f}min {logger.n_samples()} samples"
                        if is_logging else "log=OFF")
+                    + ("" if source.is_live() else f" | *** {source.name} INPUT LOST ***")
                 )
                 print(f"[JOINTS] slew={joint_angles[0]:+.1f} boom={joint_angles[1]:+.1f} "
                       f"arm={joint_angles[2]:+.1f} bucket={joint_angles[3]:+.1f} deg")
 
-            # ── 10. timing ────────────────────────────────────────────────────
+            # ── 8. timing ─────────────────────────────────────────────────────
             next_run_time += loop_period
             sleep_time = next_run_time - time.perf_counter()
             if sleep_time > 0:
@@ -734,7 +888,8 @@ def main():
         print("\nInterrupted (Ctrl+C).")
     finally:
         print("Shutting down...")
-        if logger is not None and logger.n_samples() > 0:
+        source.close()
+        if logger.n_samples() > 0:
             logger.is_logging = False
             direct.clear()
             direct.send_pending()

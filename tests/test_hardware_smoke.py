@@ -23,10 +23,13 @@ def _resolve_hardware_profile() -> dict:
     """
     try:
         from modules.board import resolve_profile  # noqa: E402
-    except Exception as exc:
-        raise unittest.SkipTest(f"Board profile resolver unavailable: {exc}") from exc
 
-    profile = resolve_profile(os.environ.get("KAIVURI_TEST_ROBOT", "auto"))
+        profile = resolve_profile(os.environ.get("KAIVURI_TEST_ROBOT", "auto"))
+    except Exception as exc:
+        # Covers both an unimportable resolver and auto-detection failing off-board
+        # (dev laptop / container without /proc/device-tree). Either way there is
+        # no PCA9685 to talk to, so skip rather than error out at collection.
+        raise unittest.SkipTest(f"Board profile unavailable: {exc}") from exc
     if "KAIVURI_TEST_I2C_BUS" in os.environ:
         profile["pwm_i2c_bus"] = int(os.environ["KAIVURI_TEST_I2C_BUS"], 0)
     if "KAIVURI_TEST_I2C_ADDR" in os.environ:

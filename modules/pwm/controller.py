@@ -14,14 +14,25 @@ from pathlib import Path
 
 from ..perf_tracker import LoopPerfTracker
 from .config import ChannelConfig, PumpConfig
-from .constants import CANONICAL_CHANNEL_NAMES, PCA9685_I2C_BUS, PCA9685_I2C_ADDRESS, PWMConstants
+from .constants import (
+    CANONICAL_CHANNEL_NAMES,
+    PCA9685_I2C_BUS,
+    PCA9685_I2C_ADDRESS,
+    PWMConstants,
+    resolve_i2c_bus,
+)
 from .errors import PWMConfigError, PWMConfigLoadError, PWMConfigValidationError
 from .validation import collect_config_validation_errors
 from .writer import DirectPWMWriter, _open_smbus as _writer_open_smbus
 
 
-def _open_smbus(bus_number: int = PCA9685_I2C_BUS):
-    """Open SMBus, honoring the legacy facade monkeypatch target."""
+def _open_smbus(bus_number: int | None = None):
+    """Open SMBus, honoring the legacy facade monkeypatch target.
+
+    The single real implementation lives in ``modules.pwm.writer``; this wrapper
+    exists only so that tests patching ``modules.PCA9685_controller._open_smbus``
+    still intercept opens made through this module.
+    """
     compat_module = sys.modules.get("modules.PCA9685_controller")
     compat_open = getattr(compat_module, "_open_smbus", None)
     if compat_open is not None and compat_open is not _open_smbus:
@@ -36,7 +47,7 @@ class PWMController:
                  default_unset_to_zero: bool = True, log_level: str = "INFO",
                  stale_timeout_s: float = 0.0, perf_enabled: bool = False,
                  cleanup_disable_osc: bool = True, pwm_frequency: Optional[int] = None,
-                 bus: int = PCA9685_I2C_BUS,  # 1 for Pi, 7 for Orin Nano.
+                 bus: Optional[int] = None,
                  i2c_addr: int = PCA9685_I2C_ADDRESS):
         """Initialize PWM controller.
 
@@ -52,7 +63,9 @@ class PWMController:
             cleanup_disable_osc: If True, stop PCA9685 oscillator on cleanup (outputs go LOW).
                                  If False, keep oscillator running (outputs stay at center).
             pwm_frequency: PWM frequency in Hz (default: from PWMConstants.PWM_FREQUENCY_DEFAULT)
-            bus: I2C bus number for PCA9685.
+            bus: I2C bus number for PCA9685. None (default) resolves from the
+                 active board profile -- 1 on Raspberry Pi, 7 on Orin Nano.
+                 Only pass an explicit value to override that (CLI flag, ROS param).
             i2c_addr: PCA9685 I2C address.
         """
         # Setup logger
@@ -91,8 +104,14 @@ class PWMController:
         # Load config
         self._load_config(config_file)
 
-        # Hardware init
-        self._i2c = _open_smbus(bus)
+        # Hardware init. Resolve the bus once here so the number is available
+        # for logging and for error messages raised by DirectPWMWriter.
+        self._i2c_bus = resolve_i2c_bus(bus)
+        self.logger.info(
+            f"PCA9685 on i2c-{self._i2c_bus} address 0x{i2c_addr:02X}"
+            f"{'' if bus is not None else ' (from board profile)'}"
+        )
+        self._i2c = _open_smbus(self._i2c_bus)
         self._i2c_addr = i2c_addr
         self._direct_writer = None
         self._pwm_period_us = 0.0
@@ -369,6 +388,7 @@ class PWMController:
             min_channel=min_ch,
             max_channel=max_ch,
             frequency=freq,
+            bus_number=getattr(self, "_i2c_bus", None),
         )
         pwm_period_us = 1e6 / float(writer.frequency)
         affects_pump_channels = [cfg for cfg in channel_configs.values() if cfg.affects_pump]

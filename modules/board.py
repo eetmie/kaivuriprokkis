@@ -35,6 +35,15 @@ import yaml
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PROFILES_DIR = ROOT_DIR / "configuration_files" / "profiles"
 
+
+class BoardDetectionError(ValueError):
+    """Raised when the compute platform cannot be identified.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers around
+    resolve_profile() keep catching it.
+    """
+
+
 BOARD_DEFAULTS: dict[str, dict[str, Any]] = {
     "rpi": {
         "pwm_i2c_bus": 1,
@@ -75,7 +84,14 @@ PROFILES: dict[str, dict[str, str]] = _discover_profiles()
 
 
 def detect() -> str:
-    """Return 'jetson' or 'rpi' based on hostname / device-tree model string."""
+    """Return 'jetson' or 'rpi' based on hostname / device-tree model string.
+
+    Raises BoardDetectionError if the board is neither. Guessing here is unsafe:
+    the wrong answer silently selects the wrong I2C bus for the PCA9685 (1 on
+    Pi, 7 on Orin Nano), which surfaces later as an opaque EBUSY from whatever
+    unrelated chip happens to live at 0x40. Callers that can run off-board
+    should pass an explicit profile name or handle this error.
+    """
     import platform
 
     hostname = platform.uname()[1].lower()
@@ -83,15 +99,20 @@ def detect() -> str:
         return "jetson"
     if "raspberry" in hostname or hostname == "raspberrypi":
         return "rpi"
+    model = ""
     try:
         model = Path("/proc/device-tree/model").read_text(errors="replace").lower()
-        if "jetson" in model:
-            return "jetson"
-        if "raspberry" in model:
-            return "rpi"
     except OSError:
         pass
-    return "rpi"
+    if "jetson" in model:
+        return "jetson"
+    if "raspberry" in model:
+        return "rpi"
+    raise BoardDetectionError(
+        f"Cannot auto-detect board: hostname {hostname!r} and device-tree model "
+        f"{model.strip(chr(0)).strip() or '<unavailable>'} match neither 'jetson' "
+        f"nor 'raspberry'. Pass an explicit profile name, e.g. resolve_profile('jetson')."
+    )
 
 
 def _load_profile_yaml(profile_name: str) -> tuple[dict[str, Any], Path]:

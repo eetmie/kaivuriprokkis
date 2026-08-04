@@ -24,8 +24,13 @@ from .pwm import controller as _controller
 from .pwm import writer as _writer
 
 
+def _open_smbus(bus_number: int | None = None):
+    """Legacy monkeypatch target -- delegates to the one real implementation.
 
-def _open_smbus(bus_number: int = PCA9685_I2C_BUS):
+    Kept as a module-level name because existing tests patch
+    ``modules.PCA9685_controller._open_smbus``; see PWMController below.
+    ``bus_number=None`` resolves from the active board profile.
+    """
     return _writer._open_smbus(bus_number)
 
 

@@ -5,15 +5,18 @@ from __future__ import annotations
 import threading
 import time
 
-from .constants import PCA9685_I2C_ADDRESS, PCA9685_I2C_BUS
+from .constants import PCA9685_I2C_ADDRESS, PCA9685_I2C_BUS, resolve_i2c_bus
 from .errors import PWMHardwareIOError
 
 
-def _open_smbus(bus_number: int = PCA9685_I2C_BUS):
-    """Open Raspberry Pi I2C via smbus2 for low-overhead direct writes."""
+def _open_smbus(bus_number: int | None = None):
+    """Open the PCA9685 I2C bus via smbus2 for low-overhead direct writes.
+
+    ``bus_number=None`` resolves from the active board profile.
+    """
     import smbus2
 
-    return smbus2.SMBus(bus_number)
+    return smbus2.SMBus(resolve_i2c_bus(bus_number))
 
 
 class DirectPWMWriter:
@@ -30,13 +33,14 @@ class DirectPWMWriter:
 
     def __init__(self, i2c_bus, address: int = PCA9685_I2C_ADDRESS,
                  min_channel: int = 0, max_channel: int = 15,
-                 frequency: int = 200):
+                 frequency: int = 200, bus_number: int | None = None):
         if not (0 <= min_channel <= max_channel < 16):
             raise ValueError(
                 f"Invalid PWM channel range [{min_channel}, {max_channel}] - expected 0 <= min <= max < 16"
             )
         self._i2c = i2c_bus
         self._addr = address
+        self._bus_number = bus_number  # diagnostics only; None = unknown
         self._min_ch = min_channel
         self._max_ch = max_channel
         self._num_channels = max_channel - min_channel + 1
@@ -55,6 +59,11 @@ class DirectPWMWriter:
 
         self._init_chip(frequency)
 
+    def _target(self) -> str:
+        """Human-readable bus/address for error messages."""
+        bus = f"i2c-{self._bus_number}" if self._bus_number is not None else "i2c-?"
+        return f"{bus} address 0x{self._addr:02X}"
+
     def _write_reg(self, reg: int, value: int):
         try:
             if self._uses_smbus:
@@ -70,7 +79,7 @@ class DirectPWMWriter:
                 self._i2c.unlock()
         except Exception as exc:
             raise PWMHardwareIOError(
-                f"Failed to write PCA9685 register 0x{reg:02X} at address 0x{self._addr:02X}: {exc}"
+                f"Failed to write PCA9685 register 0x{reg:02X} on {self._target()}: {exc}"
             ) from exc
 
     def _init_chip(self, frequency: int):
@@ -153,5 +162,5 @@ class DirectPWMWriter:
                 self._i2c.unlock()
         except Exception as exc:
             raise PWMHardwareIOError(
-                f"Failed to flush PCA9685 channel buffer at address 0x{self._addr:02X}: {exc}"
+                f"Failed to flush PCA9685 channel buffer on {self._target()}: {exc}"
             ) from exc

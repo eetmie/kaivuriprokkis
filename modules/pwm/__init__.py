@@ -1,7 +1,13 @@
 """PWM control package."""
 
 from .config import ChannelConfig, PumpConfig
-from .constants import CANONICAL_CHANNEL_NAMES, PCA9685_I2C_BUS, PCA9685_I2C_ADDRESS, PWMConstants
+from .constants import (
+    CANONICAL_CHANNEL_NAMES,
+    PCA9685_I2C_BUS,
+    PCA9685_I2C_ADDRESS,
+    PWMConstants,
+    resolve_i2c_bus,
+)
 from .controller import PWMController
 from .errors import (
     PWMControllerError,
@@ -26,5 +32,6 @@ __all__ = [
     "PumpConfig",
     "PWMConstants",
     "PWMController",
+    "resolve_i2c_bus",
     "_open_smbus",
 ]

@@ -12,35 +12,31 @@
 #   1 MHz is opt-in (SETUP_I2C_1MHZ=1). The RPi dtparam=i2c_arm_baudrate path
 #   does NOT apply to Jetson; when opted in, the 1 MHz speed is set with a
 #   device-tree overlay that bumps clock-frequency on that node and is applied
-#   through Jetson-IO (step [4/6]), taking effect after reboot. Before going to
-#   1 MHz, check pull-ups / rise time on a scope. See the I2C7/RT guide section 4.
+#   through Jetson-IO (step [4/5]), taking effect after reboot. Before going to
+#   1 MHz, check pull-ups / rise time on a scope. See the I2C7 guide section 4.
 #
 # RT (PREEMPT_RT) kernel:
-#   This script installs NVIDIA's prebuilt RT kernel packages from the r36.4
-#   repo. Those prebuilt packages only exist for JetPack 6.2.1 / Jetson Linux
-#   r36.4.x. JetPack 6.2.2 / r36.5 has no prebuilt RT packages and would need a
-#   from-source build, so step [5/6] FORCE-CHECKS that the board is on r36.4
-#   before touching the boot config, and skips otherwise (override: FORCE_RT=1).
+#   Not handled here. NVIDIA's prebuilt RT kernel packages were published for
+#   JetPack 6.2.1 / Jetson Linux r36.4.x only; there is no equivalent for
+#   JetPack 7 / r39.x, so the old auto-install step could never do anything but
+#   print a skip notice. If you need PREEMPT_RT on a supported release, install
+#   it deliberately rather than as a side effect of this script.
+#   Note that rt-tests (cyclictest) is still installed below -- it is useful for
+#   latency baselining on the stock PREEMPT kernel.
 #
 # It installs basic OS packages, creates/updates a lightweight project .venv,
 # and grants the invoking user access to serial/I2C/GPIO device groups where
 # those groups exist. Analysis packages and Raspberry Pi OLED/display packages
-# are intentionally not installed here. After group/overlay/kernel changes,
-# reboot.
+# are intentionally not installed here. After group/overlay changes, reboot.
 #
 # Optional toggles (env vars):
 #   SETUP_I2C_1MHZ=1   enable the I2C-7 1 MHz overlay (default: off => stock 400 kHz)
-#   SETUP_RT_KERNEL=0  skip the RT kernel install
-#   FORCE_RT=1         install RT packages even if the release is not r36.4
-#                      (not recommended; can break boot on the wrong release)
 
 set -e
 
-# --- Robot-specific constants (per the I2C7/RT guide) ---------------------
+# --- Robot-specific constants (per the I2C7 guide) ------------------------
 I2C_BUS=7
 I2C_NODE_PATH="/bus@0/i2c@c250000"   # what i2c-7 must map to on Orin Nano
-RT_REPO_LINE="deb https://repo.download.nvidia.com/jetson/rt-kernel r36.4 main"
-RT_REPO_FILE="/etc/apt/sources.list.d/nvidia-l4t-rt-kernel.list"
 
 echo "========================================"
 echo "  MASI Robot Jetson Setup"
@@ -57,7 +53,7 @@ USER_HOME=$(getent passwd "$USERNAME" | cut -d: -f6)
 VENV_DIR="${SCRIPT_DIR}/.venv"
 
 echo ""
-echo "[1/6] Installing system packages..."
+echo "[1/5] Installing system packages..."
 apt-get update -qq
 apt-get install -y \
     python3-pip python3-venv git \
@@ -66,7 +62,7 @@ echo "  OK: System packages installed"
 echo "  NOTE: Jetson PCA9685 is expected on I2C bus ${I2C_BUS}; run 'i2cdetect -y ${I2C_BUS}' to check."
 
 echo ""
-echo "[2/6] Creating/updating project virtualenv..."
+echo "[2/5] Creating/updating project virtualenv..."
 if [ ! -d "$VENV_DIR" ]; then
     sudo -u "$USERNAME" python3 -m venv "$VENV_DIR"
 fi
@@ -79,16 +75,20 @@ sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install \
     pandas \
     pyyaml \
     pyserial \
-    smbus2
+    smbus2 \
+    inputs
 echo "  OK: Python packages installed into ${VENV_DIR}"
 echo "  NOTE: Skipped Raspberry Pi OLED/display packages."
+# inputs is pure Python and tiny; it backs modules/gamepad.py (XboxController).
+# It reads /dev/input/event* directly, so the user also needs the 'input' group
+# granted in step [3/5] -- without it, get_gamepad() raises PermissionError.
 # pandas is NOT analysis-only on this robot: simple_drive.py --record buffers
 # samples in memory and writes the CSV via pandas in DataLogger.save(). Without
 # it, stopping a recording raises ModuleNotFoundError and the segment is lost.
 
 echo ""
-echo "[3/6] Granting device group access..."
-for group in dialout i2c gpio plugdev; do
+echo "[3/5] Granting device group access..."
+for group in dialout i2c gpio plugdev input; do
     if getent group "$group" > /dev/null; then
         usermod -aG "$group" "$USERNAME"
         echo "  OK: ${USERNAME} added to ${group}"
@@ -98,7 +98,7 @@ for group in dialout i2c gpio plugdev; do
 done
 
 echo ""
-echo "[4/6] I2C bus ${I2C_BUS} speed (1 MHz overlay is opt-in)..."
+echo "[4/5] I2C bus ${I2C_BUS} speed (1 MHz overlay is opt-in)..."
 if [ "${SETUP_I2C_1MHZ:-0}" != "1" ]; then
     echo "  SKIP: 1 MHz overlay not requested; bus stays at stock 400 kHz."
     echo "        Set SETUP_I2C_1MHZ=1 to build and apply the 1 MHz overlay."
@@ -196,73 +196,7 @@ EOF_DTS
 fi
 
 echo ""
-echo "[5/6] Installing RT (PREEMPT_RT) kernel (prebuilt r36.4 packages)..."
-if [ "${SETUP_RT_KERNEL:-1}" != "1" ]; then
-    echo "  SKIP: SETUP_RT_KERNEL != 1"
-else
-    # Force-check the Jetson Linux release. Prebuilt RT packages only exist for
-    # JetPack 6.2.1 / Jetson Linux r36.4.x.
-    L4T_MAJOR=""; L4T_REV=""
-    if [ -f /etc/nv_tegra_release ]; then
-        # e.g. "# R36 (release), REVISION: 4.4, GCID: ..."
-        L4T_MAJOR=$(sed -n 's/.*R\([0-9][0-9]*\).*/\1/p' /etc/nv_tegra_release | head -1)
-        L4T_REV=$(sed -n 's/.*REVISION:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' /etc/nv_tegra_release | head -1)
-    fi
-    echo "  Detected Jetson Linux: R${L4T_MAJOR:-?} REVISION ${L4T_REV:-?} (JetPack 6.2.1 == R36 REV 4.x)"
-
-    RT_OK=0
-    if [ "$L4T_MAJOR" = "36" ]; then
-        case "$L4T_REV" in
-            4|4.*) RT_OK=1 ;;
-        esac
-    fi
-
-    if [ "$RT_OK" -ne 1 ] && [ "${FORCE_RT:-0}" != "1" ]; then
-        echo "  SKIP: prebuilt RT packages require JetPack 6.2.1 / Jetson Linux r36.4.x."
-        echo "        This board reports R${L4T_MAJOR:-?}.${L4T_REV:-?}. r36.5 / JetPack 6.2.2 has"
-        echo "        no prebuilt RT packages; you would need a from-source RT build (guide section 9)."
-        echo "        To override and install the r36.4 repo anyway: re-run with FORCE_RT=1 (not recommended)."
-    else
-        if [ "$RT_OK" -ne 1 ]; then
-            echo "  WARN: FORCE_RT=1 set; proceeding on a non-r36.4 release. This can break boot."
-        fi
-
-        # RT install switches the kernel/boot entry; back up boot config first.
-        if [ -f /boot/extlinux/extlinux.conf ]; then
-            cp /boot/extlinux/extlinux.conf \
-               "/boot/extlinux/extlinux.conf.bak-$(date +%F-%H%M%S)"
-            echo "  OK: backed up /boot/extlinux/extlinux.conf"
-        fi
-
-        echo "$RT_REPO_LINE" > "$RT_REPO_FILE"
-        echo "  OK: added RT kernel apt source -> $RT_REPO_FILE"
-
-        set +e
-        apt-get update -qq
-        apt-get install -y \
-            nvidia-l4t-rt-kernel \
-            nvidia-l4t-rt-kernel-headers \
-            nvidia-l4t-rt-kernel-oot-modules \
-            nvidia-l4t-display-rt-kernel
-        RT_STATUS=$?
-        set -e
-
-        if [ $RT_STATUS -ne 0 ]; then
-            echo "  ERROR: RT package install failed (status $RT_STATUS)."
-            echo "         Removing the RT apt source so it does not break future apt runs."
-            rm -f "$RT_REPO_FILE"
-        else
-            echo "  OK: RT kernel packages installed (active after reboot)."
-            echo "  NOTE: to make RT the default boot entry:"
-            echo "          sudo sed -i 's/^DEFAULT .*/DEFAULT real-time/' /boot/extlinux/extlinux.conf"
-            echo "        to revert to the stock kernel:"
-            echo "          sudo sed -i 's/^DEFAULT .*/DEFAULT primary/' /boot/extlinux/extlinux.conf"
-        fi
-    fi
-fi
-
-echo ""
-echo "[6/6] Adding shell helper..."
+echo "[5/5] Adding shell helper..."
 BASHRC="${USER_HOME}/.bashrc"
 if ! grep -q "kaivuri-venv" "$BASHRC" 2>/dev/null; then
     cat >> "$BASHRC" << EOF
@@ -286,7 +220,11 @@ echo ""
 echo "After rebooting, verify the changes:"
 echo "  # I2C bus ${I2C_BUS} clock-frequency (400000 stock, 1000000 if 1 MHz overlay was applied):"
 echo "  python3 -c \"import struct; print(struct.unpack('>I', open('/proc/device-tree${I2C_NODE_PATH}/clock-frequency','rb').read(4))[0])\""
-echo "  # RT kernel present:"
-echo "  uname -a; grep -E 'PREEMPT_RT' /boot/config-\$(uname -r) | head"
+echo "  # PCA9685 should answer at 0x40 (0x70 is its All-Call address):"
+echo "  i2cdetect -y ${I2C_BUS}"
+echo "  # IMU Pico should enumerate as a USB serial device:"
+echo "  ls -l /dev/serial/by-id/"
+echo "  # Gamepad (optional) should enumerate and be readable via the 'input' group:"
+echo "  .venv/bin/python -c \"import inputs; print([g.name for g in inputs.devices.gamepads])\""
 echo ""
-echo ">>> REBOOT REQUIRED for group changes, the I2C 1 MHz overlay, and the RT kernel <<<"
+echo ">>> REBOOT REQUIRED for group changes and the I2C 1 MHz overlay <<<"

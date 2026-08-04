@@ -87,8 +87,8 @@ CHANNEL_CONFIGS:
         pulse_min: 1330
         pulse_max: 1980
         deadzone: 0.0
-        deadband_us_pos: 140.0
-        deadband_us_neg: 150.0
+        deadband_us_pos: 130.0 #140
+        deadband_us_neg: 150.0 #150
         dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0
@@ -108,8 +108,8 @@ CHANNEL_CONFIGS:
         pulse_min: 1300
         pulse_max: 1850
         deadzone: 0.0
-        deadband_us_pos: 160.0
-        deadband_us_neg: 160.0
+        deadband_us_pos: 160.0 #160
+        deadband_us_neg: 150.0
         dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0
@@ -129,8 +129,8 @@ CHANNEL_CONFIGS:
         pulse_min: 1330
         pulse_max: 1880
         deadzone: 0.0
-        deadband_us_pos: 160.0
-        deadband_us_neg: 160.0
+        deadband_us_pos: 160.0 #160
+        deadband_us_neg: 150.0 #160
         dither_enable: True
         dither_amp_us: 25.0
         dither_hz: 33.0

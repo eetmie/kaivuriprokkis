@@ -90,6 +90,8 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
         hw.latest_base_imu_quat = "base_quat"
         hw.latest_base_imu_gyro = [0.0, 0.0, 0.0]
         hw.latest_imu_gyro = [[0.0, 0.0, 0.0]]
+        hw.latest_imu_accel = [[0.0, 0.0, 9.80665]]
+        hw.latest_base_imu_accel = [0.0, 0.0, 9.80665]
         hw._imu_last_device_ts = 123
         hw._imu_snapshot = _ImuSnapshot(
             imu_data=["imu"],
@@ -173,6 +175,21 @@ class HardwareInterfaceLifecycleTests(unittest.TestCase):
 
         self.assertIsNotNone(payload)
         self.assertEqual(payload['device_timestamp_us'], 123)
+        self.assertEqual(payload['gyro'], [[0.0, 0.0, 0.0]])
+        self.assertEqual(payload['accel'], [[0.0, 0.0, 9.80665]])
+        self.assertEqual(payload['base_gyro'], [0.0, 0.0, 0.0])
+        self.assertEqual(payload['base_accel'], [0.0, 0.0, 9.80665])
+
+    def test_try_read_imu_gyro_reports_none_accel_on_legacy_firmware(self):
+        hw = self._make_hw_stub()
+        hw._debug_telemetry_enabled = False
+        hw.latest_imu_accel = None          # 7-float packets: no accel on the wire
+        hw.latest_base_imu_accel = None
+
+        payload = HardwareInterface.try_read_imu_gyro(hw)
+
+        self.assertIsNone(payload['accel'])
+        self.assertIsNone(payload['base_accel'])
         self.assertEqual(payload['gyro'], [[0.0, 0.0, 0.0]])
 
     def test_all_disabled_hardware_does_not_load_imu_config(self):

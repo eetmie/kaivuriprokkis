@@ -295,6 +295,10 @@ class HardwareInterface:
         # are gated by _debug_telemetry_enabled.
         self._debug_telemetry_enabled = False
         self.latest_imu_gyro = None  # list of [gx, gy, gz] per IMU
+        # Accel rides in the same packet as gyro, so retaining it costs one more
+        # rotation per sensor. None on firmware predating the accel stream.
+        self.latest_imu_accel = None  # list of [ax, ay, az] in g, per joint IMU
+        self.latest_base_imu_accel = None
         self._imu_last_device_ts = None
         self.imu_thread = None
         if self._enable_imu and self._auto_start_imu:
@@ -545,6 +549,25 @@ class HardwareInterface:
                         if self._base_imu_index is not None else None
                     )
 
+                    # Accel occupies pkt[7:10] on V2 firmware. The mounting offset
+                    # is a rotation of a sensor-frame vector, so the gyro
+                    # correction applies unchanged. Legacy 7-float packets have no
+                    # accel; leave the fields None rather than emitting zeros,
+                    # which would read as a valid free-fall measurement.
+                    if all(len(pkt) >= 10 for pkt in imu_packets[:self._expected_imu_count]):
+                        corrected_accel = [
+                            self._correct_imu_gyro(np.array(pkt[7:10], dtype=np.float32), i)
+                            for i, pkt in enumerate(imu_packets[:self._expected_imu_count])
+                        ]
+                        new_imu_accel = [corrected_accel[i] for i in self._imu_joint_indices]
+                        new_base_imu_accel = (
+                            corrected_accel[self._base_imu_index].copy()
+                            if self._base_imu_index is not None else None
+                        )
+                    else:
+                        new_imu_accel = None
+                        new_base_imu_accel = None
+
                     # Validate quaternion magnitudes for all configured IMUs (should be ~1.0).
                     # During the ~33 s power-on calibration phase (3 s settle + 30 s sampling)
                     # the Pico sends MSG_TYPE_CAL_WAIT every 200 ms and emits no data frames,
@@ -596,6 +619,8 @@ class HardwareInterface:
                     # and manage _imu_state transitions.
                     with self._imu_lock:
                         self.latest_imu_gyro = new_imu_gyro
+                        self.latest_imu_accel = new_imu_accel
+                        self.latest_base_imu_accel = new_base_imu_accel
                         self._imu_last_device_ts = new_device_ts
                         if new_base_imu_gyro is not None:
                             self.latest_base_imu_gyro = new_base_imu_gyro
@@ -825,6 +850,15 @@ class HardwareInterface:
                 return None
             return {
                 'gyro': [g.copy() for g in self.latest_imu_gyro],
+                # Accel in g and the base/cabin sensor are recording-only extras:
+                # both are None when the firmware or mapping does not supply them,
+                # so callers must not assume the keys carry data.
+                'accel': ([a.copy() for a in self.latest_imu_accel]
+                          if self.latest_imu_accel is not None else None),
+                'base_gyro': (self.latest_base_imu_gyro.copy()
+                              if self.latest_base_imu_gyro is not None else None),
+                'base_accel': (self.latest_base_imu_accel.copy()
+                               if self.latest_base_imu_accel is not None else None),
                 'device_timestamp_us': self._imu_last_device_ts,
             }
 
@@ -1024,6 +1058,8 @@ class HardwareInterface:
             self.latest_base_imu_quat = None
             self.latest_base_imu_gyro = None
             self.latest_imu_gyro = None
+            self.latest_imu_accel = None
+            self.latest_base_imu_accel = None
             self._imu_last_device_ts = None
             self._imu_snapshot = None
         with self._adc_lock:

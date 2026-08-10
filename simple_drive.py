@@ -80,6 +80,7 @@ RECORD_MINUTES             = 10.0   # logging auto-stops after this long
 LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
 
 JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
+G_TO_MS2          = 9.80665   # firmware reports accel in g; the dataset is SI
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
 
 # Where the sine excitation is routed, stepped with the D-pad. Named in
@@ -432,6 +433,14 @@ class DataLogger:
         self._gb:   list = []
         self._ga:   list = []
         self._gk:   list = []
+        self._ab:   list = []
+        self._aa:   list = []
+        self._ak:   list = []
+        # Base/cabin IMU. Unused by the current training set, but it is the only
+        # sensor that observes slew and machine tilt, so recording it now avoids
+        # a re-collection when that becomes interesting.
+        self._gbase: list = []
+        self._abase: list = []
         self._stale: list = []
         self._age:   list = []
         self._sine_flag:   list = []
@@ -466,15 +475,28 @@ class DataLogger:
         else:
             vb = va = vbkt = np.nan
 
+        nan3 = [np.nan, np.nan, np.nan]
         gyro = hardware.try_read_imu_gyro()
         if gyro is not None:
             g  = gyro['gyro']
-            gb = list(np.radians(g[0])) if len(g) > 0 else [np.nan]*3
-            ga = list(np.radians(g[1])) if len(g) > 1 else [np.nan]*3
-            gk = list(np.radians(g[2])) if len(g) > 2 else [np.nan]*3
+            gb = list(np.radians(g[0])) if len(g) > 0 else list(nan3)
+            ga = list(np.radians(g[1])) if len(g) > 1 else list(nan3)
+            gk = list(np.radians(g[2])) if len(g) > 2 else list(nan3)
+            # Firmware reports accel in g; the dataset is SI throughout, matching
+            # the dps -> rad/s conversion above.
+            a = gyro.get('accel')
+            ab = list(np.multiply(a[0], G_TO_MS2)) if a and len(a) > 0 else list(nan3)
+            aa = list(np.multiply(a[1], G_TO_MS2)) if a and len(a) > 1 else list(nan3)
+            ak = list(np.multiply(a[2], G_TO_MS2)) if a and len(a) > 2 else list(nan3)
+            bg = gyro.get('base_gyro')
+            ba = gyro.get('base_accel')
+            gbase = list(np.radians(bg)) if bg is not None else list(nan3)
+            abase = list(np.multiply(ba, G_TO_MS2)) if ba is not None else list(nan3)
             dev_ts = gyro.get('device_timestamp_us')
         else:
-            gb = ga = gk = [np.nan, np.nan, np.nan]
+            gb = ga = gk = list(nan3)
+            ab = aa = ak = list(nan3)
+            gbase = abase = list(nan3)
             dev_ts = None
 
         i = len(self._ts)
@@ -485,6 +507,8 @@ class DataLogger:
         self._pos.append(list(pos))
         self._vb.append(vb);  self._va.append(va);  self._vbkt.append(vbkt)
         self._gb.append(gb);  self._ga.append(ga);  self._gk.append(gk)
+        self._ab.append(ab);  self._aa.append(aa);  self._ak.append(ak)
+        self._gbase.append(gbase);  self._abase.append(abase)
         self._stale.append(int(bool(cmd_stale)))
         self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
         self._sine_flag.append(int(bool(sine_enabled)))
@@ -509,6 +533,8 @@ class DataLogger:
         man = np.array(self._man);  sin = np.array(self._sin);  com = np.array(self._com)
         pos = np.array(self._pos)
         gb  = np.array(self._gb);   ga  = np.array(self._ga);   gk  = np.array(self._gk)
+        ab  = np.array(self._ab);   aa  = np.array(self._aa);   ak  = np.array(self._ak)
+        gbs = np.array(self._gbase); abs_ = np.array(self._abase)
 
         df = pd.DataFrame({
             'timestamp': self._ts, 'sample_idx': self._idx,
@@ -525,6 +551,13 @@ class DataLogger:
             'imu_gx_boom': gb[:,0], 'imu_gy_boom': gb[:,1], 'imu_gz_boom': gb[:,2],
             'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
             'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
+            # Accel in m/s^2, mounting-offset corrected like the gyro above.
+            'imu_ax_boom': ab[:,0], 'imu_ay_boom': ab[:,1], 'imu_az_boom': ab[:,2],
+            'imu_ax_arm':  aa[:,0], 'imu_ay_arm':  aa[:,1], 'imu_az_arm':  aa[:,2],
+            'imu_ax_bucket': ak[:,0], 'imu_ay_bucket': ak[:,1], 'imu_az_bucket': ak[:,2],
+            # Base/cabin IMU: not a joint, so it has no pos/vel counterpart.
+            'imu_gx_base': gbs[:,0], 'imu_gy_base': gbs[:,1], 'imu_gz_base': gbs[:,2],
+            'imu_ax_base': abs_[:,0], 'imu_ay_base': abs_[:,1], 'imu_az_base': abs_[:,2],
             'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
             # Pico clock for the IMU sample this row saw. Joins these rows to the
             # companion imu_raw_*.csv, which is timestamped on the same clock.

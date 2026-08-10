@@ -226,3 +226,7 @@ data_collection/test_results/
 # Early-stage lerobot integration proto (not run on the RPi yet)
 integrations/
 tests/test_lerobot_kaivuri.py
+
+# LeRobot VLA integration
+.venv-lerobot/
+data_collection/lerobot_datasets/

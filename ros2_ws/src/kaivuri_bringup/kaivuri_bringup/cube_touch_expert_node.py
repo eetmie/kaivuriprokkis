@@ -223,7 +223,6 @@ class CubeTouchExpertNode(Node):
 
 
     def _tick(self) -> None:
-
         if self._stage == Stage.IDLE or self._current_target is None:
             if self._stage != Stage.IDLE and self._pending_start_from_tool_pose:
                 self._try_seed_current_target_from_tool_pose()
@@ -261,7 +260,6 @@ class CubeTouchExpertNode(Node):
                 return
 
         if self._startup_ready_time is not None:
-
             startup_hold_s = max(0.0, float(self.get_parameter("startup_hold_s").value))
             if self._elapsed(self._startup_ready_time) < startup_hold_s:
                 self._publish_target(self._current_target)
@@ -336,12 +334,12 @@ class CubeTouchExpertNode(Node):
         return current + delta * (max_step / distance)
 
     def _step_approach_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
+        # z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
         safe_z = float(goal[2])
-        if float(current[2]) < safe_z - z_tolerance:
-            lift_goal = current.copy()
-            lift_goal[2] = safe_z
-            return self._step_toward(current, lift_goal)
+        # if float(current[2]) < safe_z - z_tolerance:
+        #     lift_goal = current.copy()
+        #     lift_goal[2] = safe_z
+        #     return self._step_toward(current, lift_goal)
 
         horizontal_goal = goal.copy()
         horizontal_goal[2] = safe_z

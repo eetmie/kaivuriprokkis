@@ -209,7 +209,7 @@ class IkPoseControlNode(Node):
         self.declare_parameter("target_pose_y_topic", "/kaivuri/target_pose_y")
         self.declare_parameter("tool_pose_y_topic", "/kaivuri/tool_pose_y")
         self.declare_parameter("frame_id", "excavator")
-        self.declare_parameter("state_rate_hz", 50.0)
+        self.declare_parameter("state_rate_hz", 20.0)
         self.declare_parameter("command_timeout_s", 1.0)
         self.declare_parameter("ready_timeout_s", 30.0)
         self.declare_parameter("pump_auto_mode", False)

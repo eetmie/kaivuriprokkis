@@ -6,7 +6,10 @@
 #include "imu_reader.h"
 
 #define MAX_SENSORS 4
-#define FLOATS_PER_SENSOR 7
+// w, x, y, z, gx, gy, gz, ax, ay, az — the fused quaternion plus the exact
+// gyro/accel pair that produced it, so a host recording can re-run the AHRS
+// offline at a different gain and check how close the ranges are to clipping.
+#define FLOATS_PER_SENSOR 10
 
 // Message types for control frames (version=2)
 #define MSG_TYPE_ERR_I2C   0x05  // I2C bus init failed

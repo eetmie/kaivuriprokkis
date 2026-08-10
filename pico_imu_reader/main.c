@@ -158,7 +158,8 @@ static inline float clamp_delta_time(float delta_time_s, float nominal_s) {
     return delta_time_s;
 }
 
-static inline void write_sensor_output(float output[FLOATS_PER_SENSOR], FusionQuaternion quaternion, FusionVector gyroscope) {
+static inline void write_sensor_output(float output[FLOATS_PER_SENSOR], FusionQuaternion quaternion,
+                                       FusionVector gyroscope, FusionVector accelerometer) {
     output[0] = quaternion.element.w;
     output[1] = quaternion.element.x;
     output[2] = quaternion.element.y;
@@ -166,6 +167,9 @@ static inline void write_sensor_output(float output[FLOATS_PER_SENSOR], FusionQu
     output[4] = gyroscope.axis.x;
     output[5] = gyroscope.axis.y;
     output[6] = gyroscope.axis.z;
+    output[7] = accelerometer.axis.x;
+    output[8] = accelerometer.axis.y;
+    output[9] = accelerometer.axis.z;
 }
 
 static void calibration_service_until(uint64_t deadline_us) {
@@ -461,7 +465,7 @@ static void usb_transport_loop(void) {
 static void sensor_core1_main(void) {
     float sensors_data[MAX_SENSORS][FLOATS_PER_SENSOR] = {{0.0f}};
     for (uint8_t i = 0; i < MAX_SENSORS; i++) {
-        write_sensor_output(sensors_data[i], FUSION_IDENTITY_QUATERNION, FUSION_VECTOR_ZERO);
+        write_sensor_output(sensors_data[i], FUSION_IDENTITY_QUATERNION, FUSION_VECTOR_ZERO, FUSION_VECTOR_ZERO);
     }
     update_loop(g_sensor_runtime.period_ms, sensors_data, g_sensor_runtime.sensors, g_sensor_runtime.sensor_count);
 }
@@ -483,7 +487,8 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
                 !fusion_vector_is_finite(sensors[i].accelerometer) ||
                 !fusion_vector_is_finite(sensors[i].gyroscope)) {
                 sensors[i].previousTimestamp = sensors[i].timestamp;
-                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion, FUSION_VECTOR_ZERO);
+                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion,
+                                    FUSION_VECTOR_ZERO, FUSION_VECTOR_ZERO);
                 continue;
             }
 
@@ -503,7 +508,8 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
             if (!fusion_vector_is_finite(sensors[i].accelerometer) ||
                 !fusion_vector_is_finite(sensors[i].gyroscope)) {
                 sensors[i].previousTimestamp = sensors[i].timestamp;
-                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion, FUSION_VECTOR_ZERO);
+                write_sensor_output(sensors_data[i], sensors[i].previousQuaternion,
+                                    FUSION_VECTOR_ZERO, FUSION_VECTOR_ZERO);
                 continue;
             }
 
@@ -531,7 +537,11 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
             sensors[i].pitchDeg = tilt_pitch_deg_from_gravity(gravity);
             sensors[i].rollDeg = tilt_roll_deg_from_gravity(gravity);
 
-            write_sensor_output(sensors_data[i], quat, sensors[i].gyroscope);
+            // Publish the calibrated, bias-corrected pair that FusionAhrsUpdate
+            // was just given — not a fresh sensor read. Replaying these two with
+            // the same deltaTime reproduces this quaternion exactly, which is
+            // what makes an offline gain sweep meaningful.
+            write_sensor_output(sensors_data[i], quat, sensors[i].gyroscope, sensors[i].accelerometer);
         }
 
         const uint64_t now_us = time_us_64();

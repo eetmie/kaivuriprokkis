@@ -503,7 +503,11 @@ class HardwareInterface:
 
         while not self._stop_event.is_set():
             try:
-                # Read IMU data - returns list of [w,x,y,z,gx,gy,gz] packets
+                # Read IMU data - returns list of [w,x,y,z,gx,gy,gz,ax,ay,az] packets
+                # (7 elements on firmware predating the accel stream). The
+                # control path slices quat and gyro out by index, so the trailing
+                # accel is simply ignored here; recording taps the reader
+                # directly for it, at the full stream rate.
                 imu_packets = self.usb_reader.get_latest_imus(only_new=True)
 
                 # Silent-disconnect guard: if no packets arrive for too long, mark PENDING.
@@ -519,7 +523,6 @@ class HardwareInterface:
 
                 if imu_packets is not None and len(imu_packets) >= self._expected_imu_count:
                     # Extract only the quaternion portion [w,x,y,z] from each IMU packet
-                    # Data format is [w, x, y, z, gx, gy, gz] (7 values per IMU)
                     raw_quat_only = [
                         quat_normalize(np.array(pkt[:4], dtype=np.float32))
                         for pkt in imu_packets[:self._expected_imu_count]
@@ -824,6 +827,62 @@ class HardwareInterface:
                 'gyro': [g.copy() for g in self.latest_imu_gyro],
                 'device_timestamp_us': self._imu_last_device_ts,
             }
+
+    def start_imu_raw_capture(self, max_frames: int = 20000) -> bool:
+        """Retain every raw IMU frame off the wire until drained.
+
+        Uncorrected on purpose: these are the sensor-frame vectors the Pico fed
+        to its AHRS, so replaying them offline reproduces the firmware result.
+        Mounting offsets are a correction applied to the *output* quaternion, and
+        rotating the inputs by one would also smear per-axis clipping across
+        axes, hiding exactly the range saturation this is meant to expose.
+
+        Returns False when the IMU subsystem is disabled or not yet started.
+        """
+        if not self._enable_imu or self.usb_reader is None:
+            return False
+        self.usb_reader.start_capture(max_frames=max_frames)
+        return True
+
+    def stop_imu_raw_capture(self) -> None:
+        """Stop retaining raw IMU frames and drop anything still buffered."""
+        if self.usb_reader is not None:
+            self.usb_reader.stop_capture()
+
+    def drain_imu_raw_capture(self) -> List[Any]:
+        """Return and clear captured raw frames as [(device_ts_us, packets), ...]."""
+        if self.usb_reader is None:
+            return []
+        return self.usb_reader.drain_capture()
+
+    def imu_stream_info(self) -> Dict[str, Any]:
+        """Stream metadata needed to interpret a raw capture.
+
+        ``ranges`` is None on firmware that predates the accel stream, which is
+        also the case in which ``has_accel`` is False.
+        """
+        # Role per physical stream index, which is the order raw packets arrive
+        # in — not the controller's joint order. Unmapped slots keep a positional
+        # name so a capture stays labelled even with a partial mapping.
+        roles_by_index = [f'imu{i}' for i in range(self._expected_imu_count)]
+        for role, idx in self._imu_mapping.items():
+            if 0 <= idx < len(roles_by_index):
+                roles_by_index[idx] = str(role)
+
+        reader = self.usb_reader
+        if reader is None:
+            return {'ranges': None, 'has_accel': False, 'target_sps': 0,
+                    'descriptors': [], 'roles_by_index': roles_by_index,
+                    'capture_dropped': 0}
+        return {
+            'ranges': reader.imu_ranges,
+            'has_accel': reader.has_accel,
+            'target_sps': reader.target_sps,
+            'descriptors': reader.imu_descriptors,
+            'roles_by_index': roles_by_index,
+            # Cumulative since capture started, across strip boundaries.
+            'capture_dropped': reader.capture_dropped,
+        }
 
     def read_base_imu(self) -> Optional[Dict[str, Any]]:
         """Read latest corrected base/slew IMU data.

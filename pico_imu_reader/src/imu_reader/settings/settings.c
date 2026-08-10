@@ -2,9 +2,16 @@
 
 // AHRS settings are hardcoded — no host handshake needed.
 // Pico self-calibrates on power-on (~30 s stationary), then streams at 200 Hz.
+//
+// Sensor full scales are requests, not promises: initialize_sensors() snaps each
+// to the nearest range the ISM330DLC supports and writes the result back here.
+// Ask for the smallest range that still clears the motion actually seen on the
+// machine — the stream carries raw gyro and accel, so a recorded strip shows
+// directly how much headroom is left before clipping.
 imu_reader_settings_t imu_reader_settings = {
     .sampleRate          = 200,
     .gyroRangeDps        = 250.0f,
+    .accelRangeG         = 2.0f,
     .ahrsGain            = 4.5f,
     .ahrsAccelRejection  = 20.0f,
     .ahrsRecoveryPeriodS = 0.5f,

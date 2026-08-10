@@ -16,19 +16,37 @@ Input source:
     switches to a remote client over UDP (clients/client_gui.py).
 
 Button Controls:
-    Button A (bit 0): Start / Stop data logging (saves strip on stop)
+    Button A (bit 0): Start / Stop a recording (saves on stop)
     Button B (bit 1): Toggle sine excitation on / off (default: OFF)
     Button X (bit 2): Toggle hydraulic pump
     Button Y (bit 3): Reload servo config from disk
-    D-pad Up/Down (bits 4/5): Step sine amplitude (local pad only)
+    D-pad Up/Down (bits 4/5): Cycle sine target channel (local pad only)
 
-Amplitude is the only sine knob: every other parameter is randomized per joint
-on each enable, which explores the input space better than stepping presets by
-hand did. The seed for a run is printed and written to every logged sample.
+The sine has no operator-set waveform knobs — amplitude, frequencies, phases
+and noise are all drawn per joint, with a fresh seed per recording, so each
+file is an independent sample of the input space. The seed is printed and
+written to every logged row, which is what makes a run reconstructible.
 
-Recording runs in 10-minute strips: a strip is auto-saved and a new one
-started while logging stays on, so a long session lands as a series of files
-rather than one unbounded CSV.
+The one manual sine control is where it goes: the D-pad cycles through
+all / lift / tilt / scoop and the three two-channel pairs. Single channels
+isolate one actuator; the pairs capture cross-coupling.
+
+A recording auto-stops after RECORD_MINUTES and does not restart itself —
+press A again for the next one. The gap is deliberate: it lets the hydraulics
+cool, so a long session is a series of comparable sets rather than a slow
+thermal drift.
+
+Each recording writes two files:
+
+    drive_log_*.csv  hydraulic commands + joint state at the 100 Hz control rate
+    imu_raw_*.csv    every IMU frame at the full 200 Hz stream rate
+
+The raw strip holds each sensor's fused quaternion next to the gyro and accel
+that produced it, in the firmware's own units (dps and g, which is what Fusion
+takes). That makes it replayable: re-run the AHRS offline at a different gain
+and compare against the firmware quaternion, or check peak magnitudes against
+the gyro_range_dps / accel_range_g columns to see whether a range is clipping.
+Join the two files on the device timestamp (imu_device_ts_us / device_ts_us).
 """
 
 from __future__ import annotations
@@ -57,13 +75,27 @@ SAMPLING_FREQUENCY         = 100    # Hz
 COMMAND_STALE_TIMEOUT_S    = 0.5
 STATUS_PRINT_INTERVAL_S    = 5.0
 PRINT_DECIMATION           = 10     # IMU print decimation (→ ~10 Hz)
-STRIP_MINUTES              = 10.0   # auto-save cadence while logging
+RECORD_MINUTES             = 10.0   # logging auto-stops after this long
 
 LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
 
 JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
-AMPLITUDE_PRESETS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
+
+# Where the sine excitation is routed, stepped with the D-pad. Named in
+# hydraulic terms (lift/tilt/scoop) to match the logged command channels, not
+# the joint names. Driving one channel at a time isolates that actuator's
+# response; the pairs record the cross-coupling a single-channel strip cannot
+# show, since a real dig loads several cylinders at once.
+SINE_TARGET_MODES = [
+    ('all',        ('slew', 'boom', 'arm', 'bucket')),
+    ('lift',       ('boom',)),
+    ('tilt',       ('arm',)),
+    ('scoop',      ('bucket',)),
+    ('lift+tilt',  ('boom', 'arm')),
+    ('lift+scoop', ('boom', 'bucket')),
+    ('tilt+scoop', ('arm', 'bucket')),
+]
 IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
 
 
@@ -152,9 +184,16 @@ class SineExcitationGenerator:
 
     The randomization is bounded, not free: the carrier is frequency-modulated,
     so its peak instantaneous frequency is f_car·(1 + depth·2π·f_rate), and
-    depth is clamped to hold that under MAX_INSTANT_FREQ_HZ. Above ~2 Hz the
-    excitation is past the M545 velocity-control cutoff and the valves stop
-    tracking it, which would put noise rather than signal in the dataset.
+    depth is clamped to hold that under MAX_INSTANT_FREQ_HZ.
+
+    Rates are set for this machine, not the published M545 figures. The original
+    1 Hz carrier (2 Hz ceiling) drove the valves faster than the hydraulics can
+    follow, and a model trained on that learns to jitter: it sees command energy
+    that never became motion, so the only way to fit it is high-frequency
+    chatter. The carrier now sits near 0.22 Hz with a 0.5 Hz ceiling — roughly a
+    4 s stroke — which the cylinders actually track. If the recorded motion still
+    looks smoother than the command, lower CARRIER_FREQ_HZ further; these four
+    constants are the whole knob.
 
     On top of the deterministic term each joint carries band-limited noise, so
     the excitation is not a pure sum of tones and the recording sees frequency
@@ -163,22 +202,37 @@ class SineExcitationGenerator:
     above the valve bandwidth, so it would be filtered out mechanically while
     still chattering the solenoids.
 
-    The only operator setting left is overall amplitude — everything else is
-    drawn per joint, which covers more of the input space than hand-stepping
-    ever did.
+    That filter is two-pole, not one. A single OU stage rolls off at only
+    -20 dB/decade, which still leaves the sample-to-sample jump large — the
+    state moved ~0.17 per tick on a unit-variance signal, so most of the
+    command's *rate* was noise even after the carrier was slowed. Cascading two
+    stages gives -40 dB/decade and drops that by roughly an order of magnitude,
+    which is the difference between noise the hydraulics integrate away and
+    noise that just buzzes the valves.
+
+    Nothing about the waveform is operator-set any more — amplitude is drawn per
+    joint alongside every other parameter. The one manual control left is which
+    channels the excitation is routed to, which changes what is being measured
+    rather than how it is shaped.
 
     Pass ``seed`` to reproduce a session; otherwise one is drawn and recorded
     in ``self.seed``.
     """
 
-    ENV_FREQ_HZ         = 0.02      # envelope (slow amplitude sweep)
-    CARRIER_FREQ_HZ     = 1.0       # carrier centre frequency
+    ENV_FREQ_HZ         = 0.015     # envelope (slow amplitude sweep)
+    CARRIER_FREQ_HZ     = 0.22      # carrier centre frequency (~4.5 s stroke)
     FM_DEPTH            = 0.99      # carrier frequency-modulation depth
-    FM_RATE_HZ          = 0.1       # carrier frequency-modulation rate
-    MAX_INSTANT_FREQ_HZ = 2.0       # hard ceiling on peak carrier frequency
-    NOISE_CUTOFF_HZ     = 1.2       # noise low-pass corner
-    NOISE_FRACTION      = 0.15      # noise std as a fraction of joint amplitude
+    FM_RATE_HZ          = 0.04      # carrier frequency-modulation rate
+    MAX_INSTANT_FREQ_HZ = 0.5       # hard ceiling on peak carrier frequency
+    NOISE_CUTOFF_HZ     = 0.25      # noise low-pass corner
+    NOISE_FRACTION      = 0.10      # noise std as a fraction of joint amplitude
     NOISE_CLIP_SIGMA    = 3.0       # bound on the unit-variance noise state
+
+    # Absolute per-joint amplitude, drawn fresh with everything else. The floor
+    # stays above the valve deadband so a joint is never commanded into a range
+    # where nothing moves; the ceiling leaves room for a manual input on top
+    # before the sum clips.
+    AMPLITUDE_RANGE     = (0.15, 0.85)
 
     # Multiplicative jitter applied to each nominal value above.
     _JITTER = {
@@ -188,7 +242,6 @@ class SineExcitationGenerator:
         'depth':   (0.70, 1.20),
         'f_noise': (0.70, 1.30),
         'noise':   (0.70, 1.30),
-        'amp':     (0.75, 1.00),    # per-joint amplitude trim, never above 1
     }
 
     def __init__(self, enabled: bool = False, seed: int | None = None):
@@ -200,8 +253,7 @@ class SineExcitationGenerator:
         self._rng  = np.random.default_rng(self.seed)
 
         self.enabled       = enabled
-        self._amp_idx      = AMPLITUDE_PRESETS.index(0.3)
-        self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
+        self.target_idx    = 0
         self.start_time    = None
         self._params: dict[str, dict[str, float]] = {}
         self._noise:  dict[str, float] = {}
@@ -228,7 +280,7 @@ class SineExcitationGenerator:
             'depth':   depth,
             'f_noise': min(f_noise, self.MAX_INSTANT_FREQ_HZ),
             'noise':   self.NOISE_FRACTION * self._rng.uniform(*j['noise']),
-            'amp':     float(self._rng.uniform(*j['amp'])),
+            'amp':     float(self._rng.uniform(*self.AMPLITUDE_RANGE)),
             'phi1':    float(self._rng.uniform(0.0, 2.0 * np.pi)),
             'phi2':    float(self._rng.uniform(0.0, 2.0 * np.pi)),
         }
@@ -237,6 +289,7 @@ class SineExcitationGenerator:
         """Draw a fresh independent parameter set for every joint."""
         self._params = {n: self._draw_params() for n in JOINT_NAMES}
         self._noise  = {n: 0.0 for n in JOINT_NAMES}
+        self._noise1 = {n: 0.0 for n in JOINT_NAMES}   # first filter stage
         self._last_t = None
 
     def peak_freq_hz(self, joint: str) -> float:
@@ -244,23 +297,50 @@ class SineExcitationGenerator:
         p = self._params[joint]
         return p['f_car'] * (1.0 + p['depth'] * 2.0 * np.pi * p['f_rate'])
 
+    def reseed(self, seed: int | None = None):
+        """Start a fresh random stream and redraw every parameter.
+
+        randomize() alone keeps drawing from the same generator, so a session
+        would walk deterministically down one sequence. Reseeding per recording
+        makes each file an independent sample of the parameter space rather than
+        the next step of a single long draw.
+        """
+        if seed is None:
+            seed = int(np.random.SeedSequence().entropy % (2**32))
+        self.seed = int(seed)
+        self._rng = np.random.default_rng(self.seed)
+        self.randomize()
+
     def toggle(self):
         self.enabled = not self.enabled
         if self.enabled:
             self.start_time = time.perf_counter()
             self.randomize()
 
-    def step_amplitude(self, direction: int):
-        """Move one amplitude preset up or down, clamped at the ends."""
-        self._amp_idx = int(np.clip(self._amp_idx + direction, 0, len(AMPLITUDE_PRESETS) - 1))
-        self.amplitude_scale = AMPLITUDE_PRESETS[self._amp_idx]
+    @property
+    def target_name(self) -> str:
+        return SINE_TARGET_MODES[self.target_idx][0]
+
+    @property
+    def target_joints(self) -> tuple:
+        return SINE_TARGET_MODES[self.target_idx][1]
+
+    def step_target(self, direction: int):
+        """Cycle which channels the excitation drives, wrapping at both ends."""
+        self.target_idx = (self.target_idx + direction) % len(SINE_TARGET_MODES)
 
     def _advance_noise(self, t: float):
-        """Step each joint's noise state to time t.
+        """Step each joint's two-pole noise filter to time t.
 
-        Exact-discretization OU: with alpha = exp(-dt/tau) and a
-        sqrt(1-alpha²) innovation, the state is unit-variance regardless of
-        dt, so loop jitter changes the noise timing but not its level.
+        Stage one is an exact-discretization OU: with alpha = exp(-dt/tau) and a
+        sqrt(1-alpha²) innovation, the state is unit-variance regardless of dt,
+        so loop jitter changes the noise timing but not its level.
+
+        Stage two feeds that through the same pole again. Driving an AR(1) with
+        an AR(1) of the same coefficient has stationary variance
+        (1+alpha²)/(1-alpha²)² per unit of input, so the gain below is its
+        inverse square root — that keeps the output unit-variance too, and
+        NOISE_FRACTION keeps meaning the same thing at any dt or corner.
         """
         if self._last_t is None:
             self._last_t = t
@@ -270,8 +350,12 @@ class SineExcitationGenerator:
         for name, p in self._params.items():
             tau   = 1.0 / (2.0 * np.pi * p['f_noise'])
             alpha = float(np.exp(-dt / tau))
-            x = alpha * self._noise[name] + np.sqrt(1.0 - alpha * alpha) * self._rng.standard_normal()
-            self._noise[name] = float(np.clip(x, -self.NOISE_CLIP_SIGMA, self.NOISE_CLIP_SIGMA))
+            x1 = alpha * self._noise1[name] + np.sqrt(1.0 - alpha * alpha) * self._rng.standard_normal()
+            self._noise1[name] = float(np.clip(x1, -self.NOISE_CLIP_SIGMA, self.NOISE_CLIP_SIGMA))
+
+            gain = (1.0 - alpha * alpha) / np.sqrt(1.0 + alpha * alpha)
+            x2 = alpha * self._noise[name] + gain * self._noise1[name]
+            self._noise[name] = float(np.clip(x2, -self.NOISE_CLIP_SIGMA, self.NOISE_CLIP_SIGMA))
 
     def get_signal(self, joint: str, t: float) -> float:
         """Deterministic term plus the current noise sample.
@@ -279,7 +363,7 @@ class SineExcitationGenerator:
         Does not advance the noise state — get_all() does that once per tick,
         so every joint sees a consistent timebase.
         """
-        if not self.enabled:
+        if not self.enabled or joint not in self.target_joints:
             return 0.0
         if self.start_time is None:
             self.start_time = t
@@ -289,8 +373,7 @@ class SineExcitationGenerator:
         car = np.sin(2.0 * np.pi * p['f_car']
                      * (e + p['depth'] * np.sin(2.0 * np.pi * p['f_rate'] * e))
                      + p['phi2'])
-        amp = self.amplitude_scale * p['amp']
-        return float(np.clip(amp * (env * car + p['noise'] * self._noise[joint]), -1.0, 1.0))
+        return float(np.clip(p['amp'] * (env * car + p['noise'] * self._noise[joint]), -1.0, 1.0))
 
     def get_all(self, t: float) -> dict:
         if self.enabled:
@@ -306,8 +389,13 @@ class DataLogger:
     CSV schema matches data_collection/benchmark_actuator_models.py and the
     IsaacLab training pipeline (Isaac-hydraulic-actuator/train.py).
 
+    One recording is one file. Logging stops on its own at RECORD_MINUTES rather
+    than rolling into a numbered continuation, so there is no segment concept
+    here — the operator decides when the machine has cooled enough to start the
+    next one.
+
     Units are the Isaac convention, not the controller convention:
-      timestamp  seconds since segment start (monotonic)
+      timestamp  seconds since recording start (monotonic)
       joint_pos  radians          (controller API returns degrees)
       joint_vel  rad/s            (controller API returns deg/s)
       imu_g*     rad/s            (hardware API returns deg/s)
@@ -318,11 +406,15 @@ class DataLogger:
     benchmark scripts read.
     """
 
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, imu_roles=None, stream_info_fn=None):
         self.output_dir  = output_dir
         self.is_logging  = False
-        self.segment_id  = 0
         self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Set when IMUs are active: the raw strip is written alongside the
+        # hydraulic one and needs the sensor role order plus the firmware's
+        # reported full scales to be interpretable.
+        self.imu_roles      = list(imu_roles) if imu_roles else []
+        self.stream_info_fn = stream_info_fn
         self._clear()
 
     def _clear(self):
@@ -330,7 +422,6 @@ class DataLogger:
         self._t0_mono = None
         self._ts:   list = []
         self._idx:  list = []
-        self._seg:  list = []
         self._man:  list = []
         self._sin:  list = []
         self._com:  list = []
@@ -343,30 +434,23 @@ class DataLogger:
         self._gk:   list = []
         self._stale: list = []
         self._age:   list = []
-        self._sine_flag: list = []
-        self._sine_amp:  list = []
-        self._sine_seed: list = []
+        self._sine_flag:   list = []
+        self._sine_target: list = []
+        self._sine_seed:   list = []
+        self._dev_ts:      list = []
+        self._clear_imu_raw()
 
     def start(self):
-        self.segment_id = 0
         self._clear()
         self._t0_wall = time.time()
         self._t0_mono = time.perf_counter()
         self.is_logging = True
         print(f"\n{'='*60}\n  DATA COLLECTION STARTED\n{'='*60}\n")
 
-    def _start_segment(self):
-        self.segment_id += 1
-        self._clear()
-        self._t0_wall = time.time()
-        self._t0_mono = time.perf_counter()
-        self.is_logging = True
-        print(f"[RESUME] Segment #{self.segment_id} started")
-
     def log_sample(self, manual: dict, sine: dict, combined: dict,
                    controller, hardware, cmd_age_s: float, cmd_stale: bool,
                    sine_enabled: bool,
-                   sine_amp: float = np.nan, sine_seed: int = -1):
+                   sine_target: str = "", sine_seed: int = -1):
         if not self.is_logging:
             return
 
@@ -388,11 +472,13 @@ class DataLogger:
             gb = list(np.radians(g[0])) if len(g) > 0 else [np.nan]*3
             ga = list(np.radians(g[1])) if len(g) > 1 else [np.nan]*3
             gk = list(np.radians(g[2])) if len(g) > 2 else [np.nan]*3
+            dev_ts = gyro.get('device_timestamp_us')
         else:
             gb = ga = gk = [np.nan, np.nan, np.nan]
+            dev_ts = None
 
         i = len(self._ts)
-        self._ts.append(t);         self._idx.append(i);           self._seg.append(self.segment_id)
+        self._ts.append(t);         self._idx.append(i)
         self._man.append([manual.get(n, 0.0)   for n in JOINT_NAMES])
         self._sin.append([sine.get(n, 0.0)     for n in JOINT_NAMES])
         self._com.append([combined.get(n, 0.0) for n in JOINT_NAMES])
@@ -402,8 +488,9 @@ class DataLogger:
         self._stale.append(int(bool(cmd_stale)))
         self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
         self._sine_flag.append(int(bool(sine_enabled)))
-        self._sine_amp.append(float(sine_amp))
+        self._sine_target.append(str(sine_target))
         self._sine_seed.append(int(sine_seed))
+        self._dev_ts.append(np.nan if dev_ts is None else float(dev_ts))
 
     def n_samples(self) -> int:
         return len(self._ts)
@@ -414,6 +501,7 @@ class DataLogger:
     def save(self) -> Path | None:
         if not self._ts:
             print("No data to save.")
+            self._save_imu_raw_strip()
             return None
 
         import pandas as pd
@@ -423,7 +511,7 @@ class DataLogger:
         gb  = np.array(self._gb);   ga  = np.array(self._ga);   gk  = np.array(self._gk)
 
         df = pd.DataFrame({
-            'timestamp': self._ts, 'sample_idx': self._idx, 'segment_id': self._seg,
+            'timestamp': self._ts, 'sample_idx': self._idx,
             # JOINT_NAMES order (slew, boom, arm, bucket) → hydraulic channel names
             'manual_cmd_rotate': man[:,0], 'manual_cmd_lift':  man[:,1],
             'manual_cmd_tilt':   man[:,2], 'manual_cmd_scoop': man[:,3],
@@ -438,31 +526,117 @@ class DataLogger:
             'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
             'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
             'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
-            # Amplitude is D-pad adjustable and the seed is re-drawn on every
-            # sine enable, so both are per-sample rather than per-file. The seed
-            # is what lets a row's exact excitation parameters be reconstructed.
-            'sine_amplitude': self._sine_amp, 'sine_seed': self._sine_seed,
+            # Pico clock for the IMU sample this row saw. Joins these rows to the
+            # companion imu_raw_*.csv, which is timestamped on the same clock.
+            'imu_device_ts_us': self._dev_ts,
+            # The target is D-pad switchable mid-recording, so it is per-sample
+            # rather than per-file — rows must be groupable by which channels
+            # were actually driven. Amplitude is no longer a column: it is drawn
+            # per joint, and the seed reconstructs it along with every other
+            # waveform parameter.
+            'sine_target': self._sine_target, 'sine_seed': self._sine_seed,
         })
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = self.output_dir / f"drive_log_{ts}_seg{self.segment_id:03d}.csv"
+        out = self.output_dir / f"drive_log_{ts}.csv"
         df.to_csv(out, index=False)
         print(f"[SAVE] {len(df)} samples ({df['timestamp'].iloc[-1]/60:.2f} min) → {out}")
+        self._save_imu_raw_strip()
         return out
 
-    def save_with_pause(self, direct) -> Path | None:
-        if not self._ts:
+    def _save_imu_raw_strip(self) -> None:
+        """Write the companion raw IMU strip, if IMU capture is active."""
+        if not self.imu_roles or not self._imu_ts:
+            return
+        info = self.stream_info_fn() if self.stream_info_fn is not None else {}
+        self.save_imu_raw(self.imu_roles, info or {})
+
+    def _clear_imu_raw(self):
+        self._imu_ts:    list = []
+        self._imu_vals:  list = []
+
+    def log_imu_raw(self, frames, n_sensors: int):
+        """Buffer raw IMU frames drained from the reader.
+
+        One row per frame at the stream's own rate, not the control rate — the
+        control loop runs at 100 Hz while the Pico streams 200 Hz, and halving
+        the sample rate of an AHRS input changes the very integration behaviour
+        a gain sweep is trying to measure.
+        """
+        if not self.is_logging:
+            return
+        for ts_us, packets in frames:
+            row = []
+            for i in range(n_sensors):
+                pkt = packets[i] if i < len(packets) else []
+                # Old firmware sends 7 floats; pad so the row width is fixed.
+                row.extend(pkt[:10] + [np.nan] * (10 - len(pkt[:10])))
+            self._imu_ts.append(int(ts_us))
+            self._imu_vals.append(row)
+
+    def n_imu_raw_samples(self) -> int:
+        return len(self._imu_ts)
+
+    def save_imu_raw(self, roles: list[str], stream_info: dict) -> Path | None:
+        """Write the raw IMU strip: quaternion + the gyro/accel that produced it.
+
+        Kept out of the hydraulic CSV rather than bolted onto it — the two run at
+        different rates, and the hydraulic schema is what the training and
+        benchmark scripts read. Join on device_ts_us against the hydraulic log's
+        imu_device_ts_us column.
+
+        Units are the firmware's, not the Isaac convention used by the hydraulic
+        log: gyro in dps and accel in g, which is what Fusion's AHRS takes, so
+        an offline replay can feed these columns in without converting.
+        """
+        if not self._imu_ts:
+            return None
+
+        import pandas as pd
+
+        vals = np.array(self._imu_vals, dtype=np.float64)
+        cols = {'device_ts_us': self._imu_ts}
+        for i, role in enumerate(roles):
+            base = i * 10
+            for j, name in enumerate(('qw', 'qx', 'qy', 'qz',
+                                      'gx_dps', 'gy_dps', 'gz_dps',
+                                      'ax_g', 'ay_g', 'az_g')):
+                cols[f'imu_{role}_{name}'] = vals[:, base + j]
+        df = pd.DataFrame(cols)
+
+        ranges = stream_info.get('ranges') or {}
+        # Full scales are constant for a run; carrying them per row keeps the
+        # file self-describing, so headroom can be judged without knowing which
+        # firmware was flashed.
+        df['gyro_range_dps'] = ranges.get('gyro_dps', np.nan)
+        df['accel_range_g']  = ranges.get('accel_g', np.nan)
+
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = self.output_dir / f"imu_raw_{ts}.csv"
+        df.to_csv(out, index=False)
+        span_s = (df['device_ts_us'].iloc[-1] - df['device_ts_us'].iloc[0]) / 1e6
+        rate = len(df) / span_s if span_s > 0 else float('nan')
+        # A non-zero count means the reader's buffer overflowed between drains,
+        # so the strip has gaps — check device_ts_us deltas before trusting it.
+        dropped = int(stream_info.get('capture_dropped', 0) or 0)
+        drop_note = f", {dropped} dropped since capture start" if dropped else ""
+        print(f"[SAVE] {len(df)} IMU frames ({rate:.0f} Hz{drop_note}) → {out}")
+        return out
+
+    def stop_and_save(self, direct) -> Path | None:
+        """End the recording: neutralise the valves, then write both strips.
+
+        Outputs are zeroed before the write because saving blocks for a moment,
+        and a joint left commanded would keep moving through it.
+        """
+        self.is_logging = False
+        if not self._ts and not self._imu_ts:
             print("No data to save.")
             return None
-        was = self.is_logging
-        self.is_logging = False
         direct.clear()
         direct.send_pending()
         time.sleep(0.3)
-        path = self.save()
-        if was:
-            self._start_segment()
-        return path
+        return self.save()
 
 
 # ── stub controller ───────────────────────────────────────────────────────────
@@ -723,7 +897,22 @@ def main():
 
     # ── helpers ───────────────────────────────────────────────────────────────
     sine_gen = SineExcitationGenerator()
-    logger   = DataLogger(out_dir)
+
+    # Raw IMU strips are only meaningful when IMUs are actually streaming.
+    imu_stream = hardware.imu_stream_info() if imu_on else {}
+    imu_capture_roles = imu_stream.get('roles_by_index', []) if imu_on else []
+    logger = DataLogger(out_dir,
+                        imu_roles=imu_capture_roles,
+                        stream_info_fn=hardware.imu_stream_info if imu_on else None)
+
+    if imu_on:
+        rng = imu_stream.get('ranges')
+        if not imu_stream.get('has_accel'):
+            print("[IMU] Firmware sends no accelerometer — raw strips will hold "
+                  "quaternion + gyro only. Reflash pico_imu_reader for accel.")
+        if rng:
+            print(f"[IMU] Full scale: gyro +/-{rng['gyro_dps']:.0f} dps, "
+                  f"accel +/-{rng['accel_g']:.0f} g")
 
     # ── input source ──────────────────────────────────────────────────────────
     source = make_input_source(args)
@@ -732,7 +921,7 @@ def main():
         direct.clear(); controller.resume_ik_output(); controller.stop()
         hardware.shutdown(); raise SystemExit(1)
     print("A=log  B=sine  X=pump  Y=reload-config"
-          + ("  Dpad U/D=sine-amp\n" if source.name == "local" else "\n"))
+          + ("  Dpad U/D=sine-target\n" if source.name == "local" else "\n"))
 
     # ── loop state ────────────────────────────────────────────────────────────
     loop_period     = 1.0 / SAMPLING_FREQUENCY
@@ -743,9 +932,40 @@ def main():
     mask_prev     = 0
 
     last_status_time    = time.time()
-    last_strip_time     = time.time()
+    record_start_time   = None
     print_imu           = False
     iter_count          = 0
+
+    n_imu_sensors = len(imu_capture_roles)
+
+    def drain_imu_raw():
+        """Move buffered raw IMU frames into the logger.
+
+        Must run before a save: the reader's buffer is bounded and saving clears
+        the logger's, so anything left undrained would be dropped outright.
+        """
+        if not (imu_on and logger.is_logging):
+            return
+        frames = hardware.drain_imu_raw_capture()
+        if frames:
+            logger.log_imu_raw(frames, n_imu_sensors)
+
+    def start_recording():
+        # A fresh seed per recording, so each file is an independent draw from
+        # the parameter space rather than the next step of one long sequence.
+        sine_gen.reseed()
+        if imu_on:
+            hardware.start_imu_raw_capture()   # drops anything buffered earlier
+        logger.start()
+        print(f"[REC] target={sine_gen.target_name} seed={sine_gen.seed} "
+              f"| auto-stops after {RECORD_MINUTES:.0f} min")
+
+    def stop_recording(reason: str):
+        drain_imu_raw()
+        logger.stop_and_save(direct)
+        if imu_on:
+            hardware.stop_imu_raw_capture()
+        print(f"[REC] stopped ({reason}). Press A to record the next set.")
 
     try:
         while True:
@@ -766,14 +986,14 @@ def main():
                 def btn(b):  return bool(mask & (1 << b))
                 def prev(b): return bool(mask_prev & (1 << b))
 
-                # A: toggle logging
+                # A: start / stop a recording
                 if btn(BTN_A) and not prev(BTN_A):
                     if not logger.is_logging:
-                        logger.start()
-                        last_strip_time = now
+                        start_recording()
+                        record_start_time = now
                     else:
-                        logger.save_with_pause(direct)
-                        logger.is_logging = False
+                        stop_recording("button A")
+                        record_start_time = None
 
                 # B: toggle sine
                 if btn(BTN_B) and not prev(BTN_B):
@@ -781,7 +1001,7 @@ def main():
                     if sine_gen.enabled:
                         # Params are re-drawn on every enable, so note the seed:
                         # it is what makes a strip's excitation reproducible.
-                        print(f"\n[Button B] Sine ON (amp={sine_gen.amplitude_scale:.2f} "
+                        print(f"\n[Button B] Sine ON (target={sine_gen.target_name} "
                               f"seed={sine_gen.seed})")
                     else:
                         print("\n[Button B] Sine OFF")
@@ -803,11 +1023,11 @@ def main():
                     ok = hardware.reload_config()
                     print(f"\n[Button Y] Config reload {'OK' if ok else 'FAILED'}")
 
-                # D-pad up/down: step sine amplitude
+                # D-pad up/down: cycle which channels the sine drives
                 for bit, step in ((BTN_DPAD_UP, +1), (BTN_DPAD_DOWN, -1)):
                     if btn(bit) and not prev(bit):
-                        sine_gen.step_amplitude(step)
-                        print(f"\n[D-pad] Sine amplitude → {sine_gen.amplitude_scale:.2f}")
+                        sine_gen.step_target(step)
+                        print(f"\n[D-pad] Sine target → {sine_gen.target_name}")
 
                 mask_prev = mask
 
@@ -846,12 +1066,19 @@ def main():
                     cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
                 logger.log_sample(manual, sine, combined, controller, hardware,
                                   cmd_age_s, cmd_stale, sine_gen.enabled,
-                                  sine_gen.amplitude_scale, sine_gen.seed)
+                                  sine_gen.target_name, sine_gen.seed)
+                # Every IMU frame since the last tick, not just the newest one.
+                drain_imu_raw()
 
-            # ── 5. strip rollover ─────────────────────────────────────────────
-            if is_logging and (now - last_strip_time) >= STRIP_MINUTES * 60:
-                last_strip_time = now
-                logger.save_with_pause(direct)
+            # ── 5. auto-stop ──────────────────────────────────────────────────
+            # Ends the recording outright rather than rolling into a
+            # continuation file: the pause between sets is what keeps the
+            # hydraulics from heat-soaking, and data taken hot is not what the
+            # model should be learning from.
+            if is_logging and record_start_time is not None \
+                    and (now - record_start_time) >= RECORD_MINUTES * 60:
+                stop_recording(f"{RECORD_MINUTES:.0f} min reached")
+                record_start_time = None
 
             # ── 6. IMU print (decimated) ──────────────────────────────────────
             iter_count += 1
@@ -865,11 +1092,12 @@ def main():
             if now - last_status_time >= STATUS_PRINT_INTERVAL_S:
                 last_status_time = now
                 pump_on  = bool(pwm and pwm.pump_enabled)
-                sine_str = (f"ON amp={sine_gen.amplitude_scale:.2f} seed={sine_gen.seed}"
-                            if sine_gen.enabled else "OFF")
+                sine_str = (f"ON target={sine_gen.target_name} seed={sine_gen.seed}"
+                            if sine_gen.enabled else f"OFF (target={sine_gen.target_name})")
                 print(
                     f"[STATUS] pump={'ON' if pump_on else 'OFF'} | sine={sine_str} | "
-                    + (f"log=ON {logger.elapsed_min():.1f}min {logger.n_samples()} samples"
+                    + (f"log=ON {logger.elapsed_min():.1f}/{RECORD_MINUTES:.0f}min "
+                       f"{logger.n_samples()} samples"
                        if is_logging else "log=OFF")
                     + ("" if source.is_live() else f" | *** {source.name} INPUT LOST ***")
                 )
@@ -889,7 +1117,8 @@ def main():
     finally:
         print("Shutting down...")
         source.close()
-        if logger.n_samples() > 0:
+        drain_imu_raw()
+        if logger.n_samples() > 0 or logger.n_imu_raw_samples() > 0:
             logger.is_logging = False
             direct.clear()
             direct.send_pending()

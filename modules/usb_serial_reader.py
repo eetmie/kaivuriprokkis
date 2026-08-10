@@ -6,6 +6,7 @@ import serial.tools.list_ports
 import struct
 import math
 import threading
+from collections import deque
 
 try:
     from .rt_utils import apply_rt_to_thread, SCHED_FIFO
@@ -17,13 +18,26 @@ class USBSerialReader:
     """Read IMU quaternion data from Pico over USB serial."""
 
     MAX_SENSORS = 4
-    FLOATS_PER_SENSOR = 7  # w, x, y, z, gx, gy, gz
+    FLOATS_PER_SENSOR = 10  # w, x, y, z, gx, gy, gz, ax, ay, az
 
-    # Binary protocol frame versions
-    FRAME_VERSION_DATA = 1
+    # Binary protocol frame versions.
+    #
+    # Firmware emits the _V2 data and descriptor frames; the pre-accel types are
+    # still parsed so a Pico that has not been reflashed keeps working (its
+    # packets simply carry no accel). Widening under the old type numbers would
+    # instead have made a version mismatch look like stream corruption.
+    FRAME_VERSION_DATA = 1          # legacy: 7 floats, no accel
     FRAME_VERSION_CTRL = 2
-    FRAME_VERSION_DESC = 3
+    FRAME_VERSION_DESC = 3          # legacy: no full-scale fields
+    FRAME_VERSION_DATA_V2 = 4       # 10 floats, quat + gyro + accel
     FRAME_VERSION_CAL_REPORT = 5
+    FRAME_VERSION_DESC_V2 = 6       # descriptor + gyro/accel full scales
+
+    # Floats per sensor for each data frame type.
+    _DATA_FRAME_FLOATS = {
+        FRAME_VERSION_DATA: 7,
+        FRAME_VERSION_DATA_V2: 10,
+    }
 
     # Control frame message types (version=2)
     MSG_TYPE_ERR_I2C = 0x05
@@ -67,6 +81,7 @@ class USBSerialReader:
         self.num_sensors = 0  # discovered at runtime from first frame
         self.last_timestamp_us = None
         self._imu_descriptors = []  # list of {"bus": int, "addr": int}
+        self._imu_ranges = None     # {"gyro_dps": float, "accel_g": float} once reported
         self._descriptor_signature = None
         self._target_sps = 0       # target sample rate reported by firmware
         self._last_data_time = time.time()
@@ -91,6 +106,14 @@ class USBSerialReader:
         self._latest_frame = None
         self._latest_frame_seq = 0
         self._last_returned_seq = 0
+        self._frame_floats_per_sensor = 0
+
+        # Optional full-rate capture. get_latest_imus() deliberately keeps only
+        # the newest frame, so a 100 Hz consumer of a 200 Hz stream drops every
+        # other sample. Offline AHRS work needs the samples themselves, at their
+        # own timestamps, so recording taps the reader thread here instead.
+        self._capture_buf = None
+        self._capture_dropped = 0
 
         # SPS (samples per second) tracking
         self._reset_sps_tracking()
@@ -136,6 +159,7 @@ class USBSerialReader:
             "port": self.port,
             "num_sensors": self.num_sensors,
             "imu_descriptors": list(self._imu_descriptors),
+            "imu_ranges": None if self._imu_ranges is None else dict(self._imu_ranges),
             "target_sps": self._target_sps,
             "sps": self._host_sps,
             "host_sps": self._host_sps,
@@ -188,6 +212,21 @@ class USBSerialReader:
             label (str): Human-readable label (e.g. "I2C0:0x6A")
         """
         return list(self._imu_descriptors)
+
+    @property
+    def imu_ranges(self):
+        """Sensor full scales reported by firmware, or None.
+
+        {"gyro_dps": float, "accel_g": float}. None until a descriptor arrives,
+        and permanently None on firmware predating the accel stream. Compare
+        against it to see how much headroom a recording actually had.
+        """
+        return None if self._imu_ranges is None else dict(self._imu_ranges)
+
+    @property
+    def has_accel(self):
+        """True once a data frame carrying accelerometer samples has arrived."""
+        return self._frame_floats_per_sensor >= 10
 
     def set_log_level(self, level: str):
         """Update logger level at runtime."""
@@ -268,6 +307,7 @@ class USBSerialReader:
         self._bin_buf.clear()
         self._descriptor_signature = None
         self._imu_descriptors = []
+        self._imu_ranges = None
         self.num_sensors = 0
         self._target_sps = 0
         self._latest_frame = None
@@ -465,37 +505,55 @@ class USBSerialReader:
         self._ts_prev_us = None
         self._prime_sps = True
 
-    def _parse_descriptor_payload(self, start, desc_count):
-        """Decode descriptor payload from the current binary buffer."""
+    def _parse_descriptor_payload(self, start, desc_count, has_ranges):
+        """Decode descriptor payload from the current binary buffer.
+
+        Returns (target_sps, ranges, descriptors). ``ranges`` is None for the
+        legacy frame, which predates the sensor full scales being reported.
+        """
         target_sps = struct.unpack_from("<H", self._bin_buf, start + 4)[0]
+        offset = start + 6
+        ranges = None
+        if has_ranges:
+            gyro_dps, accel_g = struct.unpack_from("<ff", self._bin_buf, offset)
+            offset += 8
+            ranges = {"gyro_dps": gyro_dps, "accel_g": accel_g}
         descriptors = []
         for i in range(desc_count):
-            bus = self._bin_buf[start + 6 + i * 2]
-            addr = self._bin_buf[start + 6 + i * 2 + 1]
+            bus = self._bin_buf[offset + i * 2]
+            addr = self._bin_buf[offset + i * 2 + 1]
             descriptors.append({
                 "bus": bus,
                 "addr": addr,
                 "label": f"I2C{bus}:0x{addr:02X}",
             })
-        return target_sps, descriptors
+        return target_sps, ranges, descriptors
 
-    def _apply_descriptor(self, desc_count, target_sps, descriptors):
+    def _apply_descriptor(self, desc_count, target_sps, ranges, descriptors):
         """Store descriptor data and log only when it changes."""
-        signature = (target_sps, tuple((d["bus"], d["addr"]) for d in descriptors))
+        signature = (target_sps,
+                     None if ranges is None else (ranges["gyro_dps"], ranges["accel_g"]),
+                     tuple((d["bus"], d["addr"]) for d in descriptors))
         changed = signature != self._descriptor_signature
 
         with self._lock:
             self._target_sps = target_sps
             self._imu_descriptors = descriptors
+            self._imu_ranges = ranges
             self.num_sensors = desc_count
 
         if changed:
             self._descriptor_signature = signature
             labels = ", ".join(d["label"] for d in descriptors)
+            range_text = (
+                "gyro range unreported (pre-accel firmware)" if ranges is None
+                else f"gyro +/-{ranges['gyro_dps']:.0f} dps, accel +/-{ranges['accel_g']:.0f} g"
+            )
             self.logger.info(
-                "IMU descriptor: %d sensor(s) @ %d Hz - %s",
+                "IMU descriptor: %d sensor(s) @ %d Hz - %s - %s",
                 desc_count,
                 target_sps,
+                range_text,
                 labels,
             )
 
@@ -663,8 +721,8 @@ class USBSerialReader:
                 del self._bin_buf[:frame_len]
                 continue
 
-            # Handle IMU descriptor frame (version=3)
-            if version == self.FRAME_VERSION_DESC:
+            # Handle IMU descriptor frame (version=3 legacy, version=6 with ranges)
+            if version in (self.FRAME_VERSION_DESC, self.FRAME_VERSION_DESC_V2):
                 if refill:
                     self._fill_binary_buffer(min_bytes=8)
                 if len(self._bin_buf) < 8:
@@ -673,8 +731,9 @@ class USBSerialReader:
                 if desc_count < 1 or desc_count > self.MAX_SENSORS:
                     del self._bin_buf[:1]
                     continue
-                # Frame: sync(2) + ver(1) + count(1) + sps(2) + N*2 + checksum(2)
-                desc_frame_len = 4 + 2 + desc_count * 2 + 2
+                has_ranges = version == self.FRAME_VERSION_DESC_V2
+                # Frame: sync(2) + ver(1) + count(1) + sps(2) [+ ranges(8)] + N*2 + checksum(2)
+                desc_frame_len = 4 + 2 + (8 if has_ranges else 0) + desc_count * 2 + 2
                 if refill:
                     self._fill_binary_buffer(min_bytes=desc_frame_len)
                 if len(self._bin_buf) < desc_frame_len:
@@ -684,21 +743,24 @@ class USBSerialReader:
                 expected_cs = struct.unpack_from("<H", self._bin_buf, cs_off)[0]
                 calc_cs = sum(self._bin_buf[2:cs_off]) & 0xFFFF
                 if calc_cs == expected_cs:
-                    target_sps, descriptors = self._parse_descriptor_payload(0, desc_count)
-                    self._apply_descriptor(desc_count, target_sps, descriptors)
+                    target_sps, ranges, descriptors = self._parse_descriptor_payload(
+                        0, desc_count, has_ranges
+                    )
+                    self._apply_descriptor(desc_count, target_sps, ranges, descriptors)
                 del self._bin_buf[:desc_frame_len]
                 continue
 
             sensor_count = self._bin_buf[3]
+            floats_per_sensor = self._DATA_FRAME_FLOATS.get(version)
 
-            if version != self.FRAME_VERSION_DATA or sensor_count < 1 or sensor_count > self.MAX_SENSORS:
+            if floats_per_sensor is None or sensor_count < 1 or sensor_count > self.MAX_SENSORS:
                 # Drop one byte and rescan for sync
                 self._header_failures += 1
                 del self._bin_buf[0:1]
                 continue
 
             # Calculate frame length
-            payload_len = 4 + sensor_count * self.FLOATS_PER_SENSOR * 4
+            payload_len = 4 + sensor_count * floats_per_sensor * 4
             frame_len = 2 + 1 + 1 + payload_len + 2
 
             if refill:
@@ -733,10 +795,12 @@ class USBSerialReader:
             # Parse sensor data
             imu_data = []
             offset = 8
+            sensor_fmt = "<" + "f" * floats_per_sensor
+            sensor_bytes = floats_per_sensor * 4
             for _ in range(sensor_count):
-                vals = struct.unpack_from("<fffffff", self._bin_buf, offset)
+                vals = struct.unpack_from(sensor_fmt, self._bin_buf, offset)
                 imu_data.append(list(vals))
-                offset += 28
+                offset += sensor_bytes
 
             del self._bin_buf[:frame_len]
             self.last_timestamp_us = ts
@@ -745,6 +809,11 @@ class USBSerialReader:
             self._update_sps()
             sensor_count_changed = False
             with self._lock:
+                self._frame_floats_per_sensor = floats_per_sensor
+                if self._capture_buf is not None:
+                    if len(self._capture_buf) == self._capture_buf.maxlen:
+                        self._capture_dropped += 1
+                    self._capture_buf.append((ts, imu_data))
                 if self.num_sensors != sensor_count:
                     self.num_sensors = sensor_count
                     sensor_count_changed = True
@@ -804,6 +873,44 @@ class USBSerialReader:
             thread.join(timeout=1.0)
         self._reader_thread = None
 
+    def start_capture(self, max_frames=20000):
+        """Begin retaining every parsed data frame for later draining.
+
+        Independent of get_latest_imus(): that stays latest-only for the control
+        loop, while this keeps the full stream for recording. The buffer is
+        bounded — if nothing drains it, the oldest frames are discarded and
+        counted rather than growing without limit. 20000 frames is ~100 s at
+        200 Hz, far longer than the drain interval of any sane caller.
+        """
+        with self._lock:
+            self._capture_buf = deque(maxlen=int(max_frames))
+            self._capture_dropped = 0
+
+    def stop_capture(self):
+        """Stop retaining frames and discard anything still buffered."""
+        with self._lock:
+            self._capture_buf = None
+            self._capture_dropped = 0
+
+    def drain_capture(self):
+        """Return and clear buffered frames as [(timestamp_us, [pkt, ...]), ...].
+
+        Timestamps are the firmware's own microsecond clock, which is what the
+        deltas between frames must be computed from — host arrival times carry
+        USB and scheduling jitter that never touched the AHRS.
+        """
+        with self._lock:
+            if self._capture_buf is None:
+                return []
+            frames = list(self._capture_buf)
+            self._capture_buf.clear()
+            return frames
+
+    @property
+    def capture_dropped(self):
+        """Frames evicted from the capture buffer because it filled up."""
+        return self._capture_dropped
+
     def get_latest_imus(self, only_new=True):
         """Return the newest frame captured by the background reader."""
         with self._lock:
@@ -823,8 +930,10 @@ class USBSerialReader:
             auto_reconnect: If True, automatically reconnect on timeout/error.
 
         Returns:
-            List of N arrays, each containing [w, x, y, z, gx, gy, gz]
-            (quaternion + gyro in dps), or None if no data available.
+            List of N lists, each [w, x, y, z, gx, gy, gz, ax, ay, az] —
+            quaternion, gyro in dps, accel in g — or None if no data available.
+            Firmware predating the accel stream yields 7-element packets, so
+            index rather than unpack if both are in play.
         """
         if self.debug and self.ser and self.ser.in_waiting > 0:
             peek = self.ser.read(self.ser.in_waiting)
@@ -927,6 +1036,11 @@ if __name__ == "__main__":
                     print(f"\n--- IMU Descriptor ---")
                     print(f"  Sensors:    {reader.num_sensors}")
                     print(f"  Target SPS: {reader.target_sps} Hz")
+                    rng = reader.imu_ranges
+                    if rng is not None:
+                        print(f"  Full scale: gyro +/-{rng['gyro_dps']:.0f} dps, "
+                              f"accel +/-{rng['accel_g']:.0f} g")
+                    print(f"  Accel:      {'yes' if reader.has_accel else 'no (old firmware)'}")
                     for i, d in enumerate(descs):
                         print(f"  [{i}] {d['label']}  (bus={d['bus']}, addr=0x{d['addr']:02X})")
                     print(f"----------------------\n")

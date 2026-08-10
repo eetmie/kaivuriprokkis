@@ -100,6 +100,9 @@ static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
                 sensors_data[i][4] = 0.0f;
                 sensors_data[i][5] = 0.0f;
                 sensors_data[i][6] = 0.0f;
+                sensors_data[i][7] = 0.0f;
+                sensors_data[i][8] = 0.0f;
+                sensors_data[i][9] = 0.0f;
                 continue;
             }
 
@@ -129,6 +132,11 @@ static void stream_forever(Sensor *sensors, uint8_t sensor_count) {
             sensors_data[i][4] = gyroscope.axis.x;
             sensors_data[i][5] = gyroscope.axis.y;
             sensors_data[i][6] = gyroscope.axis.z;
+            // Same pair FusionAhrsUpdate consumed above, so this build's frames
+            // stay replayable too. Note the gyro here is post-FusionOffsetUpdate.
+            sensors_data[i][7] = accelerometer.axis.x;
+            sensors_data[i][8] = accelerometer.axis.y;
+            sensors_data[i][9] = accelerometer.axis.z;
         }
 
         print_output_data(loop_start_us, sensors_data, sensor_count);

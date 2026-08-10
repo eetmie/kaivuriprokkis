@@ -1,7 +1,7 @@
 """simple_drive input-source and sine-generator tests.
 
 Covers the local-gamepad path (axis signs, button mask, disconnect handling)
-and the D-pad-adjustable sine parameters. The real pad cannot be driven from a
+and the D-pad-selected sine target. The real pad cannot be driven from a
 test, so LocalGamepadInput is exercised against a stub XboxController.
 
 Known test gaps
@@ -23,7 +23,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import simple_drive  # noqa: E402
 from simple_drive import (  # noqa: E402
-    AMPLITUDE_PRESETS,
+    SINE_TARGET_MODES,
     BTN_A, BTN_B, BTN_X, BTN_Y,
     BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, BTN_DPAD_UP,
     LocalGamepadInput,
@@ -159,59 +159,98 @@ class LocalGamepadDisconnectTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Sine parameter stepping
+# Sine target stepping (D-pad)
 # ---------------------------------------------------------------------------
 
-class SineStepTests(unittest.TestCase):
+class SineTargetTests(unittest.TestCase):
 
-    def test_step_amplitude_moves_one_preset(self):
+    def test_step_target_moves_one_mode(self):
         gen = SineExcitationGenerator()
-        start = AMPLITUDE_PRESETS.index(gen.amplitude_scale)
-        gen.step_amplitude(+1)
-        self.assertEqual(gen.amplitude_scale, AMPLITUDE_PRESETS[start + 1])
-        gen.step_amplitude(-1)
-        self.assertEqual(gen.amplitude_scale, AMPLITUDE_PRESETS[start])
+        start = gen.target_idx
+        gen.step_target(+1)
+        self.assertEqual(gen.target_name, SINE_TARGET_MODES[start + 1][0])
+        gen.step_target(-1)
+        self.assertEqual(gen.target_name, SINE_TARGET_MODES[start][0])
 
-    def test_step_amplitude_clamps_at_both_ends(self):
+    def test_step_target_wraps_at_both_ends(self):
+        """Wraps rather than clamps: cycling should never dead-end on the pad."""
         gen = SineExcitationGenerator()
-        for _ in range(len(AMPLITUDE_PRESETS) + 3):
-            gen.step_amplitude(+1)
-        self.assertEqual(gen.amplitude_scale, AMPLITUDE_PRESETS[-1])
-        for _ in range(len(AMPLITUDE_PRESETS) + 3):
-            gen.step_amplitude(-1)
-        self.assertEqual(gen.amplitude_scale, AMPLITUDE_PRESETS[0])
+        for _ in range(len(SINE_TARGET_MODES)):
+            gen.step_target(+1)
+        self.assertEqual(gen.target_idx, 0)
+        gen.step_target(-1)
+        self.assertEqual(gen.target_idx, len(SINE_TARGET_MODES) - 1)
 
-    def test_amplitude_presets_reach_full_scale(self):
-        # Excitation is meant to be able to use the whole valve range.
-        self.assertEqual(AMPLITUDE_PRESETS[-1], 1.0)
-        self.assertGreater(AMPLITUDE_PRESETS[0], 0.0)
-        self.assertEqual(AMPLITUDE_PRESETS, sorted(AMPLITUDE_PRESETS))
+    def test_modes_cover_singles_and_pairs(self):
+        names = [n for n, _ in SINE_TARGET_MODES]
+        self.assertEqual(
+            names,
+            ['all', 'lift', 'tilt', 'scoop', 'lift+tilt', 'lift+scoop', 'tilt+scoop'])
+        for _, joints in SINE_TARGET_MODES:
+            for joint in joints:
+                self.assertIn(joint, simple_drive.JOINT_NAMES)
 
-    def test_amplitude_scales_the_whole_signal(self):
-        gen = SineExcitationGenerator(enabled=True, seed=3)
-        gen.start_time = 0.0
-        gen._amp_idx = 0
-        gen.amplitude_scale = AMPLITUDE_PRESETS[0]
-        small = [gen.get_signal(j, 12.3) for j in simple_drive.JOINT_NAMES]
-        gen._amp_idx = len(AMPLITUDE_PRESETS) - 1
-        gen.amplitude_scale = AMPLITUDE_PRESETS[-1]
-        large = [gen.get_signal(j, 12.3) for j in simple_drive.JOINT_NAMES]
-        ratio = AMPLITUDE_PRESETS[-1] / AMPLITUDE_PRESETS[0]
-        for s, l in zip(small, large):
-            self.assertAlmostEqual(l, s * ratio, places=6)
+    def test_target_gates_which_joints_move(self):
+        for idx, (name, joints) in enumerate(SINE_TARGET_MODES):
+            gen = SineExcitationGenerator(enabled=True, seed=5)
+            gen.target_idx = idx
+            gen.start_time = 0.0
+            peak = {j: 0.0 for j in simple_drive.JOINT_NAMES}
+            t = 0.0
+            for _ in range(2000):
+                t += 1.0 / simple_drive.SAMPLING_FREQUENCY
+                for joint, value in gen.get_all(t).items():
+                    peak[joint] = max(peak[joint], abs(value))
+            driven = {j for j, v in peak.items() if v > 0.0}
+            self.assertEqual(driven, set(joints), f"target {name}")
+
+    def test_amplitude_is_drawn_not_set(self):
+        """Amplitude is per-joint and random; there is no operator knob left."""
+        self.assertFalse(hasattr(SineExcitationGenerator, 'step_amplitude'))
+        lo, hi = SineExcitationGenerator.AMPLITUDE_RANGE
+        seen = set()
+        for seed in range(40):
+            gen = SineExcitationGenerator(seed=seed)
+            for joint in simple_drive.JOINT_NAMES:
+                amp = gen._params[joint]['amp']
+                self.assertGreaterEqual(amp, lo)
+                self.assertLessEqual(amp, hi)
+                seen.add(round(amp, 6))
+        self.assertGreater(len(seen), 100)   # genuinely varying, not quantized
+
+    def test_reseed_starts_an_independent_draw(self):
+        gen = SineExcitationGenerator(seed=1234)
+        before = (gen.seed, gen._params['boom']['amp'])
+        gen.reseed()
+        self.assertNotEqual(gen.seed, before[0])
+        self.assertNotEqual(gen._params['boom']['amp'], before[1])
 
     def test_output_never_leaves_the_valve_range(self):
         """Noise rides on top of the deterministic term, so clamp at source."""
         gen = SineExcitationGenerator(enabled=True, seed=11)
         gen.start_time = 0.0
-        gen._amp_idx = len(AMPLITUDE_PRESETS) - 1
-        gen.amplitude_scale = AMPLITUDE_PRESETS[-1]
         t = 0.0
         for _ in range(4000):
             t += 1.0 / simple_drive.SAMPLING_FREQUENCY
             for value in gen.get_all(t).values():
                 self.assertGreaterEqual(value, -1.0)
                 self.assertLessEqual(value, 1.0)
+
+    def test_excitation_stays_within_valve_bandwidth(self):
+        """The whole point of the retune: no energy the hydraulics cannot track."""
+        gen = SineExcitationGenerator(enabled=True, seed=7)
+        gen.start_time = 0.0
+        fs = simple_drive.SAMPLING_FREQUENCY
+        signal = []
+        t = 0.0
+        for _ in range(fs * 200):
+            t += 1.0 / fs
+            signal.append(gen.get_all(t)['boom'])
+        import numpy as np
+        power = np.abs(np.fft.rfft(signal)) ** 2
+        freqs = np.fft.rfftfreq(len(signal), 1.0 / fs)
+        above_1hz = power[1:][freqs[1:] > 1.0].sum() / power[1:].sum()
+        self.assertLess(above_1hz, 0.005)
 
 
 # ---------------------------------------------------------------------------

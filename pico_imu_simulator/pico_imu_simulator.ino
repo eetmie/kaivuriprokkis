@@ -19,21 +19,22 @@
 // ---- Protocol constants (must match pico_imu_reader / usb_serial_reader.py) ----
 #define FRAME_SYNC_0             0xAA
 #define FRAME_SYNC_1             0x55
-#define FRAME_VERSION_DATA       1
 #define FRAME_VERSION_CTRL       2
-#define FRAME_VERSION_DESC       3
+#define FRAME_VERSION_DATA_V2    4
 #define FRAME_VERSION_CAL_REPORT 5
+#define FRAME_VERSION_DESC_V2    6
 
 #define MSG_TYPE_CAL_WAIT 0x07
 
 #define CAL_REPORT_ACCEPTED 0x01
 
 #define NUM_SENSORS       4
-#define FLOATS_PER_SENSOR 7   // w, x, y, z, gx, gy, gz
+#define FLOATS_PER_SENSOR 10  // w, x, y, z, gx, gy, gz, ax, ay, az
 
 // ---- Hardcoded settings (must match pico_imu_reader settings.c) ----
 #define SAMPLE_RATE_HZ       200
 #define GYRO_RANGE_DPS       250.0f
+#define ACCEL_RANGE_G        2.0f
 #define AHRS_GAIN            4.5f
 #define ACCEL_REJECTION_DEG  20.0f
 #define RECOVERY_S           0.5f
@@ -92,18 +93,23 @@ static void sendControlMsg(uint8_t msgType) {
   Serial.flush();
 }
 
-// ---- Send descriptor frame (version=3) ----
+// ---- Send descriptor frame (version=6, carries full scales) ----
 static void sendDescriptor() {
-  const size_t frameLen = 2 + 1 + 1 + 2 + NUM_SENSORS * 2 + 2;
+  const size_t frameLen = 2 + 1 + 1 + 2 + 8 + NUM_SENSORS * 2 + 2;
   uint8_t frame[frameLen];
   size_t idx = 0;
 
   frame[idx++] = FRAME_SYNC_0;
   frame[idx++] = FRAME_SYNC_1;
-  frame[idx++] = FRAME_VERSION_DESC;
+  frame[idx++] = FRAME_VERSION_DESC_V2;
   frame[idx++] = NUM_SENSORS;
   frame[idx++] = (uint8_t)(SAMPLE_RATE_HZ & 0xFF);
   frame[idx++] = (uint8_t)((SAMPLE_RATE_HZ >> 8) & 0xFF);
+
+  const float gyroRange = GYRO_RANGE_DPS;
+  const float accelRange = ACCEL_RANGE_G;
+  memcpy(&frame[idx], &gyroRange, 4);  idx += 4;
+  memcpy(&frame[idx], &accelRange, 4); idx += 4;
 
   for (int i = 0; i < NUM_SENSORS; i++) {
     frame[idx++] = imuBus[i];
@@ -165,7 +171,7 @@ static void sendCalibrationReport() {
   Serial.flush();
 }
 
-// ---- Send data frame (version=1) ----
+// ---- Send data frame (version=4, quat + gyro + accel) ----
 static void sendDataFrame(uint32_t timestampUs, float data[][FLOATS_PER_SENSOR]) {
   const size_t payloadLen = 4 + NUM_SENSORS * FLOATS_PER_SENSOR * 4;
   const size_t frameLen   = 2 + 1 + 1 + payloadLen + 2;
@@ -174,7 +180,7 @@ static void sendDataFrame(uint32_t timestampUs, float data[][FLOATS_PER_SENSOR])
 
   frame[idx++] = FRAME_SYNC_0;
   frame[idx++] = FRAME_SYNC_1;
-  frame[idx++] = FRAME_VERSION_DATA;
+  frame[idx++] = FRAME_VERSION_DATA_V2;
   frame[idx++] = NUM_SENSORS;
   memcpy(&frame[idx], &timestampUs, 4); idx += 4;
 
@@ -265,6 +271,14 @@ void loop() {
     sensorData[i][4] = rollRate  + gyroNoise(gyroNoiseSigma);
     sensorData[i][5] = pitchRate + gyroNoise(gyroNoiseSigma);
     sensorData[i][6] = yawRate   + gyroNoise(gyroNoiseSigma);
+
+    // Accel: world gravity [0,0,1] g rotated into the sensor frame (NWU, so a
+    // level sensor reads +1 g on Z). Gravity only — no linear acceleration is
+    // simulated, so the magnitude stays at 1 g and never approaches full scale.
+    const float accelNoiseSigma = 0.004f;
+    sensorData[i][7] = 2.0f * (x * z - w * y)       + gyroNoise(accelNoiseSigma);
+    sensorData[i][8] = 2.0f * (y * z + w * x)       + gyroNoise(accelNoiseSigma);
+    sensorData[i][9] = 1.0f - 2.0f * (x * x + y * y) + gyroNoise(accelNoiseSigma);
   }
 
   sendDataFrame(micros(), sensorData);

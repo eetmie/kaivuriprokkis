@@ -18,6 +18,50 @@ static ActiveImu active_imus[MAX_SENSORS];
 static FusionVector active_gyro_biases[MAX_SENSORS];
 static uint8_t active_sensor_count = 0;
 
+static const imu_full_scale_t gyro_full_scales[] = ISM330_GYRO_FULL_SCALES;
+static const imu_full_scale_t accel_full_scales[] = ISM330_ACCEL_FULL_SCALES;
+
+// Register bits chosen for the ranges in imu_reader_settings, resolved once by
+// normalize_full_scales() before any sensor is configured.
+static uint8_t active_gyro_range_mask = 0x00;
+static uint8_t active_accel_range_mask = 0x00;
+
+#define ARRAY_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+
+// Pick the smallest supported full scale that still covers the request, and
+// return the whole table row. Register bits and conversion scale then always
+// come from the same row: a request the part cannot honour exactly (300 dps,
+// say) lands on the next range up, and dividing raw counts by the *requested*
+// value instead of the selected one would skew every sample by that ratio.
+static imu_full_scale_t select_full_scale(const imu_full_scale_t *table, size_t count, float requested) {
+    for (size_t i = 0; i < count; i++) {
+        if (requested <= table[i].scale) {
+            return table[i];
+        }
+    }
+    return table[count - 1];
+}
+
+// Resolve both requested ranges against the hardware and write the results back
+// into imu_reader_settings, so the conversion below, Fusion's gyroscopeRange and
+// the descriptor frame all read the range the sensor is genuinely running at.
+static void normalize_full_scales(void) {
+    const float gyro_request = (imu_reader_settings.gyroRangeDps > 0.0f)
+        ? imu_reader_settings.gyroRangeDps : 250.0f;
+    const float accel_request = (imu_reader_settings.accelRangeG > 0.0f)
+        ? imu_reader_settings.accelRangeG : 2.0f;
+
+    const imu_full_scale_t gyro_fs =
+        select_full_scale(gyro_full_scales, ARRAY_COUNT(gyro_full_scales), gyro_request);
+    const imu_full_scale_t accel_fs =
+        select_full_scale(accel_full_scales, ARRAY_COUNT(accel_full_scales), accel_request);
+
+    imu_reader_settings.gyroRangeDps = gyro_fs.scale;
+    imu_reader_settings.accelRangeG = accel_fs.scale;
+    active_gyro_range_mask = gyro_fs.mask;
+    active_accel_range_mask = accel_fs.mask;
+}
+
 static bool ism330dhcx_probe(i2c_inst_t *i2c_port, uint8_t device_addr) {
     uint8_t who_am_i = 0;
     if (!ism330dhcx_read_reg(i2c_port, device_addr, WHO_AM_I, &who_am_i, 1)) {
@@ -59,7 +103,7 @@ bool ism330dhcx_read_gyro(i2c_inst_t* i2c_port, uint8_t device_addr, FusionVecto
     int16_t raw_gyro_y = combine_8_bits(raw_gyro_values[2], raw_gyro_values[3]);
     int16_t raw_gyro_z = combine_8_bits(raw_gyro_values[4], raw_gyro_values[5]);
 
-    const float range = (imu_reader_settings.gyroRangeDps > 0.0f) ? imu_reader_settings.gyroRangeDps : 500.0f;
+    const float range = imu_reader_settings.gyroRangeDps;
     fusion_vector->axis.x = ((float)raw_gyro_x/32768.0f)*range;
     fusion_vector->axis.y = ((float)raw_gyro_y/32768.0f)*range;
     fusion_vector->axis.z = ((float)raw_gyro_z/32768.0f)*range;
@@ -82,15 +126,6 @@ static inline uint8_t select_odr_bits(int requested_hz) {
     return 0x80;                             // 1660 Hz
 }
 
-// Map gyro range (dps) to CTRL2_G FS_G/FS_125 bits.
-static inline uint8_t gyro_range_mask(float dps) {
-    if (dps <= 125.0f) return 0x02;  // FS_125 = 1
-    if (dps <= 250.0f) return 0x00;  // FS_G = 00
-    if (dps <= 500.0f) return 0x04;  // FS_G = 01
-    if (dps <= 1000.0f) return 0x08; // FS_G = 10
-    return 0x0C;                     // FS_G = 11 (2000 dps)
-}
-
 // Initialize ISM330DHCX
 bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr, uint internal_odr_hz) {
     // Optional: enable auto-increment + BDU for clean multi-byte reads
@@ -101,16 +136,14 @@ bool ism330dhcx_init(i2c_inst_t *i2c_port, uint8_t device_addr, uint internal_od
     // Map requested internal ODR to nearest supported hardware ODR at or above request
     const uint8_t odr_bits = select_odr_bits(internal_odr_hz);
 
-    // Configure accelerometer: ODR + ±2g
-    const uint8_t xl_cntrl1_val = odr_bits | XL_G_RANGE_MASK;
+    // Configure accelerometer and gyroscope: ODR + the resolved full scales.
+    const uint8_t xl_cntrl1_val = odr_bits | active_accel_range_mask;
     if (!ism330dhcx_write_reg(i2c_port, device_addr, CTRL1_XL, xl_cntrl1_val)) {
         cdc_writef("Failed to configure accelerometer (addr=0x%02x)\n", device_addr);
         return false;
     }
 
-    // Configure gyroscope: ODR + ±250 dps
-    const float range = (imu_reader_settings.gyroRangeDps > 0.0f) ? imu_reader_settings.gyroRangeDps : 500.0f;
-    const uint8_t g_cntrl_val = odr_bits | gyro_range_mask(range);
+    const uint8_t g_cntrl_val = odr_bits | active_gyro_range_mask;
     if (!ism330dhcx_write_reg(i2c_port, device_addr, CTRL2_G, g_cntrl_val)) {
         cdc_writef("Failed to configure gyroscope (addr=0x%02x)\n", device_addr);
         return false;
@@ -162,6 +195,15 @@ int initialize_sensors(uint internal_odr_hz) {
     for (uint8_t i = 0; i < MAX_SENSORS; i++) {
         active_gyro_biases[i] = FUSION_VECTOR_ZERO;
     }
+
+    // Resolve the requested ranges before any sensor is touched: the register
+    // writes below and every conversion afterwards read the normalized values.
+    normalize_full_scales();
+    // Every supported full scale is a whole number, so print as int — the
+    // console's vsnprintf has no float support linked in.
+    cdc_writef("Full scale: gyro +/-%d dps, accel +/-%d g\n",
+               (int)imu_reader_settings.gyroRangeDps,
+               (int)imu_reader_settings.accelRangeG);
     cdc_write_line("Probing IMUs on I2C0/I2C1 @ 0x6A/0x6B...");
 
     for (uint8_t i = 0; i < MAX_SENSORS; i++) {
@@ -236,9 +278,10 @@ bool ism330dhcx_read_accelerometer(i2c_inst_t* i2c_port, uint8_t device_addr, Fu
     int16_t raw_acc_y = combine_8_bits(raw_acc_values[2], raw_acc_values[3]);
     int16_t raw_acc_z = combine_8_bits(raw_acc_values[4], raw_acc_values[5]);
 
-    fusion_vector->axis.x = ((float)raw_acc_x/32768.0f)*(float)XL_G_RANGE;
-    fusion_vector->axis.y = ((float)raw_acc_y/32768.0f)*(float)XL_G_RANGE;
-    fusion_vector->axis.z = ((float)raw_acc_z/32768.0f)*(float)XL_G_RANGE;
+    const float range = imu_reader_settings.accelRangeG;
+    fusion_vector->axis.x = ((float)raw_acc_x/32768.0f)*range;
+    fusion_vector->axis.y = ((float)raw_acc_y/32768.0f)*range;
+    fusion_vector->axis.z = ((float)raw_acc_z/32768.0f)*range;
     return true;
 }
 
@@ -256,14 +299,15 @@ static bool ism330dhcx_read_motion(i2c_inst_t* i2c_port, uint8_t device_addr,
     const int16_t raw_acc_y = combine_8_bits(raw_values[8], raw_values[9]);
     const int16_t raw_acc_z = combine_8_bits(raw_values[10], raw_values[11]);
 
-    const float gyro_range = (imu_reader_settings.gyroRangeDps > 0.0f) ? imu_reader_settings.gyroRangeDps : 500.0f;
+    const float gyro_range = imu_reader_settings.gyroRangeDps;
     gyroscope->axis.x = ((float)raw_gyro_x / 32768.0f) * gyro_range;
     gyroscope->axis.y = ((float)raw_gyro_y / 32768.0f) * gyro_range;
     gyroscope->axis.z = ((float)raw_gyro_z / 32768.0f) * gyro_range;
 
-    accelerometer->axis.x = ((float)raw_acc_x / 32768.0f) * (float)XL_G_RANGE;
-    accelerometer->axis.y = ((float)raw_acc_y / 32768.0f) * (float)XL_G_RANGE;
-    accelerometer->axis.z = ((float)raw_acc_z / 32768.0f) * (float)XL_G_RANGE;
+    const float accel_range = imu_reader_settings.accelRangeG;
+    accelerometer->axis.x = ((float)raw_acc_x / 32768.0f) * accel_range;
+    accelerometer->axis.y = ((float)raw_acc_y / 32768.0f) * accel_range;
+    accelerometer->axis.z = ((float)raw_acc_z / 32768.0f) * accel_range;
     return true;
 }
 

@@ -7,10 +7,14 @@
 
 #define FRAME_SYNC_0 0xAA
 #define FRAME_SYNC_1 0x55
-#define FRAME_TYPE_DATA 1
 #define FRAME_TYPE_CTRL 2
-#define FRAME_TYPE_DESC 3
 #define FRAME_TYPE_CAL_REPORT 5
+// Data and descriptor frames both grew, so both moved to a new type rather than
+// changing length under the old one. A host that only knows the old types sees
+// unknown frames instead of silently misreading a longer payload, and types 1
+// and 3 stay reserved for the host to keep parsing older firmware.
+#define FRAME_TYPE_DATA_V2 4
+#define FRAME_TYPE_DESC_V2 6
 
 static bool cdc_send_frame_best_effort(const uint8_t *frame, size_t len, bool drop_if_full) {
     if (!tud_cdc_connected()) {
@@ -66,8 +70,11 @@ static bool cdc_send_frame_best_effort(const uint8_t *frame, size_t len, bool dr
 }
 
 // Binary data frame:
-// [0xAA 0x55] [frame_type:1] [count:1] [timestamp_us:4] [sensor0..N: 7 floats each] [checksum:2]
-// Each sensor: w, x, y, z (quaternion), gx, gy, gz (gyro dps)
+// [0xAA 0x55] [frame_type:1] [count:1] [timestamp_us:4] [sensor0..N: 10 floats each] [checksum:2]
+// Each sensor: w, x, y, z (quaternion), gx, gy, gz (gyro dps), ax, ay, az (accel g)
+//
+// At 4 sensors this is 170 bytes; 200 Hz of it is ~34 kB/s, comfortably inside
+// both the 1 kB CDC TX FIFO and USB full-speed bulk throughput.
 
 void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR], uint8_t sensor_count) {
     if (sensor_count > MAX_SENSORS) {
@@ -81,7 +88,7 @@ void print_output_data(uint64_t ts_us, float sensors_data[][FLOATS_PER_SENSOR], 
     // Sync + header
     frame[idx++] = FRAME_SYNC_0;
     frame[idx++] = FRAME_SYNC_1;
-    frame[idx++] = FRAME_TYPE_DATA;
+    frame[idx++] = FRAME_TYPE_DATA_V2;
     frame[idx++] = sensor_count;
 
     // Timestamp (truncated to 32-bit, wraps every ~71 minutes)
@@ -126,21 +133,35 @@ void send_control_msg(uint8_t msg_type) {
 }
 
 // Send a one-shot descriptor frame so the host can map stream index -> bus/address.
-// Frame: [0xAA 0x55] [frame_type=3] [count:1] [sample_rate_hz:2] [bus,addr]*N [checksum:2]
+// Frame: [0xAA 0x55] [frame_type=6] [count:1] [sample_rate_hz:2]
+//        [gyro_range_dps:4] [accel_range_g:4] [bus,addr]*N [checksum:2]
+//
+// The full scales ride along so a logged strip carries the range its raw counts
+// were converted with. Without that, judging headroom from a recording means
+// remembering which firmware was flashed at the time.
 void send_descriptor_frame(uint16_t sample_rate_hz, uint8_t sensor_count, const uint8_t *bus_ids, const uint8_t *device_addrs) {
     if (sensor_count > MAX_SENSORS) {
         sensor_count = MAX_SENSORS;
     }
 
-    uint8_t frame[4 + 2 + (MAX_SENSORS * 2) + 2];
+    uint8_t frame[4 + 2 + (2 * sizeof(float)) + (MAX_SENSORS * 2) + 2];
     size_t idx = 0;
 
     frame[idx++] = FRAME_SYNC_0;
     frame[idx++] = FRAME_SYNC_1;
-    frame[idx++] = FRAME_TYPE_DESC;
+    frame[idx++] = FRAME_TYPE_DESC_V2;
     frame[idx++] = sensor_count;
     memcpy(&frame[idx], &sample_rate_hz, sizeof(sample_rate_hz));
     idx += sizeof(sample_rate_hz);
+
+    // Read the normalized ranges rather than taking them as parameters: this is
+    // the same global the conversion path scales with, so the two cannot drift.
+    const float gyro_range_dps = imu_reader_settings.gyroRangeDps;
+    const float accel_range_g = imu_reader_settings.accelRangeG;
+    memcpy(&frame[idx], &gyro_range_dps, sizeof(float));
+    idx += sizeof(float);
+    memcpy(&frame[idx], &accel_range_g, sizeof(float));
+    idx += sizeof(float);
 
     for (uint8_t i = 0; i < sensor_count; i++) {
         frame[idx++] = bus_ids[i];

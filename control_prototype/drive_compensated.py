@@ -56,7 +56,7 @@ from simple_drive import (
     PRINT_DECIMATION,
     SAMPLING_FREQUENCY,
     STATUS_PRINT_INTERVAL_S,
-    STRIP_MINUTES,
+    RECORD_MINUTES,
     BTN_A, BTN_B, BTN_X, BTN_Y,
     BTN_DPAD_DOWN, BTN_DPAD_UP,
     DataLogger,
@@ -285,7 +285,7 @@ def main():
     mask_prev     = 0
 
     last_status_time = time.time()
-    last_strip_time  = time.time()
+    record_start_time = None
     print_imu        = False
     iter_count       = 0
 
@@ -313,18 +313,19 @@ def main():
 
                 if btn(BTN_A) and not prev(BTN_A):
                     if not logger.is_logging:
+                        sine_gen.reseed()
                         logger.start()
-                        last_strip_time = now
+                        record_start_time = now
                     else:
-                        logger.save_with_pause(direct)
-                        logger.is_logging = False
+                        logger.stop_and_save(direct)
+                        record_start_time = None
 
                 if btn(BTN_B) and not prev(BTN_B):
                     sine_gen.toggle()
                     if sine_gen.enabled:
                         # Params are re-drawn on every enable, so note the seed:
                         # it is what makes a strip's excitation reproducible.
-                        print(f"\n[Button B] Sine ON (amp={sine_gen.amplitude_scale:.2f} "
+                        print(f"\n[Button B] Sine ON (target={sine_gen.target_name} "
                               f"seed={sine_gen.seed})")
                     else:
                         print("\n[Button B] Sine OFF")
@@ -347,8 +348,8 @@ def main():
 
                 for bit, step in ((BTN_DPAD_UP, +1), (BTN_DPAD_DOWN, -1)):
                     if btn(bit) and not prev(bit):
-                        sine_gen.step_amplitude(step)
-                        print(f"\n[D-pad] Sine amplitude → {sine_gen.amplitude_scale:.2f}")
+                        sine_gen.step_target(step)
+                        print(f"\n[D-pad] Sine target → {sine_gen.target_name}")
 
                 mask_prev = mask
 
@@ -403,12 +404,17 @@ def main():
                     cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
                 logger.log_sample(manual, sine, combined, controller, hardware,
                                   cmd_age_s, cmd_stale, sine_gen.enabled,
-                                  sine_gen.amplitude_scale, sine_gen.seed)
+                                  sine_gen.target_name, sine_gen.seed)
 
-            # ── 7. strip rollover ─────────────────────────────────────────────
-            if is_logging and (now - last_strip_time) >= STRIP_MINUTES * 60:
-                last_strip_time = now
-                logger.save_with_pause(direct)
+            # ── 7. auto-stop ──────────────────────────────────────────────────
+            # Ends the recording rather than rolling into a continuation file,
+            # so the machine gets a cooling pause between sets.
+            if is_logging and record_start_time is not None \
+                    and (now - record_start_time) >= RECORD_MINUTES * 60:
+                logger.stop_and_save(direct)
+                record_start_time = None
+                print(f"[REC] stopped ({RECORD_MINUTES:.0f} min reached). "
+                      f"Press A to record the next set.")
 
             # ── 8. IMU print (decimated) ──────────────────────────────────────
             iter_count += 1
@@ -422,12 +428,13 @@ def main():
             if now - last_status_time >= STATUS_PRINT_INTERVAL_S:
                 last_status_time = now
                 pump_on  = bool(pwm and pwm.pump_enabled)
-                sine_str = (f"ON amp={sine_gen.amplitude_scale:.2f} seed={sine_gen.seed}"
-                            if sine_gen.enabled else "OFF")
+                sine_str = (f"ON target={sine_gen.target_name} seed={sine_gen.seed}"
+                            if sine_gen.enabled else f"OFF (target={sine_gen.target_name})")
                 print(
                     f"[STATUS] comp={args.comp} | pump={'ON' if pump_on else 'OFF'} | "
                     f"sine={sine_str} | "
-                    + (f"log=ON {logger.elapsed_min():.1f}min {logger.n_samples()} samples"
+                    + (f"log=ON {logger.elapsed_min():.1f}/{RECORD_MINUTES:.0f}min "
+                       f"{logger.n_samples()} samples"
                        if is_logging else "log=OFF")
                     + ("" if source.is_live() else f" | *** {source.name} INPUT LOST ***")
                 )

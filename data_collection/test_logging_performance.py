@@ -359,7 +359,7 @@ def main():
                 controller, hardware,
                 cmd_age_s=0.0, cmd_stale=False,
                 sine_enabled=sine_gen.enabled,
-                sine_amp=sine_gen.amplitude_scale,
+                sine_target=sine_gen.target_name,
                 sine_seed=sine_gen.seed,
             )
             log_sample_times_ms.append((time.perf_counter() - log_start) * 1000.0)

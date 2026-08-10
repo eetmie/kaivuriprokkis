@@ -47,8 +47,21 @@ simple_drive.py surface, no IK/PID in the loop.
 ```bash
 .venv-lerobot/bin/python -m lerobot_vla.record_episodes \
     --task "scoop sand and dump it to the left" \
-    --repo-id masi/excavator_sand_v0
+    --repo-id masi/excavator_sand_v0 --exposure-us 16000
 ```
+
+**Lock the exposure.** Auto-exposure drifts with the scene, which the policy
+then has to learn around. Find a value with the sweep tool (headless: writes
+PNGs + clip stats to inspect from another machine), then pass the same
+`--exposure-us` to BOTH record_episodes and run_inference:
+
+```bash
+.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --out /tmp/ir_sweep
+```
+
+Target mean ~80–130 with clip-hi under ~1%; at 30 fps the ceiling is
+~33 000 µs. With the work lights on, **16 000 µs @ gain 16** measured right
+(2026-08-10); re-sweep if the lighting setup changes.
 
 Sticks = same mapping as simple_drive.py (left = slew/tilt, right = lift/scoop).
 Buttons: **A** start / stop+save episode · **B** discard episode · **X** pump ·
@@ -72,6 +85,19 @@ print(ds[0]["observation.state"], ds[0]["task"])
 EOF
 ```
 
+Inspect episodes visually from another machine (the Jetson is headless):
+
+```bash
+.venv-lerobot/bin/lerobot-dataset-viz \
+    --repo-id masi/excavator_sand_v0 \
+    --root data_collection/lerobot_datasets/masi_excavator_sand_v0 \
+    --episode-index 0 --mode distant
+# then open http://<jetson-ip>:9090 in any browser on the LAN
+```
+
+(Alternatively the mp4s under `videos/` play in VLC directly, or `--save 1`
+writes an .rrd for the Rerun desktop app.)
+
 Then rsync the dataset directory to the Spark and point `lerobot-train` at it
 (`--dataset.repo_id=masi/excavator_sand_v0 --dataset.root=...`).
 
@@ -87,7 +113,7 @@ TRT_DROP_CUDA_EP=1 .venv-lerobot/bin/python -m lerobot_vla.run_inference --synth
 
 # real observations, actions PRINTED only (safe default):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
-    --instruction "scoop sand and dump it to the left"
+    --instruction "scoop sand and dump it to the left" --exposure-us 16000
 
 # actually drive the valves (only with a finetuned checkpoint!):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference --live \
@@ -101,8 +127,15 @@ and `--dataset-stats` at the training dataset's stats for correct
 state/action normalization. Base weights produce meaningless actions — they
 only prove the loop and its latency.
 
-`TRT_DROP_CUDA_EP=1` keeps the one-time engine build inside 8 GB; once
-`/tmp/smolvla_split_cache` holds the engines, run without it.
+Engines are pre-built automatically, one subprocess per graph (two TRT builds
+in one process OOM 8 GB), into `/tmp/smolvla_split_cache` — note /tmp clears
+on reboot, so the first run after boot rebuilds (~5 min). RAM is tight:
+run ONE thing at a time (never viz or recording alongside an engine build).
+
+**fps vs inference rate:** the policy is chunked — one ~220 ms inference emits
+50 actions that execute open-loop at the dataset fps (30 Hz). The camera is
+only *read* at each re-plan; `--n-action-steps` (default 25 ≈ 0.8 s) sets how
+often the robot re-looks, so ~4.5 Hz inference capability is plenty.
 
 ## Files
 

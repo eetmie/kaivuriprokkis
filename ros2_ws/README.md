@@ -429,3 +429,117 @@ ros2 bag record \
   /kaivuri/episode_event \
   /kaivuri/task_instruction
 ```
+
+## LeRobot ROS Workflow
+
+These commands are for recording LeRobot datasets from ROS 2, visualizing the
+recorded data, training a SmolVLA policy, and running the trained policy through
+`lerobot_ros`.
+
+Before running the ROS commands, make sure the ROS 2 workspace is built and
+sourced in the terminal that will run the services:
+
+```bash
+cd C:/Users/sh25016/Documents/kaivuriprokkis/ros2_ws
+source install/setup.bash
+```
+
+### Record Data
+
+Start the LeRobot ROS recorder with the Kaivuri config:
+
+```bash
+python -c "import cv2, runpy; runpy.run_module('lerobot_ros.recorder', run_name='__main__')" --ros-args -p config:=C:/Users/sh25016/Documents/kaivuriprokkis/ros2_ws/lerobot_ros/config/kaivuri/kaivuri.toml
+```
+
+In another sourced ROS 2 terminal, create a new dataset. Change `repo_id` for
+each new recording:
+
+```bash
+ros2 service call /new_dataset lerobot_interfaces/srv/NewDataset "{repo_id: 'kaivuri/ros2_recording_9', resume: false}"
+```
+
+Store recorded episodes:
+
+```bash
+ros2 service call /store_episodes std_srvs/srv/Trigger "{}"
+```
+
+Finalize the dataset when recording is complete:
+
+```bash
+ros2 service call /finalize_dataset std_srvs/srv/Trigger "{}"
+```
+
+### Visualize Dataset
+
+Use the LeRobot dataset visualizer to inspect a recorded episode. Update
+`--repo-id`, `--episode-index`, and `--root` to match the dataset to inspect:
+
+```bash
+python -m lerobot.scripts.lerobot_dataset_viz --repo-id kaivuri/ros2_recording_14 --episode-index 0 --root C:/Users/sh25016/kaivuri_lerobot_ros/kaivuri/ros2_recording_14 --tolerance-s 0.2
+```
+
+### Download SmolVLA Base Model
+
+Download the base model once before training:
+
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='lerobot/smolvla_base', local_dir='C:/Users/sh25016/hf_models/smolvla_base')"
+```
+
+### Train Model
+
+Train a policy from a recorded dataset. Update the dataset id, dataset root,
+output directory, job name, batch size, and number of steps as needed:
+
+```bash
+python -c "import cv2, runpy; runpy.run_module('lerobot.scripts.lerobot_train', run_name='__main__')" --policy.path=C:/Users/sh25016/hf_models/smolvla_base --dataset.repo_id=kaivuri/ros2_recording_23 --dataset.root=C:/Users/sh25016/kaivuri_lerobot_ros/kaivuri/ros2_recording_23 --batch_size=8 --steps=20000 --output_dir=C:/Users/sh25016/kaivuri_smolvla_policy_1 --job_name=kaivuri_smolvla_policy_1 --policy.device=cuda --wandb.enable=false --policy.push_to_hub=false --save_freq=2000
+```
+
+### Run Policy
+
+Before starting the policy controller, make sure the
+`policies."touch_red_cube"` paths in
+`lerobot_ros/config/kaivuri/kaivuri.toml` point to the trained checkpoint and
+dataset stats.
+
+Start the policy controller:
+
+```bash
+ros2 run lerobot_ros policy_controller --ros-args \
+  -p config:=C:/Users/sh25016/Documents/kaivuriprokkis/ros2_ws/lerobot_ros/config/kaivuri/kaivuri.toml
+```
+
+List available policies:
+
+```bash
+ros2 service call /list_policies lerobot_interfaces/srv/ListPolicies
+```
+
+Select the active policy:
+
+```bash
+ros2 service call /set_active_policy lerobot_interfaces/srv/SetActivePolicy "{policy_name: 'touch_red_cube'}"
+```
+
+Start inference:
+
+```bash
+ros2 service call /set_policy_running std_srvs/srv/SetBool "{data: true}"
+```
+
+Stop inference:
+
+```bash
+ros2 service call /set_policy_running std_srvs/srv/SetBool "{data: false}"
+```
+
+For the current config, `policy_controller` publishes actions to:
+
+```text
+/kaivuri/target_pose_y
+```
+
+The IK node must be running and listening to `/kaivuri/target_pose_y` before
+starting inference.

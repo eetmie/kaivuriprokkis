@@ -16,7 +16,7 @@ import time
 import threading
 import numpy as np
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Sequence, Tuple, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -36,6 +36,7 @@ from .ik import (
 from .reachability import ReachabilityResult
 from .perf_tracker import ControlLoopPerfTracker
 from .rt_utils import apply_rt_to_thread, SCHED_FIFO
+from .setpoint_schedule import SetpointSchedule
 
 # Load settings
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +59,10 @@ _Y_AXIS = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 # Maps joint name → index into the 4-element joint velocity array.
 # slew and trackL/trackR are pass-through in all modes.
 _VEL_CMD_JOINTS: Dict[str, int] = {'boom': 1, 'arm': 2, 'bucket': 3}
+
+# Default channel order for direct-command mode. Matches the dataset/logical
+# order used by lerobot_vla (slew, lift, tilt, scoop) one-to-one.
+_DIRECT_CMD_JOINTS = ('slew', 'boom', 'arm', 'bucket')
 
 
 def _angle_error(target: float, current: float) -> float:
@@ -682,6 +687,15 @@ class ExcavatorController:
         self._vel_cmd_lock = threading.Lock()
         self._vel_cmd_integrals: Dict[str, float] = {j: 0.0 for j in _VEL_CMD_JOINTS}
 
+        # Direct command mode: open-loop valve commands from a slow producer
+        # (gamepad, VLA policy), resampled onto this thread's fixed rate by a
+        # SetpointSchedule. See modules/setpoint_schedule.py for why the write
+        # has to happen every tick rather than only when a command arrives.
+        self._direct_cmd_mode = False
+        self._direct_schedule = SetpointSchedule(_DIRECT_CMD_JOINTS)
+        self._direct_last_sample = None
+        self._direct_decayed_warned = False
+
         # Debug telemetry (data capture for detailed logging/analysis)
         self._last_pi_outputs = None
         self._last_named_commands = None
@@ -1152,6 +1166,7 @@ class ExcavatorController:
         for pid in self.joint_pids:
             pid.reset()
         with self._lock:
+            self._direct_cmd_mode = False
             self._output_suspended = True
         self._outputs_zeroed = False
         self.logger.info("IK output suspended (DirectController owns PWM bus)")
@@ -1173,17 +1188,33 @@ class ExcavatorController:
         self.give_pose(self._current_position, self._current_orientation_y_deg)
 
         with self._lock:
+            self._direct_cmd_mode = False
             self._output_suspended = False
         self._outputs_zeroed = False
         self.logger.info("IK output resumed (synced to measured pose)")
 
     def emergency_stop(self, reset_pump: bool = True) -> None:
-        """Immediately center valve outputs and optionally stop the pump."""
+        """Immediately center valve outputs and optionally stop the pump.
+
+        Direct-command mode is dropped and must be re-entered explicitly; an
+        e-stop should require a deliberate re-arm, not resume on its own.
+        """
         with self._lock:
             self._raw_target_position = None
             self._raw_target_rotation_deg = None
             self._target_position = None
             self._target_orientation = None
+            self._direct_cmd_mode = False
+            schedule = self._direct_schedule
+        # Drop the held command sources too. Centering the hardware is not
+        # enough on its own: the next control tick re-sends whatever setpoint
+        # is still held, which would undo the stop within 10 ms — and in direct
+        # mode that write would also bring the pump back out of its reset.
+        schedule.clear()
+        with self._vel_cmd_lock:
+            self._vel_cmd_commands = {}
+            for k in self._vel_cmd_integrals:
+                self._vel_cmd_integrals[k] = 0.0
         self._outputs_zeroed = True
         self.hardware.reset(reset_pump=reset_pump)
 
@@ -1200,6 +1231,7 @@ class ExcavatorController:
                 self._vel_cmd_integrals[k] = 0.0
         with self._lock:
             self._output_suspended = False
+            self._direct_cmd_mode = False
             self._vel_cmd_mode = True
         self._outputs_zeroed = False
         self.logger.info("Entered velocity command mode")
@@ -1272,6 +1304,123 @@ class ExcavatorController:
 
         self.hardware.send_named_pwm_commands(output)
         self._outputs_zeroed = False
+
+    # -------------- Direct command mode (open-loop, rate-decoupled) --------------
+
+    def enter_direct_command_mode(self, *, hold_timeout_s: float = 0.25,
+                                  decay_s: float = 0.25,
+                                  blend_s: float = 0.0,
+                                  joint_names: Optional[Sequence[str]] = None) -> None:
+        """Drive open-loop valve commands from a slow producer at the loop rate.
+
+        The producer (gamepad, VLA policy, UDP client) calls
+        :meth:`give_direct_commands` or :meth:`give_direct_chunk` at whatever
+        rate it manages; this control thread resamples that setpoint onto its
+        own fixed ``control_hz`` and writes the valves every single tick.
+
+        That fixed-rate write is the whole point. The PWM layer's dither phase,
+        ramp integration, stale-command watchdog and input-rate gate all
+        advance only when it is called, so a producer that writes directly at
+        30 Hz aliases the dither and trips the rate gate. See
+        :mod:`modules.setpoint_schedule`.
+
+        Args:
+            hold_timeout_s: Setpoint age at which the command starts decaying.
+                Must exceed the producer's nominal period with margin.
+            decay_s: Ramp-to-zero window once ``hold_timeout_s`` is passed.
+            blend_s: Optional cross-fade into each new setpoint, to soften the
+                step at a policy chunk boundary. 0.0 disables it.
+            joint_names: Channels this mode drives. Defaults to
+                ``('slew', 'boom', 'arm', 'bucket')``.
+        """
+        names = list(joint_names) if joint_names is not None else list(_DIRECT_CMD_JOINTS)
+        schedule = SetpointSchedule(names, hold_timeout_s=hold_timeout_s,
+                                    decay_s=decay_s, blend_s=blend_s)
+        with self._lock:
+            self._direct_schedule = schedule
+            self._direct_last_sample = None
+            self._direct_decayed_warned = False
+            self._output_suspended = False
+            self._vel_cmd_mode = False
+            self._direct_cmd_mode = True
+        self._outputs_zeroed = False
+        self.logger.info(
+            "Entered direct command mode (%s, hold=%.3fs decay=%.3fs blend=%.3fs)",
+            ",".join(names), hold_timeout_s, decay_s, blend_s)
+
+    def exit_direct_command_mode(self) -> None:
+        """Leave direct-command mode and neutralise outputs."""
+        with self._lock:
+            self._direct_cmd_mode = False
+            schedule = self._direct_schedule
+        schedule.clear()
+        self.hardware.reset(reset_pump=False)
+        self._outputs_zeroed = True
+        self.logger.info("Exited direct command mode")
+
+    def give_direct_commands(self, commands: Dict[str, float]) -> None:
+        """Set the held valve setpoint. Non-blocking: no I/O on the caller's thread.
+
+        Args:
+            commands: {channel_name: normalized [-1, 1]}.
+        """
+        self._direct_schedule.set_point(commands)
+        self._outputs_zeroed = False
+
+    def give_direct_chunk(self, chunk, fps: float,
+                          joint_names: Optional[Sequence[str]] = None) -> None:
+        """Hand over an action chunk to play as a trajectory.
+
+        The chunk is a trajectory authored at ``fps`` (the policy's action
+        rate), not a single setpoint — the control thread indexes into it by
+        elapsed time and interpolates between adjacent steps, so a 30 Hz plan
+        drives the valves at the full loop rate without a staircase.
+
+        Args:
+            chunk: (N, J) normalized valve commands in [-1, 1].
+            fps: Rate the chunk's steps were authored at.
+            joint_names: Column names; defaults to the mode's channel order.
+        """
+        self._direct_schedule.set_chunk(chunk, fps, joint_names=joint_names)
+        self._outputs_zeroed = False
+
+    def get_direct_status(self) -> dict:
+        """Telemetry for the held setpoint: age, decay, chunk position."""
+        sample = self._direct_last_sample
+        with self._lock:
+            active = self._direct_cmd_mode
+        if sample is None:
+            return {'active': active, 'age_s': float('inf'), 'decay': 0.0,
+                    'exhausted': True, 'chunk_pos': None, 'commands': {}}
+        return {
+            'active': active,
+            'age_s': sample.age_s,
+            'decay': sample.decay,
+            'exhausted': sample.exhausted,
+            'chunk_pos': sample.chunk_pos,
+            'commands': dict(sample.commands),
+        }
+
+    def _send_direct_commands(self) -> None:
+        """Resample the held setpoint and write it. Runs every control tick."""
+        sample = self._direct_schedule.sample()
+
+        # Unconditional write, including when the command is all zeros. The
+        # usual _outputs_zeroed short-circuit is deliberately NOT used here:
+        # skipping the write is what starves the PWM watchdog and the input
+        # rate gate, which is the failure this mode exists to fix.
+        self.hardware.send_named_pwm_commands(sample.commands)
+        self._direct_last_sample = sample
+        self._outputs_zeroed = False
+
+        if sample.decay < 1.0 and not self._direct_decayed_warned:
+            self._direct_decayed_warned = True
+            self.logger.warning(
+                "Direct setpoint stale (age %.3fs) — decaying to zero (%.2f)",
+                sample.age_s, sample.decay)
+        elif sample.decay >= 1.0 and self._direct_decayed_warned:
+            self._direct_decayed_warned = False
+            self.logger.info("Direct setpoint fresh again")
 
     def get_ik_debug_info(self) -> dict:
         """Return IK telemetry such as adaptive damping and condition number."""
@@ -1388,11 +1537,18 @@ class ExcavatorController:
                 with self._lock:
                     output_suspended = self._output_suspended
                     vel_cmd_mode = self._vel_cmd_mode
+                    direct_cmd_mode = self._direct_cmd_mode
 
                 if output_suspended:
                     # Caller (DirectController) owns the PWM bus; we keep
                     # state fresh but write nothing this tick.
                     pass
+                elif direct_cmd_mode:
+                    # Direct command mode: resample the held setpoint onto this
+                    # loop's fixed rate and write it every tick.
+                    self._perf_tracker.stage_start('pwm')
+                    self._send_direct_commands()
+                    self._perf_tracker.stage_end('pwm')
                 elif vel_cmd_mode:
                     # Velocity command mode: PI tracks desired joint velocities
                     self._perf_tracker.stage_start('pwm')

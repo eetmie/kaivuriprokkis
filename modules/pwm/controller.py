@@ -551,22 +551,6 @@ class PWMController:
             self._direct_writer.set_channel(channel, count)
         self._direct_writer.flush()
 
-    def _update_channels(self):
-        with self._lock:
-            now = time.time()
-            for name, config in self.channel_configs.items():
-                if not self.toggle_channels and config.toggleable:
-                    continue
-
-                value = self.values[config.output_channel]
-                pulse = self._pulse_from_value(config, value, now, apply_ramp=True)
-
-                # Convert to native PCA9685 count and queue for batch write
-                count = self._count_from_pulse_us(pulse)
-                self._current_pulse_us[config.output_channel] = pulse
-                self._direct_writer.set_channel(config.output_channel, count)
-            # Note: flush is called by update_named after _update_pump queues pump
-
     def update_named_us(self, commands: Dict[str, float], *, unset_to_center: Optional[bool] = None,
                         command_ts: Optional[float] = None):
         """Send name-based direct pulse-width commands in microseconds.
@@ -650,7 +634,7 @@ class PWMController:
         Optional ramp limits slew rate so even deadband jumps are spread over time.
         """
         if now is None:
-            now = time.time()
+            now = time.monotonic()
 
         # Enforce input deadzone locally so preview/compute_pulse() honors it too
         value = self._apply_deadzone(value, float(getattr(config, 'deadzone_threshold', 0.0)))
@@ -1075,7 +1059,11 @@ class PWMController:
         self.logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     def _init_ramp_state(self):
-        now = time.time()
+        # monotonic, to match the clock _collect_channel_counts stamps ramp
+        # state with. Seeding from time.time() made the first ramped tick after
+        # every reset()/reload_config() see a negative dt (epoch vs uptime),
+        # clamp it to zero, and hold the channel at center for that tick.
+        now = time.monotonic()
         self._channel_ramp_state: Dict[int, tuple[float, float, float]] = {}
         for cfg in self.channel_configs.values():
             self._channel_ramp_state[cfg.output_channel] = (float(cfg.center), now, 0.0)

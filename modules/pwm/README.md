@@ -30,6 +30,16 @@ HardwareInterface
 
 Normalized commands apply deadzone, gamma, deadband mapping, ramp, and dither. Direct-us commands bypass those modifiers but still use controller safety checks and config pulse clamps.
 
+## Call Rate Is Part of the Contract
+
+`PWMController` has no clock of its own. Dither phase, ramp integration, the stale-command watchdog and the input-rate gate all advance **only when `update_named()` is called**, so the output is a function of the caller's rate, not just the command values:
+
+- Dither is sampled at the call rate. The Jetson config runs `dither_hz: 33`; calling at 100 Hz gives ~3 samples per cycle, while calling at 30 Hz aliases it to a ~3 Hz wobble worth roughly 13% of boom's command authority.
+- Falling below `input_rate_threshold` sets `is_safe_state = False`, after which `update_named()` returns early and **silently discards every command** until the measured rate recovers.
+- `stale_timeout_s` centers all channels if calls stop for that long.
+
+So a slow or bursty producer (a VLA policy, a recording loop that also encodes video) must not drive this class directly. Hand setpoints to `ExcavatorController.enter_direct_command_mode()` instead: its control thread resamples them onto a fixed `control_hz` and calls `update_named()` every tick. See `modules/setpoint_schedule.py`.
+
 ## Safety Ownership
 
 Use `PWMController` or `HardwareInterface` for normal control. These paths keep stale-command handling, rate checks, pulse clamping, pump state, and reset behavior active.

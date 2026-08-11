@@ -12,6 +12,15 @@ Per frame (at --fps, default 30):
     action                   float32[4]  normalized valve cmds actually sent [-1,1]
     task                     the natural-language instruction (--task)
 
+This loop runs at --fps because that is the dataset frame rate. It does NOT
+drive the valves at that rate: the recorded action is handed to
+ExcavatorController's direct-command mode as a setpoint, and its 100 Hz thread
+writes the hardware. That is what makes the dataset valid for deployment —
+recording and inference push setpoints through the identical fixed-rate writer,
+so the action->motion mapping the policy learns is the one it will get back.
+Driving I2C straight from this loop (the old behaviour) made that mapping
+depend on whatever rate the loop happened to hit between video encodes.
+
 Button controls (same layout as simple_drive.py):
     A: start episode / stop + SAVE episode
     B: stop + DISCARD current episode (re-record)
@@ -102,6 +111,9 @@ def main() -> int:
                    help="IR sensor gain 16..248 (only with --exposure-us)")
     p.add_argument("--resume", action="store_true",
                    help="Append to an existing dataset instead of creating a new one")
+    p.add_argument("--legacy-direct-write", action="store_true",
+                   help="Drive valves from this loop instead of the control "
+                        "thread (bench A/B only — do not record with this)")
     args = p.parse_args()
 
     root = Path(args.root) if args.root else DEFAULT_ROOT / args.repo_id.replace("/", "_")
@@ -139,9 +151,16 @@ def main() -> int:
         print(f"[dataset] Created {root}")
 
     # ── hardware ─────────────────────────────────────────────────────────────
+    # The gamepad is polled at --fps, so the setpoint hold has to cover a few
+    # missed frames without decaying. 0.15 s ≈ 4 frames at 30 Hz: long enough to
+    # ride out a video-encode hiccup, short enough that a dropped gamepad or a
+    # wedged loop ramps the valves down in well under a second.
     robot = MasiExcavator(profile=args.robot,
                           camera_config=cam_cfg,
-                          enable_slew=not args.no_slew)
+                          enable_slew=not args.no_slew,
+                          use_control_thread=not args.legacy_direct_write,
+                          setpoint_hold_s=max(0.1, 4.0 / args.fps),
+                          setpoint_decay_s=0.2)
     robot.connect()
 
     pad = LocalGamepadInput()
@@ -227,10 +246,17 @@ def main() -> int:
                 last_status = now
                 ja = robot.get_joint_angles()
                 state = (f"REC ep{saved_eps} {ep_frames} frames" if recording else "idle")
+                sp = robot.get_setpoint_status()
+                # decay < 1 means this loop is not feeding setpoints fast enough
+                # and the control thread is ramping the valves down.
+                sp_str = ("" if sp['decay'] >= 1.0
+                          else f" | *** SETPOINT STALE {sp['age_s']:.2f}s "
+                               f"decay={sp['decay']:.2f} ***")
                 print(f"[STATUS] {state} | pump={'ON' if robot.pump_enabled else 'OFF'} | "
                       f"slew={ja[0]:+.1f} lift={ja[1]:+.1f} tilt={ja[2]:+.1f} "
                       f"scoop={ja[3]:+.1f} deg"
-                      + ("" if pad.is_live() else " | *** GAMEPAD LOST ***"))
+                      + ("" if pad.is_live() else " | *** GAMEPAD LOST ***")
+                      + sp_str)
 
             next_tick += period
             sleep = next_tick - time.perf_counter()

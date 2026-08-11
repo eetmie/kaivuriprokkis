@@ -11,9 +11,18 @@ Modes (safety ladder):
                     weights produce garbage actions — do not use --live until a
                     finetuned checkpoint is in place and the pump is your call.
 
-The policy emits a 50-step action chunk per observation; we execute the first
---n-action-steps of it open-loop at --fps, then re-infer. With ~0.2 s
-inference and 25 steps at 30 Hz this re-plans roughly every 1 s.
+The policy emits a 50-step action chunk per observation; we hand the first
+--n-action-steps of it to the controller as a trajectory at --fps and re-infer
+while it plays. With ~0.2 s inference and 25 steps at 30 Hz this re-plans
+roughly every 0.8 s.
+
+The chunk is NOT replayed step-by-step from this thread. It is handed to
+ExcavatorController's direct-command mode, whose 100 Hz control thread indexes
+into it by elapsed time and interpolates. This thread only has to produce the
+next chunk before the current one runs out — inference being far slower than
+the valve update rate is exactly what that split is for. Re-inference starts
+early by the measured inference time, so the schedule does not go stale in the
+gap; if it does anyway, the held command decays to zero rather than latching.
 
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds.
@@ -80,6 +89,17 @@ def main() -> int:
     p.add_argument("--loops", type=int, default=0,
                    help="Stop after N infer+execute cycles (0 = run until Ctrl+C)")
     p.add_argument("--seed", type=int, default=None, help="Fix the denoise noise seed")
+    p.add_argument("--setpoint-hold-s", type=float, default=0.25,
+                   help="How long a chunk's last action holds full authority "
+                        "after the chunk runs out, before decaying to zero")
+    p.add_argument("--setpoint-decay-s", type=float, default=0.25,
+                   help="Ramp-to-zero window once the setpoint goes stale")
+    p.add_argument("--blend-s", type=float, default=0.0,
+                   help="Cross-fade into each new chunk, to soften the step at "
+                        "a chunk boundary (0 = apply immediately)")
+    p.add_argument("--legacy-direct-write", action="store_true",
+                   help="Drive valves from this thread instead of the control "
+                        "thread (bench A/B only — has the 30 Hz rate problems)")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -102,7 +122,11 @@ def main() -> int:
         robot = MasiExcavator(
             profile=args.robot,
             camera_config=IRCameraConfig(exposure_us=args.exposure_us,
-                                         gain=args.gain))
+                                         gain=args.gain),
+            use_control_thread=not args.legacy_direct_write,
+            setpoint_hold_s=args.setpoint_hold_s,
+            setpoint_decay_s=args.setpoint_decay_s,
+            setpoint_blend_s=args.blend_s)
         robot.connect()
         if args.live:
             LOG.warning("LIVE MODE: actions will drive the valves. Pump is under "
@@ -125,39 +149,56 @@ def main() -> int:
     policy.sample_actions(img, args.instruction, state)
     LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
 
-    period = 1.0 / args.fps
     cycle = 0
+    # Start re-inference this far before the current chunk ends, so the next one
+    # is ready when it runs out. Tracked as a decaying max of measured inference
+    # time; the first cycle sets it from its own measurement. Not seeded from
+    # the warmup — that one includes the TRT engine build.
+    infer_lead_s = 0.0
     try:
         while True:
             img, state = get_observation()
             t0 = time.perf_counter()
             chunk = policy.sample_actions(img, args.instruction, state)
-            infer_ms = (time.perf_counter() - t0) * 1000.0
+            infer_s = time.perf_counter() - t0
+            infer_lead_s = max(infer_s, infer_lead_s * 0.9)
 
             n_exec = min(args.n_action_steps, len(chunk))
-            LOG.info("cycle=%d infer=%.0fms state=[%s] a0=[%s] a%d=[%s]",
-                     cycle, infer_ms,
+            chunk_s = (n_exec - 1) / args.fps if n_exec > 1 else 0.0
+
+            if robot is not None and args.live:
+                robot.send_action_chunk(chunk[:n_exec], fps=args.fps)
+            chunk_t0 = time.perf_counter()
+
+            status = ""
+            if robot is not None and args.live:
+                st = robot.get_setpoint_status()
+                status = f" age={st['age_s']:.2f}s decay={st['decay']:.2f}"
+            LOG.info("cycle=%d infer=%.0fms chunk=%.2fs state=[%s] a0=[%s] a%d=[%s]%s",
+                     cycle, infer_s * 1000.0, chunk_s,
                      " ".join(f"{v:+.1f}" for v in state),
                      " ".join(f"{v:+.2f}" for v in chunk[0]),
                      n_exec - 1,
-                     " ".join(f"{v:+.2f}" for v in chunk[n_exec - 1]))
-
-            next_tick = time.perf_counter()
-            for i in range(n_exec):
-                if robot is not None and args.live:
-                    robot.send_action(chunk[i])
-                next_tick += period
-                dt = next_tick - time.perf_counter()
-                if dt > 0:
-                    time.sleep(dt)
+                     " ".join(f"{v:+.2f}" for v in chunk[n_exec - 1]),
+                     status)
 
             cycle += 1
             if args.loops and cycle >= args.loops:
                 break
+
+            # Sleep until it is time to start the next inference. The control
+            # thread is driving the valves from the chunk meanwhile.
+            sleep_s = chunk_s - infer_lead_s - (time.perf_counter() - chunk_t0)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
         if robot is not None:
+            try:
+                robot.stop_motion()
+            except Exception:
+                pass
             robot.disconnect()
 
     LOG.info("Done: %d cycles.", cycle)

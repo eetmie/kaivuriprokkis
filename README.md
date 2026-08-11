@@ -1,54 +1,77 @@
 # kaivuriprokkis
 
-Hardware/IRL runner for MASI excavator path planning. The main entry point is
-`run_hw_v2.py`.
+Hardware/IRL control stack for the MASI excavator: a Raspberry Pi or Jetson
+Orin Nano drives the hydraulic valves through a PCA9685, reads joint angles
+from per-link IMUs, and runs teleoperation, data collection, and on-device VLA
+inference against the real machine.
 
-The goal is to run the same planner logic as the Isaac Sim side, execute it on
-the real machine, and log data in a format that can be compared with sim runs.
-The shared planner package lives in `pathing/` and matches the sim package.
-
-## Main Run
-
-Typical hardware run:
+Start with `simple_drive.py` (open-loop gamepad driving + hydraulic data
+collection). Closed-loop and compensated driving live in `control_prototype/`,
+and the LeRobot/SmolVLA workflow in `lerobot_vla/`.
 
 ```bash
-source .venv/bin/activate
-sudo .venv/bin/python run_hw_v2.py --algorithm a_star -r --task in-and-out --log --once
+.venv/bin/python simple_drive.py --robot jetson
 ```
 
-Useful examples:
+## Control Architecture
 
-```bash
-sudo .venv/bin/python run_hw_v2.py --algorithm a_star --task in-and-out --log --once
-sudo .venv/bin/python run_hw_v2.py --algorithm rrt -r --task rotation --log --debug
-sudo .venv/bin/python run_hw_v2.py --algorithm prm -r -p --task empty --log --once
-sudo .venv/bin/python run_hw_v2.py --test --once
+Three layers, and the boundary between them matters:
+
+| Layer | What it does |
+|---|---|
+| `modules/pwm/` | PCA9685 valve output: deadband, gamma, ramp, dither, pulse clamps, watchdogs |
+| `modules/excavator_controller.py` | Background control thread at `control_hz` (100 Hz): IMU→joint angles, IK/PID, and valve output |
+| producers | gamepad, UDP client, VLA policy — whatever rate they manage |
+
+**Producers must not write the PWM layer directly.** `PWMController` has no
+clock of its own: dither phase, ramp integration, the stale-command watchdog
+and the input-rate gate all advance only when `update_named()` is called, so a
+slow or bursty caller aliases the dither and silently trips the rate gate.
+Hand setpoints to the control thread instead:
+
+```python
+controller.enter_direct_command_mode()
+controller.give_direct_commands({"boom": 0.4})        # single setpoint
+controller.give_direct_chunk(chunk, fps=30.0)         # policy action chunk
 ```
 
-`--test` sends direct A/B pose commands without the planner. It is useful for
-checking basic control behavior, but normal pathing work should use planner
-mode.
+The thread resamples onto its fixed rate and writes every tick; setpoint age is
+tracked separately and decays the command to zero if the producer stalls. See
+`modules/setpoint_schedule.py` and `modules/pwm/README.md`.
 
-On Raspberry Pi, run `run_hw_v2.py` with `sudo` as shown above. This lets the
-realtime helpers in `rt_utils` apply the requested scheduling settings while
-still using the project virtual environment.
+The controller has four mutually exclusive output modes: IK (`give_pose`),
+velocity (`enter_velocity_command_mode`), direct
+(`enter_direct_command_mode`), and suspended (`suspend_ik_output`, which hands
+the bus to a caller-owned `DirectController`).
 
 ## Platform Setup And Privileges
 
 `setup.sh` is Raspberry Pi-specific. It edits Raspberry Pi boot config, creates
 virtual I2C buses for the ADC/OLED wiring, and installs an OLED service. Do not
-use it on Jetson Nano.
+use it on Jetson.
 
 The Raspberry Pi main I2C bus runs well at 1 MHz in this project.
+
+Runtime profile defaults live in `configuration_files/profiles/<name>/profile.yaml`.
+The profile selects a `board` (`rpi` or `jetson`) for compute-platform defaults
+such as I2C bus numbers, then points at profile-local `servo_config.yaml` and
+`control_config.yaml` files for robot-specific valve, geometry, IMU, IK, PID,
+and controller settings. `--robot auto` only auto-detects the board profile;
+robot-specific profiles must be selected explicitly.
+
+USB serial should not require running the robot process with `sudo`. If
+`modules/usb_serial_reader.py` cannot import `serial`, check that you are
+running `.venv/bin/python`; plain `sudo python ...` usually switches to
+system/root Python and bypasses `.venv`. If opening `/dev/ttyACM0` or
+`/dev/ttyUSB0` needs sudo, add the user to the device group shown by
+`ls -l /dev/ttyACM0`, usually `dialout`, then relogin or reboot.
 
 ## Jetson Orin Nano Super WIP Notes
 
 Jetson support targets the **Jetson Orin Nano Super (8 GB)** and is still work
 in progress, separate from the main Raspberry Pi usage above. The original
-Maxwell-era Jetson Nano is not supported — Reflex/TensorRT FP16 and the VLA
-runner (`run_vla_v0.py`) need Ampere or newer.
-
-For the Orin Nano Super, use:
+Maxwell-era Jetson Nano is not supported — TensorRT FP16 and the VLA runner
+need Ampere or newer.
 
 ```bash
 sudo ./setup_jetson.sh
@@ -65,44 +88,44 @@ service, and OLED/display Python packages are not part of the Jetson setup.
 
 Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz on the Orin
 Nano Super, and it needs a Jetson-specific device-tree or kernel configuration
-path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`. Before changing bus speed, check the current
-PCA9685 bus with:
+path rather than Raspberry Pi `dtparam=i2c_arm_baudrate`. Before changing bus
+speed, check the current PCA9685 bus with:
 
 ```bash
 i2cdetect -y 7
 ```
 
-Runtime profile defaults live in `configuration_files/profiles/<name>/profile.yaml`.
-The profile selects a `board` (`rpi` or `jetson`) for compute-platform defaults
-such as I2C bus numbers, then points at profile-local `servo_config.yaml` and
-`control_config.yaml` files for robot-specific valve, geometry, IMU, IK, PID,
-and controller settings. `--robot auto` only auto-detects the board profile;
-robot-specific profiles must be selected explicitly.
+Real-time scheduling is not available on this Jetson — `rt_utils` requests are
+expected to fail there, and loop jitter is a CPU-governor question instead.
 
-USB serial should not require running the robot process with `sudo`. If
-`modules/usb_serial_reader.py` cannot import `serial`, check that you are
-running `.venv/bin/python`; plain `sudo python ...` usually switches to
-system/root Python and bypasses `.venv`. If opening `/dev/ttyACM0` or
-`/dev/ttyUSB0` needs sudo, add the user to the device group shown by
-`ls -l /dev/ttyACM0`, usually `dialout`, then relogin or reboot.
+## Teleoperation
 
-## Main Flags
+Local gamepad, straight to the valves:
 
-| Argument | Description |
-|---|---|
-| `--algorithm` | Base planner: `a_star`, `rrt`, `rrt_star`, `prm`. Default: `a_star`. |
-| `-r`, `--radial` | Use the radial-first wrapper around the base planner. Best fit for large excavator slew moves. |
-| `-p`, `--planar` | Use the planar variant of the base planner. |
-| `--radial-mode` | `reconstructed` by default. Use `raw` to skip radial reconstruction. |
-| `--task` | Task preset: `in-and-out`, `rotation`, `empty`. |
-| `--obstacles-json PATH` | Load obstacles exported by sim with `run_sim_v2.py --dump-obstacles`. |
-| `--log` | Write trajectory CSVs and metrics to `logs_hw/`. |
-| `--once` | Run one sweep through the task goals and stop. |
-| `--test` | Direct A/B pose test. No planner. |
-| `--debug` | Verbose hardware, controller, and planner logging. |
-| `--debug-planning` | Verbose planner logs only. |
-| `--rt-priority` | Control-loop realtime priority. Use `0` to disable. |
-| `--imu-priority` | IMU thread realtime priority. Use `0` for normal scheduling. |
+```bash
+.venv/bin/python simple_drive.py --robot jetson
+.venv/bin/python simple_drive.py --enable-slew --enable-tracks
+```
+
+Buttons: **A** start/stop a recording strip · **B** sine excitation · **X**
+pump · **Y** reload servo config · D-pad U/D sine amplitude.
+
+Remote operator over UDP — pass `--ip` on the robot to take commands from a
+client instead of the local pad:
+
+```bash
+# robot
+.venv/bin/python simple_drive.py --ip 0.0.0.0:8080
+# or the full IK/pose server
+.venv/bin/python excv_gui.py --port 8080
+
+# operator machine — robot host/port are set in the GUI (default 192.168.0.132:8080)
+python -m clients.client_gui
+```
+
+Both scripts request SCHED_FIFO for the control loop, best-effort: the request
+needs privileges and is skipped silently when unavailable, so `sudo` helps on
+the Pi and does nothing useful on the Jetson.
 
 ## EE PID Tuner
 
@@ -163,40 +186,40 @@ when paused. See the docstrings in `tools/pid_tuner/robot.py` and
 `tools/pid_tuner/client.py` for the full CLI, wire format, and algorithm
 notes.
 
-## Sim Replay Flow
+## Tests
 
-To compare sim and IRL against the same obstacle layout:
+```bash
+.venv/bin/python -m pytest tests/
+```
 
-1. Export obstacles from sim:
-
-   ```bash
-   .\isaaclab.bat -p scripts/masi/pathing/run_sim_v2.py --algorithm a_star -r --dump-obstacles obstacles.json
-   ```
-
-2. Copy or reuse that JSON on the hardware side.
-
-3. Run hardware with:
-
-   ```bash
-   sudo .venv/bin/python run_hw_v2.py --algorithm a_star -r --obstacles-json obstacles.json --log --once
-   ```
+Use the project venv — the system Python has no `numba`, so `modules/ik` fails
+to import and every controller test errors at collection.
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `run_hw_v2.py` | Main hardware pathing runner. Start here. |
-| `pathing/` | Shared planner package, identical to the sim pathing package. |
-| `configuration_files/` | Task, environment, and execution settings. |
-| `modules/` | Hardware interface, controller, math, and realtime helpers. |
-| `tools/pid_tuner/` | PID tuner package: `robot.py` (robot server) + `client.py` (PC GUI) + `common.py` (shared protocol). |
-| `logs_hw/` | Hardware logs when `--log` is enabled. Created at runtime. |
+| `simple_drive.py` | Open-loop gamepad driving + hydraulic data collection. Start here. |
+| `excv_gui.py` | UDP robot-side server for the remote client GUI. |
+| `modules/` | Hardware interface, controller, IK, PWM, IMU, realtime helpers. |
+| `lerobot_vla/` | LeRobot dataset collection + on-device SmolVLA inference. |
+| `control_prototype/` | Unvalidated control work: reachability limiter, compensation, closed loop. |
+| `clients/` | Operator-side GUIs and input handling. |
+| `configuration_files/` | Board/robot profiles: valve, geometry, IMU, IK, PID settings. |
+| `tools/` | Bring-up, calibration, analysis, and the PID tuner package. |
+| `data_collection/` | Recorded drive logs and LeRobot datasets. |
+| `pico_imu_reader/` | XIAO RP2040 firmware: 4× ISM330DHCX → fused orientation over USB CDC. |
+| `ros2_ws/` | ROS 2 workspace: URDF, MoveIt, RealSense bringup. |
 
-The other folders and scripts are mostly for prototypes, hardware bring-up,
-data collection, or testing ideas. They can be useful, but they are not the
-main pathing workflow.
+The remaining folders are prototypes, hardware bring-up, or experiments.
 
 ## More Detail
 
-`pathing/README.md` documents the shared planner internals, including radial
-and planar variants plus the red/yellow path outputs used in sim visualization.
+| Doc | Covers |
+|---|---|
+| `modules/pwm/README.md` | Valve output path, safety layers, the call-rate contract |
+| `modules/ik/README.md` | IK solver internals and the numba hot path |
+| `lerobot_vla/README.md` | Dataset recording, remote dataset viz, split-engine inference |
+| `control_prototype/README.md` | Smooth reachability limiter design and rubber-band model |
+| `ros2_ws/README.md` | URDF calibration, bringup, RViz/MoveIt on a laptop |
+| `jetson_setup.md`, `imu_tuneup.md` | Board bring-up and IMU tuning notes |

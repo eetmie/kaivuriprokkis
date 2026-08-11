@@ -57,8 +57,13 @@ old `DirectController` path for bench comparison only.
 ```bash
 .venv-lerobot/bin/python -m lerobot_vla.record_episodes \
     --task "scoop sand and dump it to the left" \
-    --repo-id masi/excavator_sand_v0 --exposure-us 16000
+    --repo-id masi/<new_dataset_name> --exposure-us 16000
 ```
+
+`--repo-id` names a **new** dataset; recording refuses to start if its folder
+already exists (use `--resume` to append). The folder is the repo-id with `/`
+replaced by `_`, under `data_collection/lerobot_datasets/`. Existing datasets:
+`masi/kaivuri_juusto` (31 episodes, blocks task).
 
 **Lock the exposure.** Auto-exposure drifts with the scene, which the policy
 then has to learn around. Find a value with the sweep tool (headless: writes
@@ -136,8 +141,73 @@ ssh -L 9090:localhost:9090 -L 9876:localhost:9876 joel@<jetson-ip>
 (Alternatively the mp4s under `videos/` play in VLC directly, or `--save 1`
 writes an .rrd for the Rerun desktop app.)
 
-Then rsync the dataset directory to the Spark and point `lerobot-train` at it
-(`--dataset.repo_id=masi/kaivuri_juusto --dataset.root=...`).
+The viz server loads **one episode per invocation** (`--episode-index`);
+restart it to look at another. It holds the decoded episode in RAM, so don't
+run it alongside a TRT engine build on this 8 GB board.
+
+### Getting the dataset to the training machine
+
+The viz URL is **not** a data source — it streams rendered frames to a Rerun
+viewer, and nothing on the other end can train from it. `lerobot-train` needs
+the actual dataset tree (parquet + mp4 + meta). Copy it:
+
+```bash
+# 67 MB for 31 episodes, ~66 MB of that video
+rsync -avP data_collection/lerobot_datasets/masi_kaivuri_juusto/ \
+    <spark-host>:~/datasets/masi_kaivuri_juusto/
+
+# on the Spark
+lerobot-train --dataset.repo_id=masi/kaivuri_juusto \
+              --dataset.root=~/datasets/masi_kaivuri_juusto ...
+```
+
+`--dataset.root` is what makes the repo-id a local lookup; without it lerobot
+searches `$HF_LEROBOT_HOME` and then the Hub.
+
+Via the Hub instead, if you'd rather not copy by hand:
+
+```bash
+.venv-lerobot/bin/python - <<'EOF'
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ds = LeRobotDataset("masi/kaivuri_juusto",
+                    root="data_collection/lerobot_datasets/masi_kaivuri_juusto")
+ds.push_to_hub(private=True)     # needs `huggingface-cli login`
+EOF
+```
+
+Then the Spark can train straight from `--dataset.repo_id=masi/kaivuri_juusto`
+with no `--dataset.root`.
+
+### Sanity-check a dataset before training
+
+Beyond frame counts, the check worth running is whether the recorded actions
+actually explain the recorded motion — it validates the whole capture path in
+one number:
+
+```bash
+.venv-lerobot/bin/python - <<'EOF'
+import pandas as pd, numpy as np
+D="data_collection/lerobot_datasets/masi_kaivuri_juusto"
+df=pd.read_parquet(f"{D}/data/chunk-000/file-000.parquet")
+A=np.stack(df["action"].values); S=np.stack(df["observation.state"].values)
+ep=df.episode_index.values
+for j,n in enumerate(["slew","lift","tilt","scoop"]):
+    best=max(((np.corrcoef(
+        np.concatenate([A[ep==e][:-l or None,j] for e in np.unique(ep)]),
+        np.concatenate([(np.gradient(S[ep==e][:,j])*30)[l:] for e in np.unique(ep)])
+    )[0,1], l) for l in range(1,9)), key=lambda t: abs(t[0]))
+    print(f"{n:6} r={best[0]:+.3f} at {best[1]} frames ({best[1]/30*1000:.0f} ms)")
+EOF
+```
+
+Healthy looks like `r = 0.75..0.96` at a 67–200 ms lag (the hydraulic response
+delay). Much lower means commands are not reaching the valves — which is what
+the pre-`b246c69` 30 Hz direct-write path did, silently dropping ~67% of them.
+
+Worth also checking action saturation per joint: on `masi/kaivuri_juusto`, lift
+sits at −1.0 for 17.5% of frames while its positive side never exceeds +0.77.
+That is real operator asymmetry (boom slammed down, raised gently), not a
+broken axis, but it skews the normalization stats the policy is trained with.
 
 ## 2. Inference (split TensorRT engines)
 
@@ -157,6 +227,20 @@ TRT_DROP_CUDA_EP=1 .venv-lerobot/bin/python -m lerobot_vla.run_inference --synth
 .venv-lerobot/bin/python -m lerobot_vla.run_inference --live \
     --dataset-stats <dataset>/meta/stats.json ...
 ```
+
+Setpoint-timing flags (all optional; defaults are sane):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--setpoint-hold-s` | 0.25 | How long the chunk's last action keeps full authority after the chunk runs out |
+| `--setpoint-decay-s` | 0.25 | Ramp-to-zero window once the setpoint goes stale |
+| `--blend-s` | 0.0 | Cross-fade into each new chunk, to soften the step at a chunk boundary |
+| `--legacy-direct-write` | off | Drive valves from this thread instead of the control thread (bench A/B only) |
+
+Each cycle logs `age=` and `decay=` for the held setpoint. `decay < 1.00` in
+steady state means inference is not keeping ahead of chunk playback — raise
+`--n-action-steps` (longer chunks, more time to think) before touching the
+hold/decay windows, which exist to make a stall safe, not to hide one.
 
 Defaults point at the base-weight split export
 (`spark-projects/.../exports/ainekko_base_split`) + its tokenizer bundle.

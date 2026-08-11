@@ -6,12 +6,19 @@ SmolVLA inference (split TensorRT engines on this Orin Nano).
 
 ```
 gamepad ─┐                                             ┌─> LeRobot v3 dataset ──> DGX Spark finetune
-         ├─> DirectController (valves, open loop)      │      (lerobot 0.5.1, h264 video)
-IR cam1 ─┼─────────────────────────────────────────────┤
+         ├─> setpoint ─┐                               │      (lerobot 0.5.1, h264 video)
+IR cam1 ─┼─────────────┼───────────────────────────────┤
 IMUs ────┴─> ExcavatorController (joint angles) ───────┘
+                       │
+                       └─> control thread @100 Hz ──> valves   (direct-command mode)
 
-split ONNX engines (vision/prefill/decode + projectors) ──> action chunk ──> DirectController
+split ONNX engines (vision/prefill/decode + projectors) ──> action chunk ──┘
 ```
+
+Producers (gamepad at 30 Hz, policy at ~1 Hz chunks) only *store* a setpoint;
+the 100 Hz control thread resamples it and writes the valves every tick. They
+must not write the PWM layer directly — its dither, watchdog and rate gate all
+advance per call. See `modules/setpoint_schedule.py` and `modules/pwm/README.md`.
 
 ## Environment
 
@@ -39,8 +46,11 @@ transcode to read AV1 reliably.
 | `observation.images.cam1` | uint8 480×640×3 | D435i **infrared left imager**, laser emitter DISABLED, gray→3ch |
 | `action` | float32[4] | normalized valve commands [-1, 1], [slew, lift, tilt, scoop] |
 
-Actions drive the valves open-loop through `DirectController` — exactly the
-simple_drive.py surface, no IK/PID in the loop.
+Actions drive the valves open-loop (no IK/PID in the loop) via
+`ExcavatorController.enter_direct_command_mode()`. `send_action()` stores a
+setpoint and returns immediately; `send_action_chunk()` hands over a whole
+policy chunk to be played as a trajectory. `--legacy-direct-write` restores the
+old `DirectController` path for bench comparison only.
 
 ## 1. Dataset collection (gamepad teleop)
 
@@ -78,28 +88,56 @@ Check a dataset quickly:
 ```bash
 .venv-lerobot/bin/python - <<'EOF'
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-ds = LeRobotDataset("masi/excavator_sand_v0",
-                    root="data_collection/lerobot_datasets/masi_excavator_sand_v0")
+ds = LeRobotDataset("masi/kaivuri_juusto",
+                    root="data_collection/lerobot_datasets/masi_kaivuri_juusto")
 print(ds.meta.total_episodes, "episodes,", ds.meta.total_frames, "frames")
 print(ds[0]["observation.state"], ds[0]["task"])
 EOF
 ```
 
-Inspect episodes visually from another machine (the Jetson is headless):
+Inspect episodes visually from another machine (the Jetson is headless). Run on
+the Jetson:
 
 ```bash
 .venv-lerobot/bin/lerobot-dataset-viz \
-    --repo-id masi/excavator_sand_v0 \
-    --root data_collection/lerobot_datasets/masi_excavator_sand_v0 \
+    --repo-id masi/kaivuri_juusto \
+    --root data_collection/lerobot_datasets/masi_kaivuri_juusto \
     --episode-index 0 --mode distant
-# then open http://<jetson-ip>:9090 in any browser on the LAN
+```
+
+It serves two ports, both on 0.0.0.0: the web viewer on 9090 and the gRPC data
+stream on 9876. **Both must be reachable** from the viewing machine — the page
+is only the app, the data arrives over 9876.
+
+Opening bare `http://<jetson-ip>:9090` gives an empty welcome screen. The viewer
+takes its source from a `?url=` query parameter, and lerobot calls rerun's
+`serve_web_viewer(open_browser=False, ...)`, whose `connect_to` argument is
+applied *only* when it opens the browser itself. So pass the stream URL yourself:
+
+```
+http://<jetson-ip>:9090/?url=rerun%2Bhttp://<jetson-ip>:9876/proxy
+```
+
+The `%2B` matters: a literal `+` in a query string decodes to a space.
+
+With the Rerun desktop app installed instead, skip the web viewer entirely:
+
+```bash
+rerun rerun+http://<jetson-ip>:9876/proxy
+```
+
+Over SSH without LAN access, forward both ports and use `localhost`:
+
+```bash
+ssh -L 9090:localhost:9090 -L 9876:localhost:9876 joel@<jetson-ip>
+# then http://localhost:9090/?url=rerun%2Bhttp://localhost:9876/proxy
 ```
 
 (Alternatively the mp4s under `videos/` play in VLC directly, or `--save 1`
 writes an .rrd for the Rerun desktop app.)
 
 Then rsync the dataset directory to the Spark and point `lerobot-train` at it
-(`--dataset.repo_id=masi/excavator_sand_v0 --dataset.root=...`).
+(`--dataset.repo_id=masi/kaivuri_juusto --dataset.root=...`).
 
 ## 2. Inference (split TensorRT engines)
 
@@ -133,9 +171,14 @@ on reboot, so the first run after boot rebuilds (~5 min). RAM is tight:
 run ONE thing at a time (never viz or recording alongside an engine build).
 
 **fps vs inference rate:** the policy is chunked — one ~220 ms inference emits
-50 actions that execute open-loop at the dataset fps (30 Hz). The camera is
-only *read* at each re-plan; `--n-action-steps` (default 25 ≈ 0.8 s) sets how
-often the robot re-looks, so ~4.5 Hz inference capability is plenty.
+50 actions authored at the dataset fps (30 Hz). The chunk is handed to the
+control thread, which interpolates it by elapsed time and drives the valves at
+100 Hz; inference being far slower than the valve rate is exactly what that
+split is for. The camera is only *read* at each re-plan; `--n-action-steps`
+(default 25 ≈ 0.8 s) sets how often the robot re-looks, so ~4.5 Hz inference
+capability is plenty. Re-inference starts early by the measured inference time
+so the schedule never runs dry; if it does, the held command decays to zero
+(`--setpoint-hold-s`, `--setpoint-decay-s`) rather than latching.
 
 ## Files
 

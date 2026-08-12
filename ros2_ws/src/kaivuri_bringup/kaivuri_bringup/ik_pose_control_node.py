@@ -407,6 +407,7 @@ class IkPoseControlNode(Node):
         if timeout_s > 0.0 and (time.monotonic() - self._last_command_time) > timeout_s:
             self._controller.clear_target()
             self._target_active = False
+            print(f"IK target timed out after {timeout_s:.3f}s; cleared active target",flush=True)
             self.get_logger().warning("IK target timed out; cleared active target")
 
     def _publish_state(self) -> None:

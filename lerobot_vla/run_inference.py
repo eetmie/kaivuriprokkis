@@ -16,6 +16,13 @@ The policy emits a 50-step action chunk per observation; we hand the first
 while it plays. With ~0.2 s inference and 25 steps at 30 Hz this re-plans
 roughly every 0.8 s.
 
+--fps is normally NOT passed. The chunk is rate commands sampled at the rate the
+checkpoint was trained on, so the playback rate belongs to the checkpoint: it is
+read from the export bundle (export_info.json / info.json). Checkpoints trained
+on decimated data (10 or 6 fps) played back at 30 Hz move the machine at a third
+or a fifth of the intended speed, silently. An explicit --fps that contradicts
+the bundle is refused.
+
 The chunk is NOT replayed step-by-step from this thread. It is handed to
 ExcavatorController's direct-command mode, whose 100 Hz control thread indexes
 into it by elapsed time and interpolates. This thread only has to produce the
@@ -53,6 +60,72 @@ DEFAULT_TOKENIZER = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runti
 
 LOG = logging.getLogger("run_inference")
 
+#: Used only when nothing in the export bundle records the training rate.
+DEFAULT_FPS = 30.0
+
+
+def resolve_policy_fps(split_dir: str, stats_path: str | None,
+                       explicit_fps: float | None) -> float:
+    """Work out the control rate this checkpoint was trained at.
+
+    A chunk is a sequence of RATE commands, played back at ``--fps``. That rate
+    is a property of the checkpoint, not a free choice: a model trained on 10 fps
+    data expects each action to be held for 100 ms, so replaying it at 30 Hz holds
+    each one for 33 ms and the machine travels a third of the intended distance.
+    Nothing about that failure is loud — the excavator just moves feebly.
+
+    Since we now have checkpoints trained at 30, 10 and 6 fps, the rate is read
+    from the export bundle where possible instead of defaulting. Search order:
+
+        1. ``fps`` in <split-dir>/export_info.json   (written by the exporter)
+        2. ``fps`` in <split-dir>/info.json          (a copied LeRobot info.json)
+        3. ``fps`` in <stats-dir>/info.json          (stats copied with its info)
+
+    An explicit --fps that disagrees with the bundle is treated as a mistake and
+    refused. If nothing records the rate we fall back to 30 with a warning.
+    """
+    candidates = [Path(split_dir) / "export_info.json", Path(split_dir) / "info.json"]
+    if stats_path:
+        candidates.append(Path(stats_path).parent / "info.json")
+
+    recorded, source = None, None
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            fps = json.loads(path.read_text()).get("fps")
+        except (json.JSONDecodeError, OSError) as exc:
+            LOG.warning("Could not read %s for the training fps: %s", path, exc)
+            continue
+        if fps:
+            recorded, source = float(fps), path
+            break
+
+    if recorded is not None:
+        if explicit_fps is not None and abs(explicit_fps - recorded) > 1e-6:
+            raise SystemExit(
+                f"--fps {explicit_fps:g} contradicts the training rate recorded in "
+                f"{source} ({recorded:g} fps).\n"
+                f"The action chunk is rate commands sampled at {recorded:g} Hz; playing it "
+                f"at {explicit_fps:g} Hz scales the executed motion by "
+                f"{recorded / explicit_fps:.2f}x.\n"
+                f"Drop --fps to use the recorded rate, or pass --fps {recorded:g}.")
+        LOG.info("Control rate %.4g Hz (training rate recorded in %s)", recorded, source.name)
+        return recorded
+
+    if explicit_fps is not None:
+        LOG.warning("No training fps recorded in the export bundle; using --fps %.4g. "
+                    "Make sure this matches the rate the checkpoint was trained at.",
+                    explicit_fps)
+        return explicit_fps
+
+    LOG.warning("No training fps recorded in the export bundle and no --fps given; "
+                "assuming %.4g Hz. If this checkpoint was trained on decimated data "
+                "(10 or 6 fps) the machine will move at the wrong speed. Record the "
+                "rate in <split-dir>/export_info.json to remove this guess.",
+                DEFAULT_FPS)
+    return DEFAULT_FPS
+
 
 def load_norm(stats_path: str | None) -> NormStats:
     if not stats_path:
@@ -74,7 +147,10 @@ def main() -> int:
     p.add_argument("--num-steps", type=int, default=10, help="Denoise steps")
     p.add_argument("--n-action-steps", type=int, default=25,
                    help="How many of the 50 chunk actions to execute before re-inferring")
-    p.add_argument("--fps", type=float, default=30.0, help="Action execution rate")
+    p.add_argument("--fps", type=float, default=None,
+                   help="Action execution rate. Normally omitted — it is read from "
+                        "the export bundle, since it is a property of the checkpoint "
+                        f"(default if nothing records it: {DEFAULT_FPS:g})")
     p.add_argument("--dataset-stats", default=None,
                    help="Path to a LeRobot dataset stats.json for state/action normalization")
     p.add_argument("--robot", default="auto")
@@ -104,6 +180,10 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # Resolve before building engines so a rate mismatch fails in a second rather
+    # than after a multi-minute TRT build.
+    args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
 
     policy = SmolVLASplitPolicy(
         split_dir=args.split_dir,

@@ -13,9 +13,11 @@ of the 450M weights, so the TRT builds peak at ~2-3 GB instead of the ~7 GB
 that killed the monolithic export (notes/findings.md, 2026-06-16/17).
 
 Orchestration mirrors github.com/aifoundry-org/ETARS modeling_smolvla_ort.py,
-checked against lerobot 0.5.1 modeling_smolvla.py. Static shapes of the base
-split: prefix 177 = 2 cameras x 64 tokens + 48 lang + 1 state; chunk 50;
-padded action dim 32.
+checked against lerobot 0.5.1 modeling_smolvla.py. The prefix length is read
+from the prefill graph at load time — it depends on how many camera slots the
+bundle was exported with (ainekko base: 2 slots -> 177 = 2x64 + 48 lang + 1
+state; our single-camera excavator export: 1 slot -> 113). Chunk 50; padded
+action dim 32.
 
 Heavy graphs (vision / prefill / decode) run on the TensorRT EP with an
 on-disk engine cache; tiny projectors and the text embedding run on CPU.
@@ -36,9 +38,13 @@ LOG = logging.getLogger("smolvla_split")
 # Static dims of the split export (verified from the ONNX graphs).
 VLM_DIM = 960
 EXPERT_DIM = 720
-PREFIX_LEN = 177
 IMG_TOKENS = 64
-NUM_CAM_SLOTS = 2
+# Camera slots (and with them the prefix length) are baked into the prefill
+# graph at export time and DIFFER between bundles: the ainekko base export has
+# 2 slots (prefix 64+64+48+1 = 177), our fine-tuned excavator export has 1
+# (64+48+1 = 113). The real value is read from the graph in __init__;
+# this is only the fallback when the graph axis is dynamic.
+DEFAULT_NUM_CAM_SLOTS = 2
 LANG_LEN = 48
 CHUNK_SIZE = 50
 MAX_ACTION_DIM = 32
@@ -240,18 +246,59 @@ class SmolVLASplitPolicy:
                             if i.name.startswith("past_key_"))
         LOG.info("decode expects %d KV layers", self.n_layers)
 
+        # Ask the prefill for its KV outputs BY NAME. Output order differs
+        # between bundles (ainekko base emits a leading vlm_output_embeds, our
+        # excavator export emits only the 32 KV tensors); names are stable.
+        self._prefill_kv_names = [
+            name for i in range(self.n_layers)
+            for name in (f"present_key_{i}", f"present_value_{i}")]
+        have = {o.name for o in self.prefill.get_outputs()}
+        missing = [n for n in self._prefill_kv_names if n not in have]
+        if missing:
+            raise ValueError(f"prefill graph lacks expected KV outputs: {missing[:4]} ...")
+
+        # Read the prefix length the prefill graph was exported with (see the
+        # note at DEFAULT_NUM_CAM_SLOTS) and derive the camera-slot count.
+        dim = next((i.shape[1] for i in self.prefill.get_inputs()
+                    if i.name == "position_ids"), None)
+        if isinstance(dim, int):
+            n_cams, rem = divmod(dim - LANG_LEN - 1, IMG_TOKENS)
+            if rem or n_cams < 1:
+                raise ValueError(
+                    f"prefill prefix length {dim} does not decompose as "
+                    f"n*{IMG_TOKENS} + {LANG_LEN} + 1 — unknown export layout")
+            self.n_cam_slots, self.prefix_len = n_cams, dim
+        else:  # dynamic axis: keep the historical layout
+            self.n_cam_slots = DEFAULT_NUM_CAM_SLOTS
+            self.prefix_len = self.n_cam_slots * IMG_TOKENS + LANG_LEN + 1
+        LOG.info("prefill expects prefix %d (%d camera slot(s))",
+                 self.prefix_len, self.n_cam_slots)
+
         # The empty-camera slot embedding is a constant (all -1 image, the
         # lerobot padding convention) — compute once, reuse every step.
-        pad_img = -np.ones((1, 3, IMG_SIZE, IMG_SIZE), dtype=np.float32)
-        self._pad_cam_emb = self._run_vision(pad_img)
+        self._pad_cam_emb = None
+        if self.n_cam_slots > 1:
+            pad_img = -np.ones((1, 3, IMG_SIZE, IMG_SIZE), dtype=np.float32)
+            self._pad_cam_emb = self._run_vision(pad_img)
 
         # Language is fixed per instruction in practice — cache by string.
         self._lang_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     # ── component wrappers ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _run_single(sess, value: np.ndarray) -> np.ndarray:
+        """Run a single-input graph, feeding by the graph's DECLARED input name.
+
+        Tensor names differ between export generations (ainekko base: 'time' /
+        'action'; our exporter: 'action_time' / 'expert_out' / 'hidden'), but
+        every one of these graphs takes exactly one input of identical shape,
+        so binding by declared name works for all bundles.
+        """
+        return sess.run(None, {sess.get_inputs()[0].name: value})[0]
+
     def _run_vision(self, img_bchw: np.ndarray) -> np.ndarray:
-        emb = self.vision.run(None, {"image": img_bchw})[0]      # [1,64,960]
+        emb = self._run_single(self.vision, img_bchw)            # [1,64,960]
         return emb * math.sqrt(emb.shape[-1])
 
     def _embed_language(self, instruction: str) -> tuple[np.ndarray, np.ndarray]:
@@ -263,7 +310,7 @@ class SmolVLASplitPolicy:
                              return_tensors="np")
         tokens = tok["input_ids"].astype(np.int64)               # [1,48]
         mask = tok["attention_mask"].astype(bool)                # [1,48]
-        emb = self.text.run(None, {"tokens": tokens})[0]         # [1,48,960]
+        emb = self._run_single(self.text, tokens)               # [1,48,960]
         emb = emb * math.sqrt(emb.shape[-1])
         self._lang_cache[instruction] = (emb, mask)
         return emb, mask
@@ -273,7 +320,7 @@ class SmolVLASplitPolicy:
     def sample_actions(self, image_hwc_uint8: np.ndarray, instruction: str,
                        state: np.ndarray, noise: np.ndarray | None = None) -> np.ndarray:
         """One observation -> (CHUNK_SIZE, action_dim) unnormalized action chunk."""
-        # prefix: [cam1(64), pad-cam(64), lang(48), state(1)] = 177 tokens
+        # prefix: [cam1(64), pad-cam(64) x (slots-1), lang(48), state(1)]
         img = resize_with_pad_uint8(image_hwc_uint8)
         img_emb = self._run_vision(img)                          # [1,64,960]
         lang_emb, lang_mask = self._embed_language(instruction)
@@ -281,29 +328,30 @@ class SmolVLASplitPolicy:
         s = self.norm.normalize_state(np.asarray(state, dtype=np.float32).reshape(-1))
         s_pad = np.zeros((1, MAX_STATE_DIM), dtype=np.float32)
         s_pad[0, :s.shape[0]] = s
-        state_emb = self.state_proj.run(None, {"state": s_pad})[0].reshape(1, 1, VLM_DIM)
+        state_emb = self._run_single(self.state_proj, s_pad).reshape(1, 1, VLM_DIM)
 
+        n_pad_cams = self.n_cam_slots - 1
         embs = np.concatenate(
-            [img_emb, self._pad_cam_emb, lang_emb, state_emb], axis=1
-        ).astype(np.float32)                                     # [1,177,960]
-        pad_masks = np.concatenate([
-            np.ones((1, IMG_TOKENS), dtype=bool),                # real camera
-            np.zeros((1, IMG_TOKENS), dtype=bool),               # empty cam slot
-            lang_mask,
-            np.ones((1, 1), dtype=bool),                         # state token
-        ], axis=1)                                               # [1,177]
-        att_masks = np.zeros((1, PREFIX_LEN), dtype=bool)
+            [img_emb] + [self._pad_cam_emb] * n_pad_cams + [lang_emb, state_emb],
+            axis=1,
+        ).astype(np.float32)                                     # [1,prefix,960]
+        pad_masks = np.concatenate(
+            [np.ones((1, IMG_TOKENS), dtype=bool)]               # real camera
+            + [np.zeros((1, IMG_TOKENS), dtype=bool)] * n_pad_cams  # empty slots
+            + [lang_mask,
+               np.ones((1, 1), dtype=bool)],                     # state token
+            axis=1)                                              # [1,prefix]
+        att_masks = np.zeros((1, self.prefix_len), dtype=bool)
         att_masks[0, -1] = True                                  # state starts a new block
 
         prefix_att_2d = make_att_2d_masks(pad_masks, att_masks)  # [1,177,177]
         prefix_pos = (np.cumsum(pad_masks, axis=1) - 1).astype(np.int64)
 
-        out = self.prefill.run(None, {
+        kv = self.prefill.run(self._prefill_kv_names, {
             "attention_mask": prefix_att_2d,
             "position_ids": prefix_pos,
             "vlm_embeds": embs,
         })
-        kv = out[1:1 + 2 * self.n_layers]
 
         # denoise loop
         if noise is None:
@@ -315,7 +363,7 @@ class SmolVLASplitPolicy:
 
         # constant across steps
         prefix_pad_2d = np.broadcast_to(
-            pad_masks[:, None, :], (1, CHUNK_SIZE, PREFIX_LEN))
+            pad_masks[:, None, :], (1, CHUNK_SIZE, self.prefix_len))
         suffix_pad = np.ones((1, CHUNK_SIZE), dtype=bool)
         suffix_att = np.ones((1, CHUNK_SIZE), dtype=bool)        # action block: causal-in-block
         suffix_att_2d = make_att_2d_masks(suffix_pad, suffix_att)
@@ -338,13 +386,13 @@ class SmolVLASplitPolicy:
         return self.norm.unnormalize_action(actions)
 
     def _denoise_step(self, x_t, t, full_att_2d, pos_ids, kv_feed) -> np.ndarray:
-        action_emb = self.action_in.run(None, {"action": x_t})[0]        # [1,50,720]
+        action_emb = self._run_single(self.action_in, x_t)               # [1,50,720]
         time_emb = np.broadcast_to(
             sinusoidal_time_embedding(t)[None, None, :], action_emb.shape)
         ate = np.concatenate([action_emb, time_emb], axis=2).astype(np.float32)
-        ate = self.time_in.run(None, {"time": ate})[0]
+        ate = self._run_single(self.time_in, ate)
         ate = ate * (1.0 / (1.0 + np.exp(-ate)))                         # SiLU
-        suffix_embs = self.time_out.run(None, {"time": ate})[0]          # [1,50,720]
+        suffix_embs = self._run_single(self.time_out, ate)               # [1,50,720]
 
         feeds = {
             "attention_mask": full_att_2d,
@@ -352,8 +400,8 @@ class SmolVLASplitPolicy:
             "expert_embeds": suffix_embs,
             **kv_feed,
         }
-        expert_out = self.decode.run(["expert_output_embeds"], feeds)[0]
-        return self.action_out.run(None, {"action": expert_out.astype(np.float32)})[0]
+        expert_out = self.decode.run(None, feeds)[0]  # single output in every bundle
+        return self._run_single(self.action_out, expert_out.astype(np.float32))
 
 
 def _build_one(onnx_path: str, cache_dir: str, precision: str) -> None:

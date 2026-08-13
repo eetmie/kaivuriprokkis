@@ -11,10 +11,13 @@ Modes (safety ladder):
                     weights produce garbage actions — do not use --live until a
                     finetuned checkpoint is in place and the pump is your call.
 
-The policy emits a 50-step action chunk per observation; we hand the first
---n-action-steps of it to the controller as a trajectory at --fps and re-infer
-while it plays. With ~0.2 s inference and 25 steps at 30 Hz this re-plans
-roughly every 0.8 s.
+The policy emits a 50-step action chunk per observation; the WHOLE chunk is
+handed to the controller as a trajectory at --fps, but we re-infer after only
+--n-action-steps of it have played. In steady state the next chunk replaces
+this one at that boundary, so the tail past n-action-steps is never executed —
+it exists so a late inference degrades into "keep playing the plan" instead of
+hold->decay-to-zero. With ~0.25 s inference and 15 steps at 30 Hz this re-plans
+roughly every 0.5 s.
 
 --fps is normally NOT passed. The chunk is rate commands sampled at the rate the
 checkpoint was trained on, so the playback rate belongs to the checkpoint: it is
@@ -145,8 +148,11 @@ def main() -> int:
     p.add_argument("--cache-dir", default="/tmp/smolvla_split_cache")
     p.add_argument("--instruction", default="scoop sand and dump it to the left")
     p.add_argument("--num-steps", type=int, default=10, help="Denoise steps")
-    p.add_argument("--n-action-steps", type=int, default=25,
-                   help="How many of the 50 chunk actions to execute before re-inferring")
+    p.add_argument("--n-action-steps", type=int, default=15,
+                   help="Replan cadence: how many chunk actions play before "
+                        "re-inferring. The full chunk is still handed to the "
+                        "scheduler, so the tail past this count is the "
+                        "late-inference fallback")
     p.add_argument("--fps", type=float, default=None,
                    help="Action execution rate. Normally omitted — it is read from "
                         "the export bundle, since it is a property of the checkpoint "
@@ -246,8 +252,13 @@ def main() -> int:
             n_exec = min(args.n_action_steps, len(chunk))
             chunk_s = (n_exec - 1) / args.fps if n_exec > 1 else 0.0
 
+            # Hand over the FULL chunk but replan on the n_exec cadence: the
+            # next chunk normally replaces this one after n_exec steps, so the
+            # tail never executes — unless inference is late, in which case
+            # the machine keeps following the predicted plan instead of
+            # falling into hold->decay at the replan boundary.
             if robot is not None and args.live:
-                robot.send_action_chunk(chunk[:n_exec], fps=args.fps)
+                robot.send_action_chunk(chunk, fps=args.fps)
             chunk_t0 = time.perf_counter()
 
             status = ""

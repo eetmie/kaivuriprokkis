@@ -259,10 +259,17 @@ run ONE thing at a time (never viz or recording alongside an engine build).
 control thread, which interpolates it by elapsed time and drives the valves at
 100 Hz; inference being far slower than the valve rate is exactly what that
 split is for. The camera is only *read* at each re-plan; `--n-action-steps`
-(default 25 ≈ 0.8 s) sets how often the robot re-looks, so ~4.5 Hz inference
-capability is plenty. Re-inference starts early by the measured inference time
-so the schedule never runs dry; if it does, the held command decays to zero
-(`--setpoint-hold-s`, `--setpoint-decay-s`) rather than latching.
+(default 15 ≈ 0.5 s) sets how often the robot re-looks, so ~4.5 Hz inference
+capability is plenty. The FULL 50-step chunk is handed to the scheduler even
+though only the first `--n-action-steps` normally play before the next chunk
+replaces it: the unplayed tail is the late-inference fallback — a slow replan
+keeps following the predicted plan instead of freezing at the boundary.
+Re-inference still starts early by the measured inference time; hold/decay to
+zero (`--setpoint-hold-s`, `--setpoint-decay-s`) now only engages if the whole
+1.67 s chunk runs out, i.e. inference stalled outright. The floor for
+`--n-action-steps` is the inference time itself: at ~0.25–0.30 s per inference
+and 30 fps, 15 steps (0.47 s) leaves ~0.2 s of margin; below ~12 the producer
+can no longer stay ahead.
 
 ## Files
 

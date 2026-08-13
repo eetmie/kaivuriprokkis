@@ -84,6 +84,7 @@ class SuccessCubeRelocatorNode(Node):
         self._cube_hidden = False
         self._last_visible_cube_pose_msg: Optional[PoseStamped] = None
         self._last_ready_event_time: Optional[object] = None
+        self._last_hidden_event_time: Optional[object] = None
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         cube_command_topic = str(self.get_parameter("cube_command_topic").value)
@@ -170,10 +171,13 @@ class SuccessCubeRelocatorNode(Node):
             self._cube_hidden = True
             if self._pending_hidden_confirmation:
                 self._pending_hidden_confirmation = False
-                self._publish_event(0, "cube_hidden")
+                self._publish_cube_hidden(force=True)
+            else:
+                self._publish_cube_hidden(force=False)
             return
 
         self._cube_hidden = False
+        self._last_hidden_event_time = None
         self._last_measured_cube_pose = measured
         visible_surface_pose = self._is_reasonable_surface_pose(measured)
         if visible_surface_pose:
@@ -262,7 +266,11 @@ class SuccessCubeRelocatorNode(Node):
 
         episode_id = self._pending_success_episode
         reason = self._pending_relocation_reason
-        if self._publish_new_cube_pose(reason):
+        if reason.startswith("episode_end after touch_success"):
+            published = self._prepare_next_visible_cube_pose(reason)
+        else:
+            published = self._publish_new_cube_pose(reason)
+        if published:
             self._pending_success_episode = None
             self._pending_relocation_reason = None
             self._relocate_after_time = None
@@ -291,11 +299,32 @@ class SuccessCubeRelocatorNode(Node):
         self.get_logger().info(f"Published cube top-center IK pose after {reason}: {np.round(top_center_ik, 4)}")
         return True
 
+    def _prepare_next_visible_cube_pose(self, reason: str) -> bool:
+        top_center_ik = self._sample_reachable_cube_top_center_ik()
+        if top_center_ik is None:
+            self.get_logger().error("Could not find a reachable cube pose inside configured workspace")
+            return False
+
+        self._last_cube_top_center_ik = top_center_ik.copy()
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = str(self.get_parameter("frame_id").value)
+        msg.pose.position.x = float(top_center_ik[0])
+        msg.pose.position.y = float(top_center_ik[1])
+        msg.pose.position.z = float(top_center_ik[2])
+        msg.pose.orientation.w = 1.0
+        self._last_visible_cube_pose_msg = self._clone_pose_msg(msg)
+        self._pending_ready_pose = None
+        self._last_ready_event_time = None
+        self.get_logger().info(f"Prepared hidden next cube pose after {reason}: {np.round(top_center_ik, 4)}")
+        return True
+
     def _hide_cube(self, reason: str) -> None:
         self._cube_hidden = True
         self._pending_hidden_confirmation = True
         self._pending_ready_pose = None
         self._last_ready_event_time = None
+        self._last_hidden_event_time = None
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = str(self.get_parameter("frame_id").value)
@@ -331,6 +360,14 @@ class SuccessCubeRelocatorNode(Node):
                 return
         self._last_ready_event_time = now
         self._publish_event(0, "cube_ready")
+
+    def _publish_cube_hidden(self, force: bool = False) -> None:
+        now = self.get_clock().now()
+        if not force and self._last_hidden_event_time is not None:
+            if (now - self._last_hidden_event_time).nanoseconds * 1e-9 < 1.0:
+                return
+        self._last_hidden_event_time = now
+        self._publish_event(0, "cube_hidden")
 
     def _publish_event(self, episode_id: int, event: str) -> None:
         msg = String()

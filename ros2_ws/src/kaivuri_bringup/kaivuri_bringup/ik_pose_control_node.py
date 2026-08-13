@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import time
 import traceback
 from dataclasses import replace
@@ -10,7 +11,9 @@ import numpy as np
 import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
+from rosgraph_msgs.msg import Clock
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32MultiArray
 
@@ -299,6 +302,10 @@ class IkPoseControlNode(Node):
         self._last_command_time: Optional[float] = None
         self._target_active = False
         self._frame_id = str(self.get_parameter("frame_id").value)
+        self._controller_lock = threading.Lock()
+        self._solver_stop = threading.Event()
+        self._solver_thread: Optional[threading.Thread] = None
+        self._publish_tool_pose_on_clock = self._use_sim_time_enabled()
 
         target_pose_y_topic = str(self.get_parameter("target_pose_y_topic").value)
         tool_pose_y_topic = str(self.get_parameter("tool_pose_y_topic").value)
@@ -309,11 +316,45 @@ class IkPoseControlNode(Node):
         self._pose_y_pub = self.create_publisher(Float32MultiArray, tool_pose_y_topic, 10)
 
         state_rate_hz = max(1.0, float(self.get_parameter("state_rate_hz").value))
-        self.create_timer(1.0 / state_rate_hz, self._state_tick)
+        self._solver_period_s = 1.0 / state_rate_hz
+        self._start_wall_time_solver()
+        if self._publish_tool_pose_on_clock:
+            clock_qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+            self.create_subscription(Clock, "/clock", self._on_clock, clock_qos)
+            self.get_logger().info(
+                "IK solver and /joint_states use wall time; tool pose publishing follows /clock"
+            )
+        else:
+            self.get_logger().info("IK solver, /joint_states, and tool pose publishing use wall time")
         self.get_logger().info(
             f"IK pose control ready; subscribe {target_pose_y_topic}; "
             f"IK origin in excavator frame={np.round(IK_ORIGIN_IN_EXCAVATOR_FRAME, 5)}"
         )
+
+    def _start_wall_time_solver(self) -> None:
+        self._solver_thread = threading.Thread(
+            target=self._solver_loop,
+            name="kaivuri_ik_wall_time_solver",
+            daemon=True,
+        )
+        self._solver_thread.start()
+
+    def _solver_loop(self) -> None:
+        next_call = time.monotonic()
+        while not self._solver_stop.is_set():
+            self._solver_tick()
+            next_call += self._solver_period_s
+            sleep_s = next_call - time.monotonic()
+            if sleep_s < -self._solver_period_s:
+                next_call = time.monotonic()
+                sleep_s = self._solver_period_s
+            self._solver_stop.wait(max(0.0, sleep_s))
+
+    def _use_sim_time_enabled(self) -> bool:
+        try:
+            return bool(self.get_parameter("use_sim_time").value)
+        except Exception:
+            return False
 
     def _apply_ik_runtime_overrides(self) -> None:
         command_type = str(self.get_parameter("ik_command_type").value).strip().lower()
@@ -379,7 +420,8 @@ class IkPoseControlNode(Node):
         return out
 
     def _send_target(self, position: np.ndarray, rot_y_deg: float) -> None:
-        result = self._controller.give_pose(position, rot_y_deg)
+        with self._controller_lock:
+            result = self._controller.give_pose(position, rot_y_deg)
         rejected = result is not None and not result.reachable
         if rejected:
             if bool(self.get_parameter("log_reachability_rejections").value):
@@ -394,48 +436,70 @@ class IkPoseControlNode(Node):
         self._last_command_time = time.monotonic()
         self._target_active = True
 
-    def _state_tick(self) -> None:
+    def _solver_tick(self) -> None:
         self._clear_stale_target_if_needed()
         if self._visualization_only:
-            self._controller.update()
-        self._publish_state()
+            with self._controller_lock:
+                self._controller.update()
+        joint_angles_rad = self._read_joint_angles_rad()
+        if joint_angles_rad is None:
+            return
+        self._publish_joint_state(joint_angles_rad)
+        if not self._publish_tool_pose_on_clock:
+            self._publish_tool_pose(joint_angles_rad)
+
+    def _on_clock(self, msg: Clock) -> None:
+        joint_angles_rad = self._read_joint_angles_rad()
+        if joint_angles_rad is None:
+            return
+        self._publish_tool_pose(joint_angles_rad, msg.clock)
 
     def _clear_stale_target_if_needed(self) -> None:
         if not self._target_active or self._last_command_time is None:
             return
         timeout_s = max(0.0, float(self.get_parameter("command_timeout_s").value))
         if timeout_s > 0.0 and (time.monotonic() - self._last_command_time) > timeout_s:
-            self._controller.clear_target()
+            with self._controller_lock:
+                self._controller.clear_target()
             self._target_active = False
             print(f"IK target timed out after {timeout_s:.3f}s; cleared active target",flush=True)
             self.get_logger().warning("IK target timed out; cleared active target")
 
-    def _publish_state(self) -> None:
+    def _read_joint_angles_rad(self) -> Optional[np.ndarray]:
         try:
-            joint_angles_deg = self._controller.get_joint_angles()
-            joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
+            with self._controller_lock:
+                joint_angles_deg = self._controller.get_joint_angles()
+            return np.radians(np.asarray(joint_angles_deg, dtype=np.float32))
         except Exception as exc:
             self.get_logger().warning(f"Joint state unavailable: {exc}", throttle_duration_sec=2.0)
-            return
+            return None
 
-        joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()
+    def _publish_joint_state(self, joint_angles_rad: np.ndarray) -> None:
+        try:
+            with self._controller_lock:
+                joint_vel_degps, vel_age = self._controller.get_joint_velocities_with_age()
+        except Exception as exc:
+            self.get_logger().warning(f"Joint velocity unavailable: {exc}", throttle_duration_sec=2.0)
+            joint_vel_degps, vel_age = None, float("inf")
+
         if joint_vel_degps is not None and vel_age < 0.2:
             joint_vel_radps = [float(np.radians(v)) for v in joint_vel_degps[:_N_ACTIVE]]
         else:
             joint_vel_radps = [0.0] * _N_ACTIVE
 
-        now = self.get_clock().now().to_msg()
         joint_msg = JointState()
-        joint_msg.header.stamp = now
+        joint_msg.header.stamp = self.get_clock().now().to_msg()
         joint_msg.name = JOINT_NAMES
         joint_msg.position = [float(v) for v in joint_angles_rad[:_N_ACTIVE]] + [0.0, 0.0, 0.0]
         joint_msg.velocity = joint_vel_radps + [0.0, 0.0, 0.0]
         self._joint_pub.publish(joint_msg)
 
+    def _publish_tool_pose(self, joint_angles_rad: np.ndarray, stamp=None) -> None:
         if bool(self.get_parameter("publish_tool_pose").value):
             state = self._get_state(joint_angles_rad[:_N_ACTIVE], self._robot_config, include_jacobian=False)
             ee_pos = state.ee_position
             ee_quat = state.ee_orientation
+            now = stamp if stamp is not None else self.get_clock().now().to_msg()
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
             pose_msg.header.frame_id = self._frame_id
@@ -459,9 +523,13 @@ class IkPoseControlNode(Node):
             self._pose_y_pub.publish(pose_y_msg)
 
     def destroy_node(self) -> bool:
+        self._solver_stop.set()
+        if self._solver_thread is not None:
+            self._solver_thread.join(timeout=1.0)
         try:
-            self._controller.clear_target()
-            self._controller.stop()
+            with self._controller_lock:
+                self._controller.clear_target()
+                self._controller.stop()
         except Exception:
             pass
         try:

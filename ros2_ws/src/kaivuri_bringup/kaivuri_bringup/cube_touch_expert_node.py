@@ -18,11 +18,14 @@ DEFAULT_CUBE_POSE_Z_OFFSET_M = 0.0
 
 class Stage(str, Enum):
     IDLE = "idle"
+    WAIT_CUBE_HIDDEN = "wait_cube_hidden"
     HOME = "home"
+    WAIT_CUBE_VISIBLE = "wait_cube_visible"
     APPROACH = "approach"
     DESCEND = "descend"
     HOLD = "hold"
     RETRACT = "retract"
+    RETURN_HOME = "return_home"
     DONE = "done"
 
 
@@ -56,7 +59,7 @@ class CubeTouchExpertNode(Node):
         self.declare_parameter("retract_xy_tolerance_m", 0.02)
         self.declare_parameter("retract_z_tolerance_m", 0.05)
         self.declare_parameter("approach_settle_s", 1.5)
-        self.declare_parameter("hold_s", 2.0)
+        self.declare_parameter("hold_s", 1.0)
         self.declare_parameter("record_retract", False)
         self.declare_parameter("timeout_s", 180.0)
         self.declare_parameter("approach_height_m", 0.05)
@@ -116,7 +119,10 @@ class CubeTouchExpertNode(Node):
         self._last_episode_cube_center: Optional[np.ndarray] = None
         self._ignore_cube_pose_until: Optional[object] = None
         self._missing_recorder_service_warnings: set[str] = set()
+        self._episode_recording_started = False
         self._episode_recording_stopped = False
+        self._cube_ready = False
+        self._cube_hidden = False
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         tool_pose_topic = str(self.get_parameter("tool_pose_topic").value)
@@ -127,6 +133,7 @@ class CubeTouchExpertNode(Node):
 
         self.create_subscription(PoseStamped, cube_pose_topic, self._on_cube_pose, 10)
         self.create_subscription(PoseStamped, tool_pose_topic, self._on_tool_pose, 10)
+        self.create_subscription(String, episode_event_topic, self._on_episode_event, 10)
         self._expert_observation_state_pub = self.create_publisher(
             Float32MultiArray,
             expert_observation_state_topic,
@@ -151,6 +158,18 @@ class CubeTouchExpertNode(Node):
         )
 
         self._publish_instruction()
+
+    def _on_episode_event(self, msg: String) -> None:
+        try:
+            _, event = msg.data.split(":", 1)
+        except ValueError:
+            return
+        if event == "cube_ready":
+            self._cube_ready = True
+            self._cube_hidden = False
+        elif event == "cube_hidden":
+            self._cube_hidden = True
+            self._cube_ready = False
 
     """Published by ik_control_node.py to command the end-effector pose. """
     def _on_tool_pose(self, msg: PoseStamped) -> None:
@@ -179,6 +198,20 @@ class CubeTouchExpertNode(Node):
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
         )
+        if self._is_hidden_cube_pose(center):
+            return
+        if not self._cube_ready:
+            self.get_logger().warning(
+                "Waiting for success_cube_relocator_node to confirm a surface cube pose before starting",
+                throttle_duration_sec=2.0,
+            )
+            return
+        if not self._is_reasonable_cube_pose(center):
+            self.get_logger().warning(
+                f"Ignoring cube pose that is not at a reasonable surface height: {np.round(center, 4)}",
+                throttle_duration_sec=2.0,
+            )
+            return
         if not self._should_start_episode_for_cube(center):
             return
         if not self._inside_configured_workspace(center):
@@ -205,18 +238,21 @@ class CubeTouchExpertNode(Node):
             Stage.DESCEND: touch,
             Stage.HOLD: touch,
             Stage.RETRACT: retract,
+            Stage.RETURN_HOME: self._default_tool_pose(),
         }
         self._last_episode_cube_center = center.copy()
         self._episode_id += 1
         self._episode_started = self.get_clock().now()
         self._episode_tool_pose_start_count = self._tool_pose_sample_count
         self._startup_ready_time = None
+        self._episode_recording_started = False
         self._episode_recording_stopped = False
+        self._cube_hidden = False
 
         self._current_target = None
         self._pending_start_from_tool_pose = True
         if bool(self.get_parameter("home_before_episode").value):
-            self._set_stage(Stage.HOME)
+            self._set_stage(Stage.WAIT_CUBE_HIDDEN)
         else:
             self._set_stage(Stage.APPROACH)
         self._publish_instruction()
@@ -266,9 +302,18 @@ class CubeTouchExpertNode(Node):
                 return
             self._startup_ready_time = None
 
-        if self._stage != Stage.HOME and self._timed_out():
+        if self._stage in (Stage.WAIT_CUBE_HIDDEN, Stage.WAIT_CUBE_VISIBLE):
+            self._publish_target()
+            if self._stage == Stage.WAIT_CUBE_HIDDEN and self._cube_hidden:
+                self._start_episode_recording()
+                self._set_stage(Stage.HOME)
+            elif self._stage == Stage.WAIT_CUBE_VISIBLE and self._cube_ready:
+                self._set_stage(Stage.APPROACH)
+            return
+
+        if self._stage not in (Stage.IDLE, Stage.DONE) and self._timed_out():
             self._publish_event("failure_timeout")
-            self._publish_event("episode_end")
+            self._end_episode_recording()
             self._set_stage(Stage.DONE)
             return
 
@@ -283,8 +328,6 @@ class CubeTouchExpertNode(Node):
                 self._hold_started = self.get_clock().now()
             if self._elapsed(self._hold_started) >= float(self.get_parameter("hold_s").value):
                 self._publish_event("touch_success")
-                if not bool(self.get_parameter("record_retract").value):
-                    self._end_episode_recording()
                 self._set_stage(Stage.RETRACT)
             return
 
@@ -308,7 +351,7 @@ class CubeTouchExpertNode(Node):
                 if not self._home_settled():
                     return
                 self._episode_started = self.get_clock().now()
-                self._set_stage(Stage.APPROACH)
+                self._set_stage(Stage.WAIT_CUBE_VISIBLE)
             elif self._stage == Stage.APPROACH:
                 if not self._approach_settled():
                     return
@@ -319,9 +362,13 @@ class CubeTouchExpertNode(Node):
                     self._current_target = hold_goal.copy()
                 self._set_stage(Stage.HOLD)
             elif self._stage == Stage.RETRACT:
+                self._set_stage(Stage.RETURN_HOME)
+            elif self._stage == Stage.RETURN_HOME:
+                if not self._home_settled():
+                    return
                 self._end_episode_recording()
                 self._set_stage(Stage.DONE)
-        elif self._stage in (Stage.HOME, Stage.APPROACH):
+        elif self._stage in (Stage.HOME, Stage.APPROACH, Stage.RETURN_HOME):
             self._approach_reached_since = None
             self._home_reached_since = None
 
@@ -417,6 +464,13 @@ class CubeTouchExpertNode(Node):
             and float(self.get_parameter("y_min").value) <= float(cube_top_center_ik[1]) <= float(self.get_parameter("y_max").value)
         )
 
+    @staticmethod
+    def _is_hidden_cube_pose(position: np.ndarray) -> bool:
+        return float(position[2]) < -1.0
+
+    def _is_reasonable_cube_pose(self, position: np.ndarray) -> bool:
+        return self._inside_configured_workspace(position) and -0.01 <= float(position[2]) <= 0.20
+
     def _front_angle_bounds(self) -> tuple[float, float]:
         angle_min = max(-90.0, float(self.get_parameter("angle_min_deg").value))
         angle_max = min(90.0, float(self.get_parameter("angle_max_deg").value))
@@ -456,6 +510,9 @@ class CubeTouchExpertNode(Node):
             return False
 
         if stage == Stage.HOME:
+            tolerance = max(0.0, float(self.get_parameter("home_tolerance_m").value))
+            return float(np.linalg.norm(reference - goal)) <= tolerance
+        if stage == Stage.RETURN_HOME:
             tolerance = max(0.0, float(self.get_parameter("home_tolerance_m").value))
             return float(np.linalg.norm(reference - goal)) <= tolerance
         if self._current_target is None:
@@ -522,10 +579,32 @@ class CubeTouchExpertNode(Node):
         self._hold_started = None
         self._approach_reached_since = None
         self._home_reached_since = None
-        if stage == Stage.APPROACH:
-            self._publish_event("episode_start")
-        if stage not in (Stage.HOME, Stage.DONE):
+        if stage == Stage.WAIT_CUBE_HIDDEN:
+            self._cube_hidden = False
+            self._publish_event("hide_cube")
             self._publish_event(stage.value)
+            return
+        if stage == Stage.WAIT_CUBE_VISIBLE:
+            self._cube_ready = False
+            self._publish_event("show_cube")
+            self._publish_event(stage.value)
+            return
+        if stage == Stage.HOME:
+            self._start_episode_recording()
+            self._publish_event(stage.value)
+            return
+        if stage == Stage.APPROACH:
+            self._start_episode_recording()
+        if stage in (Stage.RETRACT, Stage.RETURN_HOME):
+            self._publish_event("hide_cube")
+        if stage != Stage.DONE:
+            self._publish_event(stage.value)
+
+    def _start_episode_recording(self) -> None:
+        if self._episode_recording_started:
+            return
+        self._episode_recording_started = True
+        self._publish_event("episode_start")
 
     def _end_episode_recording(self) -> None:
         if self._episode_recording_stopped:

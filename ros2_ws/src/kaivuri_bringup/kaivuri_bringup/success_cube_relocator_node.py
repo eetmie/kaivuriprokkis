@@ -19,6 +19,7 @@ CUBE_TOP_Z_IN_EXCAVATOR_FRAME = 0.025000000372529023
 DEFAULT_CUBE_TOP_Z_IN_IK_FRAME = CUBE_TOP_Z_IN_EXCAVATOR_FRAME - IK_ORIGIN_Z_IN_EXCAVATOR_FRAME
 FRONT_ANGLE_MIN_DEG = -80.0
 FRONT_ANGLE_MAX_DEG = 80.0
+HIDDEN_CUBE_TOP_CENTER_IK = np.array([0.0, 0.0, -5.0], dtype=np.float32)
 
 
 class SuccessCubeRelocatorNode(Node):
@@ -33,7 +34,7 @@ class SuccessCubeRelocatorNode(Node):
         self.declare_parameter("project_root", os.environ.get("KAIVURI_PROJECT_ROOT", "/work"))
         self.declare_parameter("control_config_file", "configuration_files/profiles/rpi/control_config.yaml")
         self.declare_parameter("frame_id", "excavator")
-        self.declare_parameter("publish_initial_pose", False)
+        self.declare_parameter("publish_initial_pose", True)
         self.declare_parameter("cube_pose_is_top_center", True)
         self.declare_parameter("cube_size_m", 0.05)
         self.declare_parameter("cube_pose_z_offset_m", 0.0)
@@ -78,6 +79,11 @@ class SuccessCubeRelocatorNode(Node):
         self._pending_success_episode: Optional[int] = None
         self._pending_relocation_reason: Optional[str] = None
         self._relocate_after_time = None
+        self._pending_ready_pose: Optional[np.ndarray] = None
+        self._pending_hidden_confirmation = False
+        self._cube_hidden = False
+        self._last_visible_cube_pose_msg: Optional[PoseStamped] = None
+        self._last_ready_event_time: Optional[object] = None
 
         cube_pose_topic = str(self.get_parameter("cube_pose_topic").value)
         cube_command_topic = str(self.get_parameter("cube_command_topic").value)
@@ -85,6 +91,7 @@ class SuccessCubeRelocatorNode(Node):
         joint_states_topic = str(self.get_parameter("joint_states_topic").value)
 
         self._cube_pub = self.create_publisher(PoseStamped, cube_command_topic, 10)
+        self._event_pub = self.create_publisher(String, event_topic, 10)
         self.create_subscription(PoseStamped, cube_pose_topic, self._on_cube_pose, 10)
         self.create_subscription(String, event_topic, self._on_episode_event, 10)
         self.create_subscription(JointState, joint_states_topic, self._on_joint_state, 10)
@@ -143,8 +150,8 @@ class SuccessCubeRelocatorNode(Node):
     def _publish_initial_once(self) -> None:
         if self._published_initial:
             return
-        self._published_initial = True
-        self._publish_new_cube_pose("initial")
+        if self._pending_ready_pose is None:
+            self._publish_new_cube_pose("initial")
 
     def _on_joint_state(self, msg: JointState) -> None:
         if len(msg.position) < _N_ACTIVE:
@@ -155,18 +162,45 @@ class SuccessCubeRelocatorNode(Node):
         )
 
     def _on_cube_pose(self, msg: PoseStamped) -> None:
-        self._last_measured_cube_pose = np.array(
+        measured = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
         )
+        if self._is_hidden_pose(measured):
+            self._cube_hidden = True
+            if self._pending_hidden_confirmation:
+                self._pending_hidden_confirmation = False
+                self._publish_event(0, "cube_hidden")
+            return
+
+        self._cube_hidden = False
+        self._last_measured_cube_pose = measured
+        visible_surface_pose = self._is_reasonable_surface_pose(measured)
+        if visible_surface_pose:
+            self._last_visible_cube_pose_msg = self._clone_pose_msg(msg)
+            if self._pending_ready_pose is None or self._pose_close(measured, self._pending_ready_pose):
+                self._pending_ready_pose = None
+                self._published_initial = True
+                self._publish_cube_ready(force=True)
+            elif not self._published_initial:
+                self._last_cube_top_center_ik = measured.copy()
+                self._pending_ready_pose = None
+                self._published_initial = True
+                self._publish_cube_ready(force=True)
+            elif self._published_initial:
+                self._publish_cube_ready(force=False)
+
         if self._last_cube_top_center_ik is None:
             self._last_cube_top_center_ik = self._last_measured_cube_pose.copy()
         if (
             bool(self.get_parameter("relocate_invalid_cube_pose").value)
             and self._pending_relocation_reason is None
-            and not self._inside_configured_workspace(self._last_measured_cube_pose)
+            and not self._cube_hidden
+            and not visible_surface_pose
         ):
             delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
+            self._pending_ready_pose = None
+            self._last_ready_event_time = None
             self._pending_relocation_reason = "invalid_cube_pose"
             self._pending_success_episode = None
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
@@ -182,15 +216,22 @@ class SuccessCubeRelocatorNode(Node):
         except ValueError:
             return
 
+        if event == "hide_cube":
+            self._hide_cube(f"episode={episode_id}")
+            return
+
+        if event == "show_cube":
+            self._show_cube(f"episode={episode_id}")
+            return
+
         if event == "touch_success":
             if episode_id in self._relocated_episodes:
                 return
             self._success_episodes.add(episode_id)
             self._pending_success_episode = episode_id
-            self._pending_relocation_reason = f"touch_success episode={episode_id}"
-            delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
-            self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
-            self.get_logger().info(f"Scheduled cube relocation after touch_success episode={episode_id}")
+            self._pending_relocation_reason = None
+            self._relocate_after_time = None
+            self._hide_cube(f"touch_success episode={episode_id}")
             return
 
         if event.startswith("failure") and bool(self.get_parameter("relocate_on_failure").value):
@@ -210,6 +251,7 @@ class SuccessCubeRelocatorNode(Node):
             and episode_id not in self._relocated_episodes
         ):
             delay_s = max(0.0, float(self.get_parameter("relocate_delay_s").value))
+            self._pending_relocation_reason = f"episode_end after touch_success episode={episode_id}"
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
 
     def _relocation_tick(self) -> None:
@@ -242,8 +284,81 @@ class SuccessCubeRelocatorNode(Node):
         msg.pose.position.z = float(top_center_ik[2])
         msg.pose.orientation.w = 1.0
         self._cube_pub.publish(msg)
+        self._cube_hidden = False
+        self._pending_ready_pose = top_center_ik.copy()
+        self._last_ready_event_time = None
+        self._last_visible_cube_pose_msg = self._clone_pose_msg(msg)
         self.get_logger().info(f"Published cube top-center IK pose after {reason}: {np.round(top_center_ik, 4)}")
         return True
+
+    def _hide_cube(self, reason: str) -> None:
+        self._cube_hidden = True
+        self._pending_hidden_confirmation = True
+        self._pending_ready_pose = None
+        self._last_ready_event_time = None
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = str(self.get_parameter("frame_id").value)
+        msg.pose.position.x = float(HIDDEN_CUBE_TOP_CENTER_IK[0])
+        msg.pose.position.y = float(HIDDEN_CUBE_TOP_CENTER_IK[1])
+        msg.pose.position.z = float(HIDDEN_CUBE_TOP_CENTER_IK[2])
+        msg.pose.orientation.w = 1.0
+        self._cube_pub.publish(msg)
+        self.get_logger().info(f"Published hidden cube pose for {reason}")
+
+    def _show_cube(self, reason: str) -> None:
+        if self._last_visible_cube_pose_msg is None:
+            self.get_logger().warning(f"Cannot restore visible cube pose for {reason}; no visible cube pose has been observed")
+            self._publish_new_cube_pose(f"missing visible restore pose for {reason}")
+            return
+        msg = self._clone_pose_msg(self._last_visible_cube_pose_msg)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        target = np.array(
+            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
+            dtype=np.float32,
+        )
+        self._cube_hidden = False
+        self._pending_hidden_confirmation = False
+        self._pending_ready_pose = target
+        self._last_ready_event_time = None
+        self._cube_pub.publish(msg)
+        self.get_logger().info(f"Restored visible cube pose for {reason}")
+
+    def _publish_cube_ready(self, force: bool = False) -> None:
+        now = self.get_clock().now()
+        if not force and self._last_ready_event_time is not None:
+            if (now - self._last_ready_event_time).nanoseconds * 1e-9 < 1.0:
+                return
+        self._last_ready_event_time = now
+        self._publish_event(0, "cube_ready")
+
+    def _publish_event(self, episode_id: int, event: str) -> None:
+        msg = String()
+        msg.data = f"{episode_id}:{event}"
+        self._event_pub.publish(msg)
+        self.get_logger().info(f"Episode event: {msg.data}")
+
+    @staticmethod
+    def _is_hidden_pose(position: np.ndarray) -> bool:
+        return float(position[2]) < -1.0
+
+    @staticmethod
+    def _pose_close(a: np.ndarray, b: np.ndarray) -> bool:
+        return float(np.linalg.norm(a - b)) <= 0.01
+
+    @staticmethod
+    def _clone_pose_msg(msg: PoseStamped) -> PoseStamped:
+        out = PoseStamped()
+        out.header.frame_id = msg.header.frame_id
+        out.header.stamp = msg.header.stamp
+        out.pose.position.x = msg.pose.position.x
+        out.pose.position.y = msg.pose.position.y
+        out.pose.position.z = msg.pose.position.z
+        out.pose.orientation.x = msg.pose.orientation.x
+        out.pose.orientation.y = msg.pose.orientation.y
+        out.pose.orientation.z = msg.pose.orientation.z
+        out.pose.orientation.w = msg.pose.orientation.w
+        return out
 
     def _sample_reachable_cube_top_center_ik(self) -> Optional[np.ndarray]:
         max_attempts = max(1, int(self.get_parameter("max_attempts").value))
@@ -298,12 +413,19 @@ class SuccessCubeRelocatorNode(Node):
         return angle_min, angle_max
 
     def _command_z(self) -> float:
-        if (
-            bool(self.get_parameter("use_measured_cube_z").value)
-            and self._last_measured_cube_pose is not None
-        ):
-            return float(self._last_measured_cube_pose[2]) + float(self.get_parameter("cube_pose_z_offset_m").value)
-        return float(self.get_parameter("z").value)
+        if bool(self.get_parameter("use_measured_cube_z").value):
+            if self._last_visible_cube_pose_msg is not None:
+                return (
+                    float(self._last_visible_cube_pose_msg.pose.position.z)
+                    + float(self.get_parameter("cube_pose_z_offset_m").value)
+                )
+            if (
+                self._last_measured_cube_pose is not None
+                and self._is_reasonable_surface_pose(self._last_measured_cube_pose)
+                and not self._is_hidden_pose(self._last_measured_cube_pose)
+            ):
+                return float(self._last_measured_cube_pose[2]) + float(self.get_parameter("cube_pose_z_offset_m").value)
+        return CUBE_TOP_Z_IN_EXCAVATOR_FRAME
 
     def _joint_seed(self) -> np.ndarray:
         if self._latest_joint_angles is not None:
@@ -353,6 +475,9 @@ class SuccessCubeRelocatorNode(Node):
             float(self.get_parameter("x_min").value) <= float(cube_top_center_ik[0]) <= float(self.get_parameter("x_max").value)
             and float(self.get_parameter("y_min").value) <= float(cube_top_center_ik[1]) <= float(self.get_parameter("y_max").value)
         )
+
+    def _is_reasonable_surface_pose(self, position: np.ndarray) -> bool:
+        return self._inside_configured_workspace(position) and -0.01 <= float(position[2]) <= 0.20
 
 
 def main(args=None) -> None:

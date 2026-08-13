@@ -28,7 +28,7 @@ def generate_launch_description():
         DeclareLaunchArgument("retract_xy_tolerance_m", default_value="0.02"),
         DeclareLaunchArgument("retract_z_tolerance_m", default_value="0.05"),
         DeclareLaunchArgument("approach_settle_s", default_value="1.5"),
-        DeclareLaunchArgument("hold_s", default_value="1.5"),
+        DeclareLaunchArgument("hold_s", default_value="1.0"),
         DeclareLaunchArgument("post_touch_record_s", default_value="1.0"),
         DeclareLaunchArgument("record_retract", default_value="true"),
         DeclareLaunchArgument("use_polar_workspace", default_value="true"),

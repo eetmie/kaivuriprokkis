@@ -130,6 +130,71 @@ def resolve_policy_fps(split_dir: str, stats_path: str | None,
     return DEFAULT_FPS
 
 
+def resolve_state_blind(split_dir: str, explicit: bool) -> bool:
+    """Whether this checkpoint was trained camera-only, so state must be fed as zeros.
+
+    A state-blind checkpoint (the excav_E* bundles) saw ``observation.state == 0`` at
+    every training frame, and its normalizer was patched to mean 0 / std 1. That makes
+    normalization the identity, so a real joint reading is NOT scaled down on its way
+    into ``state_proj`` — raw degrees land in a projector whose weight never received a
+    gradient and still sits at its pretrained value. Measured on the E@017500 bundle,
+    feeding plausible angles instead of zeros moves the commanded action by up to 0.434
+    on the [-1, 1] joystick scale. Like the fps mismatch above, nothing about that
+    failure is loud: the machine just drives somewhere else.
+
+    Read from ``state_blind`` in <split-dir>/export_info.json; --state-blind forces it
+    on for a bundle that predates the flag.
+    """
+    path = Path(split_dir) / "export_info.json"
+    recorded = None
+    if path.is_file():
+        try:
+            recorded = json.loads(path.read_text()).get("state_blind")
+        except (json.JSONDecodeError, OSError) as exc:
+            LOG.warning("Could not read %s for the state_blind flag: %s", path, exc)
+
+    if recorded:
+        LOG.warning("CAMERA-ONLY checkpoint (state_blind in %s): observation.state is "
+                    "fed to the policy as ZEROS; the IMU reading is logged but unused.",
+                    path.name)
+        return True
+    if explicit:
+        LOG.warning("--state-blind given: observation.state is fed to the policy as "
+                    "ZEROS even though %s does not record state_blind.", path.name)
+        return True
+    return False
+
+
+def check_state_blind_stats(norm: NormStats, stats_path: str | None) -> None:
+    """Refuse a camera-only checkpoint paired with another run's normalization stats.
+
+    Zeroing the state in ``for_policy`` is not sufficient on its own: the zeros are
+    normalized afterwards, inside ``sample_actions``. Pointing --dataset-stats at the
+    state-fed dataset (masi_kaivuri_juusto) turns those zeros back into
+    ``(0 - mean)/std = [0.172, 1.028, -4.104, 0.869]`` — a state token four sigma out,
+    which is precisely what feeding the raw IMU would have done. The state-blind bundle
+    ships its own stats.json (mean 0 / std 1) for this reason.
+
+    Checked as the invariant that actually matters — zeros must normalize to zeros —
+    rather than by comparing file paths.
+    """
+    if norm.state_mean is None:
+        return
+    probe = norm.normalize_state(np.zeros_like(norm.state_mean))
+    if np.allclose(probe, 0.0, atol=1e-6):
+        return
+    raise SystemExit(
+        f"--dataset-stats {stats_path} cannot be used with a state_blind (camera-only) "
+        f"checkpoint.\n"
+        f"This model was trained with observation.state == 0 and expects identity "
+        f"normalization (mean 0 / std 1), but these stats normalize zeros to "
+        f"[{' '.join(f'{v:+.3f}' for v in probe)}].\n"
+        f"That puts an out-of-distribution state token into the prefix — the same failure "
+        f"as feeding the raw IMU.\n"
+        f"Use the stats.json shipped inside the bundle: "
+        f"--dataset-stats {Path(DEFAULT_SPLIT_DIR).parent}/<bundle>/stats.json")
+
+
 def load_norm(stats_path: str | None) -> NormStats:
     if not stats_path:
         LOG.warning("No --dataset-stats given: state/action normalization is "
@@ -159,6 +224,10 @@ def main() -> int:
                         f"(default if nothing records it: {DEFAULT_FPS:g})")
     p.add_argument("--dataset-stats", default=None,
                    help="Path to a LeRobot dataset stats.json for state/action normalization")
+    p.add_argument("--state-blind", action="store_true",
+                   help="Feed observation.state to the policy as zeros (camera-only "
+                        "checkpoint). Normally omitted — it is read from the export "
+                        "bundle's state_blind flag")
     p.add_argument("--robot", default="auto")
     p.add_argument("--exposure-us", type=float, default=None,
                    help="Lock IR exposure (us) — use the SAME value the dataset "
@@ -190,6 +259,11 @@ def main() -> int:
     # Resolve before building engines so a rate mismatch fails in a second rather
     # than after a multi-minute TRT build.
     args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
+    state_blind = resolve_state_blind(args.split_dir, args.state_blind)
+
+    norm = load_norm(args.dataset_stats)
+    if state_blind:
+        check_state_blind_stats(norm, args.dataset_stats)
 
     policy = SmolVLASplitPolicy(
         split_dir=args.split_dir,
@@ -197,7 +271,7 @@ def main() -> int:
         cache_dir=args.cache_dir,
         num_steps=args.num_steps,
         action_dim=4,
-        norm=load_norm(args.dataset_stats),
+        norm=norm,
         seed=args.seed,
     )
 
@@ -228,11 +302,16 @@ def main() -> int:
                .astype(np.uint8))
         return img, np.zeros(4, dtype=np.float32)
 
+    def for_policy(state):
+        """What the policy actually receives. A camera-only checkpoint gets zeros;
+        the real reading is still logged, so the IMU stays visible for diagnostics."""
+        return np.zeros_like(state) if state_blind else state
+
     # Warmup / engine build happens on the first sample_actions call.
     LOG.info("Warmup inference (builds TRT engines on first ever run)...")
     img, state = get_observation()
     t0 = time.perf_counter()
-    policy.sample_actions(img, args.instruction, state)
+    policy.sample_actions(img, args.instruction, for_policy(state))
     LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
 
     cycle = 0
@@ -245,7 +324,7 @@ def main() -> int:
         while True:
             img, state = get_observation()
             t0 = time.perf_counter()
-            chunk = policy.sample_actions(img, args.instruction, state)
+            chunk = policy.sample_actions(img, args.instruction, for_policy(state))
             infer_s = time.perf_counter() - t0
             infer_lead_s = max(infer_s, infer_lead_s * 0.9)
 
@@ -265,8 +344,9 @@ def main() -> int:
             if robot is not None and args.live:
                 st = robot.get_setpoint_status()
                 status = f" age={st['age_s']:.2f}s decay={st['decay']:.2f}"
-            LOG.info("cycle=%d infer=%.0fms chunk=%.2fs state=[%s] a0=[%s] a%d=[%s]%s",
+            LOG.info("cycle=%d infer=%.0fms chunk=%.2fs state%s=[%s] a0=[%s] a%d=[%s]%s",
                      cycle, infer_s * 1000.0, chunk_s,
+                     "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),
                      " ".join(f"{v:+.2f}" for v in chunk[0]),
                      n_exec - 1,

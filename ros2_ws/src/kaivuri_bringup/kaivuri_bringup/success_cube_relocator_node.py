@@ -2,7 +2,7 @@ import os
 import math
 import random
 from typing import Optional
-
+import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
@@ -149,6 +149,9 @@ class SuccessCubeRelocatorNode(Node):
         )
 
     def _publish_initial_once(self) -> None:
+        print(f"cube_pose_cmd subscribers: {self._cube_pub.get_subscription_count()}", flush=True)
+        if self._cube_pub.get_subscription_count() < 1:
+            return
         if self._published_initial:
             return
         if self._pending_ready_pose is None:
@@ -187,7 +190,7 @@ class SuccessCubeRelocatorNode(Node):
                 self._published_initial = True
                 self._publish_cube_ready(force=True)
             elif not self._published_initial:
-                self._last_cube_top_center_ik = measured.copy()
+                self._last_cube_top_center_ik = measured.copy() # is this unneccessary?
                 self._pending_ready_pose = None
                 self._published_initial = True
                 self._publish_cube_ready(force=True)
@@ -195,7 +198,7 @@ class SuccessCubeRelocatorNode(Node):
                 self._publish_cube_ready(force=False)
 
         if self._last_cube_top_center_ik is None:
-            self._last_cube_top_center_ik = self._last_measured_cube_pose.copy()
+            self._last_cube_top_center_ik = self._last_measured_cube_pose.copy() 
         if (
             bool(self.get_parameter("relocate_invalid_cube_pose").value)
             and self._pending_relocation_reason is None

@@ -339,7 +339,7 @@ class CubeTouchExpertNode(Node):
         if goal is None:
             return
 
-        current_position = self._tool_position.copy()
+        current_position = self._current_target.copy() # this changed from _tool.pose can effect the timing in the recorded dataset...
         if self._stage in (Stage.HOME, Stage.APPROACH):
             self._current_target = self._step_approach_toward(current_position, goal)
         else:
@@ -381,12 +381,12 @@ class CubeTouchExpertNode(Node):
         return current + delta * (max_step / distance)
 
     def _step_approach_toward(self, current: np.ndarray, goal: np.ndarray) -> np.ndarray:
-        # z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
+        z_tolerance = max(0.0, float(self.get_parameter("approach_z_tolerance_m").value))
         safe_z = float(goal[2])
-        # if float(current[2]) < safe_z - z_tolerance:
-        #     lift_goal = current.copy()
-        #     lift_goal[2] = safe_z
-        #     return self._step_toward(current, lift_goal)
+        if float(current[2]) < safe_z - z_tolerance:
+            lift_goal = current.copy()
+            lift_goal[2] = safe_z
+            return self._step_toward(current, lift_goal)
 
         horizontal_goal = goal.copy()
         horizontal_goal[2] = safe_z

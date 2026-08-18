@@ -149,7 +149,6 @@ class SuccessCubeRelocatorNode(Node):
         )
 
     def _publish_initial_once(self) -> None:
-        print(f"cube_pose_cmd subscribers: {self._cube_pub.get_subscription_count()}", flush=True)
         if self._cube_pub.get_subscription_count() < 1:
             return
         if self._published_initial:
@@ -211,6 +210,7 @@ class SuccessCubeRelocatorNode(Node):
             self._pending_relocation_reason = "invalid_cube_pose"
             self._pending_success_episode = None
             self._relocate_after_time = self.get_clock().now() + Duration(seconds=delay_s)
+            print("Pröööttistä!", flush=True)
             self.get_logger().warning(
                 f"Scheduled cube relocation for invalid pose outside workspace: {np.round(self._last_measured_cube_pose, 4)}",
                 throttle_duration_sec=2.0,
@@ -269,10 +269,9 @@ class SuccessCubeRelocatorNode(Node):
 
         episode_id = self._pending_success_episode
         reason = self._pending_relocation_reason
-        if reason.startswith("episode_end after touch_success"):
-            published = self._prepare_next_visible_cube_pose(reason)
-        else:
-            published = self._publish_new_cube_pose(reason)
+
+        published = self._publish_new_cube_pose(reason)
+
         if published:
             self._pending_success_episode = None
             self._pending_relocation_reason = None

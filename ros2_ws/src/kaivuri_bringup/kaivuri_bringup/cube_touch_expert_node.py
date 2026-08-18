@@ -305,7 +305,6 @@ class CubeTouchExpertNode(Node):
         if self._stage in (Stage.WAIT_CUBE_HIDDEN, Stage.WAIT_CUBE_VISIBLE):
             self._publish_target()
             if self._stage == Stage.WAIT_CUBE_HIDDEN and self._cube_hidden:
-                self._start_episode_recording()
                 self._set_stage(Stage.HOME)
             elif self._stage == Stage.WAIT_CUBE_VISIBLE and self._cube_ready:
                 self._set_stage(Stage.APPROACH)
@@ -590,10 +589,9 @@ class CubeTouchExpertNode(Node):
             self._publish_event(stage.value)
             return
         if stage == Stage.HOME:
-            self._start_episode_recording()
             self._publish_event(stage.value)
-            return
         if stage == Stage.APPROACH:
+            return
             self._start_episode_recording()
         if stage in (Stage.RETRACT, Stage.RETURN_HOME):
             self._publish_event("hide_cube")

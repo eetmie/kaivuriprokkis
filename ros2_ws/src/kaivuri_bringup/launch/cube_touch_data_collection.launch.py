@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="false"),
-        DeclareLaunchArgument(" ", default_value="true"),
+        DeclareLaunchArgument("use_success_cube_relocator", default_value="true"),
         DeclareLaunchArgument("use_random_cube", default_value="false"),
         DeclareLaunchArgument("cube_size_m", default_value="0.05"),
         DeclareLaunchArgument("cube_pose_z_offset_m", default_value="0.0"),

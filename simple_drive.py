@@ -697,7 +697,13 @@ class PWMOnlyController:
 BTN_A, BTN_B, BTN_X, BTN_Y = 0, 1, 2, 3
 BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT = 4, 5, 6, 7
 
-GAMEPAD_DEADZONE_PCT = 15.0
+# Shared by teleop and by record_episodes, deliberately: the recorder is the
+# training-data twin of this script, so a stick position has to mean the same
+# valve command in both. A recorder with its own deadzone would train the policy
+# on a machine that behaves differently from the one being driven.
+# 25% matches modules.gamepad.XboxController's own default (this constant used to
+# override it down to 15).
+GAMEPAD_DEADZONE_PCT = 25.0
 GAMEPAD_PADDING_PCT  = 0.0
 
 

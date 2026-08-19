@@ -352,7 +352,10 @@ def main() -> int:
     print("A=start/save episode  B=discard episode  X=pump  Y=reload-config  Ctrl+C=quit\n")
 
     period = 1.0 / args.fps
-    next_tick = time.perf_counter()
+    # Capture time of the last frame this loop consumed. The loop paces on the
+    # camera publishing a frame newer than this, rather than on its own sleep.
+    last_cam_ts = 0.0
+    stalls = 0
     mask_prev = 0
     recording = False
     ep_start = 0.0
@@ -408,6 +411,28 @@ def main() -> int:
 
     try:
         while True:
+            # Pace on the camera, not on a sleep. A 30.000 Hz sleep loop is a
+            # second clock beating against a sensor that actually delivers at
+            # ~29.976 Hz: measured over one 35 s episode the frame age walked
+            # 22 ms -> 5 ms, and continuing that slide means alternately
+            # reusing and skipping frames. Waiting for the frame removes the
+            # second clock instead of correcting for it.
+            #
+            # On timeout the loop still runs: the gamepad has to be polled and
+            # the setpoint fed (or visibly stop, so the valves decay) rather
+            # than block behind a stalled USB pipe. Nothing is recorded for a
+            # tick with no new frame -- a duplicate image would be a worse lie
+            # than a short gap, and the gap shows up in the achieved rate.
+            cam_ts = robot.wait_for_next_frame(last_cam_ts, timeout_s=4 * period)
+            fresh = cam_ts > 0.0
+            if fresh:
+                last_cam_ts = cam_ts
+            elif recording:
+                stalls += 1
+                if stalls % 30 == 1:
+                    print(f"\n*** CAMERA: no new frame for {4 * period * 1000:.0f} ms "
+                          f"({stalls} skipped this run) ***")
+
             axes, mask = pad.poll()
             if axes is not None:
                 def btn(b): return bool(mask & (1 << b))
@@ -440,7 +465,7 @@ def main() -> int:
 
             sent = robot.send_action(action)
 
-            if recording:
+            if recording and fresh:
                 obs = robot.get_observation()
                 tick = time.perf_counter()
                 # Every declared camera must be present in the frame, so a
@@ -457,9 +482,13 @@ def main() -> int:
                     frame.update(clock_fields(obs, tick, ep_perf0))
                     dataset.add_frame(frame)
                     ep_frames += 1
-                if time.time() - ep_start >= args.max_episode_s:
-                    stop_episode(save=True, reason=f"{args.max_episode_s:.0f}s limit")
-                    saved_eps += 1
+
+            # Outside the fresh-frame gate on purpose: a camera that stalls mid
+            # take must not also disable the auto-stop and leave the operator
+            # recording into a dead stream.
+            if recording and time.time() - ep_start >= args.max_episode_s:
+                stop_episode(save=True, reason=f"{args.max_episode_s:.0f}s limit")
+                saved_eps += 1
 
             now = time.time()
             if now - last_status >= 5.0:
@@ -478,12 +507,8 @@ def main() -> int:
                       + ("" if pad.is_live() else " | *** GAMEPAD LOST ***")
                       + sp_str)
 
-            next_tick += period
-            sleep = next_tick - time.perf_counter()
-            if sleep > 0:
-                time.sleep(sleep)
-            else:
-                next_tick = time.perf_counter()
+            # No sleep here: wait_for_next_frame() at the top of the loop is
+            # what paces it, and it blocks until the camera has something new.
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

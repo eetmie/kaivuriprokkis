@@ -362,7 +362,21 @@ lerobot's fps-mismatch guards catch it, because the recorded fps itself is the
 lie. `streaming_encoding=True` (set since 2026-08-19) hands frames to a
 background encoder instead: `add_frame` drops to 0.5 ms, the loop holds a
 measured 30.00 Hz with 0/150 late ticks, and `save_episode` falls from 8.7 s to
-0.4 s. Datasets recorded before that date carry the 2x error. Repeated IMU frames mean the record loop outran the 200 Hz stream and
+0.4 s. Datasets recorded before that date carry the 2x error.
+
+The loop also paces on **camera frame arrival**, not on a sleep (since
+2026-08-19). A 30.000 Hz sleep loop is a second clock beating against a D435i
+that actually delivers at ~29.976 Hz: over one 35 s episode the recorded frame
+age walked 22.35 ms -> 4.60 ms, and continuing that slide means alternately
+reusing and skipping frames. Blocking on the frame removes the second clock
+rather than correcting for it. Measured over 600 frames: age 3.25 ms mean
+(sd 0.42, max 7.44), no drift (3.31 -> 3.22 ms), 0 reused, 0 skipped.
+
+Two consequences worth knowing. The achieved rate is the camera's true
+29.985 Hz, so a dataset declaring 30 carries a 0.05% timebase error -- 17 ms
+over a 35 s episode, against the 2x this replaced. And a tick with no new frame
+records nothing at all: a duplicate image is a worse lie than a short gap, and
+the gap surfaces in the achieved rate printed at save. Repeated IMU frames mean the record loop outran the 200 Hz stream and
 wrote the same pose twice. A camera age near a full frame period means the
 policy is being trained on images that were already stale when recorded.
 

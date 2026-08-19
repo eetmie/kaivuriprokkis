@@ -119,6 +119,9 @@ class D435iCamera:
         self._latest_color_ts: float = 0.0
         self._frame_count = 0
         self._lock = threading.Lock()
+        # Signals a newly stored frame to wait_for_next(). Wraps _lock, so the
+        # existing `with self._lock:` blocks keep working unchanged.
+        self._new_frame = threading.Condition(self._lock)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._pipeline = None
@@ -184,7 +187,7 @@ class D435iCamera:
 
             if ir_img is None and color_img is None:
                 continue
-            with self._lock:
+            with self._new_frame:
                 if ir_img is not None:
                     self._latest = ir_img
                     self._latest_ts = now
@@ -192,11 +195,36 @@ class D435iCamera:
                 if color_img is not None:
                     self._latest_color = color_img
                     self._latest_color_ts = now
+                self._new_frame.notify_all()
 
     def get_latest(self) -> tuple[Optional[np.ndarray], float]:
         """Latest IR HxWx3 uint8 frame and its capture time (perf_counter)."""
         with self._lock:
             return self._latest, self._latest_ts
+
+    def wait_for_next(self, after_ts: float, timeout_s: float) -> float:
+        """Block until an IR frame newer than ``after_ts`` lands. Returns its
+        capture time, or 0.0 if none arrived within ``timeout_s``.
+
+        This is what lets a caller run on the camera's clock instead of its own.
+        A free-running loop at a nominally identical rate is still a second
+        clock: the D435i delivers at ~29.976 Hz, so a 30.000 Hz sleep loop beats
+        against it and the frame age walks the whole 0..33 ms range, reusing a
+        frame at one end and skipping one at the other. Waiting for the frame
+        removes the second clock rather than correcting for it.
+
+        The timeout exists so a stalled camera cannot wedge the caller: it has a
+        gamepad to poll and setpoints to feed, and those must keep running (or
+        visibly stop) rather than block behind a dead USB pipe.
+        """
+        deadline = time.perf_counter() + timeout_s
+        with self._new_frame:
+            while self._latest_ts <= after_ts:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0 or not self._new_frame.wait(remaining):
+                    if self._latest_ts <= after_ts:
+                        return 0.0
+            return self._latest_ts
 
     def get_latest_color(self) -> tuple[Optional[np.ndarray], float]:
         """Latest RGB HxWx3 uint8 frame and its capture time, or (None, 0.0)."""

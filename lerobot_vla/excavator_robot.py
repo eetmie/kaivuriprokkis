@@ -244,6 +244,16 @@ class MasiExcavator:
         """Whether cam2 (the RGB imager) is part of the observation."""
         return self.camera.color_enabled
 
+    def wait_for_next_frame(self, after_ts: float, timeout_s: float) -> float:
+        """Block until the camera publishes a frame newer than ``after_ts``.
+
+        Returns the new frame's capture time, or 0.0 on timeout. Lets a caller
+        pace itself on the camera rather than on its own sleep, which is what
+        keeps a recording loop from beating against the sensor -- see
+        D435iCamera.wait_for_next.
+        """
+        return self.camera.wait_for_next(after_ts, timeout_s)
+
     def get_observation(self) -> dict:
         img, img_ts = self.camera.get_latest()
         state, state_ts, imu_us = self.get_state()

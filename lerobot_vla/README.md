@@ -350,7 +350,19 @@ EOF
 ```
 
 A jitter max far above a few ms means the loop stalled — usually the video
-encode. Repeated IMU frames mean the record loop outran the 200 Hz stream and
+encode. **This is not hypothetical:** with lerobot's default
+`streaming_encoding=False`, `add_frame()` writes a PNG per camera per frame on
+the calling thread — measured 46 ms each on this board, so two cameras cost
+~69 ms against a 33.3 ms budget. The loop settles at ~14.5 Hz, every tick late,
+while `timestamp` still claims `frame_index / fps`. The result is a dataset
+asserting 30 fps for motion that happened at half that: it plays back ~2x fast,
+trains on a 2x-wrong timebase, and `run_inference.py` — which resolves its rate
+from the export bundle — then commands the machine about twice too fast. None of
+lerobot's fps-mismatch guards catch it, because the recorded fps itself is the
+lie. `streaming_encoding=True` (set since 2026-08-19) hands frames to a
+background encoder instead: `add_frame` drops to 0.5 ms, the loop holds a
+measured 30.00 Hz with 0/150 late ticks, and `save_episode` falls from 8.7 s to
+0.4 s. Datasets recorded before that date carry the 2x error. Repeated IMU frames mean the record loop outran the 200 Hz stream and
 wrote the same pose twice. A camera age near a full frame period means the
 policy is being trained on images that were already stale when recorded.
 

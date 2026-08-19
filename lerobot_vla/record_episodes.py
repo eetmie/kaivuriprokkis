@@ -249,7 +249,8 @@ def main() -> int:
                 print(f"There is no episode data to lose. Remove it and record "
                       f"without --resume:\n    rm -rf {root}")
             return 1
-        dataset = LeRobotDataset.resume(args.repo_id, root=root, vcodec="h264")
+        dataset = LeRobotDataset.resume(args.repo_id, root=root, vcodec="h264",
+                                        streaming_encoding=True)
         # Catch a schema change here rather than on the first add_frame. lerobot
         # validates every frame against the stored features, so appending to a
         # dataset recorded before the clock.* columns existed fails mid-episode
@@ -284,6 +285,14 @@ def main() -> int:
             robot_type=MasiExcavator.robot_type,
             use_videos=True,
             vcodec="h264",
+            # Without this lerobot writes a PNG per camera per frame, on this
+            # thread: measured 46 ms each, so two cameras alone blow the 33.3 ms
+            # budget and the loop settles at ~14.5 Hz while still stamping
+            # timestamps as frame_index/fps. Every dataset recorded that way
+            # claims 30 fps for motion that happened at half that, and replays
+            # (and trains, and executes) about twice too fast. The streaming
+            # encoder hands frames to a background encoder instead: 12 ms.
+            streaming_encoding=True,
         )
         print(f"[dataset] Created {root}")
 
@@ -369,7 +378,23 @@ def main() -> int:
             if pump_was_on:
                 robot.set_pump(False)
                 print("\n[pump] OFF (saving)")
-            print(f"\n[EP] saving {ep_frames} frames ({ep_frames / args.fps:.1f}s) "
+            # The rate this episode actually achieved, against the one the
+            # dataset is about to assert. lerobot stamps `timestamp` as
+            # frame_index / fps no matter what the loop managed, so a loop that
+            # cannot hold --fps produces a dataset claiming a duration it never
+            # took: it plays back fast, trains on a compressed timebase, and
+            # run_inference commands the machine by that same wrong factor.
+            # Nothing downstream can detect it, so it has to be said here.
+            elapsed = time.perf_counter() - ep_perf0
+            achieved = ep_frames / elapsed if elapsed > 0 else 0.0
+            if achieved < args.fps * 0.98:
+                print(f"\n*** RATE: recorded {achieved:.1f} Hz, dataset will claim "
+                      f"{args.fps} — motion will read {args.fps / max(achieved, 1e-6):.2f}x "
+                      f"too fast ***")
+                print(f"*** Re-record at --fps {int(achieved)} or find what is "
+                      f"stalling the loop. clock.loop vs timestamp shows it. ***")
+            print(f"\n[EP] saving {ep_frames} frames "
+                  f"({elapsed:.1f}s wall, {achieved:.1f} Hz) "
                   f"({reason})... ", end="", flush=True)
             dataset.save_episode()
             print("done.")

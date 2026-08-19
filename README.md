@@ -209,7 +209,6 @@ to import and every controller test errors at collection.
 | `tools/` | Bring-up, calibration, analysis, and the PID tuner package. |
 | `data_collection/` | Recorded drive logs and LeRobot datasets. |
 | `pico_imu_reader/` | XIAO RP2040 firmware: 4× ISM330DHCX → fused orientation over USB CDC. |
-| `ros2_ws/` | ROS 2 workspace: URDF, MoveIt, RealSense bringup. |
 
 The remaining folders are prototypes, hardware bring-up, or experiments.
 
@@ -221,5 +220,4 @@ The remaining folders are prototypes, hardware bring-up, or experiments.
 | `modules/ik/README.md` | IK solver internals and the numba hot path |
 | `lerobot_vla/README.md` | Dataset recording, remote dataset viz, split-engine inference |
 | `control_prototype/README.md` | Smooth reachability limiter design and rubber-band model |
-| `ros2_ws/README.md` | URDF calibration, bringup, RViz/MoveIt on a laptop |
 | `jetson_setup.md`, `imu_tuneup.md` | Board bring-up and IMU tuning notes |

@@ -138,7 +138,7 @@ def _read_sensor_snapshot(hardware, imu_roles: list[str], adc_names: list[str]) 
     role_to_gyro = {}
 
     try:
-        quats = hardware.read_all_imu_quaternions()
+        quats, _ = hardware.read_all_imu_quaternions()
         if quats is not None:
             for role, quat in zip(imu_roles, quats):
                 role_to_quat[role] = np.asarray(quat, dtype=np.float32)
@@ -433,7 +433,8 @@ def main() -> int:
                 perf_stats = service.get_debug_state().get("perf_stats", {})
                 hw_stats = perf_stats.get('hardware_stats', {})
                 act_pos, act_rot_deg = service.get_pose()
-                joint_deg = np.asarray(controller.get_joint_angles(), dtype=np.float32)
+                joint_angles_deg, _, _ = controller.get_joint_angles()
+                joint_deg = np.asarray(joint_angles_deg, dtype=np.float32)
                 if joint_deg.shape[0] < 4:
                     joint_deg = np.pad(joint_deg, (0, 4 - joint_deg.shape[0]))
                 vel_degps = np.asarray(controller.get_joint_velocities_degps() or [0.0, 0.0, 0.0, 0.0], dtype=np.float32)

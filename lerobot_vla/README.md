@@ -42,47 +42,170 @@ transcode to read AV1 reliably.
 
 | key | shape | meaning |
 |---|---|---|
-| `observation.state` | float32[4] | joint angles [slew, lift, tilt, scoop], degrees |
+| `observation.state` | float32[3] | joint angles [lift, tilt, scoop], degrees. **Slew IMU feedback is dropped at the moment due to drift** — see below |
 | `observation.images.cam1` | uint8 480×640×3 | D435i **infrared left imager**, laser emitter DISABLED, gray→3ch |
+| `observation.images.cam2` | uint8 480×640×3 | D435i **color imager**, rgb8 |
 | `action` | float32[4] | normalized valve commands [-1, 1], [slew, lift, tilt, scoop] |
+| `clock.loop` | float64 | seconds since episode start, `perf_counter` |
+| `clock.cam1_age` | float32 | seconds this cam1 frame had been sitting in the camera cache |
+| `clock.cam2_age` | float32 | same for cam2; equal to cam1 when both come off one `wait_for_frames()` |
+| `clock.state_age` | float32 | seconds since the IMU frame the joint angles were derived from |
+| `clock.imu_us` | int64 | Pico device clock in microseconds (counts from board power-on) |
+
+The `clock.*` columns are diagnostics, not observations — policies pick their
+features by name and never see these. They exist because nothing else in the
+dataset records when anything happened: lerobot's `timestamp` is
+`frame_index / fps`, so it reads as a flawless 33.33 ms no matter what the loop
+did, and both the camera and the 100 Hz control thread sit behind latest-value
+caches that the 30 Hz record loop samples at its own rate. A repeated frame, a
+late tick and a clean recording are indistinguishable without them.
+
+Ages are NaN when a source has not reported yet; `clock.imu_us` uses -1 for the
+same case, because int64 has no NaN and 0 is a real Pico timestamp. Measured on
+the bench at 30 Hz: camera age ~5 ms, state age ~6 ms (max 13, so the control
+thread does occasionally slip past its 10 ms period), device dt 26–41 ms.
+
+**Slew IMU feedback is dropped at the moment due to drift.** Slew comes from
+`average_z_yaw` over the IMUs, an absolute world yaw with no magnetometer to
+anchor it and no zeroing anywhere in the stack — so the same physical pose can
+read any value in ±180° after a power cycle, and a policy trained on one
+session's origin gets fed angles it never saw. Within a session it is actually
+stable (measured 2026-08-19: dig/dump centroids move only −1.1°/−1.5° over 31
+episodes); the problem is the origin, not the noise. Episode-start zeroing does
+not fix it either — slew at episode start has std 4.05° across those episodes,
+a sixth of the ~24° working range.
+
+The cameras observe slew directly, so little is lost. **Actions stay 4-dim: slew
+is still commanded**, it just is not fed back. `--state-joints` on both
+`record_episodes.py` and `run_inference.py` overrides this; `run_inference`
+refuses to start when the joint count disagrees with `--dataset-stats`. Bring
+slew back only with a real yaw correction (magnetometer, visual heading, or a
+mechanical index).
 
 Actions drive the valves open-loop (no IK/PID in the loop) via
 `ExcavatorController.enter_direct_command_mode()`. `send_action()` stores a
 setpoint and returns immediately; `send_action_chunk()` hands over a whole
-policy chunk to be played as a trajectory. `--legacy-direct-write` restores the
-old `DirectController` path for bench comparison only.
+policy chunk to be played as a trajectory. `run_inference` keeps a
+`--legacy-direct-write` escape hatch onto the old `DirectController` path for
+bench comparison; recording has no such flag — a dataset recorded through it
+would carry the wrong action→motion mapping.
 
 ## 1. Dataset collection (gamepad teleop)
 
 ```bash
 .venv-lerobot/bin/python -m lerobot_vla.record_episodes \
     --task "scoop sand and dump it to the left" \
-    --repo-id masi/<new_dataset_name> --exposure-us 16000
+    --repo-id masi/<new_dataset_name> \
+    --exposure-ir 16000 --gain-ir 16 --exposure-rgb 16000 --gain-rgb 128
 ```
 
-`--repo-id` names a **new** dataset; recording refuses to start if its folder
-already exists (use `--resume` to append). The folder is the repo-id with `/`
-replaced by `_`, under `data_collection/lerobot_datasets/`. Existing datasets:
-`masi/kaivuri_juusto` (31 episodes, blocks task).
+`--repo-id` is **required** — there is no default, so a session can never
+silently land in a leftover dataset. It names a **new** dataset; recording
+refuses to start if its folder already exists (use `--resume` to append). The
+folder is the repo-id with `/` replaced by `_`, under
+`data_collection/lerobot_datasets/`. Existing datasets: `masi/kaivuri_juusto`
+(31 episodes, blocks task).
+
+The repo-id is a *name*, not a destination: nothing is uploaded anywhere, and it
+is not even written into the dataset (`meta/info.json` has no `repo_id` key). It
+only becomes a real lookup on the training side when `--dataset.root` is omitted,
+or if you explicitly call `push_to_hub` — see below.
+
+A run that saves **no** episodes deletes its own dataset folder on exit, so using
+this script just to drive around no longer litters `lerobot_datasets/` with
+metadata-only stubs that block reusing the same `--repo-id`. `--resume` runs never
+delete anything.
 
 **Lock the exposure.** Auto-exposure drifts with the scene, which the policy
-then has to learn around. Find a value with the sweep tool (headless: writes
-PNGs + clip stats to inspect from another machine), then pass the same
-`--exposure-us` to BOTH record_episodes and run_inference:
+then has to learn around. `tune_exposure` sweeps exposure × gain for **both**
+imagers on one pipeline — so every frame of the sweep sees the same scene under
+the same light — and writes a PNG per setting plus a stats table, inspectable
+from another machine:
 
 ```bash
-.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --out /tmp/ir_sweep
+.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --out /tmp/cam_sweep
+
+# narrow it down: one camera, finer ladder, single gain
+.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --camera ir \
+    --exposures 8000,12000,16000,20000 --gains-ir 16
 ```
 
-Target mean ~80–130 with clip-hi under ~1%; at 30 fps the ceiling is
-~33 000 µs. With the work lights on, **16 000 µs @ gain 16** measured right
-(2026-08-10); re-sweep if the lighting setup changes.
+It stars the rows in band and prints the flags to copy. Target mean ~80–130 with
+clip-hi under ~1%; at 30 fps the exposure ceiling is ~33 000 µs for either
+imager. Pass the chosen values to BOTH `record_episodes` and `run_inference`.
+
+Re-sweep whenever the lighting setup changes. Measured over the sandbox with the
+work lights on (2026-08-19):
+
+| camera | setting | mean | clip-hi |
+|---|---|---|---|
+| IR cam1 | `--exposure-ir 16000 --gain-ir 16` | 89.5 | 0.07% |
+| RGB cam2 | `--exposure-rgb 16000 --gain-rgb 128` | 107.2 | 0.00% |
+
+The colour imager needs far more gain than the IR one for the same brightness —
+it is behind a Bayer filter, the IR imager is not. Its dark end suffers for it:
+at that setting ~2.8% of pixels are crushed to black, against 0% for IR.
+
+Gains are swept per camera because the scales differ (IR 16..248, RGB 0..128),
+but `--exposures` is microseconds for both: librealsense reports the colour
+sensor's exposure in 100 µs ticks (range 1..10000) and the stereo module's in
+microseconds (1..165000), and the conversion is derived from the range each
+sensor reports rather than hardcoded.
+
+### Two cameras, always
+
+**Both imagers are always recorded** — cam1 IR, cam2 colour. They ride one
+RealSense pipeline, so a cam1/cam2 pair comes out of a single
+`wait_for_frames()` and shares a capture instant. Recording both is cheap and
+which one a policy should use is a training-time question: drop the unwanted
+camera when deriving the training dataset (`lerobot.datasets.dataset_tools.
+remove_feature`), not at record time. That also means an IR-vs-RGB comparison
+runs on literally the same episodes.
+
+If a frame from either camera is missing the whole frame is skipped, rather than
+written with one camera — otherwise the two video streams desynchronize against
+the parquet rows.
+
+They are **separate sensors with separate exposure controls**, and the two do not
+even use the same unit — the stereo module reports exposure in microseconds
+(range 1..165000), the color sensor in 100 µs ticks (range 1..10000). Both
+`--exposure-ir` and `--exposure-rgb` are given in microseconds and converted from
+the range the sensor reports, so `--exposure-ir 16000` and `--exposure-rgb 16000`
+mean the same 16 ms. Passing microseconds straight to the color sensor would have
+overexposed it by 100×. Gain ranges differ too: IR 16..248, RGB 0..128.
+
+Cost: measured clean at 640×480×30 for both streams (0 dropped frames, USB ~6% —
+see `realsense_logging_bandwidth.md`). The second video encode is host CPU, not
+bandwidth.
 
 Sticks = same mapping as simple_drive.py (left = slew/tilt, right = lift/scoop).
 Buttons: **A** start / stop+save episode · **B** discard episode · **X** pump ·
 **Y** reload servo config. Episodes auto-save at `--max-episode-s` (120 s).
 Default output root: `data_collection/lerobot_datasets/<repo_id>/`.
 Use `--resume` to append episodes to an existing dataset.
+
+**The pump is cut across every save, and comes back when the save finishes.**
+`save_episode()` blocks the record loop for seconds while it encodes video —
+measured ~4 s for 60 frames × 2 cameras — during which the setpoint goes stale
+and the control thread ramps the valves to zero. Leaving the pump running through
+that just dead-heads it against closed valves and heats oil.
+
+```
+[pump] OFF (saving)
+[EP] saving 36 frames (1.2s) (button A)... done.
+[pump] ON (save complete — ready to record)
+```
+
+The pump returning is also the operator's cue that the board has finished writing
+and the next take can start. Discarding with **B** does not cycle it — nothing is
+encoded, so there is nothing to wait out.
+
+If `--resume` refuses with "holds no saved episodes", the folder is a
+metadata-only stub from a run that created the dataset and exited before saving
+anything — remove it and record without `--resume`. (Older builds instead fell
+through to *downloading* the repo-id from the Hugging Face Hub and died on a
+confusing `401 RepositoryNotFoundError`; these datasets are local-only, so the
+check now stays local.)
 
 Record one task phrasing per dataset run (`--task` is stored per frame); for
 the left/right sand task, either record separate sessions per direction with
@@ -209,6 +332,35 @@ sits at −1.0 for 17.5% of frames while its positive side never exceeds +0.77.
 That is real operator asymmetry (boom slammed down, raised gently), not a
 broken axis, but it skews the normalization stats the policy is trained with.
 
+On datasets that carry `clock.*`, check the loop and the caches too:
+
+```bash
+.venv-lerobot/bin/python - <<'EOF'
+import pandas as pd, numpy as np
+D="data_collection/lerobot_datasets/masi_kaivuri_juusto"
+df=pd.read_parquet(f"{D}/data/chunk-000/file-000.parquet")
+for e, g in df.groupby("episode_index"):
+    jit = (np.diff(g["clock.loop"].values) - 1/30) * 1000
+    dup = int((np.diff(g["clock.imu_us"].values) == 0).sum())
+    print(f"ep{e:3d} jitter mean {jit.mean():+6.2f} ms max {jit.max():+7.2f} | "
+          f"cam age {g['clock.cam1_age'].max()*1000:5.1f} ms max | "
+          f"state age {g['clock.state_age'].max()*1000:5.1f} ms max | "
+          f"repeated IMU frames {dup}")
+EOF
+```
+
+A jitter max far above a few ms means the loop stalled — usually the video
+encode. Repeated IMU frames mean the record loop outran the 200 Hz stream and
+wrote the same pose twice. A camera age near a full frame period means the
+policy is being trained on images that were already stale when recorded.
+
+Note that a naive "are consecutive video frames identical?" check does **not**
+find dropped camera frames. lerobot encodes with a two-frame GOP for random
+access, so the stream is `IPIPIP…`; on a static scene each P-frame quantizes the
+sensor noise away and reconstructs as its I-frame. That looks exactly like a
+15 Hz camera duplicating into a 30 Hz loop, and it is purely the codec. Use
+`clock.cam1_age` instead — it is measured before encoding.
+
 ## 2. Inference (split TensorRT engines)
 
 The monolithic SmolVLA ONNX cannot TRT-build on 8 GB; the deploy path is the
@@ -221,7 +373,7 @@ TRT_DROP_CUDA_EP=1 .venv-lerobot/bin/python -m lerobot_vla.run_inference --synth
 
 # real observations, actions PRINTED only (safe default):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
-    --instruction "scoop sand and dump it to the left" --exposure-us 16000
+    --instruction "scoop sand and dump it to the left" --exposure-ir 16000
 
 # actually drive the valves (only with a finetuned checkpoint!):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference --live \
@@ -236,6 +388,7 @@ Setpoint-timing flags (all optional; defaults are sane):
 | `--setpoint-decay-s` | 0.25 | Ramp-to-zero window once the setpoint goes stale |
 | `--blend-s` | 0.0 | Cross-fade into each new chunk, to soften the step at a chunk boundary |
 | `--legacy-direct-write` | off | Drive valves from this thread instead of the control thread (bench A/B only) |
+| `--camera` | `ir` | Which imager the policy sees: `ir` = cam1, `rgb` = cam2. **Must match what the checkpoint was trained on** |
 
 Each cycle logs `age=` and `decay=` for the held setpoint. `decay < 1.00` in
 steady state means inference is not keeping ahead of chunk playback — raise
@@ -275,7 +428,8 @@ can no longer stay ahead.
 
 ```
 excavator_robot.py   MasiExcavator: control stack + IR camera as one robot
-ir_camera.py         D435i IR-left reader (Y8@30, emitter off, gray→3ch)
+camera.py            D435i reader: IR-left (Y8@30, emitter off, gray→3ch)
+                     + optional color (rgb8@30) on the same pipeline
 record_episodes.py   gamepad teleop -> LeRobot v3 episodes
 smolvla_split.py     9-graph split policy: ORT/TRT sessions + denoise loop
 run_inference.py     obs -> action-chunk -> valves loop (synthetic/dry/live)

@@ -302,7 +302,7 @@ def main() -> int:
             # Pull live signals from the controller.
             meas_pos, meas_rot = controller.get_pose()
             meas_pos_arr = np.asarray(meas_pos, dtype=np.float32)
-            joint_angles_deg = controller.get_joint_angles()
+            joint_angles_deg, _, _ = controller.get_joint_angles()
             joint_angles_rad = np.radians(np.asarray(joint_angles_deg, dtype=np.float64))
             yoshikawa = controller.get_yoshikawa_index()
             cond = controller.get_condition_number()

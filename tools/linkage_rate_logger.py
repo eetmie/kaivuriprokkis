@@ -103,7 +103,7 @@ class LinkageRateLogger:
             self.hardware.shutdown()
 
     def read_state(self) -> tuple[np.ndarray, np.ndarray]:
-        quats = self.hardware.read_all_imu_quaternions()
+        quats, _ = self.hardware.read_all_imu_quaternions()
         if quats is None:
             raise RuntimeError("IMU quaternions unavailable")
         angles = canonical_joint_angles_from_imus(np.asarray(quats, dtype=np.float32), self.robot_config)

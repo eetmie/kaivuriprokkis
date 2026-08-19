@@ -4,8 +4,24 @@ Thin wrapper around the kaivuriprokkis control layer (HardwareInterface +
 ExcavatorController for joint state and valve output) plus the D435i IR camera.
 
 Observation:
-    observation.state          float32[4]  joint angles [slew, lift, tilt, scoop] (deg)
+    observation.state          float32[N]  joint angles, degrees. Defaults to
+                                           [lift, tilt, scoop] — slew is left out,
+                                           see DEFAULT_STATE_JOINTS below
     observation.images.cam1    uint8 HxWx3 infrared left imager, emitter off
+    observation.images.cam2    uint8 HxWx3 color imager — only when the camera
+                                           config sets enable_color
+
+    img_ts / rgb_ts            float       perf_counter when the camera thread
+                                           stored that frame
+    state_ts / imu_device_us   float, int  perf_counter when the IMU frame behind
+                                           observation.state was read, and that
+                                           frame's own Pico clock in microseconds
+
+The four *_ts entries are capture clocks rather than observation channels. Both
+the camera and the 100 Hz control thread publish into latest-value caches, so a
+caller sampling get_observation() at its own rate cannot otherwise tell a fresh
+reading from one it already has. record_episodes.py writes them to the dataset
+as the clock.* columns.
 
 Action:
     action                     float32[4]  normalized valve commands [-1, 1]
@@ -37,16 +53,28 @@ _KAIVURI_ROOT = Path(__file__).resolve().parents[1]
 if str(_KAIVURI_ROOT) not in sys.path:
     sys.path.insert(0, str(_KAIVURI_ROOT))
 
-from lerobot_vla.ir_camera import D435iIRCamera, IRCameraConfig
+from lerobot_vla.camera import D435iCamera, CameraConfig
 
 # Dataset/logical order used everywhere in this package. Maps to the control
 # layer's channel names [slew, boom, arm, bucket] one-to-one.
 JOINT_NAMES = ["slew", "lift", "tilt", "scoop"]
 _CONTROL_CHANNELS = ["slew", "boom", "arm", "bucket"]
 
-CAMERA_KEY = "observation.images.cam1"
+CAMERA_KEY = "observation.images.cam1"          # D435i infrared left imager
+CAMERA_KEY_RGB = "observation.images.cam2"      # D435i color imager (optional)
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
+
+# Which joints observation.state carries. Slew is excluded by default: its angle
+# is `average_z_yaw` over the IMUs (control_config.yaml), an absolute world yaw
+# with NO zeroing anywhere in the stack and no magnetometer to anchor it, so its
+# origin is whatever the AHRS converged to at power-on. Within one session it is
+# stable (measured 2026-08-19: dig/dump centroids drift -1.1/-1.5 deg over 31
+# episodes), but ACROSS sessions the same physical pose can read any value in
+# +-180 deg. A policy trained on one session's origin is then fed angles it never
+# saw. The cameras observe slew directly, so the channel is not lost — only its
+# unreliable absolute encoding is. Actions stay 4-dim; slew is still commanded.
+DEFAULT_STATE_JOINTS = ["lift", "tilt", "scoop"]
 
 
 class MasiExcavator:
@@ -55,14 +83,21 @@ class MasiExcavator:
     robot_type = "masi_excavator"
 
     def __init__(self, profile: str = "auto",
-                 camera_config: IRCameraConfig | None = None,
+                 camera_config: CameraConfig | None = None,
                  enable_slew: bool = True,
                  use_control_thread: bool = True,
                  setpoint_hold_s: float = 0.25,
                  setpoint_decay_s: float = 0.25,
-                 setpoint_blend_s: float = 0.0):
+                 setpoint_blend_s: float = 0.0,
+                 state_joints: list[str] | None = None):
+        self.state_joints = list(state_joints if state_joints is not None
+                                 else DEFAULT_STATE_JOINTS)
+        unknown = [j for j in self.state_joints if j not in JOINT_NAMES]
+        if unknown:
+            raise ValueError(f"state_joints {unknown} not in {JOINT_NAMES}")
+        self._state_idx = [JOINT_NAMES.index(j) for j in self.state_joints]
         self.profile_name = profile
-        self.camera = D435iIRCamera(camera_config)
+        self.camera = D435iCamera(camera_config)
         self.enable_slew = enable_slew
         self.use_control_thread = use_control_thread
         self.setpoint_hold_s = setpoint_hold_s
@@ -140,7 +175,8 @@ class MasiExcavator:
                   "the caller's rate ***")
 
         if start_camera:
-            print("[robot] Starting IR camera (emitter off)...")
+            print("[robot] Starting IR camera (emitter off)"
+                  + (" + RGB camera..." if self.camera.color_enabled else "..."))
             self.camera.start()
             self.camera.wait_for_frame()
 
@@ -179,17 +215,56 @@ class MasiExcavator:
 
     # ── observation / action ─────────────────────────────────────────────────
 
-    def get_joint_angles(self) -> np.ndarray:
-        """Joint angles in degrees, [slew, lift, tilt, scoop]."""
-        return np.asarray(self.controller.get_joint_angles(), dtype=np.float32)
+    def get_joint_angles(self) -> tuple[np.ndarray, float | None, int | None]:
+        """All four joint angles in degrees, [slew, lift, tilt, scoop], and their clocks.
+
+        Always the full vector — status lines and diagnostics want slew even when
+        the policy does not see it. Use ``get_state`` for the observation. Both
+        return the clocks of the IMU frame the angles came from; discard them
+        with `angles, _, _ = robot.get_joint_angles()` when only the pose matters.
+        """
+        angles, state_ts, imu_us = self.controller.get_joint_angles()
+        return np.asarray(angles, dtype=np.float32), state_ts, imu_us
+
+    def get_state(self) -> tuple[np.ndarray, float | None, int | None]:
+        """observation.state, and the clocks of the IMU frame behind it.
+
+        Returns (joints in ``state_joints`` in degrees, perf_counter seconds,
+        Pico microseconds). The angles and their timestamps come out of one lock
+        acquisition in the controller, so an age computed from them is exact
+        rather than off by up to one control period. Both clocks are None until
+        the 100 Hz thread has produced a state; callers that only want the pose
+        discard them -- `state, _, _ = robot.get_state()`.
+        """
+        angles, state_ts, imu_us = self.get_joint_angles()
+        return angles[self._state_idx], state_ts, imu_us
+
+    @property
+    def has_color(self) -> bool:
+        """Whether cam2 (the RGB imager) is part of the observation."""
+        return self.camera.color_enabled
 
     def get_observation(self) -> dict:
         img, img_ts = self.camera.get_latest()
-        return {
-            STATE_KEY: self.get_joint_angles(),
+        state, state_ts, imu_us = self.get_state()
+        # The *_ts entries are capture clocks, not observation channels: the
+        # camera runs its own thread behind a latest-frame cache and the joint
+        # angles come off the 100 Hz control thread, so a caller sampling this
+        # dict at its own rate cannot otherwise tell fresh data from a repeat.
+        obs = {
+            STATE_KEY: state,
             CAMERA_KEY: img,
             "img_ts": img_ts,
+            "state_ts": state_ts,
+            "imu_device_us": imu_us,
         }
+        if self.has_color:
+            # Same pipeline as cam1, so the pair shares a capture instant; the
+            # separate timestamp is still reported for drop diagnosis.
+            rgb, rgb_ts = self.camera.get_latest_color()
+            obs[CAMERA_KEY_RGB] = rgb
+            obs["rgb_ts"] = rgb_ts
+        return obs
 
     def send_action(self, action: np.ndarray) -> np.ndarray:
         """Set 4 normalized valve commands [slew, lift, tilt, scoop] in [-1, 1].

@@ -29,7 +29,7 @@ from simple_drive import JOINT_NAMES
 
 RESULTS_DIR = Path(__file__).parent / "test_results"
 
-# controller.get_joint_angles() returns [slew, boom, arm, bucket]
+# controller.get_joint_angles() returns ([slew, boom, arm, bucket], state_ts, imu_us)
 JOINT_TO_IMU_IDX = {
     "slew": 0,
     "boom": 1,
@@ -69,7 +69,7 @@ def sign_or_zero(value: float) -> float:
 
 
 def get_joint_angle_deg(controller, joint_name: str) -> float:
-    angles = controller.get_joint_angles()
+    angles, _, _ = controller.get_joint_angles()
     return float(angles[JOINT_TO_IMU_IDX[joint_name]])
 
 

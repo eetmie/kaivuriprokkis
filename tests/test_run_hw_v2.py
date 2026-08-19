@@ -203,7 +203,7 @@ class RunHwV2Tests(unittest.TestCase):
                 return np.asarray([1.0, 2.0, 3.0], dtype=np.float32), 12.0
 
             def get_joint_angles(self):
-                return [0.0, 90.0, -90.0, 180.0]
+                return [0.0, 90.0, -90.0, 180.0], 1234.5, 8_123_456
 
             def get_joint_velocities_degps(self):
                 return [0.0, 10.0, -10.0, 20.0]

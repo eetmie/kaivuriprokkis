@@ -14,7 +14,7 @@ import os
 import time
 import numpy as np
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 import threading
 import yaml
@@ -939,8 +939,24 @@ class HardwareInterface:
         return result
 
     @_safe_hardware_operation
-    def read_all_imu_quaternions(self) -> Optional[List[np.ndarray]]:
-        """Read corrected IMU quaternions in configured canonical role order."""
+    def read_all_imu_quaternions(self) -> Tuple[List[np.ndarray], Optional[int]]:
+        """Corrected IMU quaternions in canonical role order, and their timestamp.
+
+        Returns (quaternions, device timestamp). The timestamp comes out of the
+        same lock acquisition as the quaternions on purpose: reading it in a
+        second call could straddle a reader-thread update and pair the
+        quaternions with a different IMU frame's clock, which is the one thing a
+        staleness diagnostic must not do. Callers that only want the pose
+        discard it -- `quats, _ = hardware.read_all_imu_quaternions()`.
+
+        The timestamp is the Pico's own clock in microseconds, counting from
+        board power-on rather than the epoch, so it compares across frames but
+        not against anything on the Jetson. It is None when the firmware sends
+        no timestamp; the quaternions are still good.
+
+        Never returns None despite failure looking like it: _safe_hardware_operation
+        re-raises after stopping the pump, so the pair is always unpackable.
+        """
         with self._imu_lock:
             if self._imu_state != ReadyState.READY:
                 raise RuntimeError("IMU not ready - cannot read IMU data")
@@ -949,7 +965,8 @@ class HardwareInterface:
             missing = [role for role in self._imu_sensor_roles if role not in self.latest_imu_by_role]
             if missing:
                 raise RuntimeError(f"IMU role data is missing for {missing}")
-            return [self.latest_imu_by_role[role].copy() for role in self._imu_sensor_roles]
+            return ([self.latest_imu_by_role[role].copy() for role in self._imu_sensor_roles],
+                    self._imu_last_device_ts)
 
     def read_imu_debug_quaternions(self) -> Optional[Dict[str, Any]]:
         """Read raw and mounting-corrected IMU quaternions by physical sensor index.

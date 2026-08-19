@@ -668,6 +668,13 @@ class ExcavatorController:
         self._current_fk_quats = None  # Canonical absolute link quats [slew, boom, arm, bucket]
         self._current_sensor_quats = None  # Corrected physical IMU quats in configured role order
         self._current_joint_angles = None
+        # When the IMU frame behind _current_joint_angles was read, so consumers
+        # can tell a fresh pose from a stale cached one. _current_state_ts is
+        # this machine's perf_counter; _current_state_imu_us is the Pico's own
+        # microsecond clock, which is the only timebase that shows drops on the
+        # wire. Both None until the control thread has produced a state.
+        self._current_state_ts = None
+        self._current_state_imu_us = None
         self._current_ee_quat_full = None
         self._current_projected_quats = None  # Backward-compatible alias for canonical quats
         self._current_linear_velocity = 0.0
@@ -924,18 +931,27 @@ class ExcavatorController:
         with self._lock:
             return self._current_position.copy(), self._current_orientation_y_deg
 
-    def get_joint_angles(self) -> np.ndarray:
-        """Get current relative joint angles in degrees.
+    def get_joint_angles(self) -> Tuple[np.ndarray, Optional[float], Optional[int]]:
+        """Current relative joint angles in degrees, and their sensor clocks.
 
-        Returns angles relative to each joint's parent link, matching what
-        URDF viewers expect for ``setJointValue``.
+        Returns (angles, perf_counter seconds, Pico microseconds). Angles are
+        relative to each joint's parent link, matching what URDF viewers expect
+        for ``setJointValue``.
+
+        The clocks share the lock acquisition with the angles on purpose:
+        fetching them separately could straddle a control-thread update and
+        describe a different pose than the one returned. Callers that only want
+        the pose discard them -- `angles, _, _ = controller.get_joint_angles()`.
+
+        Both clocks are None before the first state is computed, matching the
+        zero vector returned in that window.
         """
         with self._lock:
             if self._current_joint_angles is None:
-                return np.zeros(4, dtype=np.float32)
-            joint_angles = self._current_joint_angles.copy()
-
-        return np.degrees(joint_angles)
+                return np.zeros(4, dtype=np.float32), None, None
+            return (np.degrees(self._current_joint_angles.copy()),
+                    self._current_state_ts,
+                    self._current_state_imu_us)
 
     def get_absolute_link_angles(self) -> np.ndarray:
         """Per-sensor absolute pitch in degrees after mounting correction.
@@ -1467,22 +1483,25 @@ class ExcavatorController:
         except Exception:
             pass
 
-    def _get_sensor_quaternions(self) -> Optional[np.ndarray]:
+    def _get_sensor_quaternions(self) -> Tuple[Optional[np.ndarray], Optional[int]]:
         """
-        Read corrected configured IMU sensor data.
+        Read corrected configured IMU sensor data and the device clock behind it.
 
         Returns:
-            Corrected physical IMU quaternions in configured role order, or None if hardware not ready
+            (corrected physical IMU quaternions in configured role order,
+            Pico device timestamp in microseconds). The quaternions are None if
+            hardware is not ready; the timestamp is None if the firmware sends
+            none -- the pose is still good, only the drop diagnostic is lost.
         """
         try:
-            quaternions = self.hardware.read_all_imu_quaternions()
+            quaternions, device_us = self.hardware.read_all_imu_quaternions()
             if quaternions is None or len(quaternions) == 0:
-                return None
-            return np.array(quaternions, dtype=np.float32)
+                return None, None
+            return np.array(quaternions, dtype=np.float32), device_us
 
         except Exception as e:
             self.logger.error(f"Error reading quaternions: {e}")
-            return None
+            return None, None
 
     def _control_loop(self) -> None:
         if self._rt_priority > 0 or self._rt_lock_memory or self._rt_cpu_core is not None:
@@ -1591,7 +1610,10 @@ class ExcavatorController:
         """Update current robot state from sensors."""
         try:
             # Get corrected physical IMU quaternions in configured role order.
-            sensor_quats = self._get_sensor_quaternions()
+            sensor_quats, imu_device_us = self._get_sensor_quaternions()
+            # Stamped here rather than after the FK maths below, so the mark is
+            # when the sensor data was read, not when we finished deriving from it.
+            state_ts = time.perf_counter()
             if sensor_quats is None:
                 # Invalidate stale cached state so _compute_control_commands()
                 # cannot proceed with old data while sensors are unavailable.
@@ -1599,6 +1621,8 @@ class ExcavatorController:
                     self._current_projected_quats = None
                     self._current_fk_quats = None
                     self._current_joint_angles = None
+                    self._current_state_ts = None
+                    self._current_state_imu_us = None
                 return
 
             # Convert sensor quats once into canonical relative joint angles.
@@ -1628,6 +1652,8 @@ class ExcavatorController:
                 self._current_sensor_quats = sensor_quats
                 self._current_joint_angles = joint_angles
                 self._current_ee_quat_full = ee_quat
+                self._current_state_ts = state_ts
+                self._current_state_imu_us = imu_device_us
 
             now_t = time.perf_counter()
             self._update_joint_velocity_estimate(joint_angles, now_t)

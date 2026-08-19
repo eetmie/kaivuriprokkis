@@ -466,7 +466,8 @@ class DataLogger:
         t = time.perf_counter() - self._t0_mono
 
         # Controller/hardware APIs speak degrees; the dataset is radians.
-        pos = np.radians(controller.get_joint_angles())
+        angles_deg, _, _ = controller.get_joint_angles()
+        pos = np.radians(angles_deg)
         vels, vel_age = controller.get_joint_velocities_with_age()
         if vels is not None and vel_age < 0.05:
             vb, va, vbkt = (float(np.radians(vels[1])),
@@ -684,7 +685,7 @@ class PWMOnlyController:
     def stop(self):                       pass
     def suspend_ik_output(self):          pass
     def resume_ik_output(self):           pass
-    def get_joint_angles(self):           return np.zeros(4, dtype=np.float32)
+    def get_joint_angles(self):           return np.zeros(4, dtype=np.float32), None, None
     def get_joint_velocities_with_age(self): return None, float('inf')
     def emergency_stop(self, reset_pump=True): self.hardware.reset(reset_pump=reset_pump)
 
@@ -1089,7 +1090,7 @@ def main():
             direct.send_pending()
 
             # ── 4. log ────────────────────────────────────────────────────────
-            joint_angles = controller.get_joint_angles()
+            joint_angles, _, _ = controller.get_joint_angles()
 
             if is_logging:
                 cmd_age_s = np.nan

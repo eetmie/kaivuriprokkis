@@ -72,7 +72,8 @@ class _FakeHardware:
         return True
 
     def read_all_imu_quaternions(self):
-        return [np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32) for _ in range(4)]
+        return ([np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32) for _ in range(4)],
+                8_123_456)
 
     def set_pump_enabled(self, enabled):
         self.pump_log.append(bool(enabled))
@@ -112,7 +113,7 @@ class PIDTunerRobotTests(unittest.TestCase):
     def test_read_joint_angles_uses_current_imu_pipeline(self):
         class Hardware:
             def read_all_imu_quaternions(self):
-                return [[1.0, 0.0, 0.0, 0.0]] * 4
+                return [[1.0, 0.0, 0.0, 0.0]] * 4, 8_123_456
 
         expected = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
         with patch.object(pid_tuner_robot, "canonical_joint_angles_from_imus",

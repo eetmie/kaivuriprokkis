@@ -181,7 +181,7 @@ def _safe_joint_id(value: float) -> int:
 
 
 def _read_joint_angles(hardware: HardwareInterface, robot_config) -> np.ndarray:
-    quats = hardware.read_all_imu_quaternions()
+    quats, _ = hardware.read_all_imu_quaternions()
     if quats is None:
         raise RuntimeError("IMU quaternions unavailable")
     return canonical_joint_angles_from_imus(

@@ -184,7 +184,7 @@ class RobotService:
 
     def get_state(self) -> RobotTelemetry:
         measured_pos, measured_rot = self.controller.get_pose()
-        joint_angles_deg = self.controller.get_joint_angles()
+        joint_angles_deg, _, _ = self.controller.get_joint_angles()
 
         joint_positions = tuple((0.0, 0.0, 0.0) for _ in range(5))
         joint_angles_arr = np.asarray(joint_angles_deg, dtype=np.float32)

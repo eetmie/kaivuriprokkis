@@ -95,7 +95,7 @@ def _parse_command_ladder(value: str) -> list[float]:
 
 
 def _read_bucket_angle_deg(hardware: HardwareInterface, robot_config: Any) -> float:
-    quats = hardware.read_all_imu_quaternions()
+    quats, _ = hardware.read_all_imu_quaternions()
     if quats is None:
         raise RuntimeError("IMU quaternions unavailable")
     angles = canonical_joint_angles_from_imus(np.asarray(quats, dtype=np.float32), robot_config)

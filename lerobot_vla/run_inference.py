@@ -195,6 +195,9 @@ def check_state_blind_stats(norm: NormStats, stats_path: str | None) -> None:
         f"--dataset-stats {Path(DEFAULT_SPLIT_DIR).parent}/<bundle>/stats.json")
 
 
+STATE_KEY_NAME = "observation.state"
+
+
 def load_norm(stats_path: str | None) -> NormStats:
     if not stats_path:
         LOG.warning("No --dataset-stats given: state/action normalization is "
@@ -229,10 +232,26 @@ def main() -> int:
                         "checkpoint). Normally omitted — it is read from the export "
                         "bundle's state_blind flag")
     p.add_argument("--robot", default="auto")
-    p.add_argument("--exposure-us", type=float, default=None,
-                   help="Lock IR exposure (us) — use the SAME value the dataset "
-                        "was recorded with")
-    p.add_argument("--gain", type=float, default=None, help="IR sensor gain 16..248")
+    p.add_argument("--state-joints", default="lift,tilt,scoop",
+                   help="Joints fed to the policy as observation.state. MUST "
+                        "match what the checkpoint was trained on — checked "
+                        "against --dataset-stats when that is given. Slew is out "
+                        "by default (unanchored yaw; see excavator_robot.py)")
+    p.add_argument("--exposure-ir", type=float, default=None,
+                   help="Lock cam1 (IR) exposure, microseconds — use the SAME "
+                        "value the dataset was recorded with")
+    p.add_argument("--gain-ir", type=float, default=None,
+                   help="cam1 (IR) sensor gain 16..248")
+    p.add_argument("--camera", choices=("ir", "rgb"), default="ir",
+                   help="Which imager the policy sees: ir = cam1, rgb = cam2. "
+                        "Must match what the checkpoint was TRAINED on — a "
+                        "cam1-trained policy fed colour frames is out of "
+                        "distribution and will drive badly")
+    p.add_argument("--exposure-rgb", type=float, default=None,
+                   help="Lock cam2 (RGB) exposure, microseconds — separate sensor "
+                        "from the IR one, so --exposure-ir does not apply to it")
+    p.add_argument("--gain-rgb", type=float, default=None,
+                   help="cam2 (RGB) sensor gain 0..128")
     p.add_argument("--synthetic", action="store_true",
                    help="No robot/camera; synthetic observation (model-only test)")
     p.add_argument("--live", action="store_true",
@@ -261,7 +280,20 @@ def main() -> int:
     args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
     state_blind = resolve_state_blind(args.split_dir, args.state_blind)
 
+    state_joints = [j.strip() for j in args.state_joints.split(",") if j.strip()]
+
     norm = load_norm(args.dataset_stats)
+    # The state layout is a contract between the training dataset and this loop.
+    # Getting it wrong is silent: a 3-dim policy fed 4 values, or the same count
+    # in a different order, still runs and still drives — just wrongly. The stats
+    # file carries one number that settles it, so check it.
+    if norm.state_mean is not None and len(norm.state_mean) != len(state_joints):
+        raise SystemExit(
+            f"--state-joints has {len(state_joints)} joints {state_joints} but "
+            f"--dataset-stats {args.dataset_stats} was built from a "
+            f"{len(norm.state_mean)}-dim observation.state.\n"
+            f"Check the training dataset's meta/info.json -> "
+            f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
     if state_blind:
         check_state_blind_stats(norm, args.dataset_stats)
 
@@ -278,15 +310,19 @@ def main() -> int:
     robot = None
     if not args.synthetic:
         from lerobot_vla.excavator_robot import MasiExcavator
-        from lerobot_vla.ir_camera import IRCameraConfig
+        from lerobot_vla.camera import CameraConfig
         robot = MasiExcavator(
             profile=args.robot,
-            camera_config=IRCameraConfig(exposure_us=args.exposure_us,
-                                         gain=args.gain),
+            camera_config=CameraConfig(exposure_us=args.exposure_ir,
+                                         gain=args.gain_ir,
+                                         enable_color=args.camera == "rgb",
+                                         color_exposure_us=args.exposure_rgb,
+                                         color_gain=args.gain_rgb),
             use_control_thread=not args.legacy_direct_write,
             setpoint_hold_s=args.setpoint_hold_s,
             setpoint_decay_s=args.setpoint_decay_s,
-            setpoint_blend_s=args.blend_s)
+            setpoint_blend_s=args.blend_s,
+            state_joints=state_joints)
         robot.connect()
         if args.live:
             LOG.warning("LIVE MODE: actions will drive the valves. Pump is under "
@@ -294,13 +330,21 @@ def main() -> int:
         else:
             LOG.info("Dry run: observations are real, actions are printed only.")
 
+    camera_key = ("observation.images.cam1" if args.camera == "ir"
+                  else "observation.images.cam2")
+    if not args.synthetic:
+        LOG.info("Policy camera: %s (%s)", camera_key,
+                 "IR cam1" if args.camera == "ir" else "colour cam2")
+    LOG.info("observation.state = %s%s", state_joints,
+             "" if "slew" in state_joints else "   (slew excluded: unanchored yaw)")
+
     def get_observation():
         if robot is not None:
             obs = robot.get_observation()
-            return obs["observation.images.cam1"], obs["observation.state"]
+            return obs[camera_key], obs["observation.state"]
         img = (np.random.default_rng(0).integers(0, 255, (480, 640, 3))
                .astype(np.uint8))
-        return img, np.zeros(4, dtype=np.float32)
+        return img, np.zeros(len(state_joints), dtype=np.float32)
 
     def for_policy(state):
         """What the policy actually receives. A camera-only checkpoint gets zeros;

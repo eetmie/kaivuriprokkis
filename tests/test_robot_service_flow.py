@@ -71,7 +71,8 @@ class _FakeController:
         pass
 
     def get_joint_angles(self):
-        return np.zeros(4, dtype=np.float32)
+        # (angles, perf_counter, Pico us) -- the clocks ride along with the pose.
+        return np.zeros(4, dtype=np.float32), 1234.5, 8_123_456
 
     def get_fk_quaternions(self):
         return None

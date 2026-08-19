@@ -374,7 +374,7 @@ def main():
                 combined['trackL'] = left_paddle
 
             # ── 3. compensation ───────────────────────────────────────────────
-            joint_angles = controller.get_joint_angles()
+            joint_angles, _, _ = controller.get_joint_angles()
 
             if args.comp == "raw" and linkage_comp is not None:
                 combined = linkage_comp.apply(combined, joint_angles)

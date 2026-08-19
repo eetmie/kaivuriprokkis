@@ -170,6 +170,9 @@ class ControllerIntegrationTests(unittest.TestCase):
         controller._outputs_zeroed = False
         controller._reach_enabled = True
         controller._reach_pos_tol = 5e-3
+        # __init__ sets this alongside the other telemetry counters; this fixture
+        # skips __init__, so the reject path has nothing to increment without it.
+        controller._reach_reject_count = 0
         # Pose-mode rollout (live controller default) needs more iters than
         # the historical position-only path; bump for the cache-flow test.
         controller._reach_max_iters = 400

@@ -447,10 +447,14 @@ Setpoint-timing flags (all optional; defaults are sane):
 | `--legacy-direct-write` | off | Drive valves from this thread instead of the control thread (bench A/B only) |
 | `--camera` | `ir` | Which imager the policy sees: `ir` = cam1, `rgb` = cam2. **Must match what the checkpoint was trained on** — refused when the stats file disagrees |
 
-Each cycle logs `age=` and `decay=` for the held setpoint. `decay < 1.00` in
-steady state means inference is not keeping ahead of chunk playback — raise
-`--n-action-steps` (longer chunks, more time to think) before touching the
-hold/decay windows, which exist to make a stall safe, not to hide one.
+Each cycle logs `played=` — how many steps of the *previous* chunk actually ran
+before this one replaced it, measured rather than assumed. That is the real
+execution horizon. With the default `--min-replan-s 0` it is set purely by
+inference latency (`played ~= infer_s * fps`), so at ~0.4 s and 30 fps expect
+~12. `played` climbing toward the full chunk length (50) means inference is
+falling behind playback and the machine is running off the plan's tail; that is
+the signal to look at, before touching the hold/decay windows, which exist to
+make a stall safe rather than to hide one.
 
 `--split-dir` still defaults to the base-weight split export
 (`spark-projects/.../exports/ainekko_base_split`), which ships no
@@ -468,18 +472,25 @@ run ONE thing at a time (never viz or recording alongside an engine build).
 50 actions authored at the dataset fps (30 Hz). The chunk is handed to the
 control thread, which interpolates it by elapsed time and drives the valves at
 100 Hz; inference being far slower than the valve rate is exactly what that
-split is for. The camera is only *read* at each re-plan; `--n-action-steps`
-(default 15 ≈ 0.5 s) sets how often the robot re-looks, so ~4.5 Hz inference
-capability is plenty. The FULL 50-step chunk is handed to the scheduler even
-though only the first `--n-action-steps` normally play before the next chunk
-replaces it: the unplayed tail is the late-inference fallback — a slow replan
-keeps following the predicted plan instead of freezing at the boundary.
-Re-inference still starts early by the measured inference time; hold/decay to
-zero (`--setpoint-hold-s`, `--setpoint-decay-s`) now only engages if the whole
-1.67 s chunk runs out, i.e. inference stalled outright. The floor for
-`--n-action-steps` is the inference time itself: at ~0.25–0.30 s per inference
-and 30 fps, 15 steps (0.47 s) leaves ~0.2 s of margin; below ~12 the producer
-can no longer stay ahead.
+split is for. The camera is only *read* at each re-plan.
+
+The FULL 50-step chunk is always handed to the scheduler, and **nothing
+truncates it** — `--min-replan-s` gates only when the next inference may start.
+So the executed horizon is not a setting: it is `infer_s * fps`, whatever that
+happens to be (~12 steps at 0.4 s and 30 fps). This is why the loop runs
+smoothly at any replan cadence including none — the controller always holds a
+full 1.67 s trajectory and simply gets a fresher one whenever inference lands.
+The unplayed tail is the late-inference fallback: a slow replan keeps following
+the predicted plan instead of freezing at the boundary. Hold/decay to zero
+(`--setpoint-hold-s`, `--setpoint-decay-s`) engages only if the whole 1.67 s
+chunk runs out, i.e. inference stalled outright.
+
+`--min-replan-s` therefore buys idle time, not reactivity: raise it to stop the
+Orin re-inferring flat out when the task does not need it (power and thermals on
+an 8 GB board), and to reduce how often a freshly sampled chunk replaces the
+current plan — the denoise loop draws new noise per call, so consecutive chunks
+from near-identical observations differ slightly. Lower it (or leave it at 0)
+when you want maximum reactivity.
 
 ## Files
 

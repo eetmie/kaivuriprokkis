@@ -11,13 +11,14 @@ Modes (safety ladder):
                     weights produce garbage actions — do not use --live until a
                     finetuned checkpoint is in place and the pump is your call.
 
-The policy emits a 50-step action chunk per observation; the WHOLE chunk is
-handed to the controller as a trajectory at --fps, but we re-infer after only
---n-action-steps of it have played. In steady state the next chunk replaces
-this one at that boundary, so the tail past n-action-steps is never executed —
-it exists so a late inference degrades into "keep playing the plan" instead of
-hold->decay-to-zero. With ~0.25 s inference and 15 steps at 30 Hz this re-plans
-roughly every 0.5 s.
+The policy emits a 50-step action chunk per observation and the WHOLE chunk is
+handed to the controller as a trajectory at --fps. Re-inference starts as soon
+as the previous one finishes, unless --min-replan-s throttles it. Whatever part
+of the chunk has not played when the next one lands is simply replaced, so the
+EXECUTED horizon is set by inference latency (~infer_s * fps), not by any flag:
+at ~0.4 s inference and 30 Hz that is ~12 steps. The unplayed tail is the
+late-inference fallback — a slow replan keeps following the predicted plan
+instead of degrading into hold->decay-to-zero.
 
 --fps is normally NOT passed. The chunk is rate commands sampled at the rate the
 checkpoint was trained on, so the playback rate belongs to the checkpoint: it is
@@ -330,11 +331,12 @@ def main() -> int:
                         "is a property of the checkpoint. There is NO default: a "
                         "wrong instruction is out of distribution and silent")
     p.add_argument("--num-steps", type=int, default=10, help="Denoise steps")
-    p.add_argument("--n-action-steps", type=int, default=15,
-                   help="Replan cadence: how many chunk actions play before "
-                        "re-inferring. The full chunk is still handed to the "
-                        "scheduler, so the tail past this count is the "
-                        "late-inference fallback")
+    p.add_argument("--min-replan-s", type=float, default=0.0,
+                   help="Minimum seconds between chunk hand-overs; 0 (default) "
+                        "replans as fast as inference allows. A THROTTLE, not an "
+                        "execution limit -- the full chunk is always handed to the "
+                        "scheduler, so what actually plays is set by inference "
+                        "latency (~infer_s * fps), not by this flag")
     p.add_argument("--fps", type=float, default=None,
                    help="Action execution rate. Normally omitted — it is read from "
                         "the export bundle, since it is a property of the checkpoint "
@@ -491,6 +493,7 @@ def main() -> int:
     # time; the first cycle sets it from its own measurement. Not seeded from
     # the warmup — that one includes the TRT engine build.
     infer_lead_s = 0.0
+    chunk_t0 = 0.0          # set on every hand-over; only read once cycle > 0
     try:
         while True:
             img, state = get_observation()
@@ -499,38 +502,35 @@ def main() -> int:
             infer_s = time.perf_counter() - t0
             infer_lead_s = max(infer_s, infer_lead_s * 0.9)
 
-            n_exec = min(args.n_action_steps, len(chunk))
-            chunk_s = (n_exec - 1) / args.fps if n_exec > 1 else 0.0
-
-            # Hand over the FULL chunk but replan on the n_exec cadence: the
-            # next chunk normally replaces this one after n_exec steps, so the
-            # tail never executes — unless inference is late, in which case
-            # the machine keeps following the predicted plan instead of
-            # falling into hold->decay at the replan boundary.
+            # Hand over the FULL chunk. --min-replan-s only gates when the next
+            # inference may START; it never truncates what is executed. The part
+            # of the chunk that has not played when the next one lands is the
+            # late-inference fallback: a slow replan keeps following the
+            # predicted plan instead of falling into hold->decay.
             if robot is not None and args.live:
                 robot.send_action_chunk(chunk, fps=args.fps)
-            chunk_t0 = time.perf_counter()
+            now = time.perf_counter()
+            # Steps of the PREVIOUS chunk that actually played before this one
+            # replaced it -- measured, not assumed. This is the real execution
+            # horizon; with --min-replan-s 0 it is inference latency alone.
+            played = min(round((now - chunk_t0) * args.fps), len(chunk)) if cycle else None
+            chunk_t0 = now
 
-            status = ""
-            if robot is not None and args.live:
-                st = robot.get_setpoint_status()
-                status = f" age={st['age_s']:.2f}s decay={st['decay']:.2f}"
-            LOG.info("cycle=%d infer=%.0fms chunk=%.2fs state%s=[%s] a0=[%s] a%d=[%s]%s",
-                     cycle, infer_s * 1000.0, chunk_s,
+            LOG.info("cycle=%d infer=%.0fms played=%s state%s=[%s] a0=[%s]",
+                     cycle, infer_s * 1000.0,
+                     played if played is not None else "-",
                      "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),
-                     " ".join(f"{v:+.2f}" for v in chunk[0]),
-                     n_exec - 1,
-                     " ".join(f"{v:+.2f}" for v in chunk[n_exec - 1]),
-                     status)
+                     " ".join(f"{v:+.2f}" for v in chunk[0]))
 
             cycle += 1
             if args.loops and cycle >= args.loops:
                 break
 
             # Sleep until it is time to start the next inference. The control
-            # thread is driving the valves from the chunk meanwhile.
-            sleep_s = chunk_s - infer_lead_s - (time.perf_counter() - chunk_t0)
+            # thread is driving the valves from the chunk meanwhile. The default
+            # --min-replan-s 0 means no sleep at all: replan flat out.
+            sleep_s = args.min_replan_s - infer_lead_s - (time.perf_counter() - chunk_t0)
             if sleep_s > 0:
                 time.sleep(sleep_s)
     except KeyboardInterrupt:

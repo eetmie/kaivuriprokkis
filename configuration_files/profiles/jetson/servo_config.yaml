@@ -63,8 +63,8 @@ CHANNEL_CONFIGS:
         toggleable: True
         center: None #1637,5. "none" calculates center to in-between
         direction: -1  # was 1 on Jetson
-        pulse_min: 1550
-        pulse_max: 1725
+        pulse_min: 1560 #1550
+        pulse_max: 1715 # 1725
         deadzone: 0.0
         deadband_us_pos: 44.0 #44 CW
         deadband_us_neg: 45.0 # 45

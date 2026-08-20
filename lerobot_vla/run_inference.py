@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SmolVLA inference loop for the MASI excavator (split TRT engines).
 
-    IR cam1 + joint angles + instruction -> SmolVLA (split ONNX/TRT) -> valves
+    IR cam1 + joint angles + task -> SmolVLA (split ONNX/TRT) -> valves
 
 Modes (safety ladder):
     --synthetic     no robot, no camera — synthetic image + zero state. Proves
@@ -34,11 +34,20 @@ the valve update rate is exactly what that split is for. Re-inference starts
 early by the measured inference time, so the schedule does not go stale in the
 gap; if it does anyway, the held command decays to zero rather than latching.
 
+--task is the same flag, and must carry the same string, as
+record_episodes.py --task: the policy conditions on that language embedding, so
+a phrasing the checkpoint was not finetuned on is out of distribution and
+nothing downstream notices. It has no default. Like --fps it is read from the
+export bundle when the bundle records one, and so are the tokenizer and the
+normalization stats — a finetuned bundle ships all three, which is why the
+correct invocation is --split-dir and (almost) nothing else.
+
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds.
 
-Usage (model-only check, today's goal 1):
-    .venv-lerobot/bin/python -m lerobot_vla.run_inference --synthetic --loops 3
+Usage (model-only check):
+    .venv-lerobot/bin/python -m lerobot_vla.run_inference \
+        --split-dir <bundle> --synthetic --loops 3
 """
 
 from __future__ import annotations
@@ -56,12 +65,16 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from lerobot_vla.excavator_robot import JOINT_NAMES
 from lerobot_vla.smolvla_split import NormStats, SmolVLASplitPolicy
 
 DEFAULT_SPLIT_DIR = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/ainekko_base_split"
 DEFAULT_TOKENIZER = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/tokenizer"
 
 LOG = logging.getLogger("run_inference")
+
+#: --camera choice -> the dataset image key it selects.
+CAMERA_KEYS = {"ir": "observation.images.cam1", "rgb": "observation.images.cam2"}
 
 #: Used only when nothing in the export bundle records the training rate.
 DEFAULT_FPS = 30.0
@@ -165,6 +178,99 @@ def resolve_state_blind(split_dir: str, explicit: bool) -> bool:
     return False
 
 
+def resolve_task(split_dir: str, explicit: str | None) -> str:
+    """The instruction string this checkpoint was finetuned against.
+
+    The task is a property of the checkpoint, not a free choice: SmolVLA
+    conditions on the language embedding, so a phrasing the model never trained
+    on is simply out of distribution. Unlike a wrong --fps or another run's
+    stats, nothing downstream can detect it — the prefix is well-formed, the
+    chunk is well-shaped, and the machine just drives somewhere else.
+
+    There used to be a default here (``"scoop sand and dump it to the left"``,
+    the kaivuri task). It silently mislabelled every run against any other
+    checkpoint, so it is gone: the string now comes from ``task`` in
+    <split-dir>/export_info.json, or from --task, or the run refuses to start.
+
+    An explicit --task that disagrees with the bundle is allowed but warned
+    about. Passing the flag is a statement of intent — probing how much the
+    phrasing matters is a real thing to want — where omitting it is just an
+    omission, and is refused rather than guessed.
+    """
+    path = Path(split_dir) / "export_info.json"
+    recorded = None
+    if path.is_file():
+        try:
+            recorded = json.loads(path.read_text()).get("task")
+        except (json.JSONDecodeError, OSError) as exc:
+            LOG.warning("Could not read %s for the task string: %s", path, exc)
+
+    if explicit:
+        if recorded and explicit != recorded:
+            LOG.warning("--task %r differs from the task recorded in %s (%r). The "
+                        "policy conditions on this string; a phrasing the "
+                        "checkpoint was not finetuned on is out of distribution.",
+                        explicit, path.name, recorded)
+        return explicit
+    if recorded:
+        LOG.info("Task %r (recorded in %s)", recorded, path.name)
+        return recorded
+    raise SystemExit(
+        f"No --task given and {path} records none.\n"
+        f"The policy conditions on the instruction string, so there is no safe "
+        f"default: a phrasing this checkpoint was not finetuned on is out of "
+        f"distribution and nothing downstream will notice.\n"
+        f'Pass --task "<the instruction the training dataset was recorded with>", '
+        f'or add a "task" key to the bundle\'s export_info.json.')
+
+
+def resolve_bundle_path(split_dir: str, explicit: str | None, name: str,
+                        fallback: str | None, what: str) -> str | None:
+    """Prefer what the export bundle ships over a historical default path.
+
+    The finetuned bundles carry their own ``tokenizer/`` and ``stats.json``, so
+    the correct invocation is ``--split-dir <bundle>`` and nothing else. Every
+    path an operator has to remember separately is a chance to pair a checkpoint
+    with another run's normalization — the failure check_state_blind_stats
+    exists to catch, and the one that turns real degrees into an
+    out-of-distribution state token when --dataset-stats is simply forgotten.
+    """
+    if explicit:
+        return explicit
+    shipped = Path(split_dir) / name
+    if shipped.exists():
+        LOG.info("Using the %s shipped in the bundle: %s", what, shipped)
+        return str(shipped)
+    return fallback
+
+
+def check_camera_against_stats(camera_key: str, stats_path: str | None) -> None:
+    """Refuse an imager the training dataset never carried.
+
+    record_episodes always writes both cam1 and cam2 off one pipeline, but a
+    training run derives its dataset from one of them, and the stats.json that
+    comes with it has an entry per image key that survived. That settles which
+    imager the checkpoint saw. A cam1-trained policy fed colour frames is out of
+    distribution in exactly the silent way a wrong --task is, so check it.
+    """
+    if not stats_path:
+        return
+    try:
+        stats = json.loads(Path(stats_path).read_text())
+    except (json.JSONDecodeError, OSError):
+        return  # load_norm reports the real error
+    image_keys = sorted(k for k in stats if k.startswith("observation.images."))
+    if not image_keys or camera_key in image_keys:
+        return
+    suggest = next((flag for flag, key in CAMERA_KEYS.items() if key in image_keys), None)
+    raise SystemExit(
+        f"--camera selects {camera_key}, but {stats_path} was built from "
+        f"{image_keys}.\n"
+        f"This checkpoint never saw that imager; feeding it is out of distribution "
+        f"and it will drive badly."
+        + (f"\nPass --camera {suggest} to match." if suggest else ""))
+
+
 def check_state_blind_stats(norm: NormStats, stats_path: str | None) -> None:
     """Refuse a camera-only checkpoint paired with another run's normalization stats.
 
@@ -212,9 +318,17 @@ def load_norm(stats_path: str | None) -> NormStats:
 def main() -> int:
     p = argparse.ArgumentParser(description="SmolVLA split-engine inference loop.")
     p.add_argument("--split-dir", default=str(DEFAULT_SPLIT_DIR))
-    p.add_argument("--tokenizer", default=str(DEFAULT_TOKENIZER))
+    p.add_argument("--tokenizer", default=None,
+                   help="Tokenizer dir. Normally omitted — <split-dir>/tokenizer "
+                        f"is used when the bundle ships one (fallback: {DEFAULT_TOKENIZER})")
     p.add_argument("--cache-dir", default="/tmp/smolvla_split_cache")
-    p.add_argument("--instruction", default="scoop sand and dump it to the left")
+    p.add_argument("--task", default=None,
+                   help="Instruction the policy is conditioned on, e.g. "
+                        '"scoop sand and dump it to the left". Same flag, and the '
+                        "same string, as record_episodes --task. Normally omitted "
+                        "— it is read from the export bundle, since the phrasing "
+                        "is a property of the checkpoint. There is NO default: a "
+                        "wrong instruction is out of distribution and silent")
     p.add_argument("--num-steps", type=int, default=10, help="Denoise steps")
     p.add_argument("--n-action-steps", type=int, default=15,
                    help="Replan cadence: how many chunk actions play before "
@@ -226,7 +340,9 @@ def main() -> int:
                         "the export bundle, since it is a property of the checkpoint "
                         f"(default if nothing records it: {DEFAULT_FPS:g})")
     p.add_argument("--dataset-stats", default=None,
-                   help="Path to a LeRobot dataset stats.json for state/action normalization")
+                   help="LeRobot stats.json for state/action normalization. "
+                        "Normally omitted — <split-dir>/stats.json is used when "
+                        "the bundle ships one")
     p.add_argument("--state-blind", action="store_true",
                    help="Feed observation.state to the policy as zeros (camera-only "
                         "checkpoint). Normally omitted — it is read from the export "
@@ -277,10 +393,23 @@ def main() -> int:
 
     # Resolve before building engines so a rate mismatch fails in a second rather
     # than after a multi-minute TRT build.
+    args.tokenizer = resolve_bundle_path(args.split_dir, args.tokenizer,
+                                         "tokenizer", str(DEFAULT_TOKENIZER),
+                                         "tokenizer")
+    args.dataset_stats = resolve_bundle_path(args.split_dir, args.dataset_stats,
+                                             "stats.json", None,
+                                             "normalization stats")
+    args.task = resolve_task(args.split_dir, args.task)
     args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
     state_blind = resolve_state_blind(args.split_dir, args.state_blind)
 
+    camera_key = CAMERA_KEYS[args.camera]
+    check_camera_against_stats(camera_key, args.dataset_stats)
+
     state_joints = [j.strip() for j in args.state_joints.split(",") if j.strip()]
+    unknown = [j for j in state_joints if j not in JOINT_NAMES]
+    if unknown:
+        raise SystemExit(f"--state-joints {unknown} not in {JOINT_NAMES}")
 
     norm = load_norm(args.dataset_stats)
     # The state layout is a contract between the training dataset and this loop.
@@ -330,8 +459,6 @@ def main() -> int:
         else:
             LOG.info("Dry run: observations are real, actions are printed only.")
 
-    camera_key = ("observation.images.cam1" if args.camera == "ir"
-                  else "observation.images.cam2")
     if not args.synthetic:
         LOG.info("Policy camera: %s (%s)", camera_key,
                  "IR cam1" if args.camera == "ir" else "colour cam2")
@@ -355,7 +482,7 @@ def main() -> int:
     LOG.info("Warmup inference (builds TRT engines on first ever run)...")
     img, state = get_observation()
     t0 = time.perf_counter()
-    policy.sample_actions(img, args.instruction, for_policy(state))
+    policy.sample_actions(img, args.task, for_policy(state))
     LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
 
     cycle = 0
@@ -368,7 +495,7 @@ def main() -> int:
         while True:
             img, state = get_observation()
             t0 = time.perf_counter()
-            chunk = policy.sample_actions(img, args.instruction, for_policy(state))
+            chunk = policy.sample_actions(img, args.task, for_policy(state))
             infer_s = time.perf_counter() - t0
             infer_lead_s = max(infer_s, infer_lead_s * 0.9)
 

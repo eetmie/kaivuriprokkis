@@ -393,18 +393,49 @@ The monolithic SmolVLA ONNX cannot TRT-build on 8 GB; the deploy path is the
 9-graph split with the flow-matching denoise loop in Python
 (`smolvla_split.py`; see `spark-projects/orin-nano/smolvla-runtime/notes/findings.md`).
 
+A finetuned bundle ships its own `export_info.json`, `stats.json` and
+`tokenizer/`, so `--split-dir` is (almost) the whole command — see
+*What the bundle resolves* below.
+
 ```bash
+BUNDLE=~/Desktop/smolvla-digging-ir-20k
+
 # model-only proof (no robot, no camera; first run builds engines — minutes):
-TRT_DROP_CUDA_EP=1 .venv-lerobot/bin/python -m lerobot_vla.run_inference --synthetic --loops 3
+TRT_DROP_CUDA_EP=1 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
+    --split-dir $BUNDLE --synthetic --loops 3
 
 # real observations, actions PRINTED only (safe default):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
-    --instruction "scoop sand and dump it to the left" --exposure-ir 16000
+    --split-dir $BUNDLE --exposure-ir 16000 --gain-ir 16
 
 # actually drive the valves (only with a finetuned checkpoint!):
 .venv-lerobot/bin/python -m lerobot_vla.run_inference --live \
-    --dataset-stats <dataset>/meta/stats.json ...
+    --split-dir $BUNDLE --exposure-ir 16000 --gain-ir 16
 ```
+
+### What the bundle resolves
+
+`run_inference` reads these from `<split-dir>` rather than making the operator
+carry them, and an explicit flag always wins:
+
+| Flag | Read from | If it is missing |
+|---|---|---|
+| `--task` | `export_info.json` → `task` | **hard error** — there is no default |
+| `--fps` | `export_info.json` → `fps` | 30, with a warning |
+| `--state-blind` | `export_info.json` → `state_blind` | off |
+| `--tokenizer` | `<split-dir>/tokenizer/` | the base-export tokenizer |
+| `--dataset-stats` | `<split-dir>/stats.json` | identity normalization, with a warning |
+
+`--task` used to default to `"scoop sand and dump it to the left"`. That is the
+kaivuri task, and it silently mislabelled every run against any other
+checkpoint — the policy conditions on the language embedding, so a phrasing it
+was never finetuned on is out of distribution and the prefix is still perfectly
+well-formed. The default is gone: the string comes from the bundle, or from
+`--task`, or the run refuses to start. It is spelled `--task` because that is
+what `record_episodes.py` calls it, and the two must carry the *same string*.
+
+`--camera` is cross-checked against the image keys in the stats file, so a
+cam1-trained checkpoint refuses to start on `--camera rgb`.
 
 Setpoint-timing flags (all optional; defaults are sane):
 
@@ -414,19 +445,19 @@ Setpoint-timing flags (all optional; defaults are sane):
 | `--setpoint-decay-s` | 0.25 | Ramp-to-zero window once the setpoint goes stale |
 | `--blend-s` | 0.0 | Cross-fade into each new chunk, to soften the step at a chunk boundary |
 | `--legacy-direct-write` | off | Drive valves from this thread instead of the control thread (bench A/B only) |
-| `--camera` | `ir` | Which imager the policy sees: `ir` = cam1, `rgb` = cam2. **Must match what the checkpoint was trained on** |
+| `--camera` | `ir` | Which imager the policy sees: `ir` = cam1, `rgb` = cam2. **Must match what the checkpoint was trained on** — refused when the stats file disagrees |
 
 Each cycle logs `age=` and `decay=` for the held setpoint. `decay < 1.00` in
 steady state means inference is not keeping ahead of chunk playback — raise
 `--n-action-steps` (longer chunks, more time to think) before touching the
 hold/decay windows, which exist to make a stall safe, not to hide one.
 
-Defaults point at the base-weight split export
-(`spark-projects/.../exports/ainekko_base_split`) + its tokenizer bundle.
-When the finetuned split export lands from the Spark, pass `--split-dir` at it
-and `--dataset-stats` at the training dataset's stats for correct
-state/action normalization. Base weights produce meaningless actions — they
-only prove the loop and its latency.
+`--split-dir` still defaults to the base-weight split export
+(`spark-projects/.../exports/ainekko_base_split`), which ships no
+`export_info.json`, no stats and no tokenizer — so it needs `--task` spelled out
+and normalizes with the identity. Base weights produce meaningless actions; they
+only prove the loop and its latency. For anything real, point `--split-dir` at a
+finetuned bundle and let it resolve the rest.
 
 Engines are pre-built automatically, one subprocess per graph (two TRT builds
 in one process OOM 8 GB), into `/tmp/smolvla_split_cache` — note /tmp clears

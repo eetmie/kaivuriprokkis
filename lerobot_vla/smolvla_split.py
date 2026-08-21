@@ -46,7 +46,13 @@ IMG_TOKENS = 64
 # this is only the fallback when the graph axis is dynamic.
 DEFAULT_NUM_CAM_SLOTS = 2
 LANG_LEN = 48
-CHUNK_SIZE = 50
+# The action chunk length is baked into the expert-decode graph at export time and
+# DIFFERS between bundles: lerobot/smolvla_base and every excavator export so far use
+# 50, but a bundle trained with --policy.chunk_size=12 or 30 carries that instead. The
+# real value is read from the graph in __init__; this is only the fallback when the
+# graph axis is dynamic. Feeding a 50-step suffix to a 12-step graph is a shape error,
+# and feeding 12 to a 50-step graph would silently under-drive the action head.
+DEFAULT_CHUNK_SIZE = 50
 MAX_ACTION_DIM = 32
 MAX_STATE_DIM = 32
 IMG_SIZE = 512
@@ -274,6 +280,24 @@ class SmolVLASplitPolicy:
         LOG.info("prefill expects prefix %d (%d camera slot(s))",
                  self.prefix_len, self.n_cam_slots)
 
+        # Same treatment for the action chunk length: the decode graph was exported with
+        # position_ids [1, chunk] and attention_mask [1, chunk, prefix + chunk], so the
+        # value is recoverable and cross-checkable rather than assumed.
+        dim = next((i.shape[1] for i in self.decode.get_inputs()
+                    if i.name == "position_ids"), None)
+        if isinstance(dim, int):
+            self.chunk_size = dim
+            total = next((i.shape[2] for i in self.decode.get_inputs()
+                          if i.name == "attention_mask"), None)
+            if isinstance(total, int) and total != self.prefix_len + self.chunk_size:
+                raise ValueError(
+                    f"decode graph is inconsistent: attention_mask spans {total} but "
+                    f"prefix {self.prefix_len} + chunk {self.chunk_size} = "
+                    f"{self.prefix_len + self.chunk_size} — mismatched export")
+        else:  # dynamic axis: keep the historical layout
+            self.chunk_size = DEFAULT_CHUNK_SIZE
+        LOG.info("decode expects a %d-step action chunk", self.chunk_size)
+
         # The empty-camera slot embedding is a constant (all -1 image, the
         # lerobot padding convention) — compute once, reuse every step.
         self._pad_cam_emb = None
@@ -319,7 +343,7 @@ class SmolVLASplitPolicy:
 
     def sample_actions(self, image_hwc_uint8: np.ndarray, instruction: str,
                        state: np.ndarray, noise: np.ndarray | None = None) -> np.ndarray:
-        """One observation -> (CHUNK_SIZE, action_dim) unnormalized action chunk."""
+        """One observation -> (chunk_size, action_dim) unnormalized action chunk."""
         # prefix: [cam1(64), pad-cam(64) x (slots-1), lang(48), state(1)]
         img = resize_with_pad_uint8(image_hwc_uint8)
         img_emb = self._run_vision(img)                          # [1,64,960]
@@ -356,16 +380,16 @@ class SmolVLASplitPolicy:
         # denoise loop
         if noise is None:
             noise = self._rng.standard_normal(
-                (1, CHUNK_SIZE, MAX_ACTION_DIM)).astype(np.float32)
+                (1, self.chunk_size, MAX_ACTION_DIM)).astype(np.float32)
         x_t = noise.copy()
         dt = -1.0 / self.num_steps
         t = 1.0
 
         # constant across steps
         prefix_pad_2d = np.broadcast_to(
-            pad_masks[:, None, :], (1, CHUNK_SIZE, self.prefix_len))
-        suffix_pad = np.ones((1, CHUNK_SIZE), dtype=bool)
-        suffix_att = np.ones((1, CHUNK_SIZE), dtype=bool)        # action block: causal-in-block
+            pad_masks[:, None, :], (1, self.chunk_size, self.prefix_len))
+        suffix_pad = np.ones((1, self.chunk_size), dtype=bool)
+        suffix_att = np.ones((1, self.chunk_size), dtype=bool)        # action block: causal-in-block
         suffix_att_2d = make_att_2d_masks(suffix_pad, suffix_att)
         full_att_2d = np.concatenate(
             [prefix_pad_2d, suffix_att_2d], axis=2)              # [1,50,227]

@@ -43,6 +43,13 @@ export bundle when the bundle records one, and so are the tokenizer and the
 normalization stats — a finetuned bundle ships all three, which is why the
 correct invocation is --split-dir and (almost) nothing else.
 
+A gamepad, if one is plugged in, can take the machine over during a --live
+run: A toggles between the policy and the sticks. The two are exclusive rather
+than summed — manual control drops the chunk in flight, and no inference runs
+while the operator drives, so the chunk that resumes control is inferred from
+the pose they left the machine in. A missing pad is not an error; the run
+proceeds exactly as it would without one.
+
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds.
 
@@ -57,6 +64,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -67,7 +75,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from lerobot_vla.excavator_robot import JOINT_NAMES
+from lerobot_vla.record_episodes import manual_action_from_axes
 from lerobot_vla.smolvla_split import NormStats, SmolVLASplitPolicy
+from simple_drive import BTN_A, LocalGamepadInput
 
 DEFAULT_SPLIT_DIR = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/ainekko_base_split"
 DEFAULT_TOKENIZER = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/tokenizer"
@@ -79,6 +89,17 @@ CAMERA_KEYS = {"ir": "observation.images.cam1", "rgb": "observation.images.cam2"
 
 #: Used only when nothing in the export bundle records the training rate.
 DEFAULT_FPS = 30.0
+
+#: Rate the manual setpoint is fed at while the operator drives. Deliberately
+#: NOT --fps: that is the checkpoint's action rate, and a 6 fps checkpoint would
+#: leave the setpoint stale between ticks and decay the valves mid-stroke.
+TELEOP_HZ = 30.0
+
+#: Button poll rate. Fast enough that a tap is never missed, and it only reads.
+BUTTON_POLL_HZ = 50.0
+
+#: How long to wait for a pad at startup. Short, because it is optional.
+GAMEPAD_TIMEOUT_S = 3.0
 
 
 def resolve_policy_fps(split_dir: str, stats_path: str | None,
@@ -316,6 +337,95 @@ def load_norm(stats_path: str | None) -> NormStats:
     return norm
 
 
+class GamepadTeleop:
+    """Hand the machine between the policy and the sticks, one or the other.
+
+    A toggles: press it while the policy is driving and the operator takes over
+    until it is pressed again. Useful for repositioning between takes, and for
+    rescuing a run that has driven itself somewhere useless.
+
+    The two sources are exclusive, not summed. That is what makes the hand-over
+    clean in both directions. Manual control goes out through ``send_action``,
+    whose ``set_point`` DROPS the chunk the control thread is playing
+    (modules/setpoint_schedule.py), so the operator never fights a stale plan;
+    and because no inference runs while they drive, the chunk that resumes
+    control was inferred from the pose they left the machine in rather than
+    from one taken before they touched it.
+
+    The pad is polled on its own thread only to catch the button. The inference
+    loop comes around once per chunk (~0.5 s), and the pad holds a button's
+    state only until its release event arrives, so a tap read from that loop is
+    simply missed. That thread never commands the valves.
+    """
+
+    def __init__(self, robot, pad) -> None:
+        self._robot = robot
+        self._pad = pad
+        self._edge = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch_button, daemon=True)
+        self._thread.start()
+
+    def _watch_button(self) -> None:
+        prev = False
+        while not self._stop.wait(1.0 / BUTTON_POLL_HZ):
+            _, mask = self._pad.poll()
+            down = bool(mask & (1 << BTN_A))
+            if down and not prev:
+                self._edge.set()
+            prev = down
+
+    def pressed(self) -> bool:
+        """True once per press of A, whenever it is next asked for."""
+        if self._edge.is_set():
+            self._edge.clear()
+            return True
+        return False
+
+    def run(self) -> None:
+        """Drive from the sticks until A is pressed again. Blocks the caller.
+
+        ``stop_motion`` on entry zeroes the valves and drops the policy chunk in
+        the same call, so control transfers on a stopped machine rather than
+        mid-stroke. On exit it zeroes again: the policy needs one inference
+        (~0.4 s) before it has anything to say, and the operator's last stick
+        value must not coast through that gap.
+
+        A pad that disconnects mid-teleop leaves the machine stopped -- read()
+        zeroes every axis while it is gone -- and control stays manual until it
+        is back. Resuming the policy on its own here would start autonomous
+        motion on a machine nobody is holding.
+        """
+        self._robot.stop_motion()
+        period = 1.0 / TELEOP_HZ
+        while not self.pressed():
+            axes, _ = self._pad.poll()
+            action = (manual_action_from_axes(axes)
+                      if axes is not None and self._pad.is_live()
+                      else np.zeros(len(JOINT_NAMES), dtype=np.float32))
+            self._robot.send_action(action)
+            time.sleep(period)
+        self._robot.stop_motion()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._pad.close()
+
+
+def make_teleop(robot) -> GamepadTeleop | None:
+    """Gamepad override for a live run, or None if no pad answers.
+
+    Optional on purpose: a pad that is absent, unplugged or unreadable leaves
+    the run exactly as it would have been rather than failing it, so an
+    inference session never depends on one being connected.
+    """
+    pad = LocalGamepadInput(connect_timeout_s=GAMEPAD_TIMEOUT_S)
+    if not pad.open():
+        return None
+    return GamepadTeleop(robot, pad)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="SmolVLA split-engine inference loop.")
     p.add_argument("--split-dir", default=str(DEFAULT_SPLIT_DIR))
@@ -374,6 +484,11 @@ def main() -> int:
                    help="No robot/camera; synthetic observation (model-only test)")
     p.add_argument("--live", action="store_true",
                    help="SEND actions to the valves (default: print only)")
+    p.add_argument("--no-gamepad", action="store_true",
+                   help="Do not look for a gamepad. Without it, an attached pad "
+                        "can take manual control with A during a --live run "
+                        "(exclusive with the policy, not summed); no pad "
+                        "attached is not an error either way")
     p.add_argument("--loops", type=int, default=0,
                    help="Stop after N infer+execute cycles (0 = run until Ctrl+C)")
     p.add_argument("--seed", type=int, default=None, help="Fix the denoise noise seed")
@@ -461,6 +576,15 @@ def main() -> int:
         else:
             LOG.info("Dry run: observations are real, actions are printed only.")
 
+    # Live only: without --live no source drives the valves, and the safety
+    # ladder in the module docstring should not have a hole in it for the pad.
+    teleop = (make_teleop(robot)
+              if robot is not None and args.live and not args.no_gamepad
+              else None)
+    if teleop is not None:
+        LOG.info("Gamepad attached: A hands control between the policy and the "
+                 "sticks (exclusive, not summed).")
+
     if not args.synthetic:
         LOG.info("Policy camera: %s (%s)", camera_key,
                  "IR cam1" if args.camera == "ir" else "colour cam2")
@@ -494,6 +618,9 @@ def main() -> int:
     # the warmup — that one includes the TRT engine build.
     infer_lead_s = 0.0
     chunk_t0 = 0.0          # set on every hand-over; only read once cycle > 0
+    # When teleop took a chunk over mid-play. `played` counts up to this instead
+    # of to the next hand-over, so the manual stretch is not billed to the chunk.
+    chunk_cut = None
     try:
         while True:
             img, state = get_observation()
@@ -513,8 +640,11 @@ def main() -> int:
             # Steps of the PREVIOUS chunk that actually played before this one
             # replaced it -- measured, not assumed. This is the real execution
             # horizon; with --min-replan-s 0 it is inference latency alone.
-            played = min(round((now - chunk_t0) * args.fps), len(chunk)) if cycle else None
+            played_until = chunk_cut if chunk_cut is not None else now
+            played = (min(round((played_until - chunk_t0) * args.fps), len(chunk))
+                      if cycle else None)
             chunk_t0 = now
+            chunk_cut = None
 
             LOG.info("cycle=%d infer=%.0fms played=%s state%s=[%s] a0=[%s]",
                      cycle, infer_s * 1000.0,
@@ -527,6 +657,13 @@ def main() -> int:
             if args.loops and cycle >= args.loops:
                 break
 
+            # Blocks here for as long as the operator drives. The chunk handed
+            # over above is dropped by the first manual setpoint, so record when
+            # it stopped playing before giving the machine away.
+            if teleop is not None and teleop.pressed():
+                chunk_cut = time.perf_counter()
+                teleop.run()
+
             # Sleep until it is time to start the next inference. The control
             # thread is driving the valves from the chunk meanwhile. The default
             # --min-replan-s 0 means no sleep at all: replan flat out.
@@ -536,6 +673,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        if teleop is not None:
+            teleop.close()
         if robot is not None:
             try:
                 robot.stop_motion()

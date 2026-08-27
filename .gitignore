@@ -229,4 +229,5 @@ tests/test_lerobot_kaivuri.py
 
 # LeRobot VLA integration
 .venv-lerobot/
+.venv-vla/
 data_collection/lerobot_datasets/

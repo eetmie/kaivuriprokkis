@@ -463,6 +463,55 @@ and normalizes with the identity. Base weights produce meaningless actions; they
 only prove the loop and its latency. For anything real, point `--split-dir` at a
 finetuned bundle and let it resolve the rest.
 
+### Runtime flags: `--projectors` and `--no-iobinding`
+
+Both default to the settings validated on this board in `jetson-orin-nano-vla`
+(`docs/06-optimization-backlog.md`) and re-measured here against the deployed
+`smolvla-digging-clean-ir12-35k` bundle, 30 cycles, pinned clocks, MAXN_SUPER:
+
+| projectors | iobinding | p50 ms | p95 ms | Hz | CPU cores busy | peak RSS |
+|---|---|---:|---:|---:|---:|---:|
+| cpu | off | 147.8 | 176.9 | 6.76 | 2.46 | 1873 MB |
+| cpu | **on** | 147.9 | 163.5 | 6.76 | 2.35 | 1879 MB |
+| **gpu** | off | 131.8 | 132.4 | 7.59 | 0.45 | 2065 MB |
+| **gpu** | **on** | **121.6** | **122.0** | **8.22** | **0.41** | 2060 MB |
+
+`--projectors gpu` moves the four projectors the denoise loop calls *once per
+step* (`action_in`, `time_in`, `time_out`, `action_out`) off the CPU EP. TensorRT
+declines graphs that small and they run on the CUDA EP — expected, not a failure,
+and `get_providers()[0]` will still claim TensorRT because that is the session's
+provider *preference*, not what executed. `--iobinding` (on by default) binds the
+prefill's KV cache straight to the device and leaves it there for all N steps
+instead of re-feeding 7.2 MB of numpy per step.
+
+Together: **1.22x faster, and 2.05 of the six CPU cores handed back** to the
+control stack. Parity against the old `cpu`/off default, over 36 real IR frames
+from `masi_digging_clean`, scored with `bench/parity.py`'s gate (`cosine_min >=
+0.999` and `max_abs_diff <= 1%` of action range):
+
+| change | cosine_min | worst | median | verdict |
+|---|---:|---:|---:|---|
+| gpu projectors + IOBinding | 0.9999987 | 0.043% | 0.015% | **PASS** |
+
+IOBinding on its own is **exactly bit-identical** (max abs diff 0.000e+00), in
+both projector configurations — free speed, not a precision trade. The GPU
+projectors account for all of the (tiny) difference: CUDA-EP vs CPU-EP arithmetic
+on small matmuls.
+
+`--projectors cpu --no-iobinding` reproduces the pre-benchmark loop exactly, for
+regression comparison. There is no other reason to use them.
+
+The p95 column is the quiet win for a chunk-12 bundle: 176.9 -> 122.0 ms. That
+bundle buffers 0.4 s of plan, so the margin over inference goes from ~2.3x to
+~3.3x, and the worst case stops being the thing that eats it.
+
+**Measure parity on REAL frames.** A flat-random synthetic image understates
+drift badly — it put the NaN-guard candidate below at 0.47% when real frames say
+1.32%. `bench/tools/extract_frames.py` dumps PNGs from a LeRobot episode.
+
+**NOT taken from that benchmark:** the NaN-guard-stripped vision graph and a
+reduced `--num-steps`. See the runtime notes in `smolvla_split.py`.
+
 Engines are pre-built automatically, one subprocess per graph (two TRT builds
 in one process OOM 8 GB), into `/tmp/smolvla_split_cache` — note /tmp clears
 on reboot, so the first run after boot rebuilds (~5 min). RAM is tight:

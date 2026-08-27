@@ -492,6 +492,19 @@ def main() -> int:
     p.add_argument("--loops", type=int, default=0,
                    help="Stop after N infer+execute cycles (0 = run until Ctrl+C)")
     p.add_argument("--seed", type=int, default=None, help="Fix the denoise noise seed")
+    # Both default to the settings validated on this board in
+    # jetson-orin-nano-vla (docs/06-optimization-backlog.md): together they cut
+    # p50 from 229.8 to 134.8 ms with bit-identical output. The opt-outs exist
+    # so a regression can be A/B'd against the old loop, not because there is a
+    # reason to run them.
+    p.add_argument("--projectors", choices=("gpu", "cpu"), default="gpu",
+                   help="Where the four per-step action/time projectors run. "
+                        "gpu (default) keeps the denoise loop off the CPU; "
+                        "cpu reproduces the pre-benchmark loop")
+    p.add_argument("--no-iobinding", dest="iobinding", action="store_false",
+                   help="Re-feed the KV cache as numpy on every denoise step "
+                        "instead of binding it to the device once. Slower, and "
+                        "bit-identical — for regression comparison only")
     p.add_argument("--setpoint-hold-s", type=float, default=0.25,
                    help="How long a chunk's last action holds full authority "
                         "after the chunk runs out, before decaying to zero")
@@ -551,6 +564,8 @@ def main() -> int:
         action_dim=4,
         norm=norm,
         seed=args.seed,
+        projectors=args.projectors,
+        iobinding=args.iobinding,
     )
 
     robot = None

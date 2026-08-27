@@ -1,7 +1,7 @@
 """SmolVLA split-engine inference — ONNX Runtime + TensorRT EP, numpy only.
 
-Runs the 9-graph split export (see spark-projects/orin-nano/smolvla-runtime/
-exports/ainekko_base_split) with the flow-matching denoise loop in Python:
+Runs the 9-graph split export produced by spark-projects/smolvla-spark-finetune/
+export_split_onnx.py, with the flow-matching denoise loop in Python:
 
     vision (x per camera) + text + state_proj  ->  prefix embeddings [1,177,960]
     expert_prefill (once)                      ->  KV cache
@@ -16,11 +16,39 @@ Orchestration mirrors github.com/aifoundry-org/ETARS modeling_smolvla_ort.py,
 checked against lerobot 0.5.1 modeling_smolvla.py. The prefix length is read
 from the prefill graph at load time — it depends on how many camera slots the
 bundle was exported with (ainekko base: 2 slots -> 177 = 2x64 + 48 lang + 1
-state; our single-camera excavator export: 1 slot -> 113). Chunk 50; padded
-action dim 32.
+state; our single-camera excavator export: 1 slot -> 113). The chunk length is
+likewise read from the decode graph (50 for the base export, 12 for the deployed
+digging bundle); padded action dim 32.
 
 Heavy graphs (vision / prefill / decode) run on the TensorRT EP with an
-on-disk engine cache; tiny projectors and the text embedding run on CPU.
+on-disk engine cache. The text embedding and the state projector stay on the
+CPU EP -- they run once per inference. The four PER-STEP projectors and the
+denoise loop's KV feeds do not, and both are handled on the GPU by default:
+
+  * `projectors="gpu"` re-creates action_in / time_in / time_out / action_out
+    on the TRT->CUDA stack. TensorRT declines graphs this small (they fall
+    under trt_min_subgraph_size) and they run on the CUDA EP -- that is the
+    expected placement, not a failure.
+  * `iobinding=True` binds the prefill's KV cache straight to device and keeps
+    it there for the whole denoise loop, instead of round-tripping 7.2 MB of
+    numpy through the host on every one of the N steps.
+
+Both were validated on the board in github.com/eetmie/jetson-orin-nano-vla
+(docs/06-optimization-backlog.md), and re-measured here against the deployed
+smolvla-digging-clean-ir12-35k bundle: 147.8 -> 121.6 ms p50 (and 176.9 ->
+122.0 p95), with 2.05 of the six CPU cores handed back to the control stack.
+
+Parity against the previous cpu/off default, same observation and same noise:
+IOBinding is EXACTLY bit-identical (max abs 0.000e+00) in both projector
+configurations. The GPU projectors account for all of the difference -- max
+abs 3.26e-4, 0.042% of the action range, cosine 0.999999940 -- which is
+CUDA-EP vs CPU-EP arithmetic on tiny matmuls, well inside this project's
+1%-of-range gate. `projectors="cpu"` / `iobinding=False` reproduce the old
+loop exactly, for regression comparisons.
+
+NOT taken from that benchmark: the NaN-guard-stripped vision graph (faster,
+but still outside the repo's own parity gate) and a reduced `num_steps`
+(faster, but it changes the policy rather than its runtime).
 """
 
 from __future__ import annotations
@@ -61,6 +89,17 @@ MAX_PERIOD = 4.0
 
 _DEFAULT_TRT_WORKSPACE = 1 << 30   # 1 GiB
 _DEFAULT_CUDA_MEM_LIMIT = 3 << 30  # 3 GiB
+
+# The four projectors the denoise loop calls ONCE PER STEP -- ten host round
+# trips each per inference at the default budget, which is what makes them
+# worth moving to the GPU. `smolvlm_text` and `state_projector` run once per
+# inference and stay on the CPU EP.
+_PER_STEP_PROJECTORS = {
+    "action_in": "action_in_projector.onnx",
+    "time_in": "time_in_projector.onnx",
+    "time_out": "time_out_projector.onnx",
+    "action_out": "action_out_projector.onnx",
+}
 
 
 def build_providers(cache_dir: str, precision: str = "fp16"):
@@ -213,15 +252,23 @@ class SmolVLASplitPolicy:
                  num_steps: int = 10,
                  action_dim: int = 4,
                  norm: NormStats | None = None,
-                 seed: int | None = None):
+                 seed: int | None = None,
+                 projectors: str = "gpu",
+                 iobinding: bool = True):
         import onnxruntime as ort
         from transformers import AutoTokenizer
 
         split_dir = Path(split_dir)
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
+        if projectors not in ("gpu", "cpu"):
+            raise ValueError(f"projectors must be 'gpu' or 'cpu', got {projectors!r}")
         self.num_steps = num_steps
         self.action_dim = action_dim
         self.norm = norm or NormStats()
         self._rng = np.random.default_rng(seed)
+        self.projectors = projectors
+        self.iobinding = iobinding
 
         self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
 
@@ -241,12 +288,31 @@ class SmolVLASplitPolicy:
         self.vision = sess("smolvlm_vision.onnx", heavy)
         self.prefill = sess("smolvlm_expert_prefill.onnx", heavy)
         self.decode = sess("smolvlm_expert_decode.onnx", heavy)
+        # Once per inference -> the host round trip is a rounding error.
         self.text = sess("smolvlm_text.onnx", cpu)
         self.state_proj = sess("state_projector.onnx", cpu)
-        self.action_in = sess("action_in_projector.onnx", cpu)
-        self.action_out = sess("action_out_projector.onnx", cpu)
-        self.time_in = sess("time_in_projector.onnx", cpu)
-        self.time_out = sess("time_out_projector.onnx", cpu)
+        # Once per DENOISE STEP. On the CPU EP these four cost ~26 ms and 2.0
+        # CPU cores per inference on this board; on the GPU stack they cost
+        # neither, at 0.042% of the action range in arithmetic difference (see
+        # the module docstring). Falling back to the CPU EP
+        # per graph is deliberate: a projector that will not load on CUDA must
+        # not take the excavator down with it, it must only be slower.
+        self.projectors_on_gpu: list[str] = []
+        for attr, fname in _PER_STEP_PROJECTORS.items():
+            providers = cpu
+            if projectors == "gpu":
+                try:
+                    setattr(self, attr, sess(fname, heavy))
+                    self.projectors_on_gpu.append(attr)
+                    continue
+                except Exception as e:
+                    LOG.warning("projector %s would not load on the GPU stack "
+                                "(%s: %s) -- falling back to the CPU EP",
+                                fname, type(e).__name__, e)
+            setattr(self, attr, sess(fname, providers))
+        if projectors == "gpu":
+            LOG.info("per-step projectors on GPU: %s",
+                     ", ".join(self.projectors_on_gpu) or "none")
 
         self.n_layers = sum(1 for i in self.decode.get_inputs()
                             if i.name.startswith("past_key_"))
@@ -308,6 +374,14 @@ class SmolVLASplitPolicy:
         # Language is fixed per instruction in practice — cache by string.
         self._lang_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
+        # Every bundle's decode emits exactly one tensor; IOBinding wants its name.
+        self._decode_out_name = self.decode.get_outputs()[0].name
+        self._ort = ort
+        self._pio = self.prefill.io_binding() if iobinding else None
+        self._io = self.decode.io_binding() if iobinding else None
+        LOG.info("denoise loop: %s KV feeds",
+                 "device-resident (IOBinding)" if iobinding else "numpy (stock)")
+
     # ── component wrappers ───────────────────────────────────────────────────
 
     @staticmethod
@@ -368,60 +442,131 @@ class SmolVLASplitPolicy:
         att_masks = np.zeros((1, self.prefix_len), dtype=bool)
         att_masks[0, -1] = True                                  # state starts a new block
 
-        prefix_att_2d = make_att_2d_masks(pad_masks, att_masks)  # [1,177,177]
-        prefix_pos = (np.cumsum(pad_masks, axis=1) - 1).astype(np.int64)
+        return self._prefill_and_denoise(embs, pad_masks, att_masks, noise)
 
-        kv = self.prefill.run(self._prefill_kv_names, {
-            "attention_mask": prefix_att_2d,
-            "position_ids": prefix_pos,
-            "vlm_embeds": embs,
-        })
+    # ── prefill + denoise ────────────────────────────────────────────────────
 
-        # denoise loop
+    def _prefill_and_denoise(self, embs, pad_masks, att_masks,
+                             noise: np.ndarray | None = None) -> np.ndarray:
+        """Prefix embeddings -> unnormalized action chunk.
+
+        Split out from `sample_actions` because the two KV strategies differ
+        only from here on, and because a multi-camera caller builds its own
+        prefix but wants the identical loop.
+        """
+        if self.iobinding:
+            return self._prefill_and_denoise_iobind(embs, pad_masks, att_masks, noise)
+        return self._prefill_and_denoise_feeds(embs, pad_masks, att_masks, noise)
+
+    def _initial_noise(self, noise: np.ndarray | None) -> np.ndarray:
         if noise is None:
             noise = self._rng.standard_normal(
                 (1, self.chunk_size, MAX_ACTION_DIM)).astype(np.float32)
-        x_t = noise.copy()
-        dt = -1.0 / self.num_steps
-        t = 1.0
+        return np.asarray(noise, dtype=np.float32).copy()   # x_t is updated in place
 
-        # constant across steps
+    def _denoise_constants(self, pad_masks) -> tuple[np.ndarray, np.ndarray]:
+        """The decode inputs that never change across the N steps."""
         prefix_pad_2d = np.broadcast_to(
             pad_masks[:, None, :], (1, self.chunk_size, self.prefix_len))
-        suffix_pad = np.ones((1, self.chunk_size), dtype=bool)
-        suffix_att = np.ones((1, self.chunk_size), dtype=bool)        # action block: causal-in-block
-        suffix_att_2d = make_att_2d_masks(suffix_pad, suffix_att)
-        full_att_2d = np.concatenate(
-            [prefix_pad_2d, suffix_att_2d], axis=2)              # [1,50,227]
-        pos_ids = (pad_masks.sum(axis=-1, keepdims=True)
-                   + np.cumsum(suffix_pad, axis=1) - 1).astype(np.int64)
+        suffix = np.ones((1, self.chunk_size), dtype=bool)   # action block: causal-in-block
+        full_att_2d = np.ascontiguousarray(np.concatenate(
+            [prefix_pad_2d, make_att_2d_masks(suffix, suffix)], axis=2))  # [1,chunk,prefix+chunk]
+        pos_ids = np.ascontiguousarray(
+            (pad_masks.sum(axis=-1, keepdims=True) + np.cumsum(suffix, axis=1) - 1
+             ).astype(np.int64))
+        return full_att_2d, pos_ids
 
+    def _prefill_and_denoise_feeds(self, embs, pad_masks, att_masks, noise) -> np.ndarray:
+        """Stock path: the KV cache is re-fed as numpy on every step."""
+        kv = self.prefill.run(self._prefill_kv_names, {
+            "attention_mask": make_att_2d_masks(pad_masks, att_masks),
+            "position_ids": (np.cumsum(pad_masks, axis=1) - 1).astype(np.int64),
+            "vlm_embeds": embs,
+        })
+        x_t = self._initial_noise(noise)
+        full_att_2d, pos_ids = self._denoise_constants(pad_masks)
         kv_feed = {}
         for i in range(self.n_layers):
             kv_feed[f"past_key_{i}"] = kv[2 * i]
             kv_feed[f"past_value_{i}"] = kv[2 * i + 1]
 
+        dt = -1.0 / self.num_steps
+        t = 1.0
         while t >= -dt / 2:
-            v_t = self._denoise_step(x_t, t, full_att_2d, pos_ids, kv_feed)
-            x_t += dt * v_t
+            x_t += dt * self._denoise_step(x_t, t, full_att_2d, pos_ids, kv_feed)
             t += dt
+        return self.norm.unnormalize_action(x_t[0, :, :self.action_dim])
 
-        actions = x_t[0, :, :self.action_dim]                    # (50, act_dim)
-        return self.norm.unnormalize_action(actions)
+    def _prefill_and_denoise_iobind(self, embs, pad_masks, att_masks, noise) -> np.ndarray:
+        """Device-resident path: prefill writes its KV to the GPU and it stays there.
 
-    def _denoise_step(self, x_t, t, full_att_2d, pos_ids, kv_feed) -> np.ndarray:
-        action_emb = self._run_single(self.action_in, x_t)               # [1,50,720]
+        The KV cache is ~7.2 MB and is identical for all N steps, so the stock
+        path copies it host->device N times (72 MB per inference at N=10) after
+        having copied it device->host once. Here prefill's outputs are bound
+        straight to CUDA and handed to decode as device pointers; only
+        `expert_embeds` is rebound per step. Measured bit-identical.
+        """
+        ort = self._ort
+
+        pio = self._pio
+        pio.clear_binding_inputs()
+        pio.clear_binding_outputs()
+        pio.bind_cpu_input("attention_mask",
+                           np.ascontiguousarray(make_att_2d_masks(pad_masks, att_masks)))
+        pio.bind_cpu_input("position_ids", np.ascontiguousarray(
+            (np.cumsum(pad_masks, axis=1) - 1).astype(np.int64)))
+        pio.bind_cpu_input("vlm_embeds", np.ascontiguousarray(embs))
+        # Bound BY NAME, in _prefill_kv_names order. IOBinding returns exactly the
+        # outputs that were bound, in bind order — so a bundle whose prefill also
+        # emits vlm_output_embeds (ainekko's does, ours does not) cannot shift the
+        # KV indices out from under the loop below.
+        for name in self._prefill_kv_names:
+            pio.bind_output(name, "cuda", 0)
+        self.prefill.run_with_iobinding(pio)
+        kv = pio.get_outputs()                        # OrtValues, already on device
+
+        x_t = self._initial_noise(noise)
+        full_att_2d, pos_ids = self._denoise_constants(pad_masks)
+
+        io = self._io
+        io.clear_binding_inputs()
+        io.clear_binding_outputs()
+        for i in range(self.n_layers):
+            io.bind_ortvalue_input(f"past_key_{i}", kv[2 * i])
+            io.bind_ortvalue_input(f"past_value_{i}", kv[2 * i + 1])
+        io.bind_ortvalue_input("attention_mask",
+                               ort.OrtValue.ortvalue_from_numpy(full_att_2d, "cuda", 0))
+        io.bind_ortvalue_input("position_ids",
+                               ort.OrtValue.ortvalue_from_numpy(pos_ids, "cuda", 0))
+        io.bind_output(self._decode_out_name, "cuda", 0)
+
+        dt = -1.0 / self.num_steps
+        t = 1.0
+        while t >= -dt / 2:
+            suffix_embs = np.ascontiguousarray(self._suffix_embeds(x_t, t))
+            io.bind_ortvalue_input(
+                "expert_embeds", ort.OrtValue.ortvalue_from_numpy(suffix_embs, "cuda", 0))
+            self.decode.run_with_iobinding(io)
+            expert_out = io.get_outputs()[0].numpy()
+            x_t += dt * self._run_single(self.action_out, expert_out.astype(np.float32))
+            t += dt
+        return self.norm.unnormalize_action(x_t[0, :, :self.action_dim])
+
+    def _suffix_embeds(self, x_t, t) -> np.ndarray:
+        """Action chunk + timestep -> the expert's suffix embeddings for one step."""
+        action_emb = self._run_single(self.action_in, x_t)               # [1,chunk,720]
         time_emb = np.broadcast_to(
             sinusoidal_time_embedding(t)[None, None, :], action_emb.shape)
         ate = np.concatenate([action_emb, time_emb], axis=2).astype(np.float32)
         ate = self._run_single(self.time_in, ate)
         ate = ate * (1.0 / (1.0 + np.exp(-ate)))                         # SiLU
-        suffix_embs = self._run_single(self.time_out, ate)               # [1,50,720]
+        return self._run_single(self.time_out, ate)                      # [1,chunk,720]
 
+    def _denoise_step(self, x_t, t, full_att_2d, pos_ids, kv_feed) -> np.ndarray:
         feeds = {
             "attention_mask": full_att_2d,
             "position_ids": pos_ids,
-            "expert_embeds": suffix_embs,
+            "expert_embeds": self._suffix_embeds(x_t, t),
             **kv_feed,
         }
         expert_out = self.decode.run(None, feeds)[0]  # single output in every bundle

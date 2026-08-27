@@ -75,7 +75,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from lerobot_vla.action_log import ActionLogger
+# Control-layer channel names. Column-aligned with JOINT_NAMES (the dataset
+# order), and the keys the setpoint status dict uses — so an action-log
+# column means the same thing in the chunk stream and the emitted stream.
 from lerobot_vla.excavator_robot import JOINT_NAMES
+from lerobot_vla.excavator_robot import _CONTROL_CHANNELS as CONTROL_CHANNELS
 from lerobot_vla.record_episodes import manual_action_from_axes
 from lerobot_vla.smolvla_split import NormStats, SmolVLASplitPolicy
 from simple_drive import BTN_A, LocalGamepadInput
@@ -526,6 +531,26 @@ def main() -> int:
     p.add_argument("--legacy-direct-write", action="store_true",
                    help="Drive valves from this thread instead of the control "
                         "thread (bench A/B only — has the 30 Hz rate problems)")
+    p.add_argument("--log-actions", metavar="PATH", nargs="?", const=".",
+                   default=None,
+                   help="Record every inference to a JSONL file: the whole "
+                        "action chunk, the state that produced it and the "
+                        "timing. Bare --log-actions writes "
+                        "infer_<timestamp>.jsonl into the current directory; "
+                        "any directory given instead gets the timestamped file, "
+                        "and a filename is used as-is. Works in dry-run too — "
+                        "that is the safe way to collect the command "
+                        "distribution for a position. Analyse with "
+                        "tools/analyze_action_log.py")
+    p.add_argument("--log-emitted-hz", type=float, default=100.0,
+                   help="With --log-actions on a real robot, also poll the "
+                        "setpoint the control thread is writing at this rate. "
+                        "This is the stream the valves see — interpolation, "
+                        "chunk cross-fade and stale-decay all make small "
+                        "values that never appear in the chunk itself. The "
+                        "default matches the control thread; polling is "
+                        "unsynchronized, so measured spool travel is a floor, "
+                        "not an exact figure. 0 disables")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -629,6 +654,30 @@ def main() -> int:
         the real reading is still logged, so the IMU stays visible for diagnostics."""
         return np.zeros_like(state) if state_blind else state
 
+    # Opened before the warmup so the meta record carries the resolved settings
+    # even if the warmup is what blows up.
+    action_log = None
+    if args.log_actions:
+        action_log = ActionLogger(args.log_actions, CONTROL_CHANNELS, meta={
+            "split_dir": args.split_dir,
+            "task": args.task,
+            "fps": args.fps,
+            "live": bool(args.live),
+            "synthetic": bool(args.synthetic),
+            "camera": args.camera,
+            "state_joints": list(state_joints),
+            "state_blind": bool(state_blind),
+            "min_replan_s": args.min_replan_s,
+            "setpoint_hold_s": args.setpoint_hold_s,
+            "setpoint_decay_s": args.setpoint_decay_s,
+            "blend_s": args.blend_s,
+            "robot_profile": None if robot is None else args.robot,
+        })
+        LOG.info("Logging actions to %s", action_log.path)
+        if robot is not None and args.log_emitted_hz > 0:
+            action_log.start_emitted_sampler(robot.get_setpoint_status,
+                                             args.log_emitted_hz)
+
     # Warmup / engine build happens on the first sample_actions call.
     LOG.info("Warmup inference (builds TRT engines on first ever run)...")
     img, state = get_observation()
@@ -678,6 +727,9 @@ def main() -> int:
                      " ".join(f"{v:+.1f}" for v in state),
                      " ".join(f"{v:+.2f}" for v in chunk[0]))
 
+            if action_log is not None:
+                action_log.log_chunk(cycle, infer_s, played, state, chunk)
+
             cycle += 1
             if args.loops and cycle >= args.loops:
                 break
@@ -687,7 +739,11 @@ def main() -> int:
             # it stopped playing before giving the machine away.
             if teleop is not None and teleop.pressed():
                 chunk_cut = time.perf_counter()
+                if action_log is not None:
+                    action_log.log_event("teleop_start", cycle=cycle)
                 teleop.run()
+                if action_log is not None:
+                    action_log.log_event("teleop_end", cycle=cycle)
 
             # Sleep until it is time to start the next inference. The control
             # thread is driving the valves from the chunk meanwhile. The default
@@ -698,6 +754,9 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
+        if action_log is not None:
+            action_log.close()
+            LOG.info("Action log written: %s", action_log.path)
         if teleop is not None:
             teleop.close()
         if robot is not None:

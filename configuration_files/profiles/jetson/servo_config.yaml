@@ -13,6 +13,35 @@
 
 pwm_frequency: 100
 
+# deadzone is a PERCENT of the normalized command (deadzone_threshold =
+# deadzone / 100.0 in modules/pwm/config.py), applied with rescaling: |v| below
+# the threshold goes to center, and what is left is stretched so 1.0 still
+# reaches pulse_max. Nothing at the top of the range is lost.
+#
+# slew/boom/arm/bucket run 2.0 (= |v| < 0.02 -> center) because ANY non-zero
+# command jumps the spool straight to the deadband edge -- 130-160 us on the
+# working joints, which on arm and bucket is more than the 115 us of pulse
+# width covering the entire rest of the command range. A command dithering
+# around zero therefore slams the spool across the deadband while the machine
+# does not move, and it also holds dither_enable on (dither_active is just
+# base_pulse != center), so the valve gets +-25 us at 33 Hz on top.
+#
+# 2% was measured, not guessed: 100 s of live VLA digging
+# (tools/analyze_action_log.py on a run_inference --log-actions log, 2026-08-27)
+# put 31-71% of emitted commands under 0.02 while the 0.02-0.12 band was
+# nearly empty -- the threshold sits in a real gap in the distribution. It cut
+# full-deadband traverses from 2.9-6.9/s to ~0.2/s and total spool travel by
+# 42-87%, at the cost of 0.6-3.5% of commanded displacement. The policy emits
+# these because its target is exactly 0.0 (a centered stick records a hard zero
+# through the gamepad's own 25% deadzone; the dataset's action q50 is 0.0 on
+# all four channels) and a denoiser lands near zero rather than on it. No
+# retraining fixes that, which is why the gate lives here: it is downstream of
+# every producer, and of the setpoint schedule's interpolation and decay ramp.
+#
+# Re-measure before assuming 2.0 suits a different checkpoint or task string.
+# Track and extra channels stay at 0.0 -- they have no deadband configured.
+
+
 CHANNEL_CONFIGS:
 
     trackL:
@@ -65,7 +94,7 @@ CHANNEL_CONFIGS:
         direction: -1  # was 1 on Jetson
         pulse_min: 1560 #1550
         pulse_max: 1715 # 1725
-        deadzone: 0.0
+        deadzone: 2.0      # % — see the header note on the gate
         deadband_us_pos: 44.0 #44 CW
         deadband_us_neg: 45.0 # 45
         dither_enable: False
@@ -86,7 +115,7 @@ CHANNEL_CONFIGS:
         direction: -1  # -1
         pulse_min: 1330
         pulse_max: 1980
-        deadzone: 0.0
+        deadzone: 2.0      # % — see the header note on the gate
         deadband_us_pos: 130.0 #140
         deadband_us_neg: 150.0 #150
         dither_enable: True
@@ -107,7 +136,7 @@ CHANNEL_CONFIGS:
         direction: -1 #-1
         pulse_min: 1300
         pulse_max: 1850
-        deadzone: 0.0
+        deadzone: 2.0      # % — see the header note on the gate
         deadband_us_pos: 160.0 #160
         deadband_us_neg: 150.0
         dither_enable: True
@@ -128,7 +157,7 @@ CHANNEL_CONFIGS:
         direction: -1
         pulse_min: 1330
         pulse_max: 1880
-        deadzone: 0.0
+        deadzone: 2.0      # % — see the header note on the gate
         deadband_us_pos: 160.0 #160
         deadband_us_neg: 150.0 #160
         dither_enable: True

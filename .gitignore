@@ -231,3 +231,6 @@ tests/test_lerobot_kaivuri.py
 .venv-lerobot/
 .venv-vla/
 data_collection/lerobot_datasets/
+
+# run_inference --log-actions: bare flag writes into the current directory
+infer_*.jsonl

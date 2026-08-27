@@ -15,7 +15,7 @@ IMUs ────┴─> ExcavatorController (joint angles) ──────�
 split ONNX engines (vision/prefill/decode + projectors) ──> action chunk ──┘
 ```
 
-Producers (gamepad at 30 Hz, policy at ~1 Hz chunks) only *store* a setpoint;
+Producers (gamepad at 30 Hz, policy at ~8 Hz chunks) only *store* a setpoint;
 the 100 Hz control thread resamples it and writes the valves every tick. They
 must not write the PWM layer directly — its dither, watchdog and rate gate all
 advance per call. See `modules/setpoint_schedule.py` and `modules/pwm/README.md`.
@@ -450,18 +450,26 @@ Setpoint-timing flags (all optional; defaults are sane):
 Each cycle logs `played=` — how many steps of the *previous* chunk actually ran
 before this one replaced it, measured rather than assumed. That is the real
 execution horizon. With the default `--min-replan-s 0` it is set purely by
-inference latency (`played ~= infer_s * fps`), so at ~0.4 s and 30 fps expect
-~12. `played` climbing toward the full chunk length (50) means inference is
+inference latency (`played ~= infer_s * fps`), so at the measured 0.12 s and 30
+fps expect ~4. `played` climbing toward the full chunk length means inference is
 falling behind playback and the machine is running off the plan's tail; that is
 the signal to look at, before touching the hold/decay windows, which exist to
 make a stall safe rather than to hide one.
 
-`--split-dir` still defaults to the base-weight split export
-(`spark-projects/.../exports/ainekko_base_split`), which ships no
-`export_info.json`, no stats and no tokenizer — so it needs `--task` spelled out
-and normalizes with the identity. Base weights produce meaningless actions; they
-only prove the loop and its latency. For anything real, point `--split-dir` at a
-finetuned bundle and let it resolve the rest.
+`--split-dir` is **required** — there is no default bundle. A checkpoint decides
+what the machine does, so it is named on the command line, never inherited from an
+argparse default. Point it at a finetuned bundle
+(`~/bundles/smolvla-digging-clean-ir12-35k`) and `--task`, `--fps`,
+`--dataset-stats`, the tokenizer and the chunk length all resolve from what the
+bundle ships.
+
+It used to default to the public `ainekko/smolvla_base_onnx` base-weight split.
+That export did not work for me: scored against a LeRobot 0.5.1 reference it
+disagrees with the checkpoint it claims to be, by ~13% of commanded range. Their
+export notebook pins `lerobot==0.3.3`, so a version gap between their trace and my
+reference is the obvious explanation — but I have not tested it against its own
+0.3.3-era module, so that is a guess, not a finding. It may well be perfectly
+correct on the software it was built for. YMMV.
 
 ### Runtime flags: `--projectors` and `--no-iobinding`
 
@@ -485,18 +493,15 @@ prefill's KV cache straight to the device and leaves it there for all N steps
 instead of re-feeding 7.2 MB of numpy per step.
 
 Together: **1.22x faster, and 2.05 of the six CPU cores handed back** to the
-control stack. Parity against the old `cpu`/off default, over 36 real IR frames
-from `masi_digging_clean`, scored with `bench/parity.py`'s gate (`cosine_min >=
-0.999` and `max_abs_diff <= 1%` of action range):
+control stack. Parity against the old `cpu`/off default, same observation and
+same noise:
 
-| change | cosine_min | worst | median | verdict |
-|---|---:|---:|---:|---|
-| gpu projectors + IOBinding | 0.9999987 | 0.043% | 0.015% | **PASS** |
-
-IOBinding on its own is **exactly bit-identical** (max abs diff 0.000e+00), in
-both projector configurations — free speed, not a precision trade. The GPU
-projectors account for all of the (tiny) difference: CUDA-EP vs CPU-EP arithmetic
-on small matmuls.
+- IOBinding is **exactly bit-identical** (max abs diff 0.000e+00), in both
+  projector configurations. It is free speed, not a precision trade.
+- The GPU projectors account for all of the difference: max abs 3.26e-4, i.e.
+  **0.042% of the action range**, cosine 0.999999940. That is CUDA-EP vs CPU-EP
+  arithmetic on tiny matmuls, ~24x inside this project's own 1%-of-range parity
+  gate.
 
 `--projectors cpu --no-iobinding` reproduces the pre-benchmark loop exactly, for
 regression comparison. There is no other reason to use them.
@@ -505,20 +510,18 @@ The p95 column is the quiet win for a chunk-12 bundle: 176.9 -> 122.0 ms. That
 bundle buffers 0.4 s of plan, so the margin over inference goes from ~2.3x to
 ~3.3x, and the worst case stops being the thing that eats it.
 
-**Measure parity on REAL frames.** A flat-random synthetic image understates
-drift badly — it put the NaN-guard candidate below at 0.47% when real frames say
-1.32%. `bench/tools/extract_frames.py` dumps PNGs from a LeRobot episode.
-
-**NOT taken from that benchmark:** the NaN-guard-stripped vision graph and a
-reduced `--num-steps`. See the runtime notes in `smolvla_split.py`.
+**NOT taken from that benchmark:** the NaN-guard-stripped vision graph (faster,
+but still outside the parity gate) and a reduced `--num-steps` (faster, but it
+changes the policy rather than its runtime — validate against the robot first).
 
 Engines are pre-built automatically, one subprocess per graph (two TRT builds
 in one process OOM 8 GB), into `/tmp/smolvla_split_cache` — note /tmp clears
 on reboot, so the first run after boot rebuilds (~5 min). RAM is tight:
 run ONE thing at a time (never viz or recording alongside an engine build).
 
-**fps vs inference rate:** the policy is chunked — one ~220 ms inference emits
-50 actions authored at the dataset fps (30 Hz). The chunk is handed to the
+**fps vs inference rate:** the policy is chunked — one ~122 ms inference emits
+the bundle's chunk (12 actions for the deployed digging bundle) authored at the
+dataset fps (30 Hz). The chunk is handed to the
 control thread, which interpolates it by elapsed time and drives the valves at
 100 Hz; inference being far slower than the valve rate is exactly what that
 split is for. The camera is only *read* at each re-plan.
@@ -526,13 +529,14 @@ split is for. The camera is only *read* at each re-plan.
 The FULL 50-step chunk is always handed to the scheduler, and **nothing
 truncates it** — `--min-replan-s` gates only when the next inference may start.
 So the executed horizon is not a setting: it is `infer_s * fps`, whatever that
-happens to be (~12 steps at 0.4 s and 30 fps). This is why the loop runs
+happens to be (~4 steps at 0.12 s and 30 fps). This is why the loop runs
 smoothly at any replan cadence including none — the controller always holds a
-full 1.67 s trajectory and simply gets a fresher one whenever inference lands.
+full chunk as a trajectory (1.67 s at chunk 50, 0.4 s at the deployed chunk 12)
+and simply gets a fresher one whenever inference lands.
 The unplayed tail is the late-inference fallback: a slow replan keeps following
 the predicted plan instead of freezing at the boundary. Hold/decay to zero
-(`--setpoint-hold-s`, `--setpoint-decay-s`) engages only if the whole 1.67 s
-chunk runs out, i.e. inference stalled outright.
+(`--setpoint-hold-s`, `--setpoint-decay-s`) engages only if the whole chunk
+runs out, i.e. inference stalled outright.
 
 `--min-replan-s` therefore buys idle time, not reactivity: raise it to stop the
 Orin re-inferring flat out when the task does not need it (power and thermals on

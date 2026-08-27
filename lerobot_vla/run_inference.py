@@ -11,14 +11,15 @@ Modes (safety ladder):
                     weights produce garbage actions — do not use --live until a
                     finetuned checkpoint is in place and the pump is your call.
 
-The policy emits a 50-step action chunk per observation and the WHOLE chunk is
-handed to the controller as a trajectory at --fps. Re-inference starts as soon
-as the previous one finishes, unless --min-replan-s throttles it. Whatever part
-of the chunk has not played when the next one lands is simply replaced, so the
-EXECUTED horizon is set by inference latency (~infer_s * fps), not by any flag:
-at ~0.4 s inference and 30 Hz that is ~12 steps. The unplayed tail is the
-late-inference fallback — a slow replan keeps following the predicted plan
-instead of degrading into hold->decay-to-zero.
+The policy emits an action chunk per observation (length is a property of the
+bundle -- 50 for the base export, 12 for the deployed digging bundle) and the
+WHOLE chunk is handed to the controller as a trajectory at --fps. Re-inference
+starts as soon as the previous one finishes, unless --min-replan-s throttles it.
+Whatever part of the chunk has not played when the next one lands is simply
+replaced, so the EXECUTED horizon is set by inference latency (~infer_s * fps),
+not by any flag: at the measured 0.12 s inference and 30 Hz that is ~4 steps.
+The unplayed tail is the late-inference fallback — a slow replan keeps following
+the predicted plan instead of degrading into hold->decay-to-zero.
 
 --fps is normally NOT passed. The chunk is rate commands sampled at the rate the
 checkpoint was trained on, so the playback rate belongs to the checkpoint: it is
@@ -79,8 +80,13 @@ from lerobot_vla.record_episodes import manual_action_from_axes
 from lerobot_vla.smolvla_split import NormStats, SmolVLASplitPolicy
 from simple_drive import BTN_A, LocalGamepadInput
 
-DEFAULT_SPLIT_DIR = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/ainekko_base_split"
-DEFAULT_TOKENIZER = Path.home() / "GitHub/spark-projects/orin-nano/smolvla-runtime/exports/tokenizer"
+#: Where deployable export bundles live on the Jetson. Only used to make error
+#: messages concrete — there is deliberately NO default bundle. A checkpoint is the
+#: single biggest thing deciding what the machine does, so it gets named out loud
+#: rather than inherited from an argparse default. (The old default was a public
+#: base-weight split that did not work here; see the README.)
+BUNDLE_ROOT = Path.home() / "bundles"
+DEFAULT_TOKENIZER = BUNDLE_ROOT / "smolvlm2-tokenizer"
 
 LOG = logging.getLogger("run_inference")
 
@@ -320,7 +326,7 @@ def check_state_blind_stats(norm: NormStats, stats_path: str | None) -> None:
         f"That puts an out-of-distribution state token into the prefix — the same failure "
         f"as feeding the raw IMU.\n"
         f"Use the stats.json shipped inside the bundle: "
-        f"--dataset-stats {Path(DEFAULT_SPLIT_DIR).parent}/<bundle>/stats.json")
+        f"--dataset-stats {BUNDLE_ROOT}/<bundle>/stats.json")
 
 
 STATE_KEY_NAME = "observation.state"
@@ -428,7 +434,11 @@ def make_teleop(robot) -> GamepadTeleop | None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="SmolVLA split-engine inference loop.")
-    p.add_argument("--split-dir", default=str(DEFAULT_SPLIT_DIR))
+    p.add_argument("--split-dir", required=True,
+                   help="The export bundle to drive with, e.g. "
+                        f"{BUNDLE_ROOT}/smolvla-digging-clean-ir12-35k. Required: "
+                        "the checkpoint is the single biggest thing that decides "
+                        "what the machine does, so it is never defaulted")
     p.add_argument("--tokenizer", default=None,
                    help="Tokenizer dir. Normally omitted — <split-dir>/tokenizer "
                         f"is used when the bundle ships one (fallback: {DEFAULT_TOKENIZER})")

@@ -180,7 +180,7 @@ bandwidth.
 
 Sticks = same mapping as simple_drive.py (left = slew/tilt, right = lift/scoop).
 Buttons: **A** start / stop+save episode · **B** discard episode · **X** pump ·
-**Y** reload servo config. Episodes auto-save at `--max-episode-s` (120 s).
+**Y** reload servo config. Episodes auto-save at `--max-episode-s` (180s).
 Default output root: `data_collection/lerobot_datasets/<repo_id>/`.
 Use `--resume` to append episodes to an existing dataset.
 

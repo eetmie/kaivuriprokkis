@@ -190,7 +190,7 @@ def main() -> int:
                    help=f"Dataset root dir (default {DEFAULT_ROOT}/<repo-id>)")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--robot", default="auto", help="Board profile (auto = detect)")
-    p.add_argument("--max-episode-s", type=float, default=120.0,
+    p.add_argument("--max-episode-s", type=float, default=180.0,
                    help="Auto-stop + save an episode after this long")
     p.add_argument("--no-slew", action="store_true",
                    help="Disable the slew ACTION channel (the machine will not slew)")

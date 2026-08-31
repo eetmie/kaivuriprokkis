@@ -52,7 +52,9 @@ the pose they left the machine in. A missing pad is not an error; the run
 proceeds exactly as it would without one.
 
 First run builds the TRT engines (minutes); later runs load from
---cache-dir in seconds.
+--cache-dir in seconds. The cache is per bundle — a second --split-dir builds
+its own engines beside the first one's rather than colliding with them, and
+either model then starts in seconds. --rebuild forces one bundle's rebuild.
 
 Usage (model-only check):
     .venv-lerobot/bin/python -m lerobot_vla.run_inference \
@@ -447,7 +449,15 @@ def main() -> int:
     p.add_argument("--tokenizer", default=None,
                    help="Tokenizer dir. Normally omitted — <split-dir>/tokenizer "
                         f"is used when the bundle ships one (fallback: {DEFAULT_TOKENIZER})")
-    p.add_argument("--cache-dir", default="/tmp/smolvla_split_cache")
+    p.add_argument("--cache-dir", default="/tmp/smolvla_split_cache",
+                   help="Root of the TRT engine cache. Each bundle gets its own "
+                        "subdirectory under it, so switching --split-dir needs "
+                        "no extra flag and switching back is still instant.")
+    p.add_argument("--rebuild", action="store_true",
+                   help="Wipe this bundle's engine cache and rebuild it "
+                        "(minutes). The cache is dropped automatically when the "
+                        "bundle's weights change on disk, so this is only for a "
+                        "cache you suspect rather than one you changed.")
     p.add_argument("--task", default=None,
                    help="Instruction the policy is conditioned on, e.g. "
                         '"scoop sand and dump it to the left". Same flag, and the '
@@ -595,6 +605,7 @@ def main() -> int:
         split_dir=args.split_dir,
         tokenizer_dir=args.tokenizer,
         cache_dir=args.cache_dir,
+        rebuild=args.rebuild,
         num_steps=args.num_steps,
         action_dim=4,
         norm=norm,

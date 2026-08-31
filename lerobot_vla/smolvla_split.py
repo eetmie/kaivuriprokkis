@@ -53,9 +53,11 @@ but still outside the repo's own parity gate) and a reduced `num_steps`
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -174,6 +176,57 @@ HEAVY_GRAPHS = ("smolvlm_vision.onnx", "smolvlm_expert_prefill.onnx",
                 "smolvlm_expert_decode.onnx")
 
 
+def _bundle_fingerprint(split_dir: Path) -> str:
+    """Identify the WEIGHTS of a bundle, not just its path.
+
+    A bundle re-exported in place keeps its directory name, so the path alone
+    would happily serve the previous checkpoint's engines. Size + mtime of each
+    heavy graph and its external-weights sidecar is enough to notice, and costs
+    six stats rather than 1.4 GB of hashing.
+    """
+    parts = []
+    for name in HEAVY_GRAPHS:
+        for f in (split_dir / name, split_dir / f"{name}.data"):
+            st = f.stat() if f.exists() else None
+            parts.append(f"{f.name}:{st.st_size if st else 0}:"
+                         f"{int(st.st_mtime) if st else 0}")
+    return "\n".join(parts) + "\n"
+
+
+def prepare_cache(split_dir: str | Path, cache_root: str | Path,
+                  rebuild: bool = False) -> Path:
+    """Give this bundle its OWN engine-cache directory, and invalidate it.
+
+    The engine cache used to be one flat directory shared by every bundle, which
+    is why a second model could not be run after a first: `prebuild_engines`
+    treats "three engines are already here" as "this bundle is built", so the
+    new bundle skipped its per-graph subprocess builds and tried to build all
+    three graphs inside the inference process — the 8 GB OOM the subprocess
+    split exists to avoid.
+
+    Keyed on the resolved path, so switching back to a model reuses its engines
+    instead of paying the multi-minute build again. The directory is wiped when
+    the bundle's weights change underneath it (re-export in place) or when the
+    caller asks for it.
+    """
+    split_dir = Path(split_dir).resolve()
+    tag = hashlib.sha1(str(split_dir).encode()).hexdigest()[:8]
+    cache = Path(cache_root) / f"{split_dir.name}-{tag}"
+    stamp = cache / "bundle.fingerprint"
+    fingerprint = _bundle_fingerprint(split_dir)
+
+    if cache.is_dir():
+        stale = not stamp.exists() or stamp.read_text() != fingerprint
+        if rebuild or stale:
+            LOG.info("clearing engine cache %s (%s)", cache,
+                     "asked for a rebuild" if rebuild else "bundle changed on disk")
+            shutil.rmtree(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(fingerprint)
+    LOG.info("engine cache: %s", cache)
+    return cache
+
+
 def prebuild_engines(split_dir: str | Path, cache_dir: str,
                      precision: str = "fp16") -> None:
     """Build + cache the heavy TRT engines, ONE SUBPROCESS PER GRAPH.
@@ -188,7 +241,11 @@ def prebuild_engines(split_dir: str | Path, cache_dir: str,
     import sys as _sys
 
     cache = Path(cache_dir)
-    if len(list(cache.glob("*.engine"))) >= len(HEAVY_GRAPHS):
+    # Written only after every graph has built. Counting *.engine files instead
+    # would call a half-finished cache complete, and TRT is free to emit more
+    # than one engine per graph.
+    done = cache / "prebuilt"
+    if done.exists():
         return
     for name in HEAVY_GRAPHS:
         LOG.info("prebuilding TRT engine for %s (subprocess, ~1 min)...", name)
@@ -209,6 +266,7 @@ def prebuild_engines(split_dir: str | Path, cache_dir: str,
         if r.returncode != 0:
             raise RuntimeError(f"engine build failed for {name}")
         LOG.info("  built %s in %.0fs", name, time.perf_counter() - t0)
+    done.touch()
 
 
 class NormStats:
@@ -248,6 +306,7 @@ class SmolVLASplitPolicy:
                  split_dir: str | Path,
                  tokenizer_dir: str | Path,
                  cache_dir: str = "/tmp/smolvla_split_cache",
+                 rebuild: bool = False,
                  precision: str = "fp16",
                  num_steps: int = 10,
                  action_dim: int = 4,
@@ -272,9 +331,12 @@ class SmolVLASplitPolicy:
 
         self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
 
-        prebuild_engines(split_dir, cache_dir, precision)
+        # cache_dir is a ROOT holding one subdirectory per bundle — see
+        # prepare_cache. Two bundles cannot share one engine cache.
+        self.cache_dir = prepare_cache(split_dir, cache_dir, rebuild=rebuild)
+        prebuild_engines(split_dir, self.cache_dir, precision)
 
-        heavy = build_providers(cache_dir, precision=precision)
+        heavy = build_providers(str(self.cache_dir), precision=precision)
         cpu = ["CPUExecutionProvider"]
 
         def sess(name, providers):

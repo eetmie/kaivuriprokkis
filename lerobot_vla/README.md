@@ -1,8 +1,11 @@
 # lerobot_vla — LeRobot integration for the MASI excavator
 
 The VLA layer on top of the kaivuriprokkis control stack: LeRobot-format
-dataset collection (for SmolVLA fine-tuning on the DGX Spark) and on-device
-SmolVLA inference (split TensorRT engines on this Orin Nano).
+dataset collection (for fine-tuning on the DGX Spark) and on-device inference
+from split TensorRT engines on this Orin Nano. Two architectures share the loop
+— SmolVLA-450M (deployed) and X-VLA-0.9B (feasibility proven on the board, fine-
+tune pending) — and which one runs is read from the bundle, not chosen with a
+flag. See section 3.
 
 ```
 gamepad ─┐                                             ┌─> LeRobot v3 dataset ──> DGX Spark finetune
@@ -207,9 +210,23 @@ through to *downloading* the repo-id from the Hugging Face Hub and died on a
 confusing `401 RepositoryNotFoundError`; these datasets are local-only, so the
 check now stays local.)
 
-Record one task phrasing per dataset run (`--task` is stored per frame); for
-the left/right sand task, either record separate sessions per direction with
-matching instructions, or keep one canonical phrasing throughout.
+One `--task` phrasing per *run*, stored per frame — but a dataset can hold
+several, which is how a multi-task checkpoint gets trained. Record the first
+task, then `--resume` into the same `--repo-id` with a different `--task`;
+lerobot appends the new string to `meta/tasks.parquet` and every later episode
+carries its index. `masi_digging_dry_2` is built that way:
+
+```
+task_index 0  "move sand to container"   63 episodes / 53531 frames
+task_index 1  "move rock to container"   15 episodes / 12124 frames
+```
+
+Keep the phrasings short and clearly different from each other, and spell each
+one identically across every session that belongs to it — the policy conditions
+on the string, and two spellings of one intent are two tasks as far as the
+language embedding is concerned. Balance is worth watching too: the 4.4:1 split
+above is the model's prior on which task it is doing before it has looked at
+anything.
 
 Check a dataset quickly:
 
@@ -420,7 +437,7 @@ carry them, and an explicit flag always wins:
 
 | Flag | Read from | If it is missing |
 |---|---|---|
-| `--task` | `export_info.json` → `task` | **hard error** — there is no default |
+| `--task` | `export_info.json` → `tasks` (list) or `task` — an explicit `--task` goes *first*, the bundle's others stay behind it on the D-pad | **hard error** — there is no default |
 | `--fps` | `export_info.json` → `fps` | 30, with a warning |
 | `--state-blind` | `export_info.json` → `state_blind` | off |
 | `--tokenizer` | `<split-dir>/tokenizer/` | the base-export tokenizer |
@@ -436,6 +453,61 @@ what `record_episodes.py` calls it, and the two must carry the *same string*.
 
 `--camera` is cross-checked against the image keys in the stats file, so a
 cam1-trained checkpoint refuses to start on `--camera rgb`.
+
+### More than one task in a run
+
+A checkpoint finetuned on a multi-task dataset has several phrasings *in*
+distribution. Its export records them as a `tasks` list — the same strings as the
+dataset's `meta/tasks.parquet`, in the same order — and then the run carries all
+of them and the pad's **D-pad** picks which one is live: right = next, left =
+previous. Until the exporter writes the list, repeating the flag does the same
+thing:
+
+```bash
+.venv-lerobot/bin/python -m lerobot_vla.run_inference --split-dir $BUNDLE \
+    --task "move sand to container" --task "move rock to container"
+```
+
+The run starts on the first entry. Each cycle logs `task=<index>` when there is
+more than one, and a switch writes a `task_switch` event into `--log-actions`.
+
+`--task` picks the instruction the run **starts** on; it does not narrow the
+list. On a bundle recording both tasks,
+
+```bash
+--task "move rock to container"      # -> rock first, sand still on the D-pad
+```
+
+so naming one never costs the operator the others — every phrasing a multi-task
+checkpoint was finetuned on stays in distribution whatever the command line said,
+and which one is live is a decision for the machine's side of the fence. A
+`--task` the bundle already records is a reordering; one it does not is prepended
+(with the warning below) and the recorded tasks stay reachable behind it.
+
+What a switch actually costs: nothing. Only the instruction string changes — one
+policy, one set of engines, one process — and the language embedding is cached
+per string inside the policy, so the first use of an instruction costs one
+text-encoder run (~10 ms of a ~125 ms inference) and every later one costs
+nothing. This is not the model switch that needs a restart; that limit is about
+two sets of engines not fitting in 8 GB, and there is still only one set here.
+
+A switch **stops the machine first** (live runs), the same way a teleop hand-over
+does. The chunk in flight was planned under the old instruction, and half of one
+task's plan followed by half of another's is a trajectory neither of them meant;
+the replan throttle is skipped too, so the next chunk is for the new task.
+
+The selector is the one pad job that does not need `--live`: picking the next
+inference's instruction writes no valve, so a multi-task run opens the pad in a
+dry run as well, with A (takeover) disabled. That is how a two-task bundle gets
+checked on the bench — watch the printed `a0=` change when you cycle the task,
+before anyone stands next to a live machine.
+
+A caveat worth being blunt about: switching the string only *means* something if
+the checkpoint was finetuned on both. Feed a single-task checkpoint a second
+phrasing and it will still emit a well-formed chunk that differs from the first
+one (measured: 0.34 max difference on the 4 channels) — that is out-of-distribution
+noise, not a second skill. `--task` strings the bundle does not record are warned
+about for exactly this reason.
 
 Setpoint-timing flags (all optional; defaults are sane):
 
@@ -545,6 +617,94 @@ current plan — the denoise loop draws new noise per call, so consecutive chunk
 from near-identical observations differ slightly. Lower it (or leave it at 0)
 when you want maximum reactivity.
 
+## 3. The other architecture: X-VLA
+
+`run_inference.py` drives either SmolVLA or X-VLA-0.9B, and **which one is read
+from the bundle, not chosen with a flag** (`policy.py`): an X-VLA export carries
+`bundle.json`, a SmolVLA one carries `export_info.json` + `smolvlm_vision.onnx`.
+Everything else about a run — task, rate, normalization, camera, chunk length —
+already came from the bundle; the architecture is one more property of it, so an
+`--arch` flag would only add a way to contradict what is on disk.
+
+**Only one of the two fits on this board at a time.** Measured 2026-08-31 with
+the D435i reader and the 100 Hz control thread in the same process:
+
+| | SmolVLA `digging-clean-ir12-35k` | X-VLA `split_fp16` |
+|---|---:|---:|
+| engines | 9 | 12 |
+| p50 inference | 126 ms | 395 ms |
+| replan rate | 7.9 Hz | 2.53 Hz |
+| actions per chunk | 12 | 30 |
+| peak RSS **with the robot stack** | 2.22 GB | **5.47 GB** |
+| available floor of 7.4 GB | ~5.2 GB | **1.48 GB** |
+
+The robot stack itself (camera + IMUs + control thread) is only 0.14 GB, which is
+why X-VLA fits at all. But SmolVLA's 2.2 GB does not fit in X-VLA's 1.48 GB of
+headroom, so switching models is a **restart, not a runtime toggle** —
+`make_policy` raises rather than letting it be discovered as an OOM mid-run.
+
+X-VLA's engine cache lives in `<split-dir>/trt_cache`, not `/tmp`: twelve engines
+are a ~5 minute cold build, and `/tmp` clears on reboot. (The SmolVLA side still
+uses `/tmp` and does pay that every boot.)
+
+### The base checkpoint cannot drive this machine, and says so
+
+`lerobot/xvla-base` is a 20-dim `ee6d` arm policy — end-effector xyz + 6D rotation
++ gripper. Its chunk is 20 columns of arm motion, and **nothing about the shape
+says so**: `chunk[:, :4]` is a perfectly well-formed action chunk that is nonsense
+on a hydraulic excavator. So a bundle with no processor contract (or one whose
+`physical_boundary_complete` is false) refuses to load at all, and loading it
+anyway with `--allow-base-bundle` marks the run model-only — `--live` is then
+refused outright. That mode is what proved engines, latency and memory on this
+board before any fine-tune existed:
+
+```bash
+XV=~/GitHub/spark-projects/orin-nano/xvla-runtime
+.venv-lerobot/bin/python -m lerobot_vla.run_inference \
+    --split-dir $XV/exports/split_fp16 --allow-base-bundle \
+    --tokenizer $XV/models/tokenizer \
+    --task "move the sand to the container" --fps 30 \
+    --exposure-ir 16000 --gain-ir 16
+```
+
+A **fine-tuned** bundle needs none of those extra flags. Its processor contract
+carries the physical boundary, and the vendored runtime applies it inside
+`sample_actions`: state normalized on the way in, the model's padded 20 action
+dims trimmed back to the real 4 on the way out, then unnormalized. `--split-dir`
+is again (almost) the whole command.
+
+### What a deployable X-VLA bundle must carry
+
+Beyond the graphs and `MANIFEST.sha256`, the export has to record two things that
+are **not recoverable from the weights**, both now written by
+`xvla-runtime/tools/export_split_onnx.py`:
+
+| exporter flag | why the robot side refuses without it |
+|---|---|
+| `--fps <dataset fps>` | the chunk is *rate* commands; the wrong rate scales every motion the machine makes, silently |
+| `--task "<instruction>"` | the policy conditions on the language embedding; an unseen phrasing is out of distribution and nothing downstream detects it. A multi-task fine-tune writes a `tasks` list instead, in the dataset's order |
+
+Unlike the SmolVLA path there is no 30 fps fallback here: an X-VLA bundle that
+records no rate has never been validated at any rate on this robot, so the run
+refuses rather than assuming one.
+
+The rate also decides whether ~400 ms is comfortable. A 30-action chunk is 3.0 s
+of motion at 10 fps (13% duty) but 1.0 s at 30 fps (40% duty) — workable, with
+less slack than SmolVLA's chunk gives. Training at `chunk_size=50` (what
+`xvla-spark-finetune` uses) lengthens the denoise sequence from 262 to 282 tokens
+through all 24 blocks, ten times, with no KV cache possible — so **re-measure the
+latency after the fine-tune**; the 395 ms above is a chunk-30 number.
+
+### Still open
+
+- **The fine-tune itself** (`spark-projects/xvla-spark-finetune`) — written and
+  smoke-tested, not yet trained.
+- **Parity** (`xvla-runtime/parity.py`) must pass on the fine-tuned export before
+  anything drives a valve. It runs in two processes because the PyTorch reference
+  and the engines do not fit in memory together.
+- **A multi-camera checkpoint has no deploy path** on either architecture; the
+  X-VLA split is exported with `--valid-views 1`.
+
 ## Files
 
 ```
@@ -553,5 +713,10 @@ camera.py            D435i reader: IR-left (Y8@30, emitter off, gray→3ch)
                      + optional color (rgb8@30) on the same pipeline
 record_episodes.py   gamepad teleop -> LeRobot v3 episodes
 smolvla_split.py     9-graph split policy: ORT/TRT sessions + denoise loop
+xvla_split.py        X-VLA side: call-shape bridge, bundle resolution, and the
+                     gate that keeps a base ee6d checkpoint off the valves
+policy.py            make_policy: architecture from the bundle, one per process
+vendor/              runtime code copied in from other repos, pinned by source
+                     SHA256 (xvla_split_ort.py, xvla_bundle_contract.py)
 run_inference.py     obs -> action-chunk -> valves loop (synthetic/dry/live)
 ```

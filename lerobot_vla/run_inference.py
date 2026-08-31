@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""SmolVLA inference loop for the MASI excavator (split TRT engines).
+"""VLA inference loop for the MASI excavator (split TRT engines).
 
-    IR cam1 + joint angles + task -> SmolVLA (split ONNX/TRT) -> valves
+    IR cam1 + joint angles + task -> SmolVLA or X-VLA (split ONNX/TRT) -> valves
+
+Which architecture runs is read from the bundle rather than chosen with a flag —
+see policy.py. SmolVLA is the deployed path; X-VLA is 12 engines instead of 9,
+~3x the inference time, and 2.5x the resident memory, and only one of the two
+fits in this board's 8 GB at a time, so switching models means restarting.
 
 Modes (safety ladder):
     --synthetic     no robot, no camera — synthetic image + zero state. Proves
@@ -10,6 +15,12 @@ Modes (safety ladder):
     --live          actions are actually sent to the valves. Base (un-finetuned)
                     weights produce garbage actions — do not use --live until a
                     finetuned checkpoint is in place and the pump is your call.
+
+    --allow-base-bundle loads an X-VLA export that carries no physical boundary
+                    (the base ee6d checkpoint). Its chunk is arm dimensions, not
+                    valve commands, so that mode refuses --live outright: it
+                    exists to prove engines, latency and memory on the board
+                    before a fine-tune exists.
 
 The policy emits an action chunk per observation (length is a property of the
 bundle -- 50 for the base export, 12 for the deployed digging bundle) and the
@@ -44,12 +55,29 @@ export bundle when the bundle records one, and so are the tokenizer and the
 normalization stats — a finetuned bundle ships all three, which is why the
 correct invocation is --split-dir and (almost) nothing else.
 
+A checkpoint finetuned on a multi-task dataset has more than one phrasing in
+distribution, and its export records them as a "tasks" LIST (the same strings as
+the dataset's meta/tasks.parquet). Then the run carries all of them and the D-pad
+picks which one is live: right = next, left = previous. Only the string changes —
+one policy, one set of engines, one process — so a switch costs one text-encoder
+run the first time an instruction is used and nothing afterwards; it is nothing
+like the model switch in the paragraph above. Repeating --task does the same from
+the command line, in the order given — and a --task the bundle already records is a
+REORDERING, not a filter: it goes first, the rest stay behind it on the D-pad, so
+naming the task to start on never costs the operator the others. Switching drops
+the chunk in flight and
+stops the machine first: that chunk was planned under the old instruction, and
+half of one task's plan followed by half of another's is a trajectory neither of
+them meant.
+
 A gamepad, if one is plugged in, can take the machine over during a --live
 run: A toggles between the policy and the sticks. The two are exclusive rather
 than summed — manual control drops the chunk in flight, and no inference runs
 while the operator drives, so the chunk that resumes control is inferred from
 the pose they left the machine in. A missing pad is not an error; the run
-proceeds exactly as it would without one.
+proceeds exactly as it would without one. Takeover is live-only, but the D-pad's
+task selector is not: a multi-task run opens the pad without --live too, with A
+disabled, because picking the next inference's instruction never writes a valve.
 
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds. The cache is per bundle — a second --split-dir builds
@@ -84,8 +112,12 @@ from lerobot_vla.action_log import ActionLogger
 from lerobot_vla.excavator_robot import JOINT_NAMES
 from lerobot_vla.excavator_robot import _CONTROL_CHANNELS as CONTROL_CHANNELS
 from lerobot_vla.record_episodes import manual_action_from_axes
-from lerobot_vla.smolvla_split import NormStats, SmolVLASplitPolicy
-from simple_drive import BTN_A, LocalGamepadInput
+from lerobot_vla import xvla_split
+from lerobot_vla.policy import (
+    bundle_tasks, detect_architecture, make_policy, merge_tasks, warn_off_bundle,
+)
+from lerobot_vla.smolvla_split import NormStats
+from simple_drive import BTN_A, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, LocalGamepadInput
 
 #: Where deployable export bundles live on the Jetson. Only used to make error
 #: messages concrete — there is deliberately NO default bundle. A checkpoint is the
@@ -102,6 +134,13 @@ CAMERA_KEYS = {"ir": "observation.images.cam1", "rgb": "observation.images.cam2"
 
 #: Used only when nothing in the export bundle records the training rate.
 DEFAULT_FPS = 30.0
+
+#: Argparse defaults kept as names because the X-VLA path has to tell "left at
+#: the default" from "asked for explicitly": its runtime derives both from the
+#: bundle (engine cache beside the graphs, denoise steps from bundle.json), so a
+#: default carried over from the SmolVLA side would silently override them.
+DEFAULT_CACHE_DIR = "/tmp/smolvla_split_cache"
+DEFAULT_NUM_STEPS = 10
 
 #: Rate the manual setpoint is fed at while the operator drives. Deliberately
 #: NOT --fps: that is the checkpoint's action rate, and a 6 fps checkpoint would
@@ -213,8 +252,8 @@ def resolve_state_blind(split_dir: str, explicit: bool) -> bool:
     return False
 
 
-def resolve_task(split_dir: str, explicit: str | None) -> str:
-    """The instruction string this checkpoint was finetuned against.
+def resolve_tasks(split_dir: str, explicit: list[str] | None) -> list[str]:
+    """The instruction strings this run may condition on, in order.
 
     The task is a property of the checkpoint, not a free choice: SmolVLA
     conditions on the language embedding, so a phrasing the model never trained
@@ -224,31 +263,41 @@ def resolve_task(split_dir: str, explicit: str | None) -> str:
 
     There used to be a default here (``"scoop sand and dump it to the left"``,
     the kaivuri task). It silently mislabelled every run against any other
-    checkpoint, so it is gone: the string now comes from ``task`` in
+    checkpoint, so it is gone: the strings now come from ``tasks``/``task`` in
     <split-dir>/export_info.json, or from --task, or the run refuses to start.
 
-    An explicit --task that disagrees with the bundle is allowed but warned
-    about. Passing the flag is a statement of intent — probing how much the
-    phrasing matters is a real thing to want — where omitting it is just an
-    omission, and is refused rather than guessed.
+    A checkpoint finetuned on a multi-task dataset has more than one phrasing IN
+    distribution, and its export records them as a list (see policy.bundle_tasks).
+    A single-task bundle is the one-element case of that, so both come back as a
+    list and the loop never branches on which kind it was handed. The first entry
+    is the one the run starts on; the operator cycles the rest with the D-pad.
+
+    An explicit --task goes to the FRONT of the list rather than replacing it
+    (policy.merge_tasks): the flag picks which instruction the run starts on, and
+    the bundle's other tasks stay on the D-pad behind it. An explicit --task the
+    bundle does not record is allowed but warned about. Passing the flag is a
+    statement of intent — probing how much the phrasing matters is a real thing to
+    want — where omitting it is just an omission, and is refused rather than
+    guessed.
     """
     path = Path(split_dir) / "export_info.json"
-    recorded = None
+    recorded: list[str] = []
     if path.is_file():
         try:
-            recorded = json.loads(path.read_text()).get("task")
+            recorded = bundle_tasks(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError) as exc:
             LOG.warning("Could not read %s for the task string: %s", path, exc)
 
     if explicit:
-        if recorded and explicit != recorded:
-            LOG.warning("--task %r differs from the task recorded in %s (%r). The "
-                        "policy conditions on this string; a phrasing the "
-                        "checkpoint was not finetuned on is out of distribution.",
-                        explicit, path.name, recorded)
-        return explicit
+        warn_off_bundle(explicit, recorded, path.name)
+        tasks = merge_tasks(explicit, recorded)
+        LOG.info("Task%s %s (--task first, then the rest of %s)",
+                 "s" if len(tasks) > 1 else "",
+                 ", ".join(repr(t) for t in tasks), path.name)
+        return tasks
     if recorded:
-        LOG.info("Task %r (recorded in %s)", recorded, path.name)
+        LOG.info("Task%s %s (recorded in %s)", "s" if len(recorded) > 1 else "",
+                 ", ".join(repr(t) for t in recorded), path.name)
         return recorded
     raise SystemExit(
         f"No --task given and {path} records none.\n"
@@ -256,7 +305,8 @@ def resolve_task(split_dir: str, explicit: str | None) -> str:
         f"default: a phrasing this checkpoint was not finetuned on is out of "
         f"distribution and nothing downstream will notice.\n"
         f'Pass --task "<the instruction the training dataset was recorded with>", '
-        f'or add a "task" key to the bundle\'s export_info.json.')
+        f'or add a "task" key (or a "tasks" list, for a multi-task checkpoint) '
+        f"to the bundle's export_info.json.")
 
 
 def resolve_bundle_path(split_dir: str, explicit: str | None, name: str,
@@ -351,11 +401,11 @@ def load_norm(stats_path: str | None) -> NormStats:
 
 
 class GamepadTeleop:
-    """Hand the machine between the policy and the sticks, one or the other.
+    """The pad's two jobs in a run: hand the machine over, and pick the task.
 
-    A toggles: press it while the policy is driving and the operator takes over
-    until it is pressed again. Useful for repositioning between takes, and for
-    rescuing a run that has driven itself somewhere useless.
+    A toggles control: press it while the policy is driving and the operator takes
+    over until it is pressed again. Useful for repositioning between takes, and
+    for rescuing a run that has driven itself somewhere useless.
 
     The two sources are exclusive, not summed. That is what makes the hand-over
     clean in both directions. Manual control goes out through ``send_action``,
@@ -365,28 +415,44 @@ class GamepadTeleop:
     control was inferred from the pose they left the machine in rather than
     from one taken before they touched it.
 
-    The pad is polled on its own thread only to catch the button. The inference
+    D-pad right/left cycles the active instruction when the run carries more than
+    one (see resolve_tasks). That is a selector, not a command: it changes the
+    string the NEXT inference conditions on and never writes a valve itself, which
+    is why it is offered in a dry run too — there ``allow_takeover`` is False and
+    A does nothing. Taking the machine over stays live-only, because the sticks
+    DO write setpoints and the safety ladder in the module docstring must not have
+    a hole in it for the pad.
+
+    The pad is polled on its own thread only to catch the buttons. The inference
     loop comes around once per chunk (~0.5 s), and the pad holds a button's
     state only until its release event arrives, so a tap read from that loop is
     simply missed. That thread never commands the valves.
     """
 
-    def __init__(self, robot, pad) -> None:
+    def __init__(self, robot, pad, allow_takeover: bool = True) -> None:
         self._robot = robot
         self._pad = pad
+        self._allow_takeover = allow_takeover
         self._edge = threading.Event()
+        self._task_step = 0                 # net D-pad clicks not yet acted on
+        self._task_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch_button, daemon=True)
         self._thread.start()
 
     def _watch_button(self) -> None:
-        prev = False
+        prev = 0
         while not self._stop.wait(1.0 / BUTTON_POLL_HZ):
             _, mask = self._pad.poll()
-            down = bool(mask & (1 << BTN_A))
-            if down and not prev:
+            hit = mask & ~prev              # rising edges only
+            prev = mask
+            if self._allow_takeover and hit & (1 << BTN_A):
                 self._edge.set()
-            prev = down
+            step = (bool(hit & (1 << BTN_DPAD_RIGHT))
+                    - bool(hit & (1 << BTN_DPAD_LEFT)))
+            if step:
+                with self._task_lock:
+                    self._task_step += step
 
     def pressed(self) -> bool:
         """True once per press of A, whenever it is next asked for."""
@@ -394,6 +460,17 @@ class GamepadTeleop:
             self._edge.clear()
             return True
         return False
+
+    def take_task_step(self) -> int:
+        """Net D-pad clicks since this was last asked, and clear them.
+
+        Net rather than one per call: the loop asks once per chunk, so two clicks
+        landing inside one inference should move two tasks along rather than queue
+        the second switch behind the next chunk.
+        """
+        with self._task_lock:
+            step, self._task_step = self._task_step, 0
+        return step
 
     def run(self) -> None:
         """Drive from the sticks until A is pressed again. Blocks the caller.
@@ -426,8 +503,8 @@ class GamepadTeleop:
         self._pad.close()
 
 
-def make_teleop(robot) -> GamepadTeleop | None:
-    """Gamepad override for a live run, or None if no pad answers.
+def make_teleop(robot, allow_takeover: bool = True) -> GamepadTeleop | None:
+    """The run's pad, or None if no pad answers.
 
     Optional on purpose: a pad that is absent, unplugged or unreadable leaves
     the run exactly as it would have been rather than failing it, so an
@@ -436,7 +513,7 @@ def make_teleop(robot) -> GamepadTeleop | None:
     pad = LocalGamepadInput(connect_timeout_s=GAMEPAD_TIMEOUT_S)
     if not pad.open():
         return None
-    return GamepadTeleop(robot, pad)
+    return GamepadTeleop(robot, pad, allow_takeover=allow_takeover)
 
 
 def main() -> int:
@@ -448,24 +525,33 @@ def main() -> int:
                         "what the machine does, so it is never defaulted")
     p.add_argument("--tokenizer", default=None,
                    help="Tokenizer dir. Normally omitted — <split-dir>/tokenizer "
-                        f"is used when the bundle ships one (fallback: {DEFAULT_TOKENIZER})")
-    p.add_argument("--cache-dir", default="/tmp/smolvla_split_cache",
+                        f"is used when the bundle ships one (SmolVLA fallback: "
+                        f"{DEFAULT_TOKENIZER}; an X-VLA bundle that ships none is "
+                        f"a base export and needs this passed explicitly)")
+    p.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR,
                    help="Root of the TRT engine cache. Each bundle gets its own "
                         "subdirectory under it, so switching --split-dir needs "
-                        "no extra flag and switching back is still instant.")
+                        "no extra flag and switching back is still instant. "
+                        "Left alone, an X-VLA bundle caches into its own "
+                        "<split-dir>/trt_cache instead, which survives a reboot.")
     p.add_argument("--rebuild", action="store_true",
                    help="Wipe this bundle's engine cache and rebuild it "
                         "(minutes). The cache is dropped automatically when the "
                         "bundle's weights change on disk, so this is only for a "
                         "cache you suspect rather than one you changed.")
-    p.add_argument("--task", default=None,
+    p.add_argument("--task", action="append", dest="tasks", default=None,
+                   metavar="INSTRUCTION",
                    help="Instruction the policy is conditioned on, e.g. "
                         '"scoop sand and dump it to the left". Same flag, and the '
                         "same string, as record_episodes --task. Normally omitted "
                         "— it is read from the export bundle, since the phrasing "
                         "is a property of the checkpoint. There is NO default: a "
-                        "wrong instruction is out of distribution and silent")
-    p.add_argument("--num-steps", type=int, default=10, help="Denoise steps")
+                        "wrong instruction is out of distribution and silent. "
+                        "REPEAT the flag for a multi-task checkpoint: the run "
+                        "starts on the first and the pad's D-pad cycles the rest")
+    p.add_argument("--num-steps", type=int, default=DEFAULT_NUM_STEPS,
+                   help="Denoise steps. Left alone, an X-VLA bundle uses the "
+                        "num_denoising_steps it was exported with")
     p.add_argument("--min-replan-s", type=float, default=0.0,
                    help="Minimum seconds between chunk hand-overs; 0 (default) "
                         "replans as fast as inference allows. A THROTTLE, not an "
@@ -484,6 +570,13 @@ def main() -> int:
                    help="Feed observation.state to the policy as zeros (camera-only "
                         "checkpoint). Normally omitted — it is read from the export "
                         "bundle's state_blind flag")
+    p.add_argument("--allow-base-bundle", action="store_true",
+                   help="Load an X-VLA bundle that carries no physical boundary "
+                        "(the base ee6d checkpoint, or an export missing its "
+                        "normalization stats). Its action columns are arm "
+                        "dimensions, NOT valve commands, so the run is "
+                        "model-only: --live is refused. This is how engines, "
+                        "latency and memory get proven before a fine-tune exists")
     p.add_argument("--robot", default="auto")
     p.add_argument("--state-joints", default="lift,tilt,scoop",
                    help="Joints fed to the policy as observation.state. MUST "
@@ -512,8 +605,9 @@ def main() -> int:
     p.add_argument("--no-gamepad", action="store_true",
                    help="Do not look for a gamepad. Without it, an attached pad "
                         "can take manual control with A during a --live run "
-                        "(exclusive with the policy, not summed); no pad "
-                        "attached is not an error either way")
+                        "(exclusive with the policy, not summed) and cycle the "
+                        "task with the D-pad when the run carries more than one; "
+                        "no pad attached is not an error either way")
     p.add_argument("--loops", type=int, default=0,
                    help="Stop after N infer+execute cycles (0 = run until Ctrl+C)")
     p.add_argument("--seed", type=int, default=None, help="Fix the denoise noise seed")
@@ -566,53 +660,101 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # Resolve before building engines so a rate mismatch fails in a second rather
-    # than after a multi-minute TRT build.
-    args.tokenizer = resolve_bundle_path(args.split_dir, args.tokenizer,
-                                         "tokenizer", str(DEFAULT_TOKENIZER),
-                                         "tokenizer")
-    args.dataset_stats = resolve_bundle_path(args.split_dir, args.dataset_stats,
-                                             "stats.json", None,
-                                             "normalization stats")
-    args.task = resolve_task(args.split_dir, args.task)
-    args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
-    state_blind = resolve_state_blind(args.split_dir, args.state_blind)
+    # The architecture is a property of the bundle, not a flag — see policy.py.
+    architecture = detect_architecture(args.split_dir)
+    LOG.info("Architecture: %s (detected from %s)", architecture, args.split_dir)
 
     camera_key = CAMERA_KEYS[args.camera]
-    check_camera_against_stats(camera_key, args.dataset_stats)
-
     state_joints = [j.strip() for j in args.state_joints.split(",") if j.strip()]
     unknown = [j for j in state_joints if j not in JOINT_NAMES]
     if unknown:
         raise SystemExit(f"--state-joints {unknown} not in {JOINT_NAMES}")
 
-    norm = load_norm(args.dataset_stats)
-    # The state layout is a contract between the training dataset and this loop.
-    # Getting it wrong is silent: a 3-dim policy fed 4 values, or the same count
-    # in a different order, still runs and still drives — just wrongly. The stats
-    # file carries one number that settles it, so check it.
-    if norm.state_mean is not None and len(norm.state_mean) != len(state_joints):
-        raise SystemExit(
-            f"--state-joints has {len(state_joints)} joints {state_joints} but "
-            f"--dataset-stats {args.dataset_stats} was built from a "
-            f"{len(norm.state_mean)}-dim observation.state.\n"
-            f"Check the training dataset's meta/info.json -> "
-            f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
-    if state_blind:
-        check_state_blind_stats(norm, args.dataset_stats)
+    # Everything below resolves BEFORE any engine is built, so a wrong rate, task
+    # or camera fails in a second rather than after a multi-minute TRT build.
+    # The two architectures record the same facts in different files: SmolVLA in
+    # export_info.json + stats.json, X-VLA in its bundle.json + processor
+    # contract. Each resolver lives beside the runtime that owns that format.
+    if architecture == "xvla":
+        if args.dataset_stats:
+            raise SystemExit(
+                "--dataset-stats does not apply to an X-VLA bundle: its "
+                "normalization is carried in bundle.json's processor contract, "
+                "which the runtime applies at the physical boundary itself.")
+        # Refuse the non-drivable combination BEFORE the engines load: the
+        # authoritative check is on the constructed policy below, but that costs a
+        # 25 s engine load first, and --allow-base-bundle is the only way a
+        # feasibility bundle gets in at all.
+        if args.live and args.allow_base_bundle:
+            raise SystemExit(
+                "--live and --allow-base-bundle are contradictory: a bundle that "
+                "needs --allow-base-bundle emits arm dimensions, not valve "
+                "commands. Run it without --live to watch it against real "
+                "observations.")
+        tasks = xvla_split.resolve_tasks(args.split_dir, args.tasks)
+        args.fps = xvla_split.resolve_fps(args.split_dir, args.fps)
+        xvla_split.check_camera(args.split_dir, camera_key)
+        state_blind = args.state_blind
+        if args.projectors != "gpu" or not args.iobinding:
+            LOG.warning("--projectors / --no-iobinding are SmolVLA-only knobs and "
+                        "are ignored for an X-VLA bundle.")
+        policy = make_policy(
+            "xvla", args.split_dir,
+            cache_dir=args.cache_dir if args.cache_dir != DEFAULT_CACHE_DIR else None,
+            num_steps=args.num_steps if args.num_steps != DEFAULT_NUM_STEPS else None,
+            seed=args.seed,
+            tokenizer_dir=args.tokenizer,
+            state_joints=state_joints,
+            allow_base_bundle=args.allow_base_bundle,
+        )
+    else:
+        args.tokenizer = resolve_bundle_path(args.split_dir, args.tokenizer,
+                                             "tokenizer", str(DEFAULT_TOKENIZER),
+                                             "tokenizer")
+        args.dataset_stats = resolve_bundle_path(args.split_dir, args.dataset_stats,
+                                                 "stats.json", None,
+                                                 "normalization stats")
+        tasks = resolve_tasks(args.split_dir, args.tasks)
+        args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
+        state_blind = resolve_state_blind(args.split_dir, args.state_blind)
+        check_camera_against_stats(camera_key, args.dataset_stats)
 
-    policy = SmolVLASplitPolicy(
-        split_dir=args.split_dir,
-        tokenizer_dir=args.tokenizer,
-        cache_dir=args.cache_dir,
-        rebuild=args.rebuild,
-        num_steps=args.num_steps,
-        action_dim=4,
-        norm=norm,
-        seed=args.seed,
-        projectors=args.projectors,
-        iobinding=args.iobinding,
-    )
+        norm = load_norm(args.dataset_stats)
+        # The state layout is a contract between the training dataset and this loop.
+        # Getting it wrong is silent: a 3-dim policy fed 4 values, or the same count
+        # in a different order, still runs and still drives — just wrongly. The stats
+        # file carries one number that settles it, so check it.
+        if norm.state_mean is not None and len(norm.state_mean) != len(state_joints):
+            raise SystemExit(
+                f"--state-joints has {len(state_joints)} joints {state_joints} but "
+                f"--dataset-stats {args.dataset_stats} was built from a "
+                f"{len(norm.state_mean)}-dim observation.state.\n"
+                f"Check the training dataset's meta/info.json -> "
+                f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
+        if state_blind:
+            check_state_blind_stats(norm, args.dataset_stats)
+
+        policy = make_policy(
+            "smolvla", args.split_dir,
+            tokenizer_dir=args.tokenizer,
+            cache_dir=args.cache_dir,
+            rebuild=args.rebuild,
+            num_steps=args.num_steps,
+            action_dim=4,
+            norm=norm,
+            seed=args.seed,
+            projectors=args.projectors,
+            iobinding=args.iobinding,
+        )
+
+    # A bundle with no physical boundary emits arm dimensions, not valve commands
+    # (see xvla_split.py). It is loadable on purpose — that is how engines, latency
+    # and memory get proven before a fine-tune exists — but it never drives.
+    if getattr(policy, "feasibility_only", False) and args.live:
+        raise SystemExit(
+            "--live refused: this bundle is a model-only feasibility export whose "
+            "action columns are not valve commands. Drop --live to watch it run "
+            "against real observations.")
 
     robot = None
     if not args.synthetic:
@@ -637,14 +779,26 @@ def main() -> int:
         else:
             LOG.info("Dry run: observations are real, actions are printed only.")
 
-    # Live only: without --live no source drives the valves, and the safety
-    # ladder in the module docstring should not have a hole in it for the pad.
-    teleop = (make_teleop(robot)
-              if robot is not None and args.live and not args.no_gamepad
+    # Takeover is live only: without --live no source drives the valves, and the
+    # safety ladder in the module docstring should not have a hole in it for the
+    # pad. A multi-task run still opens the pad without --live, with takeover off
+    # -- the D-pad only picks the instruction the next inference conditions on, so
+    # it writes no valve, and it is how a two-task bundle gets checked on the
+    # bench before anyone stands next to a live machine.
+    takeover = bool(args.live) and robot is not None
+    teleop = (make_teleop(robot, allow_takeover=takeover)
+              if not args.no_gamepad and (takeover or len(tasks) > 1)
               else None)
     if teleop is not None:
-        LOG.info("Gamepad attached: A hands control between the policy and the "
-                 "sticks (exclusive, not summed).")
+        LOG.info("Gamepad attached: %s%s.",
+                 "A hands control between the policy and the sticks (exclusive, "
+                 "not summed)" if takeover
+                 else "takeover is live-only, so A does nothing in this mode",
+                 "; D-pad right/left cycles the task" if len(tasks) > 1 else "")
+    elif len(tasks) > 1 and not args.no_gamepad:
+        LOG.warning("%d tasks are loaded but no gamepad answered, so this run "
+                    "stays on %r for its whole length. --task <instruction> puts "
+                    "another one first.", len(tasks), tasks[0])
 
     if not args.synthetic:
         LOG.info("Policy camera: %s (%s)", camera_key,
@@ -671,7 +825,8 @@ def main() -> int:
     if args.log_actions:
         action_log = ActionLogger(args.log_actions, CONTROL_CHANNELS, meta={
             "split_dir": args.split_dir,
-            "task": args.task,
+            "task": tasks[0],
+            "tasks": list(tasks),
             "fps": args.fps,
             "live": bool(args.live),
             "synthetic": bool(args.synthetic),
@@ -693,24 +848,31 @@ def main() -> int:
     LOG.info("Warmup inference (builds TRT engines on first ever run)...")
     img, state = get_observation()
     t0 = time.perf_counter()
-    policy.sample_actions(img, args.task, for_policy(state))
+    policy.sample_actions(img, tasks[0], for_policy(state))
     LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
 
     cycle = 0
+    # Index into `tasks`. Only the D-pad moves it, and only between chunks: the
+    # string is an input to inference like the image and the state, so switching
+    # is a one-line change of what the next prefix says. The language embedding is
+    # cached per string inside the policy, so the first use of each instruction
+    # costs one text-encoder run (~ms) and every later one costs nothing.
+    task_index = 0
     # Start re-inference this far before the current chunk ends, so the next one
     # is ready when it runs out. Tracked as a decaying max of measured inference
     # time; the first cycle sets it from its own measurement. Not seeded from
     # the warmup — that one includes the TRT engine build.
     infer_lead_s = 0.0
     chunk_t0 = 0.0          # set on every hand-over; only read once cycle > 0
-    # When teleop took a chunk over mid-play. `played` counts up to this instead
-    # of to the next hand-over, so the manual stretch is not billed to the chunk.
+    # When a chunk stopped playing mid-play -- teleop took the machine over, or
+    # the operator switched task. `played` counts up to this instead of to the
+    # next hand-over, so the stopped stretch is not billed to the chunk.
     chunk_cut = None
     try:
         while True:
             img, state = get_observation()
             t0 = time.perf_counter()
-            chunk = policy.sample_actions(img, args.task, for_policy(state))
+            chunk = policy.sample_actions(img, tasks[task_index], for_policy(state))
             infer_s = time.perf_counter() - t0
             infer_lead_s = max(infer_s, infer_lead_s * 0.9)
 
@@ -731,12 +893,16 @@ def main() -> int:
             chunk_t0 = now
             chunk_cut = None
 
-            LOG.info("cycle=%d infer=%.0fms played=%s state%s=[%s] a0=[%s]",
-                     cycle, infer_s * 1000.0,
+            LOG.info("cycle=%d%s infer=%.0fms played=%s state%s=[%s] a0=[%s]%s",
+                     cycle,
+                     f" task={task_index}" if len(tasks) > 1 else "",
+                     infer_s * 1000.0,
                      played if played is not None else "-",
                      "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),
-                     " ".join(f"{v:+.2f}" for v in chunk[0]))
+                     " ".join(f"{v:+.2f}" for v in chunk[0][:4]),
+                     f" (+{chunk.shape[1] - 4} more columns; not valve commands)"
+                     if chunk.shape[1] > 4 else "")
 
             if action_log is not None:
                 action_log.log_chunk(cycle, infer_s, played, state, chunk)
@@ -756,11 +922,38 @@ def main() -> int:
                 if action_log is not None:
                     action_log.log_event("teleop_end", cycle=cycle)
 
+            # A task switch lands on the NEXT inference rather than at the end of
+            # the current chunk: the operator pressed the D-pad to change what the
+            # machine is doing, and a chunk planned under the old instruction is
+            # exactly what they no longer want. So it is dropped the way a teleop
+            # hand-over drops it -- stopped machine, then a fresh plan -- and the
+            # replan throttle is skipped, since the whole point of the press is
+            # that the next chunk should be for the new task.
+            switched = False
+            if teleop is not None and len(tasks) > 1:
+                step = teleop.take_task_step()
+                if step:
+                    task_index = (task_index + step) % len(tasks)
+                    switched = True
+                    LOG.info("Task -> [%d/%d] %r", task_index + 1, len(tasks),
+                             tasks[task_index])
+                    if robot is not None and args.live:
+                        robot.stop_motion()
+                        # Same accounting as the teleop hand-over: the chunk
+                        # stopped playing here, so `played` is billed to here
+                        # rather than to the next hand-over.
+                        if chunk_cut is None:
+                            chunk_cut = time.perf_counter()
+                    if action_log is not None:
+                        action_log.log_event("task_switch", cycle=cycle,
+                                             index=task_index,
+                                             task=tasks[task_index])
+
             # Sleep until it is time to start the next inference. The control
             # thread is driving the valves from the chunk meanwhile. The default
             # --min-replan-s 0 means no sleep at all: replan flat out.
             sleep_s = args.min_replan_s - infer_lead_s - (time.perf_counter() - chunk_t0)
-            if sleep_s > 0:
+            if sleep_s > 0 and not switched:
                 time.sleep(sleep_s)
     except KeyboardInterrupt:
         print("\nInterrupted.")

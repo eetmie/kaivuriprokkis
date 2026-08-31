@@ -234,3 +234,6 @@ data_collection/lerobot_datasets/
 
 # run_inference --log-actions: bare flag writes into the current directory
 infer_*.jsonl
+
+# Export bundles (GB of ONNX graphs + weights); they live on the board, not in git
+lerobot_vla/model/

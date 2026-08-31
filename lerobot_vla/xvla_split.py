@@ -24,9 +24,8 @@ well-formed, plausible-looking action chunk that is pure nonsense on a hydraulic
 excavator. The bundle records the difference (schema v1 with no processor
 contract, or `physical_boundary_complete: false`), so this refuses to construct a
 drivable policy from one unless `allow_base_bundle=True`, and then marks itself
-`feasibility_only` so `--live` stays shut. That flag exists for exactly one job:
-proving engines, latency and memory on the board before a fine-tune exists, which
-is what it was used for on 2026-08-31.
+`feasibility_only` so `--live` stays shut. That override is only for model/engine
+diagnostics; it never enables valve output.
 
 Differences from `smolvla_split.SmolVLASplitPolicy`, all absorbed here:
 
@@ -235,8 +234,6 @@ class XVLAExcavatorPolicy:
                  tokenizer_dir: str | Path | None = None,
                  state_joints: list[str] | None = None,
                  allow_base_bundle: bool = False):
-        from lerobot_vla.vendor.xvla_split_ort import XVLASplitPolicy, prebuild_engines
-
         split_dir = Path(split_dir)
         self.bundle = load_bundle(split_dir)
         self.contract = contract_of(self.bundle)
@@ -252,6 +249,11 @@ class XVLAExcavatorPolicy:
             or not self.contract.get("physical_boundary_complete"))
         if self.feasibility_only and not allow_base_bundle:
             raise SystemExit(self._base_bundle_message())
+
+        # Keep the heavy ONNX Runtime import behind the bundle safety gate. A
+        # base or incomplete bundle must be rejected from metadata alone, before
+        # any inference dependency is required or a TensorRT engine can load.
+        from lerobot_vla.vendor.xvla_split_ort import XVLASplitPolicy, prebuild_engines
 
         cache_dir = Path(cache_dir) if cache_dir else split_dir / ENGINE_CACHE_DIRNAME
 

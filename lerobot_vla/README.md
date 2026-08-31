@@ -3,9 +3,8 @@
 The VLA layer on top of the kaivuriprokkis control stack: LeRobot-format
 dataset collection (for fine-tuning on the DGX Spark) and on-device inference
 from split TensorRT engines on this Orin Nano. Two architectures share the loop
-— SmolVLA-450M (deployed) and X-VLA-0.9B (feasibility proven on the board, fine-
-tune pending) — and which one runs is read from the bundle, not chosen with a
-flag. See section 3.
+— SmolVLA-450M and X-VLA-0.9B — and which one runs is read from the bundle,
+not chosen with a flag. See section 3.
 
 ```
 gamepad ─┐                                             ┌─> LeRobot v3 dataset ──> DGX Spark finetune
@@ -655,8 +654,7 @@ says so**: `chunk[:, :4]` is a perfectly well-formed action chunk that is nonsen
 on a hydraulic excavator. So a bundle with no processor contract (or one whose
 `physical_boundary_complete` is false) refuses to load at all, and loading it
 anyway with `--allow-base-bundle` marks the run model-only — `--live` is then
-refused outright. That mode is what proved engines, latency and memory on this
-board before any fine-tune existed:
+refused outright. For model-only diagnostics of base weights:
 
 ```bash
 XV=~/GitHub/spark-projects/orin-nano/xvla-runtime
@@ -695,10 +693,8 @@ less slack than SmolVLA's chunk gives. Training at `chunk_size=50` (what
 through all 24 blocks, ten times, with no KV cache possible — so **re-measure the
 latency after the fine-tune**; the 395 ms above is a chunk-30 number.
 
-### Still open
+### Before live deployment
 
-- **The fine-tune itself** (`spark-projects/xvla-spark-finetune`) — written and
-  smoke-tested, not yet trained.
 - **Parity** (`xvla-runtime/parity.py`) must pass on the fine-tuned export before
   anything drives a valve. It runs in two processes because the PyTorch reference
   and the engines do not fit in memory together.

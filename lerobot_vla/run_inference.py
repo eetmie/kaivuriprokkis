@@ -19,8 +19,7 @@ Modes (safety ladder):
     --allow-base-bundle loads an X-VLA export that carries no physical boundary
                     (the base ee6d checkpoint). Its chunk is arm dimensions, not
                     valve commands, so that mode refuses --live outright: it
-                    exists to prove engines, latency and memory on the board
-                    before a fine-tune exists.
+                    exists only for model/engine diagnostics.
 
 The policy emits an action chunk per observation (length is a property of the
 bundle -- 50 for the base export, 12 for the deployed digging bundle) and the
@@ -575,8 +574,8 @@ def main() -> int:
                         "(the base ee6d checkpoint, or an export missing its "
                         "normalization stats). Its action columns are arm "
                         "dimensions, NOT valve commands, so the run is "
-                        "model-only: --live is refused. This is how engines, "
-                        "latency and memory get proven before a fine-tune exists")
+                        "model-only: --live is refused. Use this only for "
+                        "model/engine diagnostics")
     p.add_argument("--robot", default="auto")
     p.add_argument("--state-joints", default="lift,tilt,scoop",
                    help="Joints fed to the policy as observation.state. MUST "
@@ -748,8 +747,8 @@ def main() -> int:
         )
 
     # A bundle with no physical boundary emits arm dimensions, not valve commands
-    # (see xvla_split.py). It is loadable on purpose — that is how engines, latency
-    # and memory get proven before a fine-tune exists — but it never drives.
+    # (see xvla_split.py). It is loadable for model/engine diagnostics, but it
+    # never drives.
     if getattr(policy, "feasibility_only", False) and args.live:
         raise SystemExit(
             "--live refused: this bundle is a model-only feasibility export whose "

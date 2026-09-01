@@ -12,22 +12,21 @@ Primary target:
 
 ## Existing Logger
 
-`drive_logger.py` already logs the key signals needed for offline identification:
+`simple_drive.py` logs the key signals needed for offline identification to Snappy-compressed Parquet:
 
 - valve commands actually sent: `combined_cmd_*`
 - manual commands: `manual_cmd_*`
 - sine excitation overlay: `sine_cmd_*`
 - joint positions: `joint_pos_*`
 - joint velocities: `joint_vel_*`
-- cylinder pressures: `pext_*`, `pret_*`
-- pump pressure: `pump_ps`
-- quality flags: `cmd_stale`, `pressure_stale`
+- raw and fused IMU signals with device timestamps
+- monotonic host timestamps for continuity and resampling
 
 Collection runs in direct mode, so IK/PID is bypassed during recording.
 
 ## Pressure Handling
 
-Log raw pressure channels and derive extra features offline later.
+When pressure hardware is re-enabled, log raw pressure channels and derive extra features offline later.
 
 Prefer keeping:
 
@@ -75,7 +74,7 @@ Avoid overfocusing on end stops. Most model fitting should use mid-stroke data.
 
 Before fitting models:
 
-- drop rows with `cmd_stale != 0`
+- split at non-monotonic timestamps, gaps larger than the sampling tolerance, and non-finite sensor rows
 - drop rows with invalid or stale pressure if the model uses pressure
 - exclude near-zero commands when identifying valve gain
 - exclude near-stall and end-stop regions for the first models
@@ -222,7 +221,7 @@ or with valve nonlinearity:
 
 1. Record several direct-mode datasets with multi-channel excitation.
 2. Keep notes for each session: surface/load/task conditions, pump behavior, and anything unusual.
-3. Build an offline benchmark script that reads the current CSV format.
+3. Run the offline benchmark directly on the current Parquet format.
 4. Fit and compare the baseline linear, angle-scheduled, and Hammerstein-style models.
 5. Promote the best model into a feedforward block while keeping PID trim active.
 
@@ -230,11 +229,11 @@ or with valve nonlinearity:
 
 - [x] Drop pressure logging for now — pressure columns are all NaN or unreliable in current hardware setup. ADC disabled in HardwareInterface.
 - [x] Log joint velocities directly from the controller (already computed at control rate) — avoids finite-difference noise and ensures training targets match what the model will see at inference time.
-- [x] Train with `--no-pressures` until pressure hardware is confirmed working end-to-end.
+- [x] Keep pressure out of the actuator model until the hardware is confirmed end-to-end.
 
 ## Future logging direction
 
-- Consider migrating from CSV to **ROS 2 / rosbag2** for richer multi-topic recording once the system moves to a ROS 2 runtime. Benefits: timestamped topics per sensor, replay support, standard tooling (rqt, ros2 bag play). The current CSV format with `sanitize_drive_logs.py` is sufficient for offline blackbox training but becomes awkward if more sensors (IMU topics, pressure, camera) are added or if real-time replay is needed for RL policy rollout.
+- Parquet is now the lightweight single-process format. Revisit ROS 2 / rosbag2 only when synchronized multi-topic replay becomes a real runtime requirement.
 
 ## Pump speed note
 

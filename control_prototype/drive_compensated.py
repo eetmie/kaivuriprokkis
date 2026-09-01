@@ -50,7 +50,6 @@ from tools.linkage_rate_compensation import (
     UniversalShapeCompensator,
 )
 from simple_drive import (
-    COMMAND_STALE_TIMEOUT_S,
     JOINT_NAMES,
     LOG_OUTPUT_DIR,
     PRINT_DECIMATION,
@@ -281,7 +280,6 @@ def main():
     prev_loop_time  = time.perf_counter()
 
     right_rl = right_ud = left_rl = left_ud = right_paddle = left_paddle = 0.0
-    last_cmd_mono = None
     mask_prev     = 0
 
     last_status_time = time.time()
@@ -305,8 +303,6 @@ def main():
                 left_ud      = axes['left_ud']
                 right_paddle = axes['right_paddle']
                 left_paddle  = axes['left_paddle']
-                if source.is_live():
-                    last_cmd_mono = time.monotonic()
 
                 def btn(b):  return bool(mask & (1 << b))
                 def prev(b): return bool(mask_prev & (1 << b))
@@ -397,13 +393,8 @@ def main():
 
             # ── 6. log ────────────────────────────────────────────────────────
             if is_logging:
-                cmd_age_s = np.nan
-                cmd_stale = True
-                if last_cmd_mono is not None:
-                    cmd_age_s = max(0.0, time.monotonic() - last_cmd_mono)
-                    cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
                 logger.log_sample(manual, sine, combined, controller, hardware,
-                                  cmd_age_s, cmd_stale, sine_gen.enabled,
+                                  sine_gen.enabled,
                                   sine_gen.target_name, sine_gen.seed)
 
             # ── 7. auto-stop ──────────────────────────────────────────────────

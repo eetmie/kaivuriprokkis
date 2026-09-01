@@ -36,10 +36,10 @@ press A again for the next one. The gap is deliberate: it lets the hydraulics
 cool, so a long session is a series of comparable sets rather than a slow
 thermal drift.
 
-Each recording writes two files:
+Each recording writes two Parquet files:
 
-    drive_log_*.csv  hydraulic commands + joint state at the 100 Hz control rate
-    imu_raw_*.csv    every IMU frame at the full 200 Hz stream rate
+    drive_log_*.parquet  hydraulic commands + joint state at the 100 Hz control rate
+    imu_raw_*.parquet    every IMU frame at the full 200 Hz stream rate
 
 The raw strip holds each sensor's fused quaternion next to the gyro and accel
 that produced it, in the firmware's own units (dps and g, which is what Fusion
@@ -72,7 +72,6 @@ from modules.udp_socket import UDPSocket
 # ── constants ────────────────────────────────────────────────────────────────
 
 SAMPLING_FREQUENCY         = 100    # Hz
-COMMAND_STALE_TIMEOUT_S    = 0.5
 STATUS_PRINT_INTERVAL_S    = 5.0
 PRINT_DECIMATION           = 10     # IMU print decimation (→ ~10 Hz)
 RECORD_MINUTES             = 10.0   # logging auto-stops after this long
@@ -387,7 +386,7 @@ class SineExcitationGenerator:
 class DataLogger:
     """100 Hz hydraulic actuator data recorder for blackbox model training.
 
-    CSV schema matches data_collection/benchmark_actuator_models.py and the
+    Parquet schema matches data_collection/benchmark_actuator_models.py and the
     IsaacLab training pipeline (Isaac-hydraulic-actuator/train.py).
 
     One recording is one file. Logging stops on its own at RECORD_MINUTES rather
@@ -410,7 +409,6 @@ class DataLogger:
     def __init__(self, output_dir: Path, imu_roles=None, stream_info_fn=None):
         self.output_dir  = output_dir
         self.is_logging  = False
-        self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Set when IMUs are active: the raw strip is written alongside the
         # hydraulic one and needs the sensor role order plus the firmware's
         # reported full scales to be interpretable.
@@ -422,7 +420,6 @@ class DataLogger:
         self._t0_wall = None
         self._t0_mono = None
         self._ts:   list = []
-        self._idx:  list = []
         self._man:  list = []
         self._sin:  list = []
         self._com:  list = []
@@ -441,8 +438,6 @@ class DataLogger:
         # a re-collection when that becomes interesting.
         self._gbase: list = []
         self._abase: list = []
-        self._stale: list = []
-        self._age:   list = []
         self._sine_flag:   list = []
         self._sine_target: list = []
         self._sine_seed:   list = []
@@ -457,8 +452,7 @@ class DataLogger:
         print(f"\n{'='*60}\n  DATA COLLECTION STARTED\n{'='*60}\n")
 
     def log_sample(self, manual: dict, sine: dict, combined: dict,
-                   controller, hardware, cmd_age_s: float, cmd_stale: bool,
-                   sine_enabled: bool,
+                   controller, hardware, sine_enabled: bool,
                    sine_target: str = "", sine_seed: int = -1):
         if not self.is_logging:
             return
@@ -500,8 +494,7 @@ class DataLogger:
             gbase = abase = list(nan3)
             dev_ts = None
 
-        i = len(self._ts)
-        self._ts.append(t);         self._idx.append(i)
+        self._ts.append(t)
         self._man.append([manual.get(n, 0.0)   for n in JOINT_NAMES])
         self._sin.append([sine.get(n, 0.0)     for n in JOINT_NAMES])
         self._com.append([combined.get(n, 0.0) for n in JOINT_NAMES])
@@ -510,9 +503,7 @@ class DataLogger:
         self._gb.append(gb);  self._ga.append(ga);  self._gk.append(gk)
         self._ab.append(ab);  self._aa.append(aa);  self._ak.append(ak)
         self._gbase.append(gbase);  self._abase.append(abase)
-        self._stale.append(int(bool(cmd_stale)))
-        self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
-        self._sine_flag.append(int(bool(sine_enabled)))
+        self._sine_flag.append(bool(sine_enabled))
         self._sine_target.append(str(sine_target))
         self._sine_seed.append(int(sine_seed))
         self._dev_ts.append(np.nan if dev_ts is None else float(dev_ts))
@@ -531,14 +522,24 @@ class DataLogger:
 
         import pandas as pd
 
-        man = np.array(self._man);  sin = np.array(self._sin);  com = np.array(self._com)
-        pos = np.array(self._pos)
-        gb  = np.array(self._gb);   ga  = np.array(self._ga);   gk  = np.array(self._gk)
-        ab  = np.array(self._ab);   aa  = np.array(self._aa);   ak  = np.array(self._ak)
-        gbs = np.array(self._gbase); abs_ = np.array(self._abase)
+        man = np.asarray(self._man, dtype=np.float32)
+        sin = np.asarray(self._sin, dtype=np.float32)
+        com = np.asarray(self._com, dtype=np.float32)
+        pos = np.asarray(self._pos, dtype=np.float32)
+        gb = np.asarray(self._gb, dtype=np.float32)
+        ga = np.asarray(self._ga, dtype=np.float32)
+        gk = np.asarray(self._gk, dtype=np.float32)
+        ab = np.asarray(self._ab, dtype=np.float32)
+        aa = np.asarray(self._aa, dtype=np.float32)
+        ak = np.asarray(self._ak, dtype=np.float32)
+        gbs = np.asarray(self._gbase, dtype=np.float32)
+        abs_ = np.asarray(self._abase, dtype=np.float32)
 
         df = pd.DataFrame({
-            'timestamp': self._ts, 'sample_idx': self._idx,
+            # Timestamp deltas define recording continuity. A generated sample index
+            # duplicated row order, while logged stale/age flags duplicated source
+            # state without improving the actuator training contract.
+            'timestamp': np.asarray(self._ts, dtype=np.float64),
             # JOINT_NAMES order (slew, boom, arm, bucket) → hydraulic channel names
             'manual_cmd_rotate': man[:,0], 'manual_cmd_lift':  man[:,1],
             'manual_cmd_tilt':   man[:,2], 'manual_cmd_scoop': man[:,3],
@@ -548,7 +549,9 @@ class DataLogger:
             'combined_cmd_tilt':   com[:,2], 'combined_cmd_scoop': com[:,3],
             'joint_pos_slew':   pos[:,0], 'joint_pos_boom': pos[:,1],
             'joint_pos_arm':    pos[:,2], 'joint_pos_bucket': pos[:,3],
-            'joint_vel_boom': self._vb, 'joint_vel_arm': self._va, 'joint_vel_bucket': self._vbkt,
+            'joint_vel_boom': np.asarray(self._vb, dtype=np.float32),
+            'joint_vel_arm': np.asarray(self._va, dtype=np.float32),
+            'joint_vel_bucket': np.asarray(self._vbkt, dtype=np.float32),
             'imu_gx_boom': gb[:,0], 'imu_gy_boom': gb[:,1], 'imu_gz_boom': gb[:,2],
             'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
             'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
@@ -559,9 +562,9 @@ class DataLogger:
             # Base/cabin IMU: not a joint, so it has no pos/vel counterpart.
             'imu_gx_base': gbs[:,0], 'imu_gy_base': gbs[:,1], 'imu_gz_base': gbs[:,2],
             'imu_ax_base': abs_[:,0], 'imu_ay_base': abs_[:,1], 'imu_az_base': abs_[:,2],
-            'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
+            'sine_enabled': self._sine_flag,
             # Pico clock for the IMU sample this row saw. Joins these rows to the
-            # companion imu_raw_*.csv, which is timestamped on the same clock.
+            # companion imu_raw_*.parquet, which is timestamped on the same clock.
             'imu_device_ts_us': self._dev_ts,
             # The target is D-pad switchable mid-recording, so it is per-sample
             # rather than per-file — rows must be groupable by which channels
@@ -572,8 +575,8 @@ class DataLogger:
         })
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = self.output_dir / f"drive_log_{ts}.csv"
-        df.to_csv(out, index=False)
+        out = self.output_dir / f"drive_log_{ts}.parquet"
+        df.to_parquet(out, index=False, engine="pyarrow", compression="snappy")
         print(f"[SAVE] {len(df)} samples ({df['timestamp'].iloc[-1]/60:.2f} min) → {out}")
         self._save_imu_raw_strip()
         return out
@@ -614,7 +617,7 @@ class DataLogger:
     def save_imu_raw(self, roles: list[str], stream_info: dict) -> Path | None:
         """Write the raw IMU strip: quaternion + the gyro/accel that produced it.
 
-        Kept out of the hydraulic CSV rather than bolted onto it — the two run at
+        Kept out of the hydraulic log rather than bolted onto it — the two run at
         different rates, and the hydraulic schema is what the training and
         benchmark scripts read. Join on device_ts_us against the hydraulic log's
         imu_device_ts_us column.
@@ -628,7 +631,7 @@ class DataLogger:
 
         import pandas as pd
 
-        vals = np.array(self._imu_vals, dtype=np.float64)
+        vals = np.asarray(self._imu_vals, dtype=np.float32)
         cols = {'device_ts_us': self._imu_ts}
         for i, role in enumerate(roles):
             base = i * 10
@@ -646,8 +649,8 @@ class DataLogger:
         df['accel_range_g']  = ranges.get('accel_g', np.nan)
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = self.output_dir / f"imu_raw_{ts}.csv"
-        df.to_csv(out, index=False)
+        out = self.output_dir / f"imu_raw_{ts}.parquet"
+        df.to_parquet(out, index=False, engine="pyarrow", compression="snappy")
         span_s = (df['device_ts_us'].iloc[-1] - df['device_ts_us'].iloc[0]) / 1e6
         rate = len(df) / span_s if span_s > 0 else float('nan')
         # A non-zero count means the reader's buffer overflowed between drains,
@@ -968,7 +971,6 @@ def main():
     next_run_time   = time.perf_counter()
 
     right_rl = right_ud = left_rl = left_ud = right_paddle = left_paddle = 0.0
-    last_cmd_mono = None
     mask_prev     = 0
 
     last_status_time    = time.time()
@@ -1020,8 +1022,6 @@ def main():
                 left_ud      = axes['left_ud']
                 right_paddle = axes['right_paddle']
                 left_paddle  = axes['left_paddle']
-                if source.is_live():
-                    last_cmd_mono = time.monotonic()
 
                 def btn(b):  return bool(mask & (1 << b))
                 def prev(b): return bool(mask_prev & (1 << b))
@@ -1099,13 +1099,8 @@ def main():
             joint_angles, _, _ = controller.get_joint_angles()
 
             if is_logging:
-                cmd_age_s = np.nan
-                cmd_stale = True
-                if last_cmd_mono is not None:
-                    cmd_age_s = max(0.0, time.monotonic() - last_cmd_mono)
-                    cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
                 logger.log_sample(manual, sine, combined, controller, hardware,
-                                  cmd_age_s, cmd_stale, sine_gen.enabled,
+                                  sine_gen.enabled,
                                   sine_gen.target_name, sine_gen.seed)
                 # Every IMU frame since the last tick, not just the newest one.
                 drain_imu_raw()

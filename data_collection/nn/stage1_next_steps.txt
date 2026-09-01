@@ -1,62 +1,33 @@
-Stage 1 Next Steps (Logging -> Cleaning -> Training)
-
-What was updated
-- Logger now saves chunked files by segment (no more skewed re-saves across autosave boundaries).
-- Logger writes quality fields: sample_idx, segment_id, cmd_stale, cmd_age_s, pressure_age_s, pressure_stale.
-- Training defaults moved to 50 Hz (dt=0.02) and segment-aware preprocessing.
-- New sanitizer script added to split messy logs and produce clean segments + manifest.
-- Training scripts now expect `data_collection/drive_logger.py` CSVs.
-
-Recommended workflow from now on
+Hydraulic Actuator Workflow (Parquet)
 
 1) Record data
-- Run `python data_collection/drive_logger.py` and record varied motions.
-- Keep files in `data_collection/hydraulic_data/`.
-- Prefer multiple 5-10 min chunks with different regimes (slow/fast/reversals/coupled joints).
+- Run `python simple_drive.py` and use button A to start/stop a set.
+- Each set writes `drive_log_*.parquet`; active IMU capture also writes `imu_raw_*.parquet`.
+- Keep multiple 5-10 minute sets with reversals, coupled joints, varied poses, and cold/warm hydraulics.
+- Continuity is defined by `timestamp`; there are no generated sample/stale columns.
 
-2) Sanitize raw logs
-Command:
-python data_collection/nn/sanitize_drive_logs.py --input "data_collection/hydraulic_data/*.csv" --out data_collection/nn/cleaned_logs --dt 0.02 --gap-factor 3.0 --min-segment-sec 5.0
+2) Inspect simple baselines
+```bash
+python data_collection/benchmark_actuator_models.py \
+  --input "data_collection/hydraulic_data/*.parquet"
+```
+The benchmark also accepts legacy CSV logs.
 
-Outputs:
-- cleaned_logs/segments/*.csv
-- cleaned_logs/manifest.csv
-- cleaned_logs/summary.json
+3) Train the Isaac actuator model
+```bash
+python train.py --data /path/to/hydraulic_data --out runs/my_run --device cuda
+```
+The loader resamples each continuous timestamped segment to 100 Hz and splits at gaps or non-finite required signals. Legacy `--csv` and CSV files remain supported.
 
-3) Train actuator model
-Command:
-python data_collection/nn/train_blackbox.py --csv data_collection/nn/cleaned_logs/segments --dt 0.02 --hist-u-sec 1.5 --hist-qdot-sec 0.3 --out data_collection/nn/actuator_model_out
+4) Evaluate before using the model in simulation
+```bash
+python eval.py --model runs/my_run --data "held_out/*.parquet"
+```
+Use free-running trajectory position MAE as the checkpoint-selection metric. Also inspect final position error, velocity error, rest drift, and one-step loss/R2 as diagnostics.
 
-Optional: quick dataset QA report
-Command:
-python data_collection/nn/check_dataset.py --input "data_collection/hydraulic_data/*.csv" --dt 0.02 --out-json data_collection/nn/dataset_report_raw.json
-
-Or on cleaned data:
-python data_collection/nn/check_dataset.py --input "data_collection/nn/cleaned_logs/segments/*.csv" --dt 0.02 --out-json data_collection/nn/dataset_report_cleaned.json
-
-Notes:
-- Try hist-u-sec = 2.0 as an ablation for slower valves.
-- Keep include_pressures on only if pressure_stale stays low and pressure channels are trustworthy.
-- The training inputs now use `combined_cmd_lift/tilt/scoop` and `joint_pos/joint_vel` for `boom/arm/bucket` from `drive_logger.py`.
-
-4) Evaluate before RL
-- Check train_history.csv trend (watch for overfit/divergence).
-- Run short open-loop rollouts (2-5 s) on held-out segments.
-- If rollout drifts badly, increase data variation first (do not tune endlessly on one dataset).
-
-Data quality targets (practical)
-- Minimize long timestamp gaps (sanitizer can split, but fewer is better).
-- Collect enough active command time (avoid mostly-idle sessions).
-- Include coupled motions (2-3 joints active together) and direction reversals.
-- Capture both cold and warm hydraulic behavior over session time.
-
-Suggested update path
-- Phase A (now): robust Stage 1 PoC model at 50 Hz with 1.5-2.0 s command history.
-- Phase B: add automated excitation routines for systematic coverage.
-- Phase C: install RPM/oil temp sensors and include these channels in training.
-- Phase D: retrain with richer data and then proceed to RL policy training.
-
-Quick troubleshooting
-- "No usable segments produced": lower --min-segment-sec or inspect raw logs for NaNs/gaps.
-- Very high validation error: check command/activity coverage and stale signal ratios.
-- Good one-step loss but poor rollout: increase history horizon and improve data diversity.
+Practical data-quality targets
+- Minimize timestamp gaps and invalid joint velocities.
+- Collect enough active command time in both directions.
+- Include simultaneous two/three-joint motion and direction reversals.
+- Keep whole held-out driving sessions for the final generalization report.
+- Good one-step loss with poor rollout means the autoregressive model is not stable enough.

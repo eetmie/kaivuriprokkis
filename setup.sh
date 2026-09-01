@@ -98,6 +98,7 @@ pip3 install --break-system-packages --quiet \
     numpy \
     scipy \
     pandas \
+    pyarrow \
     numba \
     pyyaml \
     pyserial \
@@ -108,7 +109,7 @@ pip3 install --break-system-packages --quiet \
     2>/dev/null
 
 echo "  OK: Python packages installed"
-echo "      numpy, scipy, pandas, numba, pyyaml, pyserial, smbus2"
+echo "      numpy, scipy, pandas, pyarrow, numba, pyyaml, pyserial, smbus2"
 echo "      adafruit-blinka, ssd1306"
 
 # --- OLED systemd service ---

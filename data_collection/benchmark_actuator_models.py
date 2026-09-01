@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline benchmark for simple excavator actuator models.
 
-This script reads logs from ``data_collection/drive_logger.py`` and compares a
+This script reads logs from ``simple_drive.py`` and compares a
 small set of predictive models for the three hydraulic arm axes
 ``[boom, arm, bucket]``.
 
@@ -24,6 +24,7 @@ joint-angle rollout metric on held-out data.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,30 +43,46 @@ VEL_COLS = ["joint_vel_boom", "joint_vel_arm", "joint_vel_bucket"]
 PEXT_COLS = ["pext_lift", "pext_tilt", "pext_scoop"]
 PRET_COLS = ["pret_lift", "pret_tilt", "pret_scoop"]
 JOINT_NAMES = ["boom", "arm", "bucket"]
+DATA_SUFFIXES = {".parquet", ".pq", ".csv"}
 
 LEGACY_CMD_COLS = ["valve_cmd_0", "valve_cmd_1", "valve_cmd_2"]
 LEGACY_POS_COLS = ["joint_pos_0", "joint_pos_1", "joint_pos_2"]
 LEGACY_VEL_COLS = ["joint_vel_0", "joint_vel_1", "joint_vel_2"]
 
 
+def _is_drive_log(path: Path) -> bool:
+    return (
+        path.suffix.lower() in DATA_SUFFIXES
+        and not path.name.startswith("imu_raw_")
+    )
+
+
 def _resolve_inputs(inputs: Iterable[str]) -> List[Path]:
+    """Resolve Parquet logs and legacy CSVs from files, directories, or globs."""
     files: List[Path] = []
     for item in inputs:
-        p = Path(item)
-        if p.is_file() and p.suffix.lower() == ".csv":
-            files.append(p.resolve())
-        elif p.is_dir():
-            files.extend(sorted(x.resolve() for x in p.glob("*.csv")))
+        path = Path(item)
+        if path.is_file() and _is_drive_log(path):
+            files.append(path.resolve())
+        elif path.is_dir():
+            files.extend(
+                child.resolve() for child in sorted(path.iterdir())
+                if child.is_file() and _is_drive_log(child)
+            )
         else:
-            files.extend(sorted(x.resolve() for x in Path().glob(item)))
+            files.extend(
+                Path(match).resolve() for match in sorted(glob.glob(item))
+                if Path(match).is_file() and _is_drive_log(Path(match))
+            )
 
-    seen = set()
-    unique: List[Path] = []
-    for p in files:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return unique
+    return list(dict.fromkeys(files))
+
+
+def _read_frame(path: Path) -> pd.DataFrame:
+    """Read one supported drive-log format. New recordings are Parquet."""
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
 
 
 def _has_all(df: pd.DataFrame, cols: list[str]) -> bool:
@@ -73,11 +90,11 @@ def _has_all(df: pd.DataFrame, cols: list[str]) -> bool:
 
 
 def _normalize_drive_log_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize supported log schemas to the current drive_logger layout.
+    """Normalize supported log schemas to the current drive-log layout.
 
-    The primary target is ``data_collection/drive_logger.py``. A compact legacy
-    three-joint logger schema is also accepted so the benchmark can be exercised
-    on old sample files already present in the repo.
+    The primary target is the Parquet schema written by ``simple_drive.py``.
+    A compact legacy three-joint logger schema is also accepted so the benchmark
+    can still exercise old sample files.
     """
 
     df = df.copy()
@@ -114,7 +131,7 @@ def _normalize_drive_log_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     required = CMD_COLS + POS_COLS + VEL_COLS
     raise ValueError(
-        "Unsupported CSV schema. Expected drive_logger columns "
+        "Unsupported drive-log schema. Expected current columns "
         f"{required} or legacy columns {LEGACY_CMD_COLS + LEGACY_POS_COLS + LEGACY_VEL_COLS}."
     )
 
@@ -132,8 +149,12 @@ def _split_into_segments(df: pd.DataFrame, *, expected_dt: float, gap_factor: fl
     t = pd.to_numeric(df[TIME_COL], errors="coerce").to_numpy(np.float64)
     gaps = np.diff(t)
     split_idx = np.where((gaps <= 0.0) | (gaps > gap_factor * expected_dt))[0] + 1
-    chunks = np.split(df, split_idx)
-    return [c.copy() for c in chunks if len(c) >= 2]
+    bounds = [0, *split_idx.tolist(), len(df)]
+    return [
+        df.iloc[start:stop].copy()
+        for start, stop in zip(bounds[:-1], bounds[1:])
+        if stop - start >= 2
+    ]
 
 
 def _sanitize_segment(seg: pd.DataFrame, *, min_rows: int) -> Optional[pd.DataFrame]:
@@ -648,8 +669,8 @@ def _results_to_score_rows(results: list[BenchmarkResult]) -> list[dict[str, Any
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark simple excavator actuator models on drive logs")
-    parser.add_argument("--input", nargs="+", required=True, help="Training CSV file(s), directory, or glob pattern(s)")
-    parser.add_argument("--test-input", nargs="*", default=None, help="Optional held-out benchmark CSVs; if omitted, uses an internal split")
+    parser.add_argument("--input", nargs="+", required=True, help="Training Parquet or legacy CSV file(s), directory, or glob pattern(s)")
+    parser.add_argument("--test-input", nargs="*", default=None, help="Optional held-out Parquet or legacy CSV logs; if omitted, uses an internal split")
     parser.add_argument("--out", default="data_collection/model_benchmarks", help="Output directory")
     parser.add_argument("--dt", type=float, default=0.01, help="Expected sample period for gap splitting")
     parser.add_argument("--gap-factor", type=float, default=3.0, help="Split when timestamp gap exceeds dt*gap_factor")
@@ -661,7 +682,7 @@ def main() -> None:
 
     train_files = _resolve_inputs(args.input)
     if not train_files:
-        raise FileNotFoundError("No input CSV files found")
+        raise FileNotFoundError("No supported input logs found")
 
     test_files = _resolve_inputs(args.test_input or [])
     out_dir = Path(args.out)
@@ -672,7 +693,7 @@ def main() -> None:
     def load_segments(files: list[Path]) -> list[pd.DataFrame]:
         segments: list[pd.DataFrame] = []
         for file_path in files:
-            df = pd.read_csv(file_path)
+            df = _read_frame(file_path)
             df = _normalize_drive_log_schema(df)
             df["_source_file"] = str(file_path)
             raw_segments = _split_into_segments(df, expected_dt=float(args.dt), gap_factor=float(args.gap_factor))

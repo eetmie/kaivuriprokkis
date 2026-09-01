@@ -73,6 +73,7 @@ sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install \
     scipy \
     numba \
     pandas \
+    pyarrow \
     pyyaml \
     pyserial \
     smbus2 \
@@ -80,11 +81,11 @@ sudo -u "$USERNAME" "$VENV_DIR/bin/python" -m pip install \
 echo "  OK: Python packages installed into ${VENV_DIR}"
 echo "  NOTE: Skipped Raspberry Pi OLED/display packages."
 # inputs is pure Python and tiny; it backs modules/gamepad.py (XboxController).
-# It reads /dev/input/event* directly, so the user also needs the 'input' group
-# granted in step [3/5] -- without it, get_gamepad() raises PermissionError.
-# pandas is NOT analysis-only on this robot: simple_drive.py --record buffers
-# samples in memory and writes the CSV via pandas in DataLogger.save(). Without
-# it, stopping a recording raises ModuleNotFoundError and the segment is lost.
+# It reads /dev/input/event* directly, so the user also needs the input group
+# granted in step [3/5]; otherwise get_gamepad() raises PermissionError.
+# pandas and pyarrow are runtime dependencies: simple_drive.py buffers samples
+# in memory and writes Snappy-compressed Parquet when a recording stops. Without
+# them, stopping a recording raises ModuleNotFoundError and the segment is lost.
 
 echo ""
 echo "[3/5] Granting device group access..."

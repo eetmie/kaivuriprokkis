@@ -259,7 +259,7 @@ def main():
 
         # ---- Logger + Sine ----
         # Samples are held in memory and never written: this measures the cost
-        # of log_sample(), not of the CSV flush.
+        # of log_sample(), not of the Parquet encode at recording stop.
         data_logger = DataLogger(RESULTS_DIR)
         sine_gen = SineExcitationGenerator()
         if args.with_sine:
@@ -357,7 +357,6 @@ def main():
             data_logger.log_sample(
                 zero_cmds, sine_cmds, combined,
                 controller, hardware,
-                cmd_age_s=0.0, cmd_stale=False,
                 sine_enabled=sine_gen.enabled,
                 sine_target=sine_gen.target_name,
                 sine_seed=sine_gen.seed,

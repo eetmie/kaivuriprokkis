@@ -83,8 +83,8 @@ lightweight project `.venv`, and adds the user to device groups such as
 profile uses only the main header I2C bus for the PCA9685, mapped as Linux bus
 7, plus USB serial for IMU reading. The Raspberry Pi virtual I2C channels, OLED
 service, and OLED/display Python packages are not part of the Jetson setup.
-`pandas` is installed: it is a runtime dependency, not analysis-only, because
-`simple_drive.py --record` writes drive logs through it.
+`pandas` and `pyarrow` are runtime dependencies because `simple_drive.py` writes
+Snappy-compressed Parquet drive and raw-IMU logs when a recording stops.
 
 Jetson bus 7 (default i2c bus) has not yet been tested at 1 MHz on the Orin
 Nano Super, and it needs a Jetson-specific device-tree or kernel configuration

@@ -116,7 +116,8 @@ class SetpointSchedule:
 
     def set_chunk(self, chunk, fps: float,
                   t_now: Optional[float] = None,
-                  joint_names: Optional[Sequence[str]] = None) -> None:
+                  joint_names: Optional[Sequence[str]] = None,
+                  t0: Optional[float] = None) -> None:
         """Play ``chunk`` as a trajectory at its own nominal ``fps``.
 
         Args:
@@ -125,6 +126,17 @@ class SetpointSchedule:
                 action rate, not the control thread's rate.
             t_now: Playback start time (monotonic clock).
             joint_names: Column names; defaults to this schedule's names.
+            t0: Monotonic time that chunk index 0 corresponds to. Defaults to
+                ``t_now``, i.e. index 0 plays the instant the chunk arrives.
+                Pass the OBSERVATION time to compensate inference latency: the
+                chunk was planned for the world as it looked then, so by
+                hand-over its first ``infer_s * fps`` steps are already in the
+                past and playing them walks the machine through stale commands.
+                With t0 = t_obs the schedule simply starts at the step whose
+                timestamp is now, and self-corrects as inference time varies.
+                The cross-fade is still armed at ``t_now``: the blend softens
+                the seam at the moment of hand-over, which is a real event,
+                whereas t0 only re-times the trajectory.
         """
         values = np.asarray(chunk, dtype=np.float32)
         if values.ndim != 2:
@@ -141,8 +153,9 @@ class SetpointSchedule:
 
         values = np.clip(values, -1.0, 1.0)
         t_now = time.monotonic() if t_now is None else float(t_now)
+        chunk_t0 = t_now if t0 is None else float(t0)
         with self._lock:
-            self._chunk = _Chunk(values=values, names=names, fps=float(fps), t0=t_now)
+            self._chunk = _Chunk(values=values, names=names, fps=float(fps), t0=chunk_t0)
             self._point = None
             self._arm_blend(t_now)
 

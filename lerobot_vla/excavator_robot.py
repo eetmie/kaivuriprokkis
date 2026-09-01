@@ -293,12 +293,17 @@ class MasiExcavator:
             self.direct.send_pending()
         return a
 
-    def send_action_chunk(self, chunk: np.ndarray, fps: float) -> np.ndarray:
+    def send_action_chunk(self, chunk: np.ndarray, fps: float,
+                          t0: float | None = None) -> np.ndarray:
         """Hand a policy action chunk over as a trajectory to play at ``fps``.
 
         The control thread indexes into the chunk by elapsed time and
         interpolates between steps, so an N-step plan authored at ``fps`` drives
         the valves at the full loop rate. Returns the clipped chunk.
+
+        ``t0`` is the monotonic time chunk index 0 corresponds to; it defaults
+        to the moment of hand-over. Pass the observation time to compensate
+        inference latency -- see SetpointSchedule.set_chunk.
 
         Requires the control-thread path; with ``use_control_thread=False``
         there is no scheduler to play it.
@@ -313,7 +318,7 @@ class MasiExcavator:
                 f"chunk must be (N, {len(_CONTROL_CHANNELS)}), got {c.shape}")
         if not self.enable_slew:
             c[:, 0] = 0.0
-        self.controller.give_direct_chunk(c, fps, joint_names=_CONTROL_CHANNELS)
+        self.controller.give_direct_chunk(c, fps, joint_names=_CONTROL_CHANNELS, t0=t0)
         return c
 
     def _clip(self, action: np.ndarray) -> np.ndarray:

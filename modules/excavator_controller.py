@@ -1384,7 +1384,8 @@ class ExcavatorController:
         self._outputs_zeroed = False
 
     def give_direct_chunk(self, chunk, fps: float,
-                          joint_names: Optional[Sequence[str]] = None) -> None:
+                          joint_names: Optional[Sequence[str]] = None,
+                          t0: Optional[float] = None) -> None:
         """Hand over an action chunk to play as a trajectory.
 
         The chunk is a trajectory authored at ``fps`` (the policy's action
@@ -1396,8 +1397,11 @@ class ExcavatorController:
             chunk: (N, J) normalized valve commands in [-1, 1].
             fps: Rate the chunk's steps were authored at.
             joint_names: Column names; defaults to the mode's channel order.
+            t0: Monotonic time chunk index 0 corresponds to; defaults to now.
+                See SetpointSchedule.set_chunk -- pass the observation time to
+                compensate inference latency.
         """
-        self._direct_schedule.set_chunk(chunk, fps, joint_names=joint_names)
+        self._direct_schedule.set_chunk(chunk, fps, joint_names=joint_names, t0=t0)
         self._outputs_zeroed = False
 
     def get_direct_status(self) -> dict:

@@ -631,6 +631,20 @@ def main() -> int:
     p.add_argument("--blend-s", type=float, default=0.0,
                    help="Cross-fade into each new chunk, to soften the step at "
                         "a chunk boundary (0 = apply immediately)")
+    p.add_argument("--lag-compensation", default="off", metavar="off|auto|SECONDS",
+                   help="Skip the part of each chunk that is already in the past "
+                        "by the time it is handed over. The chunk is planned for "
+                        "the world as it looked at the OBSERVATION, but playback "
+                        "starts at hand-over, one inference later -- so index 0 is "
+                        "executed ~infer_s late and the machine follows commands "
+                        "meant for a frame it has already left behind. "
+                        "'auto' (recommended) times the chunk from the observation, "
+                        "so playback starts at the step whose timestamp is now and "
+                        "self-corrects as inference time varies; a float forces a "
+                        "fixed compensation in seconds; 'off' (default) is the "
+                        "historical behaviour. NOTE this consumes the chunk from "
+                        "both ends -- it needs chunk_size >= 2 * infer_s * fps "
+                        "before any reserve is left for a late replan")
     p.add_argument("--legacy-direct-write", action="store_true",
                    help="Drive valves from this thread instead of the control "
                         "thread (bench A/B only — has the 30 Hz rate problems)")
@@ -862,6 +876,26 @@ def main() -> int:
     # time; the first cycle sets it from its own measurement. Not seeded from
     # the warmup — that one includes the TRT engine build.
     infer_lead_s = 0.0
+    # --lag-compensation, resolved once: None = off, "auto" = time the chunk from
+    # the observation, float = force that many seconds. Validated here rather than
+    # in the loop so a typo fails before the machine is armed.
+    _lag_raw = str(args.lag_compensation).strip().lower()
+    if _lag_raw in ("off", "none", "0", "false"):
+        lag_mode = None
+    elif _lag_raw == "auto":
+        lag_mode = "auto"
+    else:
+        try:
+            lag_mode = float(_lag_raw)
+        except ValueError:
+            raise SystemExit(
+                f"--lag-compensation wants 'off', 'auto' or seconds, got {args.lag_compensation!r}")
+        if lag_mode < 0:
+            raise SystemExit("--lag-compensation seconds must be >= 0")
+    if lag_mode is not None:
+        LOG.info("lag compensation: %s -- playback starts at the chunk step whose "
+                 "timestamp is now, not at index 0",
+                 "auto (measured per cycle)" if lag_mode == "auto" else f"{lag_mode:.3f}s fixed")
     chunk_t0 = 0.0          # set on every hand-over; only read once cycle > 0
     # When a chunk stopped playing mid-play -- teleop took the machine over, or
     # the operator switched task. `played` counts up to this instead of to the
@@ -870,6 +904,9 @@ def main() -> int:
     try:
         while True:
             img, state = get_observation()
+            # Monotonic clock on purpose: SetpointSchedule times chunks with
+            # time.monotonic(), and perf_counter has a different epoch.
+            t_obs = time.monotonic()
             t0 = time.perf_counter()
             chunk = policy.sample_actions(img, tasks[task_index], for_policy(state))
             infer_s = time.perf_counter() - t0
@@ -880,8 +917,19 @@ def main() -> int:
             # of the chunk that has not played when the next one lands is the
             # late-inference fallback: a slow replan keeps following the
             # predicted plan instead of falling into hold->decay.
+            # With compensation the chunk is timestamped from the observation, so
+            # the scheduler starts at the step that is due now instead of replaying
+            # the ~infer_s of plan that expired while we were computing it.
+            if lag_mode is None:
+                play_t0 = None
+            elif lag_mode == "auto":
+                play_t0 = t_obs
+            else:
+                play_t0 = time.monotonic() - lag_mode
+            skipped = 0.0 if play_t0 is None else max(
+                0.0, (time.monotonic() - play_t0) * args.fps)
             if robot is not None and args.live:
-                robot.send_action_chunk(chunk, fps=args.fps)
+                robot.send_action_chunk(chunk, fps=args.fps, t0=play_t0)
             now = time.perf_counter()
             # Steps of the PREVIOUS chunk that actually played before this one
             # replaced it -- measured, not assumed. This is the real execution
@@ -892,10 +940,11 @@ def main() -> int:
             chunk_t0 = now
             chunk_cut = None
 
-            LOG.info("cycle=%d%s infer=%.0fms played=%s state%s=[%s] a0=[%s]%s",
+            LOG.info("cycle=%d%s infer=%.0fms%s played=%s state%s=[%s] a0=[%s]%s",
                      cycle,
                      f" task={task_index}" if len(tasks) > 1 else "",
                      infer_s * 1000.0,
+                     "" if lag_mode is None else f" skip={skipped:.1f}",
                      played if played is not None else "-",
                      "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),

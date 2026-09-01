@@ -683,6 +683,26 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"--state-joints {unknown} not in {JOINT_NAMES}")
 
+    # --lag-compensation resolves to None (off), "auto", or a float of seconds.
+    # Done here, with the other fail-fast checks, so a typo costs a second rather
+    # than surfacing after a multi-minute TRT build with the machine armed.
+    _lag = str(args.lag_compensation).strip().lower()
+    if _lag in ("off", "none", "false"):
+        args.lag_comp = None
+    elif _lag == "auto":
+        args.lag_comp = "auto"
+    else:
+        try:
+            args.lag_comp = float(_lag)
+        except ValueError:
+            raise SystemExit("--lag-compensation wants 'off', 'auto' or seconds, "
+                             f"got {args.lag_compensation!r}")
+        if args.lag_comp < 0:
+            raise SystemExit("--lag-compensation seconds must be >= 0, got "
+                             f"{args.lag_comp}")
+        if args.lag_comp == 0:
+            args.lag_comp = None
+
     # Everything below resolves BEFORE any engine is built, so a wrong rate, task
     # or camera fails in a second rather than after a multi-minute TRT build.
     # The two architectures record the same facts in different files: SmolVLA in
@@ -876,22 +896,7 @@ def main() -> int:
     # time; the first cycle sets it from its own measurement. Not seeded from
     # the warmup — that one includes the TRT engine build.
     infer_lead_s = 0.0
-    # --lag-compensation, resolved once: None = off, "auto" = time the chunk from
-    # the observation, float = force that many seconds. Validated here rather than
-    # in the loop so a typo fails before the machine is armed.
-    _lag_raw = str(args.lag_compensation).strip().lower()
-    if _lag_raw in ("off", "none", "0", "false"):
-        lag_mode = None
-    elif _lag_raw == "auto":
-        lag_mode = "auto"
-    else:
-        try:
-            lag_mode = float(_lag_raw)
-        except ValueError:
-            raise SystemExit(
-                f"--lag-compensation wants 'off', 'auto' or seconds, got {args.lag_compensation!r}")
-        if lag_mode < 0:
-            raise SystemExit("--lag-compensation seconds must be >= 0")
+    lag_mode = args.lag_comp          # resolved and validated in parse_args
     if lag_mode is not None:
         LOG.info("lag compensation: %s -- playback starts at the chunk step whose "
                  "timestamp is now, not at index 0",

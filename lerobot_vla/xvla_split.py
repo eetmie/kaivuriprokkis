@@ -3,7 +3,7 @@
     IR cam1 + joint angles + task -> X-VLA-0.9B (12 split ONNX/TRT engines) -> valves
 
 The runtime itself is vendored under `vendor/xvla_split_ort.py` (from
-spark-projects/xvla-spark-finetune). This module is only the excavator side of
+spark-projects/vla-onnx/xvla). This module is only the excavator side of
 it: the call-shape bridge, the bundle resolution `run_inference` expects, and the
 gate that stops a base checkpoint from ever reaching a valve.
 
@@ -92,7 +92,7 @@ def load_bundle(split_dir: str | Path) -> dict:
     if not (split_dir / "bundle.json").is_file():
         raise SystemExit(
             f"{split_dir} has no bundle.json, so it is not an X-VLA export.\n"
-            f"Export one with xvla-spark-finetune/export_split_onnx.py.")
+            f"Export one with vla-onnx/xvla/export_split_onnx.py.")
     try:
         return verify_bundle(split_dir, verify_manifest=False)
     except ValueError as exc:
@@ -331,7 +331,7 @@ class XVLAExcavatorPolicy:
                    f"{self.bundle.get('max_state_dim', 20)} action columns are arm "
                    f"end-effector dimensions, not valve commands.")
             fix = ("Fine-tune it on excavator data first "
-                   "(spark-projects/xvla-spark-finetune), then re-export.")
+                   "(spark-projects/vla-onnx/xvla), then re-export.")
         else:
             why = ("Its processor contract is incomplete "
                    "(`physical_boundary_complete: false`): the checkpoint did not "

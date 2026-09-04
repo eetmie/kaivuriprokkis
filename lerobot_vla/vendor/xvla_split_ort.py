@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# VENDORED from spark-projects/xvla-spark-finetune/split_ort.py
+# VENDORED from spark-projects/vla-onnx/xvla/split_ort.py
 # source SHA256 249e4744a0c9062e04a16ccfd50e96ebc921ab1a3969f076e0ff3ca7d45fd638
 #
 # The X-VLA split-engine runtime: twelve exported graphs through ONNX Runtime

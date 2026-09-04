@@ -33,7 +33,7 @@ cd ~/kaivuriprokkis
                            # onnxruntime-gpu 1.24 (TRT+CUDA EPs), transformers
 ```
 
-`lerobot==0.5.1` matches `spark-projects/smolvla-spark-finetune`, so datasets
+`lerobot==0.5.1` matches `spark-projects/vla-onnx/smolvla`, so datasets
 recorded here load directly in `lerobot-train` on the Spark. Videos are
 encoded **h264** (not the AV1 default) — the Spark side needed an H.264
 transcode to read AV1 reliably.
@@ -407,7 +407,7 @@ sensor noise away and reconstructs as its I-frame. That looks exactly like a
 
 The monolithic SmolVLA ONNX cannot TRT-build on 8 GB; the deploy path is the
 9-graph split with the flow-matching denoise loop in Python
-(`smolvla_split.py`; see `spark-projects/smolvla-spark-finetune/notes/orin-split-findings.md`).
+(`smolvla_split.py`; see `spark-projects/vla-onnx/smolvla/notes/orin-split-findings.md`).
 
 A finetuned bundle ships its own `export_info.json`, `stats.json` and
 `tokenizer/`, so `--split-dir` is (almost) the whole command — see
@@ -657,7 +657,7 @@ anyway with `--allow-base-bundle` marks the run model-only — `--live` is then
 refused outright. For model-only diagnostics of base weights:
 
 ```bash
-XV=~/spark-projects/xvla-spark-finetune
+XV=~/spark-projects/vla-onnx/xvla
 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
     --split-dir $XV/exports/split_fp16 --allow-base-bundle \
     --tokenizer $XV/models/tokenizer \
@@ -675,7 +675,7 @@ is again (almost) the whole command.
 
 Beyond the graphs and `MANIFEST.sha256`, the export has to record two things that
 are **not recoverable from the weights**, both now written by
-`xvla-spark-finetune/export_split_onnx.py`:
+`vla-onnx/xvla/export_split_onnx.py`:
 
 | exporter flag | why the robot side refuses without it |
 |---|---|
@@ -689,13 +689,13 @@ refuses rather than assuming one.
 The rate also decides whether ~400 ms is comfortable. A 30-action chunk is 3.0 s
 of motion at 10 fps (13% duty) but 1.0 s at 30 fps (40% duty) — workable, with
 less slack than SmolVLA's chunk gives. Training at `chunk_size=50` (what
-`xvla-spark-finetune` uses) lengthens the denoise sequence from 262 to 282 tokens
+`vla-onnx/xvla` uses) lengthens the denoise sequence from 262 to 282 tokens
 through all 24 blocks, ten times, with no KV cache possible — so **re-measure the
 latency after the fine-tune**; the 395 ms above is a chunk-30 number.
 
 ### Before live deployment
 
-- **Parity** (`xvla-spark-finetune/parity.py`) must pass on the fine-tuned export before
+- **Parity** (`vla-onnx/xvla/parity.py`) must pass on the fine-tuned export before
   anything drives a valve. It runs in two processes because the PyTorch reference
   and the engines do not fit in memory together.
 - **A multi-camera checkpoint has no deploy path** on either architecture; the

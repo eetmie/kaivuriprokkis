@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# VENDORED from spark-projects/xvla-spark-finetune/bundle_contract.py
+# VENDORED from spark-projects/vla-onnx/xvla/bundle_contract.py
 # source SHA256 407ff95c940e2b98f296b9b4c5d0a871c492711b67e4e23b899415685eb830f9
 #
 # The X-VLA bundle identity + physical-boundary contract: what a deployable

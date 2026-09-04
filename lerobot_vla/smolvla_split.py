@@ -1,6 +1,6 @@
 """SmolVLA split-engine inference — ONNX Runtime + TensorRT EP, numpy only.
 
-Runs the 9-graph split export produced by spark-projects/smolvla-spark-finetune/
+Runs the 9-graph split export produced by spark-projects/vla-onnx/smolvla/
 export_split_onnx.py, with the flow-matching denoise loop in Python:
 
     vision (x per camera) + text + state_proj  ->  prefix embeddings [1,177,960]

@@ -3,7 +3,7 @@
     IR cam1 + joint angles + task -> X-VLA-0.9B (12 split ONNX/TRT engines) -> valves
 
 The runtime itself is vendored under `vendor/xvla_split_ort.py` (from
-spark-projects/orin-nano/xvla-runtime). This module is only the excavator side of
+spark-projects/xvla-spark-finetune). This module is only the excavator side of
 it: the call-shape bridge, the bundle resolution `run_inference` expects, and the
 gate that stops a base checkpoint from ever reaching a valve.
 
@@ -92,7 +92,7 @@ def load_bundle(split_dir: str | Path) -> dict:
     if not (split_dir / "bundle.json").is_file():
         raise SystemExit(
             f"{split_dir} has no bundle.json, so it is not an X-VLA export.\n"
-            f"Export one with xvla-runtime/tools/export_split_onnx.py.")
+            f"Export one with xvla-spark-finetune/export_split_onnx.py.")
     try:
         return verify_bundle(split_dir, verify_manifest=False)
     except ValueError as exc:
@@ -284,7 +284,7 @@ class XVLAExcavatorPolicy:
                 f"No tokenizer at {tokenizer_dir}.\n"
                 f"A fine-tuned bundle ships its own under <split-dir>/tokenizer; this "
                 f"one does not, so pass --tokenizer <dir> (the X-VLA base tokenizer "
-                f"lives in xvla-runtime/models/tokenizer).")
+                f"lives in the bundle's tokenizer/ dir).")
 
         self.policy = XVLASplitPolicy(
             split_dir,

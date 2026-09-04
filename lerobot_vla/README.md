@@ -28,7 +28,7 @@ One venv for everything here, created with `--system-site-packages` so it sees
 the system `pyrealsense2` and JetPack `tensorrt`:
 
 ```bash
-cd ~/GitHub/kaivuriprokkis
+cd ~/kaivuriprokkis
 .venv-lerobot/bin/python   # lerobot 0.5.1 (same pin as the Spark), torch-cpu,
                            # onnxruntime-gpu 1.24 (TRT+CUDA EPs), transformers
 ```
@@ -407,7 +407,7 @@ sensor noise away and reconstructs as its I-frame. That looks exactly like a
 
 The monolithic SmolVLA ONNX cannot TRT-build on 8 GB; the deploy path is the
 9-graph split with the flow-matching denoise loop in Python
-(`smolvla_split.py`; see `spark-projects/orin-nano/smolvla-runtime/notes/findings.md`).
+(`smolvla_split.py`; see `spark-projects/smolvla-spark-finetune/notes/orin-split-findings.md`).
 
 A finetuned bundle ships its own `export_info.json`, `stats.json` and
 `tokenizer/`, so `--split-dir` is (almost) the whole command — see
@@ -657,7 +657,7 @@ anyway with `--allow-base-bundle` marks the run model-only — `--live` is then
 refused outright. For model-only diagnostics of base weights:
 
 ```bash
-XV=~/GitHub/spark-projects/orin-nano/xvla-runtime
+XV=~/spark-projects/xvla-spark-finetune
 .venv-lerobot/bin/python -m lerobot_vla.run_inference \
     --split-dir $XV/exports/split_fp16 --allow-base-bundle \
     --tokenizer $XV/models/tokenizer \
@@ -675,7 +675,7 @@ is again (almost) the whole command.
 
 Beyond the graphs and `MANIFEST.sha256`, the export has to record two things that
 are **not recoverable from the weights**, both now written by
-`xvla-runtime/tools/export_split_onnx.py`:
+`xvla-spark-finetune/export_split_onnx.py`:
 
 | exporter flag | why the robot side refuses without it |
 |---|---|
@@ -695,7 +695,7 @@ latency after the fine-tune**; the 395 ms above is a chunk-30 number.
 
 ### Before live deployment
 
-- **Parity** (`xvla-runtime/parity.py`) must pass on the fine-tuned export before
+- **Parity** (`xvla-spark-finetune/parity.py`) must pass on the fine-tuned export before
   anything drives a valve. It runs in two processes because the PyTorch reference
   and the engines do not fit in memory together.
 - **A multi-camera checkpoint has no deploy path** on either architecture; the

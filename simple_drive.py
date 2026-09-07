@@ -46,7 +46,16 @@ that produced it, in the firmware's own units (dps and g, which is what Fusion
 takes). That makes it replayable: re-run the AHRS offline at a different gain
 and compare against the firmware quaternion, or check peak magnitudes against
 the gyro_range_dps / accel_range_g columns to see whether a range is clipping.
-Join the two files on the device timestamp (imu_device_ts_us / device_ts_us).
+
+Both files carry the Pico's own clock, so they join on it. The drive log has two
+such columns, because a row is built from two separate reads: state_imu_ts_us is
+the IMU frame the logged *pose* was computed from, imu_device_ts_us the frame
+its gyro/accel columns came from. They usually agree; when the loop straddles a
+stream update they will not, and the row says so rather than implying a
+coherence it does not have. Alongside them, state_age_s and vel_age_s record how
+stale each reading was when the row was written -- the control thread publishes
+into a latest-value cache that this loop samples at its own rate, so without
+them a repeated sample and a fresh one look identical afterwards.
 """
 
 from __future__ import annotations
@@ -82,6 +91,29 @@ LOG_OUTPUT_DIR = Path(__file__).parent / "data_collection" / "hydraulic_data"
 JOINT_NAMES       = ['slew', 'boom', 'arm', 'bucket']
 G_TO_MS2          = 9.80665   # firmware reports accel in g; the dataset is SI
 CONTROL_JOINT_NAMES = ['slew', 'lift', 'arm', 'bucket']
+
+# ── log schema ───────────────────────────────────────────────────────────────
+#
+# The CSV names command channels hydraulically (rotate/lift/tilt/scoop) while the
+# controller speaks joint names (slew/boom/arm/bucket). This is the one place
+# that mapping is written down: the recorder builds every command column from it
+# rather than repeating a positional index per column.
+COMMAND_CHANNELS = (
+    ('slew',   'rotate'),
+    ('boom',   'lift'),
+    ('arm',    'tilt'),
+    ('bucket', 'scoop'),
+)
+
+# Joints whose finite-difference velocity is logged. Slew has none: its angle is
+# an absolute world yaw with no zeroing anywhere in the stack, so it is not
+# comparable across sessions and the model does not use it.
+VELOCITY_JOINTS = ('boom', 'arm', 'bucket')
+
+# IMU roles whose gyro/accel vectors go into the drive log, in stream order. The
+# base/cabin sensor is not a joint, so it has no pos/vel counterpart -- it is
+# recorded because it is the only sensor that observes slew and machine tilt.
+IMU_VECTOR_ROLES = ('boom', 'arm', 'bucket', 'base')
 
 # Where the sine excitation is routed, stepped with the D-pad. Named in
 # hydraulic terms (lift/tilt/scoop) to match the logged command channels, not
@@ -400,11 +432,18 @@ class DataLogger:
       joint_pos  radians          (controller API returns degrees)
       joint_vel  rad/s            (controller API returns deg/s)
       imu_g*     rad/s            (hardware API returns deg/s)
+      imu_a*     m/s^2            (firmware reports g)
       *_cmd_*    normalized [-1, 1]
+      *_age_s    seconds          how stale that reading was when the row was written
+      *_ts_us    microseconds     Pico device clock, -1 when never reported
 
     Command channels use hydraulic names (rotate/lift/tilt/scoop), not joint
     names (slew/boom/arm/bucket), because that is what the training and
-    benchmark scripts read.
+    benchmark scripts read. COMMAND_CHANNELS is the mapping.
+
+    The schema lives in one place, :meth:`_build_row`. Samples accumulate as one
+    list per named column, so adding a channel is one line there rather than a
+    matching edit in three.
     """
 
     def __init__(self, output_dir: Path, imu_roles=None, stream_info_fn=None):
@@ -421,33 +460,28 @@ class DataLogger:
     def _clear(self):
         self._t0_wall = None
         self._t0_mono = None
-        self._ts:   list = []
-        self._idx:  list = []
-        self._man:  list = []
-        self._sin:  list = []
-        self._com:  list = []
-        self._pos:  list = []
-        self._vb:   list = []
-        self._va:   list = []
-        self._vbkt: list = []
-        self._gb:   list = []
-        self._ga:   list = []
-        self._gk:   list = []
-        self._ab:   list = []
-        self._aa:   list = []
-        self._ak:   list = []
-        # Base/cabin IMU. Unused by the current training set, but it is the only
-        # sensor that observes slew and machine tilt, so recording it now avoids
-        # a re-collection when that becomes interesting.
-        self._gbase: list = []
-        self._abase: list = []
-        self._stale: list = []
-        self._age:   list = []
-        self._sine_flag:   list = []
-        self._sine_target: list = []
-        self._sine_seed:   list = []
-        self._dev_ts:      list = []
+        # One list per CSV column, keyed by the column's own name. The schema is
+        # therefore written exactly once -- in _build_row -- instead of being
+        # spread over a set of parallel lists here, an append site, and a block
+        # of positional slicing in save().
+        self._cols: dict[str, list] = {}
         self._clear_imu_raw()
+
+    def _append(self, row: dict) -> None:
+        """Fan one sample into the per-column lists.
+
+        Rows are built by a single expression so they always carry the same
+        keys, but this checks rather than trusts: a column that skipped one
+        sample would shift every later value against the timeline, and the CSV
+        would still look well formed.
+        """
+        if not self._cols:
+            self._cols = {name: [] for name in row}
+        elif row.keys() != self._cols.keys():
+            drift = sorted(set(row) ^ set(self._cols))
+            raise RuntimeError(f"log row changed shape mid-recording: {drift}")
+        for name, value in row.items():
+            self._cols[name].append(value)
 
     def start(self):
         self._clear()
@@ -456,127 +490,164 @@ class DataLogger:
         self.is_logging = True
         print(f"\n{'='*60}\n  DATA COLLECTION STARTED\n{'='*60}\n")
 
+    @staticmethod
+    def _imu_vectors(gyro: dict | None) -> dict:
+        """Per-role gyro [rad/s] and accel [m/s^2] columns, NaN where absent.
+
+        The firmware reports dps and g; the dataset is SI throughout. Roles the
+        stream did not supply come back NaN rather than zero -- zero is a real
+        reading, and a missing sensor must not look like a stationary one.
+        """
+        nan3 = (np.nan, np.nan, np.nan)
+        gyros = list(gyro['gyro']) if gyro else []
+        accels = list(gyro.get('accel') or []) if gyro else []
+
+        out: dict[str, float] = {}
+        for i, role in enumerate(IMU_VECTOR_ROLES):
+            if role == 'base':
+                # The base sensor is carried outside the per-joint arrays.
+                g = gyro.get('base_gyro') if gyro else None
+                a = gyro.get('base_accel') if gyro else None
+            else:
+                g = gyros[i] if i < len(gyros) else None
+                a = accels[i] if i < len(accels) else None
+            gx, gy, gz = np.radians(g) if g is not None else nan3
+            ax, ay, az = np.multiply(a, G_TO_MS2) if a is not None else nan3
+            out[f'imu_gx_{role}'] = float(gx)
+            out[f'imu_gy_{role}'] = float(gy)
+            out[f'imu_gz_{role}'] = float(gz)
+            out[f'imu_ax_{role}'] = float(ax)
+            out[f'imu_ay_{role}'] = float(ay)
+            out[f'imu_az_{role}'] = float(az)
+        return out
+
+    def _build_row(self, t: float, manual: dict, sine: dict, combined: dict,
+                   pos_deg, state_ts, state_imu_us,
+                   vels, vel_age: float, gyro: dict | None,
+                   cmd_age_s: float, cmd_stale: bool, sine_enabled: bool,
+                   sine_target: str, sine_seed: int) -> dict:
+        """One CSV row. THE schema -- every column this file writes is named here."""
+        now = time.perf_counter()
+        pos = np.radians(pos_deg)
+        fresh_vel = vels is not None and vel_age < 0.05
+
+        row: dict = {'timestamp': t, 'sample_idx': len(self._cols.get('timestamp', ()))}
+
+        for joint, channel in COMMAND_CHANNELS:
+            row[f'manual_cmd_{channel}'] = float(manual.get(joint, 0.0))
+        for joint, channel in COMMAND_CHANNELS:
+            row[f'sine_cmd_{channel}'] = float(sine.get(joint, 0.0))
+        for joint, channel in COMMAND_CHANNELS:
+            row[f'combined_cmd_{channel}'] = float(combined.get(joint, 0.0))
+
+        for i, joint in enumerate(JOINT_NAMES):
+            row[f'joint_pos_{joint}'] = float(pos[i]) if i < len(pos) else np.nan
+        for joint in VELOCITY_JOINTS:
+            i = JOINT_NAMES.index(joint)
+            row[f'joint_vel_{joint}'] = float(np.radians(vels[i])) if fresh_vel else np.nan
+
+        row.update(self._imu_vectors(gyro))
+
+        row['cmd_stale'] = int(bool(cmd_stale))
+        row['cmd_age_s'] = float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan
+        row['sine_enabled'] = int(bool(sine_enabled))
+
+        # ── capture clocks ───────────────────────────────────────────────────
+        # How stale each reading was when this row was written. The control
+        # thread and the IMU stream both publish into latest-value caches that
+        # this loop samples at its own rate, so without these a repeated sample
+        # and a fresh one are indistinguishable after the fact.
+        row['state_age_s'] = np.nan if state_ts is None else max(0.0, now - float(state_ts))
+        row['vel_age_s'] = float(vel_age) if np.isfinite(vel_age) else np.nan
+        # Pico clocks, joining these rows to the companion imu_raw_*.csv. Two of
+        # them because they come from two reads: the pose was computed from one
+        # IMU frame and the gyro/accel columns above are another, and the loop
+        # can straddle a stream update between the two. -1 means the source has
+        # not reported yet; int64 has no NaN and 0 is a real Pico timestamp.
+        row['state_imu_ts_us'] = -1 if state_imu_us is None else int(state_imu_us)
+        gyro_ts = gyro.get('device_timestamp_us') if gyro else None
+        row['imu_device_ts_us'] = -1 if gyro_ts is None else int(gyro_ts)
+
+        # The sine target is D-pad switchable mid-recording, so it is per-sample
+        # rather than per-file -- rows must be groupable by which channels were
+        # actually driven. Amplitude is not a column: it is drawn per joint, and
+        # the seed reconstructs it along with every other waveform parameter.
+        row['sine_target'] = str(sine_target)
+        row['sine_seed'] = int(sine_seed)
+        return row
+
     def log_sample(self, manual: dict, sine: dict, combined: dict,
-                   controller, hardware, cmd_age_s: float, cmd_stale: bool,
+                   joint_state, hardware, cmd_age_s: float, cmd_stale: bool,
                    sine_enabled: bool,
-                   sine_target: str = "", sine_seed: int = -1):
+                   sine_target: str = "", sine_seed: int = -1,
+                   controller=None):
+        """Record one sample.
+
+        Args:
+            joint_state: The ``(angles_deg, state_ts, imu_us)`` triple the caller
+                already read this tick. Passed in rather than re-read so the
+                logged pose is the same one the rest of the loop saw, and so its
+                clocks describe *that* pose -- they come out of one lock
+                acquisition inside the controller for exactly that reason.
+            hardware: Source of the best-effort gyro/accel read.
+            controller: Only for the velocity read, which carries its own age.
+        """
         if not self.is_logging:
             return
 
         t = time.perf_counter() - self._t0_mono
-
-        # Controller/hardware APIs speak degrees; the dataset is radians.
-        angles_deg, _, _ = controller.get_joint_angles()
-        pos = np.radians(angles_deg)
-        vels, vel_age = controller.get_joint_velocities_with_age()
-        if vels is not None and vel_age < 0.05:
-            vb, va, vbkt = (float(np.radians(vels[1])),
-                            float(np.radians(vels[2])),
-                            float(np.radians(vels[3])))
-        else:
-            vb = va = vbkt = np.nan
-
-        nan3 = [np.nan, np.nan, np.nan]
-        gyro = hardware.try_read_imu_gyro()
-        if gyro is not None:
-            g  = gyro['gyro']
-            gb = list(np.radians(g[0])) if len(g) > 0 else list(nan3)
-            ga = list(np.radians(g[1])) if len(g) > 1 else list(nan3)
-            gk = list(np.radians(g[2])) if len(g) > 2 else list(nan3)
-            # Firmware reports accel in g; the dataset is SI throughout, matching
-            # the dps -> rad/s conversion above.
-            a = gyro.get('accel')
-            ab = list(np.multiply(a[0], G_TO_MS2)) if a and len(a) > 0 else list(nan3)
-            aa = list(np.multiply(a[1], G_TO_MS2)) if a and len(a) > 1 else list(nan3)
-            ak = list(np.multiply(a[2], G_TO_MS2)) if a and len(a) > 2 else list(nan3)
-            bg = gyro.get('base_gyro')
-            ba = gyro.get('base_accel')
-            gbase = list(np.radians(bg)) if bg is not None else list(nan3)
-            abase = list(np.multiply(ba, G_TO_MS2)) if ba is not None else list(nan3)
-            dev_ts = gyro.get('device_timestamp_us')
-        else:
-            gb = ga = gk = list(nan3)
-            ab = aa = ak = list(nan3)
-            gbase = abase = list(nan3)
-            dev_ts = None
-
-        i = len(self._ts)
-        self._ts.append(t);         self._idx.append(i)
-        self._man.append([manual.get(n, 0.0)   for n in JOINT_NAMES])
-        self._sin.append([sine.get(n, 0.0)     for n in JOINT_NAMES])
-        self._com.append([combined.get(n, 0.0) for n in JOINT_NAMES])
-        self._pos.append(list(pos))
-        self._vb.append(vb);  self._va.append(va);  self._vbkt.append(vbkt)
-        self._gb.append(gb);  self._ga.append(ga);  self._gk.append(gk)
-        self._ab.append(ab);  self._aa.append(aa);  self._ak.append(ak)
-        self._gbase.append(gbase);  self._abase.append(abase)
-        self._stale.append(int(bool(cmd_stale)))
-        self._age.append(float(cmd_age_s) if np.isfinite(cmd_age_s) else np.nan)
-        self._sine_flag.append(int(bool(sine_enabled)))
-        self._sine_target.append(str(sine_target))
-        self._sine_seed.append(int(sine_seed))
-        self._dev_ts.append(np.nan if dev_ts is None else float(dev_ts))
+        angles_deg, state_ts, state_imu_us = joint_state
+        vels, vel_age = (controller.get_joint_velocities_with_age()
+                         if controller is not None else (None, float('inf')))
+        self._append(self._build_row(
+            t, manual, sine, combined,
+            angles_deg, state_ts, state_imu_us,
+            vels, vel_age, hardware.try_read_imu_gyro(),
+            cmd_age_s, cmd_stale, sine_enabled, sine_target, sine_seed,
+        ))
 
     def n_samples(self) -> int:
-        return len(self._ts)
+        return len(self._cols.get('timestamp', ()))
 
     def elapsed_min(self) -> float:
         return (time.time() - self._t0_wall) / 60.0 if self._t0_wall else 0.0
 
     def save(self) -> Path | None:
-        if not self._ts:
+        """Write the hydraulic strip. Column order is _build_row's insertion order."""
+        if not self._cols:
             print("No data to save.")
             self._save_imu_raw_strip()
             return None
 
         import pandas as pd
 
-        man = np.array(self._man);  sin = np.array(self._sin);  com = np.array(self._com)
-        pos = np.array(self._pos)
-        gb  = np.array(self._gb);   ga  = np.array(self._ga);   gk  = np.array(self._gk)
-        ab  = np.array(self._ab);   aa  = np.array(self._aa);   ak  = np.array(self._ak)
-        gbs = np.array(self._gbase); abs_ = np.array(self._abase)
-
-        df = pd.DataFrame({
-            'timestamp': self._ts, 'sample_idx': self._idx,
-            # JOINT_NAMES order (slew, boom, arm, bucket) → hydraulic channel names
-            'manual_cmd_rotate': man[:,0], 'manual_cmd_lift':  man[:,1],
-            'manual_cmd_tilt':   man[:,2], 'manual_cmd_scoop': man[:,3],
-            'sine_cmd_rotate':   sin[:,0], 'sine_cmd_lift':    sin[:,1],
-            'sine_cmd_tilt':     sin[:,2], 'sine_cmd_scoop':   sin[:,3],
-            'combined_cmd_rotate': com[:,0], 'combined_cmd_lift':  com[:,1],
-            'combined_cmd_tilt':   com[:,2], 'combined_cmd_scoop': com[:,3],
-            'joint_pos_slew':   pos[:,0], 'joint_pos_boom': pos[:,1],
-            'joint_pos_arm':    pos[:,2], 'joint_pos_bucket': pos[:,3],
-            'joint_vel_boom': self._vb, 'joint_vel_arm': self._va, 'joint_vel_bucket': self._vbkt,
-            'imu_gx_boom': gb[:,0], 'imu_gy_boom': gb[:,1], 'imu_gz_boom': gb[:,2],
-            'imu_gx_arm':  ga[:,0], 'imu_gy_arm':  ga[:,1], 'imu_gz_arm':  ga[:,2],
-            'imu_gx_bucket': gk[:,0], 'imu_gy_bucket': gk[:,1], 'imu_gz_bucket': gk[:,2],
-            # Accel in m/s^2, mounting-offset corrected like the gyro above.
-            'imu_ax_boom': ab[:,0], 'imu_ay_boom': ab[:,1], 'imu_az_boom': ab[:,2],
-            'imu_ax_arm':  aa[:,0], 'imu_ay_arm':  aa[:,1], 'imu_az_arm':  aa[:,2],
-            'imu_ax_bucket': ak[:,0], 'imu_ay_bucket': ak[:,1], 'imu_az_bucket': ak[:,2],
-            # Base/cabin IMU: not a joint, so it has no pos/vel counterpart.
-            'imu_gx_base': gbs[:,0], 'imu_gy_base': gbs[:,1], 'imu_gz_base': gbs[:,2],
-            'imu_ax_base': abs_[:,0], 'imu_ay_base': abs_[:,1], 'imu_az_base': abs_[:,2],
-            'cmd_stale': self._stale, 'cmd_age_s': self._age, 'sine_enabled': self._sine_flag,
-            # Pico clock for the IMU sample this row saw. Joins these rows to the
-            # companion imu_raw_*.csv, which is timestamped on the same clock.
-            'imu_device_ts_us': self._dev_ts,
-            # The target is D-pad switchable mid-recording, so it is per-sample
-            # rather than per-file — rows must be groupable by which channels
-            # were actually driven. Amplitude is no longer a column: it is drawn
-            # per joint, and the seed reconstructs it along with every other
-            # waveform parameter.
-            'sine_target': self._sine_target, 'sine_seed': self._sine_seed,
-        })
-
+        df = pd.DataFrame(self._cols)
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = self.output_dir / f"drive_log_{ts}.csv"
         df.to_csv(out, index=False)
         print(f"[SAVE] {len(df)} samples ({df['timestamp'].iloc[-1]/60:.2f} min) → {out}")
+        self._report_staleness(df)
         self._save_imu_raw_strip()
         return out
+
+    @staticmethod
+    def _report_staleness(df) -> None:
+        """Say how fresh the readings behind this strip actually were.
+
+        Worth a line at save time rather than a question later: the ages are in
+        the file either way, but nobody goes looking at them unless something
+        already looks wrong, and by then the run is over.
+        """
+        for column, label in (('state_age_s', 'pose'), ('vel_age_s', 'velocity')):
+            ages = df[column].to_numpy(dtype=float)
+            finite = ages[np.isfinite(ages)]
+            if finite.size == 0:
+                print(f"[AGE ] {label}: never reported")
+                continue
+            missing = ages.size - finite.size
+            note = f", {missing} rows without a reading" if missing else ""
+            print(f"[AGE ] {label}: median {np.median(finite)*1e3:.1f} ms, "
+                  f"max {finite.max()*1e3:.1f} ms{note}")
 
     def _save_imu_raw_strip(self) -> None:
         """Write the companion raw IMU strip, if IMU capture is active."""
@@ -664,7 +735,7 @@ class DataLogger:
         and a joint left commanded would keep moving through it.
         """
         self.is_logging = False
-        if not self._ts and not self._imu_ts:
+        if not self._cols and not self._imu_ts:
             print("No data to save.")
             return None
         direct.clear()
@@ -1096,7 +1167,12 @@ def main():
             direct.send_pending()
 
             # ── 4. log ────────────────────────────────────────────────────────
-            joint_angles, _, _ = controller.get_joint_angles()
+            # One read per tick, shared by the log and the prints below. The
+            # controller hands back the pose's own sensor clocks alongside it,
+            # from a single lock acquisition -- reading them separately could
+            # straddle a control-thread update and describe a different pose.
+            joint_state = controller.get_joint_angles()
+            joint_angles = joint_state[0]
 
             if is_logging:
                 cmd_age_s = np.nan
@@ -1104,9 +1180,10 @@ def main():
                 if last_cmd_mono is not None:
                     cmd_age_s = max(0.0, time.monotonic() - last_cmd_mono)
                     cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S
-                logger.log_sample(manual, sine, combined, controller, hardware,
+                logger.log_sample(manual, sine, combined, joint_state, hardware,
                                   cmd_age_s, cmd_stale, sine_gen.enabled,
-                                  sine_gen.target_name, sine_gen.seed)
+                                  sine_gen.target_name, sine_gen.seed,
+                                  controller=controller)
                 # Every IMU frame since the last tick, not just the newest one.
                 drain_imu_raw()
 

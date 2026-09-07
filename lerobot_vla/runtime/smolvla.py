@@ -258,7 +258,7 @@ def prebuild_engines(split_dir: str | Path, cache_dir: str,
         env.setdefault("TRT_WORKSPACE_MB", "512")
         env.setdefault("TRT_OPT_LEVEL", "2")
         r = subprocess.run(
-            [_sys.executable, "-m", "lerobot_vla.smolvla_split",
+            [_sys.executable, "-m", "lerobot_vla.runtime.smolvla",
              "--build-one", str(Path(split_dir) / name),
              "--cache-dir", str(cache_dir), "--precision", precision],
             env=env, cwd=str(Path(__file__).resolve().parents[1]),

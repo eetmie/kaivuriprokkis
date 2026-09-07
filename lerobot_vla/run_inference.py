@@ -104,19 +104,19 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from lerobot_vla.action_log import ActionLogger
+from lerobot_vla.runtime.action_log import ActionLogger
 # Control-layer channel names. Column-aligned with JOINT_NAMES (the dataset
 # order), and the keys the setpoint status dict uses — so an action-log
 # column means the same thing in the chunk stream and the emitted stream.
 from lerobot_vla.excavator_robot import JOINT_NAMES
 from lerobot_vla.excavator_robot import _CONTROL_CHANNELS as CONTROL_CHANNELS
 from lerobot_vla.record_episodes import manual_action_from_axes
-from lerobot_vla import xvla_split
+from lerobot_vla.runtime import xvla
 from lerobot_vla.policy import (
     bundle_tasks, detect_architecture, make_policy, merge_tasks, warn_off_bundle,
 )
-from lerobot_vla.smolvla_split import NormStats
-from simple_drive import BTN_A, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, LocalGamepadInput
+from lerobot_vla.runtime.smolvla import NormStats
+from lerobot_vla.gamepad import BTN_A, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, LocalGamepadInput
 
 #: Where deployable export bundles live on the Jetson. Only used to make error
 #: messages concrete — there is deliberately NO default bundle. A checkpoint is the
@@ -724,9 +724,9 @@ def main() -> int:
                 "needs --allow-base-bundle emits arm dimensions, not valve "
                 "commands. Run it without --live to watch it against real "
                 "observations.")
-        tasks = xvla_split.resolve_tasks(args.split_dir, args.tasks)
-        args.fps = xvla_split.resolve_fps(args.split_dir, args.fps)
-        xvla_split.check_camera(args.split_dir, camera_key)
+        tasks = xvla.resolve_tasks(args.split_dir, args.tasks)
+        args.fps = xvla.resolve_fps(args.split_dir, args.fps)
+        xvla.check_camera(args.split_dir, camera_key)
         state_blind = args.state_blind
         if args.projectors != "gpu" or not args.iobinding:
             LOG.warning("--projectors / --no-iobinding are SmolVLA-only knobs and "
@@ -781,7 +781,7 @@ def main() -> int:
         )
 
     # A bundle with no physical boundary emits arm dimensions, not valve commands
-    # (see xvla_split.py). It is loadable for model/engine diagnostics, but it
+    # (see runtime/xvla.py). It is loadable for model/engine diagnostics, but it
     # never drives.
     if getattr(policy, "feasibility_only", False) and args.live:
         raise SystemExit(

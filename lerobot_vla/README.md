@@ -6,6 +6,13 @@ from split TensorRT engines on this Orin Nano. Two architectures share the loop
 — SmolVLA-450M and X-VLA-0.9B — and which one runs is read from the bundle,
 not chosen with a flag. See section 3.
 
+This package is deliberately separate from the repository-root
+`simple_drive.py`. That script is the general hydraulic test/data-collection
+application; this package owns the LeRobot dataset and VLA workflows. The
+LeRobot side now implements the matching controller layout in `gamepad.py`, so
+importing this package no longer executes or depends on another top-level
+application.
+
 ```
 gamepad ─┐                                             ┌─> LeRobot v3 dataset ──> DGX Spark finetune
          ├─> setpoint ─┐                               │      (lerobot 0.5.1, h264 video)
@@ -119,16 +126,16 @@ metadata-only stubs that block reusing the same `--repo-id`. `--resume` runs nev
 delete anything.
 
 **Lock the exposure.** Auto-exposure drifts with the scene, which the policy
-then has to learn around. `tune_exposure` sweeps exposure × gain for **both**
+then has to learn around. `tools.tune_exposure` sweeps exposure × gain for **both**
 imagers on one pipeline — so every frame of the sweep sees the same scene under
 the same light — and writes a PNG per setting plus a stats table, inspectable
 from another machine:
 
 ```bash
-.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --out /tmp/cam_sweep
+.venv-lerobot/bin/python -m lerobot_vla.tools.tune_exposure --out /tmp/cam_sweep
 
 # narrow it down: one camera, finer ladder, single gain
-.venv-lerobot/bin/python -m lerobot_vla.tune_exposure --camera ir \
+.venv-lerobot/bin/python -m lerobot_vla.tools.tune_exposure --camera ir \
     --exposures 8000,12000,16000,20000 --gains-ir 16
 ```
 
@@ -180,7 +187,8 @@ Cost: measured clean at 640×480×30 for both streams (0 dropped frames, USB ~6%
 see `realsense_logging_bandwidth.md`). The second video encode is host CPU, not
 bandwidth.
 
-Sticks = same mapping as simple_drive.py (left = slew/tilt, right = lift/scoop).
+Sticks use the shared excavator layout (left = slew/tilt, right = lift/scoop),
+the same physical mapping used by `simple_drive.py`.
 Buttons: **A** start / stop+save episode · **B** discard episode · **X** pump ·
 **Y** reload servo config. Episodes auto-save at `--max-episode-s` (180s).
 Default output root: `data_collection/lerobot_datasets/<repo_id>/`.
@@ -407,7 +415,7 @@ sensor noise away and reconstructs as its I-frame. That looks exactly like a
 
 The monolithic SmolVLA ONNX cannot TRT-build on 8 GB; the deploy path is the
 9-graph split with the flow-matching denoise loop in Python
-(`smolvla_split.py`; see `spark-projects/vla-onnx/smolvla/notes/orin-split-findings.md`).
+(`runtime/smolvla.py`; see `spark-projects/vla-onnx/smolvla/notes/orin-split-findings.md`).
 
 A finetuned bundle ships its own `export_info.json`, `stats.json` and
 `tokenizer/`, so `--split-dir` is (almost) the whole command — see
@@ -701,18 +709,31 @@ latency after the fine-tune**; the 395 ms above is a chunk-30 number.
 - **A multi-camera checkpoint has no deploy path** on either architecture; the
   X-VLA split is exported with `--valid-views 1`.
 
-## Files
+## Project layout
 
+The package root is reserved for the two main tasks and the small set of shared
+components they directly compose:
+
+```text
+lerobot_vla/
+├── record_episodes.py       gamepad teleop → LeRobot v3 episodes
+├── run_inference.py         observations → action chunks → valves
+├── excavator_robot.py       LeRobot-style robot/control-stack adapter
+├── camera.py                synchronized D435i IR + RGB reader
+├── gamepad.py               local controller adapter and button layout
+├── policy.py                bundle detection and common policy factory
+├── runtime/
+│   ├── action_log.py        requested-versus-emitted action diagnostics
+│   ├── smolvla.py           SmolVLA 9-graph ORT/TRT runtime
+│   ├── xvla.py              X-VLA adapter and live-safety gate
+│   └── vendor/              pinned X-VLA runtime and bundle contract
+└── tools/
+    └── tune_exposure.py     operator camera exposure/gain sweep
 ```
-excavator_robot.py   MasiExcavator: control stack + IR camera as one robot
-camera.py            D435i reader: IR-left (Y8@30, emitter off, gray→3ch)
-                     + optional color (rgb8@30) on the same pipeline
-record_episodes.py   gamepad teleop -> LeRobot v3 episodes
-smolvla_split.py     9-graph split policy: ORT/TRT sessions + denoise loop
-xvla_split.py        X-VLA side: call-shape bridge, bundle resolution, and the
-                     gate that keeps a base ee6d checkpoint off the valves
-policy.py            make_policy: architecture from the bundle, one per process
-vendor/              runtime code copied in from other repos, pinned by source
-                     SHA256 (xvla_split_ort.py, xvla_bundle_contract.py)
-run_inference.py     obs -> action-chunk -> valves loop (synthetic/dry/live)
-```
+
+All of these files are used. The root scripts are executable workflows;
+`camera.py`, `gamepad.py`, and `excavator_robot.py` isolate hardware concerns;
+`policy.py` is the architecture-independent loading seam; and `runtime/`
+contains the large architecture-specific implementation that normally should
+not be touched when changing a top-level task. The vendored files stay explicit
+because their headers pin their upstream source hashes and local changes.

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """LeRobot dataset collection for the MASI excavator (gamepad teleop).
 
-The training-data twin of simple_drive.py: drives the valves open-loop
-straight from the gamepad while recording synchronized episodes into the
+Drives the valves open-loop from the same gamepad layout as the repository's
+standalone ``simple_drive.py``, while recording synchronized episodes into the
 LeRobot v3 dataset format (lerobot 0.5.1 — the same version pinned on the
 DGX Spark finetune side).
 
@@ -77,7 +77,7 @@ from lerobot_vla.excavator_robot import (
     STATE_KEY, MasiExcavator,
 )
 from lerobot_vla.camera import CameraConfig
-from simple_drive import (
+from lerobot_vla.gamepad import (
     BTN_A, BTN_B, BTN_X, BTN_Y, LocalGamepadInput,
 )
 
@@ -168,7 +168,7 @@ def unresumable_reason(root: Path) -> str | None:
 
 
 def manual_action_from_axes(axes: dict) -> np.ndarray:
-    """Map gamepad axes to [slew, lift, tilt, scoop] — same sticks as simple_drive."""
+    """Map gamepad axes to [slew, lift, tilt, scoop]."""
     return np.array([
         axes["left_rl"],    # slew
         axes["right_ud"],   # lift (boom)
@@ -205,7 +205,7 @@ def main() -> int:
     # question. Drop the unwanted camera when deriving the training dataset.
     p.add_argument("--exposure-ir", type=float, default=None,
                    help="Lock cam1 (IR) exposure, microseconds "
-                        "(default: auto; find a value with tune_exposure.py)")
+                        "(default: auto; find a value with tools/tune_exposure.py)")
     p.add_argument("--gain-ir", type=float, default=None,
                    help="cam1 (IR) sensor gain 16..248 (only with --exposure-ir)")
     p.add_argument("--exposure-rgb", type=float, default=None,

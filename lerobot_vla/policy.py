@@ -137,10 +137,10 @@ def make_policy(architecture: str, split_dir: str | Path, **kwargs):
             f"restart, not a runtime toggle.")
 
     if architecture == "smolvla":
-        from lerobot_vla.smolvla_split import SmolVLASplitPolicy
+        from lerobot_vla.runtime.smolvla import SmolVLASplitPolicy
         policy = SmolVLASplitPolicy(split_dir=str(split_dir), **kwargs)
     elif architecture == "xvla":
-        from lerobot_vla.xvla_split import XVLAExcavatorPolicy
+        from lerobot_vla.runtime.xvla import XVLAExcavatorPolicy
         policy = XVLAExcavatorPolicy(split_dir=split_dir, **kwargs)
     else:
         raise ValueError(f"unknown architecture {architecture!r}")

@@ -2,7 +2,7 @@
 
     IR cam1 + joint angles + task -> X-VLA-0.9B (12 split ONNX/TRT engines) -> valves
 
-The runtime itself is vendored under `vendor/xvla_split_ort.py` (from
+The runtime itself is vendored under `runtime/vendor/xvla_split_ort.py` (from
 spark-projects/vla-onnx/xvla). This module is only the excavator side of
 it: the call-shape bridge, the bundle resolution `run_inference` expects, and the
 gate that stops a base checkpoint from ever reaching a valve.
@@ -86,7 +86,7 @@ def load_bundle(split_dir: str | Path) -> dict:
     of that and is returned as-is; `XVLAExcavatorPolicy` is what refuses to drive
     with one.
     """
-    from lerobot_vla.vendor.xvla_bundle_contract import verify_bundle
+    from lerobot_vla.runtime.vendor.xvla_bundle_contract import verify_bundle
 
     split_dir = Path(split_dir)
     if not (split_dir / "bundle.json").is_file():
@@ -253,7 +253,7 @@ class XVLAExcavatorPolicy:
         # Keep the heavy ONNX Runtime import behind the bundle safety gate. A
         # base or incomplete bundle must be rejected from metadata alone, before
         # any inference dependency is required or a TensorRT engine can load.
-        from lerobot_vla.vendor.xvla_split_ort import XVLASplitPolicy, prebuild_engines
+        from lerobot_vla.runtime.vendor.xvla_split_ort import XVLASplitPolicy, prebuild_engines
 
         cache_dir = Path(cache_dir) if cache_dir else split_dir / ENGINE_CACHE_DIRNAME
 

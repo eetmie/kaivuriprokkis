@@ -34,7 +34,8 @@ class CameraConfig:
     ir_index: int = 1          # 1 = left imager (the one physically positioned well)
     warmup_frames: int = 15    # let the (auto-)exposure settle before first use
     # Manual exposure lock. None = auto-exposure (varies with scene — bad for
-    # VLA consistency; lock it once a good value is found, see tune_exposure.py).
+    # VLA consistency; lock it once a good value is found, see
+    # tools/tune_exposure.py).
     # At 30 fps the exposure ceiling is ~33000 us (one frame period).
     exposure_us: float | None = None
     gain: float | None = None  # sensor gain (D435i stereo range 16..248), None = default

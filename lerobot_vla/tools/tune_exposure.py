@@ -6,10 +6,10 @@ frame of the sweep sees the same scene under the same light. Headless-friendly:
 writes a PNG per setting plus a stats table, so the images can be inspected from
 another machine.
 
-    .venv-lerobot/bin/python -m lerobot_vla.tune_exposure --out /tmp/cam_sweep
+    .venv-lerobot/bin/python -m lerobot_vla.tools.tune_exposure --out /tmp/cam_sweep
 
     # IR only, finer exposure ladder, one gain
-    .venv-lerobot/bin/python -m lerobot_vla.tune_exposure --camera ir \
+    .venv-lerobot/bin/python -m lerobot_vla.tools.tune_exposure --camera ir \
         --exposures 8000,12000,16000,20000 --gains-ir 16
 
 Reading the stats: mean around 80-130 with clip_hi below ~1% is usually right,
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-_ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 

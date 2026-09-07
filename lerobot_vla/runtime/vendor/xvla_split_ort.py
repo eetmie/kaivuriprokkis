@@ -7,7 +7,8 @@
 # imported so the robot repo stands alone -- see vendor/__init__.py.
 #
 # MODIFICATIONS vs the original: the contract import uses xvla_bundle_contract,
-# and the engine-prebuild subprocess imports lerobot_vla.vendor.xvla_split_ort
+# and the engine-prebuild subprocess imports
+# lerobot_vla.runtime.vendor.xvla_split_ort
 # from this repo root. The model code, provider stack, physical boundary and
 # denoising loop are untouched.
 #
@@ -20,7 +21,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 """X-VLA split-engine inference on the Orin Nano (ONNX Runtime + TensorRT EP).
 
-Mirrors the SmolVLA split runtime (`kaivuriprokkis/lerobot_vla/smolvla_split.py`): the
+Mirrors the SmolVLA split runtime (`lerobot_vla/runtime/smolvla.py`): the
 graphs are exported by `tools/export_split_onnx.py`, engines are prebuilt one per
 subprocess, and the denoising loop lives in Python rather than in the graph.
 
@@ -363,11 +364,11 @@ import sys
 import numpy as np
 import onnxruntime as ort
 sys.path.insert(0, %r)
-from lerobot_vla.vendor.xvla_split_ort import build_providers
+from lerobot_vla.runtime.vendor.xvla_split_ort import build_providers
 
 onnx_path, cache_dir, precision = sys.argv[1], sys.argv[2], sys.argv[3]
 ctx_dir = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
-from lerobot_vla.vendor.xvla_split_ort import make_session_options
+from lerobot_vla.runtime.vendor.xvla_split_ort import make_session_options
 so = make_session_options()
 sess = ort.InferenceSession(onnx_path, sess_options=so,
                             providers=build_providers(cache_dir, precision, ctx_dir))

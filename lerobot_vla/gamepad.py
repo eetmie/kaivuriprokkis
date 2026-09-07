@@ -1,10 +1,4 @@
-"""Local gamepad input shared by LeRobot recording and inference.
-
-This adapter intentionally lives in :mod:`lerobot_vla` rather than being
-imported from the repository's ``simple_drive.py`` application.  The two
-applications use the same physical layout, but neither one should need to
-import the other's executable module just to read a controller.
-"""
+"""Local gamepad input shared by LeRobot recording and inference."""
 
 from __future__ import annotations
 
@@ -21,8 +15,8 @@ GAMEPAD_PADDING_PCT = 0.0
 class LocalGamepadInput:
     """Axes and button mask from an Xbox controller connected locally.
 
-    Axis signs match ``simple_drive.py`` and the remote client, so teleoperation
-    has the same direction in data collection and VLA inference.
+    Axis signs match the remote client, so teleoperation has the same direction
+    in data collection and VLA inference.
     """
 
     name = "local"
@@ -107,4 +101,3 @@ class LocalGamepadInput:
                 self._pad.stop_monitoring()
             except Exception:
                 pass
-

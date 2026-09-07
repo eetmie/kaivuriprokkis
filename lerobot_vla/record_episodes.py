@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """LeRobot dataset collection for the MASI excavator (gamepad teleop).
 
-Drives the valves open-loop from the same gamepad layout as the repository's
-standalone ``simple_drive.py``, while recording synchronized episodes into the
-LeRobot v3 dataset format (lerobot 0.5.1 — the same version pinned on the
-DGX Spark finetune side).
+Drives the valves open-loop from a local gamepad while recording synchronized
+episodes into the LeRobot v3 dataset format (lerobot 0.5.1 — the same version
+pinned on the DGX Spark finetune side).
 
 Per frame (at --fps, default 30):
     observation.state        float32[4]  joint angles [slew, lift, tilt, scoop] deg
@@ -43,7 +42,7 @@ The hydraulic pump is cut while an episode is being written and switched back on
 when the write finishes, which is also the operator's signal that the board is
 ready for the next take.
 
-Button controls (same layout as simple_drive.py):
+Button controls:
     A: start episode / stop + SAVE episode
     B: stop + DISCARD current episode (re-record)
     X: toggle hydraulic pump

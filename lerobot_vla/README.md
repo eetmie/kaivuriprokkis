@@ -6,13 +6,6 @@ from split TensorRT engines on this Orin Nano. Two architectures share the loop
 — SmolVLA-450M and X-VLA-0.9B — and which one runs is read from the bundle,
 not chosen with a flag. See section 3.
 
-This package is deliberately separate from the repository-root
-`simple_drive.py`. That script is the general hydraulic test/data-collection
-application; this package owns the LeRobot dataset and VLA workflows. The
-LeRobot side now implements the matching controller layout in `gamepad.py`, so
-importing this package no longer executes or depends on another top-level
-application.
-
 ```
 gamepad ─┐                                             ┌─> LeRobot v3 dataset ──> DGX Spark finetune
          ├─> setpoint ─┐                               │      (lerobot 0.5.1, h264 video)
@@ -187,8 +180,7 @@ Cost: measured clean at 640×480×30 for both streams (0 dropped frames, USB ~6%
 see `realsense_logging_bandwidth.md`). The second video encode is host CPU, not
 bandwidth.
 
-Sticks use the shared excavator layout (left = slew/tilt, right = lift/scoop),
-the same physical mapping used by `simple_drive.py`.
+Sticks use the excavator layout: left = slew/tilt, right = lift/scoop.
 Buttons: **A** start / stop+save episode · **B** discard episode · **X** pump ·
 **Y** reload servo config. Episodes auto-save at `--max-episode-s` (180s).
 Default output root: `data_collection/lerobot_datasets/<repo_id>/`.

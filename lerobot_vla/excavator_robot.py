@@ -155,7 +155,7 @@ class MasiExcavator:
             control_config_file=profile["control_config_file"],
         )
         self.controller.start()
-        time.sleep(2.0)  # numba JIT warmup, same as simple_drive.py
+        time.sleep(2.0)  # numba JIT warmup
 
         if self.use_control_thread:
             self.controller.enter_direct_command_mode(
@@ -345,7 +345,7 @@ class MasiExcavator:
             self.direct.clear()
             self.direct.send_pending()
 
-    # ── auxiliary controls (same surface simple_drive.py exposes) ────────────
+    # ── auxiliary controls ──────────────────────────────────────────────────
 
     def set_pump(self, enabled: bool) -> None:
         self.hardware.set_pump_enabled(enabled)

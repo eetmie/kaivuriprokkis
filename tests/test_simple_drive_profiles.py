@@ -1,7 +1,7 @@
 """simple_drive profile / wiring tests.
 
-simple_drive is now open-loop only and takes four args (--robot, --ip,
---enable-slew, --enable-tracks). The per-run config overrides it used to
+simple_drive is now open-loop only and takes five args (--robot, --ip,
+--enable-slew, --enable-tracks, --suffix). The per-run config overrides it used to
 carry (--config-file, --pwm-i2c-bus, --disable-imu, ...) are gone, so profile
 resolution is a straight delegation to modules.board.resolve_profile and is
 covered there; what remains worth testing here is that the resolved profile
@@ -224,11 +224,53 @@ class ArgSurfaceTests(unittest.TestCase):
         # update this set — it exists so knobs do not creep back in one at a
         # time. Per-run tuning belongs in the profile's control_config.yaml,
         # and compensation belongs in control_prototype/drive_compensated.py.
+        #
+        # --suffix is admitted under that rule because it does not tune
+        # anything: it only labels the strips a run writes, which is not
+        # expressible in a config file that several runs share.
         args = self._parse([])
         self.assertEqual(
             set(vars(args)),
-            {"robot", "ip", "enable_slew", "enable_tracks"},
+            {"robot", "ip", "enable_slew", "enable_tracks", "suffix"},
         )
+
+    def test_suffix_defaults_to_unlabelled(self):
+        self.assertEqual(self._parse([]).suffix, "")
+
+
+# ---------------------------------------------------------------------------
+# Strip naming
+# ---------------------------------------------------------------------------
+
+class SuffixNamingTests(unittest.TestCase):
+    """The label has to survive into the filename, and only into the filename.
+
+    Sanitized rather than trusted: the value is operator-typed and lands in a
+    path, so a slash would scatter strips outside the output directory.
+    """
+
+    def test_label_lands_on_both_strips(self):
+        logger = simple_drive.DataLogger(Path("/tmp"), suffix="slew")
+        self.assertEqual(logger.suffix, "_slew")
+
+    def test_unset_label_leaves_no_dangling_underscore(self):
+        for raw in ("", None):
+            self.assertEqual(simple_drive.DataLogger(Path("/tmp"), suffix=raw).suffix, "")
+
+    def test_path_separators_cannot_escape_the_output_dir(self):
+        cleaned = simple_drive._clean_suffix("../../etc/passwd")
+        self.assertNotIn("/", cleaned)
+        self.assertNotIn("..", cleaned)
+        out = Path("/tmp") / f"drive_log_20260101_000000{cleaned}.csv"
+        self.assertEqual(out.parent, Path("/tmp"))
+
+    def test_unusable_label_falls_back_to_the_plain_name(self):
+        # All-punctuation collapses to nothing; better a plain name than a
+        # file called drive_log_<ts>_.csv.
+        self.assertEqual(simple_drive._clean_suffix("!!!"), "")
+
+    def test_whitespace_and_case_survive_as_a_readable_label(self):
+        self.assertEqual(simple_drive._clean_suffix(" Slew Test "), "_Slew-Test")
 
 
 if __name__ == "__main__":

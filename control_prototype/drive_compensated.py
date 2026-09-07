@@ -263,7 +263,10 @@ def main():
         pass
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    sine_gen = SineExcitationGenerator()
+    # Slew is its own D-pad mode under the flag and absent otherwise -- see
+    # simple_drive.sine_target_modes. Passed through here too, or this script
+    # would never excite slew at all now that no hydraulic mode carries it.
+    sine_gen = SineExcitationGenerator(enable_slew=args.enable_slew)
     logger   = DataLogger(out_dir)
 
     # ── input source ──────────────────────────────────────────────────────────

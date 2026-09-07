@@ -10,6 +10,7 @@ Usage:
     python simple_drive.py --robot jetson
     python simple_drive.py --ip 0.0.0.0:8080      # remote UDP client instead
     python simple_drive.py --enable-slew --enable-tracks
+    python simple_drive.py --suffix slew          # label this run's strips
 
 Input source:
     Default is a gamepad wired straight into this machine. Passing --ip
@@ -29,7 +30,10 @@ written to every logged row, which is what makes a run reconstructible.
 
 The one manual sine control is where it goes: the D-pad cycles through
 all / lift / tilt / scoop and the three two-channel pairs. Single channels
-isolate one actuator; the pairs capture cross-coupling.
+isolate one actuator; the pairs capture cross-coupling. Slew is not in any of
+them, 'all' included -- under --enable-slew it is appended as its own solo
+mode, because it is a separate drive from the boom cylinders and mixing the
+two records coupling between systems that share no model.
 
 A recording auto-stops after RECORD_MINUTES and does not restart itself —
 press A again for the next one. The gap is deliberate: it lets the hydraulics
@@ -60,6 +64,7 @@ them a repeated sample and a fresh one look identical afterwards.
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 import argparse
@@ -120,8 +125,15 @@ IMU_VECTOR_ROLES = ('boom', 'arm', 'bucket', 'base')
 # the joint names. Driving one channel at a time isolates that actuator's
 # response; the pairs record the cross-coupling a single-channel strip cannot
 # show, since a real dig loads several cylinders at once.
+#
+# Slew appears in none of these, 'all' included. It is a separate drive from the
+# three boom cylinders — different actuator, and its only observation is an
+# absolute world yaw that is not comparable across sessions (see
+# VELOCITY_JOINTS) — so a strip that swings the cabin while the arm works
+# records cross-coupling between systems that do not share a model. Slew is
+# excited on its own or not at all, via SINE_SLEW_MODE below.
 SINE_TARGET_MODES = [
-    ('all',        ('slew', 'boom', 'arm', 'bucket')),
+    ('all',        ('boom', 'arm', 'bucket')),
     ('lift',       ('boom',)),
     ('tilt',       ('arm',)),
     ('scoop',      ('bucket',)),
@@ -129,6 +141,20 @@ SINE_TARGET_MODES = [
     ('lift+scoop', ('boom', 'bucket')),
     ('tilt+scoop', ('arm', 'bucket')),
 ]
+
+# Appended to the D-pad cycle only under --enable-slew. Off by default, so
+# without the flag the mode is not merely inert but absent: the operator cannot
+# step onto a target that will not move.
+SINE_SLEW_MODE = ('slew', ('slew',))
+
+
+def sine_target_modes(enable_slew: bool = False) -> list:
+    """The D-pad cycle for this run.
+
+    Solo and last, so the hydraulic cycle keeps the index order every existing
+    strip was recorded under and slew is something you step past the end into.
+    """
+    return [*SINE_TARGET_MODES, SINE_SLEW_MODE] if enable_slew else list(SINE_TARGET_MODES)
 IMU_ROLE_ORDER      = ['base', 'boom', 'arm', 'bucket']
 
 
@@ -223,10 +249,17 @@ class SineExcitationGenerator:
     1 Hz carrier (2 Hz ceiling) drove the valves faster than the hydraulics can
     follow, and a model trained on that learns to jitter: it sees command energy
     that never became motion, so the only way to fit it is high-frequency
-    chatter. The carrier now sits near 0.22 Hz with a 0.5 Hz ceiling — roughly a
-    4 s stroke — which the cylinders actually track. If the recorded motion still
-    looks smoother than the command, lower CARRIER_FREQ_HZ further; these four
-    constants are the whole knob.
+    chatter. The carrier sits at 0.35 Hz — roughly a 3 s stroke — under a 0.9 Hz
+    ceiling, still well inside what the cylinders track. If the recorded motion
+    looks smoother than the command, lower CARRIER_FREQ_HZ; these four constants
+    are the whole knob.
+
+    The f_car jitter is deliberately wide (0.6–1.6×, a 1.8–4.5 s stroke) rather
+    than the ±15% it used to be. Narrow jitter made every strip the same tempo
+    at a different phase, which is variety the model cannot learn anything from;
+    the spread is what makes successive recordings independent samples of the
+    frequency axis rather than repeats. The FM depth clamp still bounds the top
+    end, so widening the draw cannot push a joint past the ceiling.
 
     On top of the deterministic term each joint carries band-limited noise, so
     the excitation is not a pure sum of tones and the recording sees frequency
@@ -248,36 +281,44 @@ class SineExcitationGenerator:
     channels the excitation is routed to, which changes what is being measured
     rather than how it is shaped.
 
+    ``enable_slew`` fixes the D-pad cycle for the life of the generator: without
+    it the slew mode is absent rather than inert, so a machine started without
+    the flag has no target the operator can step onto that will not move.
+
     Pass ``seed`` to reproduce a session; otherwise one is drawn and recorded
     in ``self.seed``.
     """
 
-    ENV_FREQ_HZ         = 0.015     # envelope (slow amplitude sweep)
-    CARRIER_FREQ_HZ     = 0.22      # carrier centre frequency (~4.5 s stroke)
+    ENV_FREQ_HZ         = 0.03      # envelope (slow amplitude sweep, ~33 s)
+    CARRIER_FREQ_HZ     = 0.35      # carrier centre frequency (~2.9 s stroke)
     FM_DEPTH            = 0.99      # carrier frequency-modulation depth
     FM_RATE_HZ          = 0.04      # carrier frequency-modulation rate
-    MAX_INSTANT_FREQ_HZ = 0.5       # hard ceiling on peak carrier frequency
+    MAX_INSTANT_FREQ_HZ = 0.9       # hard ceiling on peak carrier frequency
     NOISE_CUTOFF_HZ     = 0.25      # noise low-pass corner
     NOISE_FRACTION      = 0.10      # noise std as a fraction of joint amplitude
     NOISE_CLIP_SIGMA    = 3.0       # bound on the unit-variance noise state
 
     # Absolute per-joint amplitude, drawn fresh with everything else. The floor
-    # stays above the valve deadband so a joint is never commanded into a range
-    # where nothing moves; the ceiling leaves room for a manual input on top
-    # before the sum clips.
-    AMPLITUDE_RANGE     = (0.15, 0.85)
+    # stays well above the valve deadband so a joint is never commanded into a
+    # range where nothing moves. The ceiling is the full valve range: the
+    # envelope multiplies the carrier, so a joint only reaches its drawn
+    # amplitude at an envelope peak — mean |command| lands near 0.41·amp — and
+    # a ceiling held back to leave manual headroom just costs stroke everywhere
+    # for a sum the main loop clips to [-1, 1] anyway.
+    AMPLITUDE_RANGE     = (0.35, 1.0)
 
     # Multiplicative jitter applied to each nominal value above.
     _JITTER = {
-        'f_env':   (0.80, 1.25),
-        'f_car':   (0.85, 1.15),
+        'f_env':   (0.60, 1.50),
+        'f_car':   (0.60, 1.60),
         'f_rate':  (0.70, 1.10),
         'depth':   (0.70, 1.20),
         'f_noise': (0.70, 1.30),
         'noise':   (0.70, 1.30),
     }
 
-    def __init__(self, enabled: bool = False, seed: int | None = None):
+    def __init__(self, enabled: bool = False, seed: int | None = None,
+                 enable_slew: bool = False):
         if seed is None:
             # Draw an explicit seed rather than passing None through, so the
             # session can be reproduced from what gets printed/stored.
@@ -285,6 +326,10 @@ class SineExcitationGenerator:
         self.seed  = int(seed)
         self._rng  = np.random.default_rng(self.seed)
 
+        # Fixed for the life of the generator: the D-pad cycle is a run-level
+        # decision, so slew cannot appear mid-recording on a machine that was
+        # started without it.
+        self.modes         = sine_target_modes(enable_slew)
         self.enabled       = enabled
         self.target_idx    = 0
         self.start_time    = None
@@ -352,15 +397,15 @@ class SineExcitationGenerator:
 
     @property
     def target_name(self) -> str:
-        return SINE_TARGET_MODES[self.target_idx][0]
+        return self.modes[self.target_idx][0]
 
     @property
     def target_joints(self) -> tuple:
-        return SINE_TARGET_MODES[self.target_idx][1]
+        return self.modes[self.target_idx][1]
 
     def step_target(self, direction: int):
         """Cycle which channels the excitation drives, wrapping at both ends."""
-        self.target_idx = (self.target_idx + direction) % len(SINE_TARGET_MODES)
+        self.target_idx = (self.target_idx + direction) % len(self.modes)
 
     def _advance_noise(self, t: float):
         """Step each joint's two-pole noise filter to time t.
@@ -416,6 +461,23 @@ class SineExcitationGenerator:
 
 # ── data logger ───────────────────────────────────────────────────────────────
 
+def _clean_suffix(raw: str | None) -> str:
+    """Normalize a --suffix into a filename tail, with its leading underscore.
+
+    Sanitized rather than trusted: the value lands in a path, and a stray slash
+    or space would either scatter strips into unintended directories or produce
+    names the training scripts have to be quoted around. Anything outside
+    [A-Za-z0-9._-] collapses to a single dash.
+
+    Returns "" for empty or all-punctuation input, which restores the plain
+    ``drive_log_<ts>.csv`` name rather than leaving a dangling underscore.
+    """
+    if not raw:
+        return ""
+    kept = re.sub(r'[^A-Za-z0-9._-]+', '-', raw.strip()).strip('-_.')
+    return f"_{kept}" if kept else ""
+
+
 class DataLogger:
     """100 Hz hydraulic actuator data recorder for blackbox model training.
 
@@ -446,10 +508,15 @@ class DataLogger:
     matching edit in three.
     """
 
-    def __init__(self, output_dir: Path, imu_roles=None, stream_info_fn=None):
+    def __init__(self, output_dir: Path, imu_roles=None, stream_info_fn=None,
+                 suffix: str = ""):
         self.output_dir  = output_dir
         self.is_logging  = False
         self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Operator label appended to every strip this run writes, so a special
+        # recording is identifiable from the filename alone. Carries its own
+        # leading underscore, or is "" when unset.
+        self.suffix      = _clean_suffix(suffix)
         # Set when IMUs are active: the raw strip is written alongside the
         # hydraulic one and needs the sensor role order plus the firmware's
         # reported full scales to be interpretable.
@@ -623,7 +690,7 @@ class DataLogger:
 
         df = pd.DataFrame(self._cols)
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = self.output_dir / f"drive_log_{ts}.csv"
+        out = self.output_dir / f"drive_log_{ts}{self.suffix}.csv"
         df.to_csv(out, index=False)
         print(f"[SAVE] {len(df)} samples ({df['timestamp'].iloc[-1]/60:.2f} min) → {out}")
         self._report_staleness(df)
@@ -717,7 +784,7 @@ class DataLogger:
         df['accel_range_g']  = ranges.get('accel_g', np.nan)
 
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = self.output_dir / f"imu_raw_{ts}.csv"
+        out = self.output_dir / f"imu_raw_{ts}{self.suffix}.csv"
         df.to_csv(out, index=False)
         span_s = (df['device_ts_us'].iloc[-1] - df['device_ts_us'].iloc[0]) / 1e6
         rate = len(df) / span_s if span_s > 0 else float('nan')
@@ -741,7 +808,12 @@ class DataLogger:
         direct.clear()
         direct.send_pending()
         time.sleep(0.3)
-        return self.save()
+        out = self.save()
+        # Buffers are already on disk -- drop them so a later Ctrl+C exit
+        # (which re-saves whatever is still buffered) doesn't write the same
+        # recording out again under a new timestamp.
+        self._clear()
+        return out
 
 
 # ── stub controller ───────────────────────────────────────────────────────────
@@ -924,6 +996,9 @@ def _parse_args():
                    help="Allow slew in manual commands and sine (default: off)")
     p.add_argument("--enable-tracks", action="store_true",
                    help="Allow track drive from the triggers/paddles (default: off)")
+    p.add_argument("--suffix", default="", metavar="LABEL",
+                   help="Append a label to every strip this run writes, e.g. "
+                        "--suffix slew gives drive_log_<ts>_slew.csv")
     return p.parse_args()
 
 
@@ -1007,14 +1082,25 @@ def main():
         pass
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    sine_gen = SineExcitationGenerator()
+    sine_gen = SineExcitationGenerator(enable_slew=args.enable_slew)
 
     # Raw IMU strips are only meaningful when IMUs are actually streaming.
     imu_stream = hardware.imu_stream_info() if imu_on else {}
     imu_capture_roles = imu_stream.get('roles_by_index', []) if imu_on else []
     logger = DataLogger(out_dir,
                         imu_roles=imu_capture_roles,
-                        stream_info_fn=hardware.imu_stream_info if imu_on else None)
+                        stream_info_fn=hardware.imu_stream_info if imu_on else None,
+                        suffix=args.suffix)
+
+    if args.suffix:
+        # Echo the sanitized form, not what was typed: a label that got
+        # rewritten (or dropped entirely) should be visible now rather than
+        # discovered when the file turns up under an unexpected name.
+        if logger.suffix:
+            print(f"[LOG] Strips this run: drive_log_<ts>{logger.suffix}.csv")
+        else:
+            print(f"[LOG] --suffix {args.suffix!r} had no usable characters — "
+                  "writing unlabelled strips.")
 
     if imu_on:
         rng = imu_stream.get('ranges')
@@ -1154,6 +1240,9 @@ def main():
 
             t = time.perf_counter()
             sine = sine_gen.get_all(t)
+            # Redundant against the mode list, which has no slew target without
+            # the flag -- kept because this is the line that actually reaches a
+            # valve, and a wiring mistake upstream should not swing the cabin.
             if not args.enable_slew:
                 sine['slew'] = 0.0
 

@@ -387,13 +387,97 @@ class SineRandomizationTests(unittest.TestCase):
         gen = SineExcitationGenerator(enabled=True, seed=7)
         gen.start_time = 0.0
         t = np.arange(0.0, 300.0, 0.01)
-        signals = {j: np.array([gen.get_signal(j, x) for x in t])
-                   for j in simple_drive.JOINT_NAMES}
+        # Over the joints 'all' actually drives. Slew is excluded from every
+        # mode, so it holds a flat zero here and its correlation is undefined
+        # rather than low -- which is a stronger property, checked separately
+        # in SineSlewRoutingTests.
+        driven = list(gen.target_joints)
+        signals = {j: np.array([gen.get_signal(j, x) for x in t]) for j in driven}
 
-        for i, a in enumerate(simple_drive.JOINT_NAMES):
-            for b in simple_drive.JOINT_NAMES[i + 1:]:
+        for i, a in enumerate(driven):
+            for b in driven[i + 1:]:
                 r = abs(float(np.corrcoef(signals[a], signals[b])[0, 1]))
                 self.assertLess(r, 0.30, msg=f"{a}/{b} correlated at |r|={r:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Slew routing
+# ---------------------------------------------------------------------------
+
+class SineSlewRoutingTests(unittest.TestCase):
+    """Slew is excited solo, only under --enable-slew, or not at all.
+
+    It is a separate drive from the three boom cylinders, and its only
+    observation is an absolute world yaw with no session-to-session origin, so
+    a strip that swings the cabin while the arm works records coupling between
+    systems that share no model.
+    """
+
+    def _peaks(self, gen, seconds=30.0):
+        gen.start_time = 0.0
+        peak = {j: 0.0 for j in simple_drive.JOINT_NAMES}
+        t = 0.0
+        for _ in range(int(seconds * simple_drive.SAMPLING_FREQUENCY)):
+            t += 1.0 / simple_drive.SAMPLING_FREQUENCY
+            for joint, value in gen.get_all(t).items():
+                peak[joint] = max(peak[joint], abs(value))
+        return peak
+
+    def test_no_hydraulic_mode_carries_slew(self):
+        """Including 'all' — that is the mode most likely to grow it back."""
+        for name, joints in SINE_TARGET_MODES:
+            self.assertNotIn('slew', joints, msg=f"mode {name}")
+
+    def test_slew_mode_is_absent_without_the_flag(self):
+        """Absent, not merely inert: no target the operator can step onto and
+        then wonder why nothing moves."""
+        gen = SineExcitationGenerator(enabled=True, seed=3)
+        self.assertNotIn('slew', [n for n, _ in gen.modes])
+        self.assertEqual(gen.modes, list(SINE_TARGET_MODES))
+
+    def test_slew_mode_is_appended_solo_when_enabled(self):
+        gen = SineExcitationGenerator(enabled=True, seed=3, enable_slew=True)
+        names = [n for n, _ in gen.modes]
+        self.assertEqual(names[-1], 'slew')
+        # Appended, so every hydraulic mode keeps the index it was recorded
+        # under in existing strips.
+        self.assertEqual(names[:-1], [n for n, _ in SINE_TARGET_MODES])
+        self.assertEqual(gen.modes[-1][1], ('slew',))
+
+    def test_slew_never_shares_a_mode_with_a_cylinder(self):
+        gen = SineExcitationGenerator(enabled=True, seed=3, enable_slew=True)
+        for name, joints in gen.modes:
+            if 'slew' in joints:
+                self.assertEqual(joints, ('slew',), msg=f"mode {name} mixes slew")
+
+    def test_slew_is_never_driven_without_the_flag(self):
+        """Whatever the D-pad is on."""
+        gen = SineExcitationGenerator(enabled=True, seed=5)
+        for idx in range(len(gen.modes)):
+            gen.target_idx = idx
+            self.assertEqual(self._peaks(gen)['slew'], 0.0, msg=f"mode {gen.target_name}")
+
+    def test_slew_mode_drives_only_slew(self):
+        gen = SineExcitationGenerator(enabled=True, seed=5, enable_slew=True)
+        gen.target_idx = len(gen.modes) - 1
+        self.assertEqual(gen.target_name, 'slew')
+        peak = self._peaks(gen)
+        self.assertGreater(peak['slew'], 0.0)
+        for joint in ('boom', 'arm', 'bucket'):
+            self.assertEqual(peak[joint], 0.0, msg=joint)
+
+    def test_dpad_wraps_onto_and_past_the_slew_mode(self):
+        gen = SineExcitationGenerator(enabled=True, seed=5, enable_slew=True)
+        gen.step_target(-1)                     # one step back from 'all'
+        self.assertEqual(gen.target_name, 'slew')
+        gen.step_target(+1)
+        self.assertEqual(gen.target_name, 'all')
+
+    def test_target_modes_helper_matches_the_generator(self):
+        for flag in (False, True):
+            self.assertEqual(
+                simple_drive.sine_target_modes(flag),
+                SineExcitationGenerator(enable_slew=flag).modes)
 
 
 if __name__ == "__main__":

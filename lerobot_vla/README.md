@@ -105,8 +105,7 @@ would carry the wrong action→motion mapping.
 silently land in a leftover dataset. It names a **new** dataset; recording
 refuses to start if its folder already exists (use `--resume` to append). The
 folder is the repo-id with `/` replaced by `_`, under
-`data_collection/lerobot_datasets/`. Existing datasets: `masi/kaivuri_juusto`
-(31 episodes, blocks task).
+`data_collection/lerobot_datasets/`.
 
 The repo-id is a *name*, not a destination: nothing is uploaded anywhere, and it
 is not even written into the dataset (`meta/info.json` has no `repo_id` key). It
@@ -131,28 +130,6 @@ from another machine:
 .venv-lerobot/bin/python -m lerobot_vla.tools.tune_exposure --camera ir \
     --exposures 8000,12000,16000,20000 --gains-ir 16
 ```
-
-It stars the rows in band and prints the flags to copy. Target mean ~80–130 with
-clip-hi under ~1%; at 30 fps the exposure ceiling is ~33 000 µs for either
-imager. Pass the chosen values to BOTH `record_episodes` and `run_inference`.
-
-Re-sweep whenever the lighting setup changes. Measured over the sandbox with the
-work lights on (2026-08-19):
-
-| camera | setting | mean | clip-hi |
-|---|---|---|---|
-| IR cam1 | `--exposure-ir 16000 --gain-ir 16` | 89.5 | 0.07% |
-| RGB cam2 | `--exposure-rgb 16000 --gain-rgb 128` | 107.2 | 0.00% |
-
-The colour imager needs far more gain than the IR one for the same brightness —
-it is behind a Bayer filter, the IR imager is not. Its dark end suffers for it:
-at that setting ~2.8% of pixels are crushed to black, against 0% for IR.
-
-Gains are swept per camera because the scales differ (IR 16..248, RGB 0..128),
-but `--exposures` is microseconds for both: librealsense reports the colour
-sensor's exposure in 100 µs ticks (range 1..10000) and the stereo module's in
-microseconds (1..165000), and the conversion is derived from the range each
-sensor reports rather than hardcoded.
 
 ### Two cameras, always
 
@@ -213,12 +190,7 @@ One `--task` phrasing per *run*, stored per frame — but a dataset can hold
 several, which is how a multi-task checkpoint gets trained. Record the first
 task, then `--resume` into the same `--repo-id` with a different `--task`;
 lerobot appends the new string to `meta/tasks.parquet` and every later episode
-carries its index. `masi_digging_dry_2` is built that way:
-
-```
-task_index 0  "move sand to container"   63 episodes / 53531 frames
-task_index 1  "move rock to container"   15 episodes / 12124 frames
-```
+carries its index. 
 
 Keep the phrasings short and clearly different from each other, and spell each
 one identically across every session that belongs to it — the policy conditions
@@ -343,10 +315,6 @@ Healthy looks like `r = 0.75..0.96` at a 67–200 ms lag (the hydraulic response
 delay). Much lower means commands are not reaching the valves — which is what
 the pre-`b246c69` 30 Hz direct-write path did, silently dropping ~67% of them.
 
-Worth also checking action saturation per joint: on `masi/kaivuri_juusto`, lift
-sits at −1.0 for 17.5% of frames while its positive side never exceeds +0.77.
-That is real operator asymmetry (boom slammed down, raised gently), not a
-broken axis, but it skews the normalization stats the policy is trained with.
 
 On datasets that carry `clock.*`, check the loop and the caches too:
 

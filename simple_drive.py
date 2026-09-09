@@ -22,6 +22,9 @@ Button Controls:
     Button X (bit 2): Toggle hydraulic pump
     Button Y (bit 3): Reload servo config from disk
     D-pad Up/Down (bits 4/5): Cycle sine target channel (local pad only)
+    Bumpers (local pad only, --enable-tracks): hold the bumper on a side to
+        reverse that track; the trigger on the same side still sets speed.
+        Released = forward, held = reverse.
 
 The sine has no operator-set waveform knobs — amplitude, frequencies, phases
 and noise are all drawn per joint, with a fresh seed per recording, so each
@@ -903,8 +906,10 @@ class LocalGamepadInput:
     is what the UDP client applies before encoding, so both sources drive the
     machine the same direction.
 
-    Tracks are on the triggers, which only read 0..1 — a local run drives them
-    forward only, unlike the paddles on the remote client.
+    Tracks are on the triggers, which only read 0..1. Direction is set by
+    holding the bumper on the same side: released drives that track forward,
+    held reverses it. This is a local-pad-only convention — the remote client
+    already sends signed paddle values.
     """
 
     name = "local"
@@ -943,13 +948,15 @@ class LocalGamepadInput:
 
     def poll(self):
         s = self._pad.read()
+        right_sign = -1.0 if s.get('RightBumper') else 1.0
+        left_sign  = -1.0 if s.get('LeftBumper') else 1.0
         axes = {
             'right_rl': -float(s['RightJoystickX']),   # bucket
             'right_ud':  float(s['RightJoystickY']),   # boom
             'left_rl':  -float(s['LeftJoystickX']),    # slew
             'left_ud':  -float(s['LeftJoystickY']),    # arm
-            'right_paddle': float(s['RightTrigger']),
-            'left_paddle':  float(s['LeftTrigger']),
+            'right_paddle': right_sign * float(s['RightTrigger']),
+            'left_paddle':  left_sign  * float(s['LeftTrigger']),
         }
         mask = 0
         for bit, key in ((BTN_A, 'A'), (BTN_B, 'B'), (BTN_X, 'X'), (BTN_Y, 'Y'),
@@ -1118,7 +1125,8 @@ def main():
         direct.clear(); controller.resume_ik_output(); controller.stop()
         hardware.shutdown(); raise SystemExit(1)
     print("A=log  B=sine  X=pump  Y=reload-config"
-          + ("  Dpad U/D=sine-target\n" if source.name == "local" else "\n"))
+          + ("  Dpad U/D=sine-target  Bumper=reverse-track\n"
+             if source.name == "local" else "\n"))
 
     # ── loop state ────────────────────────────────────────────────────────────
     loop_period     = 1.0 / SAMPLING_FREQUENCY

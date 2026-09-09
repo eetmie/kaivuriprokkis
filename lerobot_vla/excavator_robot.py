@@ -60,10 +60,17 @@ from lerobot_vla.camera import D435iCamera, CameraConfig
 JOINT_NAMES = ["slew", "lift", "tilt", "scoop"]
 _CONTROL_CHANNELS = ["slew", "boom", "arm", "bucket"]
 
+# Tracks are a separate drive from the boom cylinders (see excavator_controller's
+# trackL/trackR pass-through) and are recorded as their own action feature, gated
+# by enable_tracks, rather than folded into the 4-dim action above -- most
+# datasets never touch them and existing ones must not gain columns silently.
+TRACK_NAMES = ["trackL", "trackR"]
+
 CAMERA_KEY = "observation.images.cam1"          # D435i infrared left imager
 CAMERA_KEY_RGB = "observation.images.cam2"      # D435i color imager (optional)
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
+ACTION_TRACKS_KEY = "action.tracks"
 
 # Which joints observation.state carries. Slew is excluded by default: its angle
 # is `average_z_yaw` over the IMUs (control_config.yaml), an absolute world yaw
@@ -85,6 +92,7 @@ class MasiExcavator:
     def __init__(self, profile: str = "auto",
                  camera_config: CameraConfig | None = None,
                  enable_slew: bool = True,
+                 enable_tracks: bool = False,
                  use_control_thread: bool = True,
                  setpoint_hold_s: float = 0.25,
                  setpoint_decay_s: float = 0.25,
@@ -99,6 +107,7 @@ class MasiExcavator:
         self.profile_name = profile
         self.camera = D435iCamera(camera_config)
         self.enable_slew = enable_slew
+        self.enable_tracks = enable_tracks
         self.use_control_thread = use_control_thread
         self.setpoint_hold_s = setpoint_hold_s
         self.setpoint_decay_s = setpoint_decay_s
@@ -158,16 +167,20 @@ class MasiExcavator:
         time.sleep(2.0)  # numba JIT warmup
 
         if self.use_control_thread:
+            direct_channels = list(_CONTROL_CHANNELS)
+            if self.enable_tracks:
+                direct_channels += TRACK_NAMES
             self.controller.enter_direct_command_mode(
                 hold_timeout_s=self.setpoint_hold_s,
                 decay_s=self.setpoint_decay_s,
                 blend_s=self.setpoint_blend_s,
-                joint_names=_CONTROL_CHANNELS,
+                joint_names=direct_channels,
             )
             hz = self.controller.config.control_frequency
             print(f"[robot] Valve output on control thread at {hz:.0f} Hz "
                   f"(setpoint hold {self.setpoint_hold_s:.2f}s, "
-                  f"decay {self.setpoint_decay_s:.2f}s)")
+                  f"decay {self.setpoint_decay_s:.2f}s)"
+                  + (", tracks enabled" if self.enable_tracks else ""))
         else:
             self.direct = DirectController(self.hardware)
             self.controller.suspend_ik_output()
@@ -276,22 +289,41 @@ class MasiExcavator:
             obs["rgb_ts"] = rgb_ts
         return obs
 
-    def send_action(self, action: np.ndarray) -> np.ndarray:
+    def send_action(self, action: np.ndarray,
+                    tracks: np.ndarray | None = None) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Set 4 normalized valve commands [slew, lift, tilt, scoop] in [-1, 1].
+
+        ``tracks`` is [trackL, trackR], also normalized [-1, 1] -- already the
+        combined trigger+bumper sign, not the two read separately. Only takes
+        effect with ``enable_tracks=True`` (the direct-command schedule was not
+        set up to drive trackL/trackR otherwise); passing it without that flag
+        raises rather than silently dropping the command.
+
+        Both setpoints go out in one ``give_direct_commands`` dict: the
+        schedule replaces its whole point on every call, so a separate track
+        call would zero the boom/arm/bucket/slew setpoint it didn't repeat.
 
         Non-blocking on the control-thread path: this stores the setpoint and
         returns; the 100 Hz control thread does the I2C write. Returns the
         clipped action (this is what should be recorded in the dataset — it is
-        the setpoint the control thread was actually handed).
+        the setpoint the control thread was actually handed), and the clipped
+        tracks alongside it when ``tracks`` was given.
         """
+        if tracks is not None and not self.enable_tracks:
+            raise RuntimeError("send_action(tracks=...) requires enable_tracks=True")
         a = self._clip(action)
         cmds = {ch: float(v) for ch, v in zip(_CONTROL_CHANNELS, a)}
+        t = None
+        if self.enable_tracks:
+            t = np.clip(np.asarray(tracks if tracks is not None else np.zeros(2),
+                                   dtype=np.float32), -1.0, 1.0)
+            cmds.update({ch: float(v) for ch, v in zip(TRACK_NAMES, t)})
         if self.use_control_thread:
             self.controller.give_direct_commands(cmds)
         else:
             self.direct.give_commands(cmds)
             self.direct.send_pending()
-        return a
+        return a if tracks is None else (a, t)
 
     def send_action_chunk(self, chunk: np.ndarray, fps: float,
                           t0: float | None = None) -> np.ndarray:
@@ -340,7 +372,8 @@ class MasiExcavator:
             # Zeroed setpoint, not a cleared schedule: the control thread keeps
             # writing zeros every tick, which holds the valves centered *and*
             # keeps the PWM watchdog fed.
-            self.controller.give_direct_commands({ch: 0.0 for ch in _CONTROL_CHANNELS})
+            channels = list(_CONTROL_CHANNELS) + (TRACK_NAMES if self.enable_tracks else [])
+            self.controller.give_direct_commands({ch: 0.0 for ch in channels})
         else:
             self.direct.clear()
             self.direct.send_pending()

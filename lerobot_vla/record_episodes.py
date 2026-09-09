@@ -10,6 +10,8 @@ Per frame (at --fps, default 30):
     observation.images.cam1  uint8 480x640x3  D435i infrared left imager (emitter OFF)
     observation.images.cam2  uint8 480x640x3  D435i color imager
     action                   float32[4]  normalized valve cmds actually sent [-1,1]
+    action.tracks            float32[2]  normalized [trackL, trackR] cmds actually
+                                         sent [-1,1] (--enable-tracks only)
     task                     the natural-language instruction (--task)
     clock.loop               float64     seconds since episode start (perf_counter)
     clock.cam1_age           float32     seconds this cam1 frame had been sitting
@@ -47,6 +49,10 @@ Button controls:
     B: stop + DISCARD current episode (re-record)
     X: toggle hydraulic pump
     Y: reload servo config from disk
+    Bumpers (--enable-tracks): hold the bumper on a side to reverse that
+        track; the trigger on the same side still sets speed. Released =
+        forward, held = reverse. Without the flag the triggers/bumpers are
+        read but never sent to the valves.
 
 Usage:
     .venv-lerobot/bin/python -m lerobot_vla.record_episodes \
@@ -72,8 +78,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from lerobot_vla.excavator_robot import (
-    ACTION_KEY, CAMERA_KEY, CAMERA_KEY_RGB, DEFAULT_STATE_JOINTS, JOINT_NAMES,
-    STATE_KEY, MasiExcavator,
+    ACTION_KEY, ACTION_TRACKS_KEY, CAMERA_KEY, CAMERA_KEY_RGB, DEFAULT_STATE_JOINTS,
+    JOINT_NAMES, STATE_KEY, TRACK_NAMES, MasiExcavator,
 )
 from lerobot_vla.camera import CameraConfig
 from lerobot_vla.gamepad import (
@@ -114,14 +120,15 @@ def clock_fields(obs: dict, tick: float, ep_perf0: float) -> dict:
 
 
 def build_features(cam_h: int, cam_w: int,
-                   state_joints: list[str] | None = None) -> dict:
+                   state_joints: list[str] | None = None,
+                   enable_tracks: bool = False) -> dict:
     # `names` is the record of which joints observation.state carries — the
     # dataset documents its own state layout, so training and inference cannot
     # silently disagree about whether slew is in there.
     state_joints = list(state_joints or DEFAULT_STATE_JOINTS)
     video = {"dtype": "video", "shape": (cam_h, cam_w, 3),
              "names": ["height", "width", "channels"]}
-    return {
+    features = {
         STATE_KEY: {
             "dtype": "float32",
             "shape": (len(state_joints),),
@@ -140,6 +147,16 @@ def build_features(cam_h: int, cam_w: int,
         CLOCK_STATE_AGE: {"dtype": "float32", "shape": (1,), "names": None},
         CLOCK_IMU_US: {"dtype": "int64", "shape": (1,), "names": None},
     }
+    # A separate feature, not folded into ACTION_KEY: most datasets never touch
+    # tracks, and an existing dataset's schema must not gain columns silently
+    # just because a later run happened to pass --enable-tracks.
+    if enable_tracks:
+        features[ACTION_TRACKS_KEY] = {
+            "dtype": "float32",
+            "shape": (len(TRACK_NAMES),),
+            "names": list(TRACK_NAMES),
+        }
+    return features
 
 
 def unresumable_reason(root: Path) -> str | None:
@@ -176,6 +193,19 @@ def manual_action_from_axes(axes: dict) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def manual_tracks_from_axes(axes: dict) -> np.ndarray:
+    """Map gamepad axes to [trackL, trackR].
+
+    right_paddle/left_paddle already carry the trigger+bumper conversion to a
+    single -1..1 value (LocalGamepadInput.poll), so this is a pure rename, not
+    a second conversion.
+    """
+    return np.array([
+        axes["left_paddle"],   # trackL
+        axes["right_paddle"],  # trackR
+    ], dtype=np.float32)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Record LeRobot episodes with gamepad teleop.")
     p.add_argument("--repo-id", required=True,
@@ -193,6 +223,10 @@ def main() -> int:
                    help="Auto-stop + save an episode after this long")
     p.add_argument("--no-slew", action="store_true",
                    help="Disable the slew ACTION channel (the machine will not slew)")
+    p.add_argument("--enable-tracks", action="store_true",
+                   help="Record and drive tracks from the triggers/bumpers as an "
+                        "action.tracks feature (default: off — read but not driven "
+                        "or logged)")
     p.add_argument("--state-joints", default=",".join(DEFAULT_STATE_JOINTS),
                    help="Joints recorded into observation.state. Slew is out by "
                         "default: nothing zeroes its yaw and there is no "
@@ -255,7 +289,8 @@ def main() -> int:
         # dataset recorded before the clock.* columns existed fails mid-episode
         # -- after the operator has already driven the take.
         want = set(build_features(cam_cfg.height, cam_cfg.width,
-                                  state_joints=state_joints))
+                                  state_joints=state_joints,
+                                  enable_tracks=args.enable_tracks))
         have = set(dataset.meta.features) - {"timestamp", "frame_index",
                                              "episode_index", "index", "task_index"}
         if want != have:
@@ -279,7 +314,8 @@ def main() -> int:
             repo_id=args.repo_id,
             fps=args.fps,
             features=build_features(cam_cfg.height, cam_cfg.width,
-                                    state_joints=state_joints),
+                                    state_joints=state_joints,
+                                    enable_tracks=args.enable_tracks),
             root=root,
             robot_type=MasiExcavator.robot_type,
             use_videos=True,
@@ -324,6 +360,7 @@ def main() -> int:
     robot = MasiExcavator(profile=args.robot,
                           camera_config=cam_cfg,
                           enable_slew=not args.no_slew,
+                          enable_tracks=args.enable_tracks,
                           use_control_thread=True,
                           setpoint_hold_s=max(0.1, 4.0 / args.fps),
                           setpoint_decay_s=0.2,
@@ -348,7 +385,8 @@ def main() -> int:
         return 1
 
     print(f"\nTask: {args.task!r}")
-    print("A=start/save episode  B=discard episode  X=pump  Y=reload-config  Ctrl+C=quit\n")
+    print("A=start/save episode  B=discard episode  X=pump  Y=reload-config  Ctrl+C=quit"
+          + ("  Bumper=reverse-track\n" if args.enable_tracks else "\n"))
 
     period = 1.0 / args.fps
     # Capture time of the last frame this loop consumed. The loop paces on the
@@ -456,13 +494,19 @@ def main() -> int:
                 mask_prev = mask
 
                 action = manual_action_from_axes(axes)
+                tracks = manual_tracks_from_axes(axes) if args.enable_tracks else None
             else:
                 action = np.zeros(4, dtype=np.float32)
+                tracks = np.zeros(2, dtype=np.float32) if args.enable_tracks else None
 
             if not pad.is_live():
                 action = np.zeros(4, dtype=np.float32)
+                tracks = np.zeros(2, dtype=np.float32) if args.enable_tracks else None
 
-            sent = robot.send_action(action)
+            if args.enable_tracks:
+                sent, sent_tracks = robot.send_action(action, tracks=tracks)
+            else:
+                sent = robot.send_action(action)
 
             if recording and fresh:
                 obs = robot.get_observation()
@@ -477,6 +521,8 @@ def main() -> int:
                         ACTION_KEY: sent,
                         "task": args.task,
                     }
+                    if args.enable_tracks:
+                        frame[ACTION_TRACKS_KEY] = sent_tracks
                     frame.update({k: obs[k] for k in cam_keys})
                     frame.update(clock_fields(obs, tick, ep_perf0))
                     dataset.add_frame(frame)

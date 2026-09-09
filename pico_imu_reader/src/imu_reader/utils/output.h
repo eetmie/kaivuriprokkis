@@ -23,6 +23,10 @@
 #define CAL_FAIL_GYRO_STD            0x0002
 #define CAL_FAIL_ACCEL_STD           0x0004
 #define CAL_FAIL_ACCEL_NORM          0x0008
+// Gravity direction moved between the first and last third of the window.
+// Variance gates cannot see a steady slow rotation; this one can, for any
+// rotation with a component off the gravity axis.
+#define CAL_FAIL_GRAVITY_DRIFT       0x0010
 
 typedef struct calibration_vector_t {
     float x;

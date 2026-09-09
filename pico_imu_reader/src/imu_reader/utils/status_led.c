@@ -41,14 +41,16 @@ void status_led_off(void) {
 }
 
 void status_led_set(status_led_state_t state) {
-    // Minimal brightness — still clearly visible
+    // Minimal brightness — still clearly visible. Calibration is the exception:
+    // it is the one state an operator has to notice from the cab before
+    // touching a control, so it runs at full brightness.
     switch (state) {
-        case STATUS_BOOT:       status_led_set_rgb( 3,  1,  0); break;  // Amber (reddish)
-        case STATUS_CFG_WAIT:   status_led_set_rgb( 2,  2,  0); break;  // Yellow (greenish)
-        case STATUS_INIT:       status_led_set_rgb( 0,  0,  3); break;  // Blue
-        case STATUS_STREAM:     status_led_set_rgb( 0,  3,  0); break;  // Green
-        case STATUS_ERROR:      status_led_set_rgb( 5,  0,  0); break;  // Red
-        case STATUS_CALIBRATE:  status_led_set_rgb(24,  8,  0); break;  // Bright orange
-        default:                status_led_off();                break;
+        case STATUS_BOOT:       status_led_set_rgb(  3,  1,  0); break;  // Amber (reddish)
+        case STATUS_CFG_WAIT:   status_led_set_rgb(  2,  2,  0); break;  // Yellow (greenish)
+        case STATUS_INIT:       status_led_set_rgb(  0,  0,  3); break;  // Blue
+        case STATUS_STREAM:     status_led_set_rgb(  0,  3,  0); break;  // Green
+        case STATUS_ERROR:      status_led_set_rgb(  5,  0,  0); break;  // Red
+        case STATUS_CALIBRATE:  status_led_set_rgb(255, 85,  0); break;  // Amber, full brightness
+        default:                status_led_off();                 break;
     }
 }

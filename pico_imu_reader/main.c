@@ -20,14 +20,38 @@
 #define SENSOR_INTERNAL_ODR_HZ 416u
 #define SENSOR_OUTPUT_HZ       200u
 
+// Startup gyro-bias calibration.
+//
+// The window is retried instead of being one long take, and the measured bias
+// is applied only if the window was accepted. The previous version always
+// applied the mean and reported acceptance as advisory, so a boot with the
+// machine moving produced a silently wrong bias on every sensor and streamed
+// anyway. Worst case here is still the same ~30 s the host expects; a clean
+// boot now finishes in about 13 s.
 #define STARTUP_CALIBRATION_SETTLE_MS 3000u
-#define STARTUP_CALIBRATION_DURATION_MS 30000u
+#define STARTUP_CALIBRATION_WINDOW_MS 10000u
+#define STARTUP_CALIBRATION_RETRY_SETTLE_MS 1000u
+#define STARTUP_CALIBRATION_MAX_ATTEMPTS 3u
 #define STARTUP_CALIBRATION_SAMPLE_PERIOD_US 10000u
-#define STARTUP_CALIBRATION_MIN_SAMPLES 1000u
+// 80% of the 100 Hz samples one window can hold, so a few I2C read errors are
+// tolerated but a mostly-failed window is not. Scale this with the window: at
+// the old 1000 out of a nominal 3000 the check was nearly unreachable.
+#define STARTUP_CALIBRATION_MIN_SAMPLES     (((STARTUP_CALIBRATION_WINDOW_MS * 1000u) / STARTUP_CALIBRATION_SAMPLE_PERIOD_US) * 4u / 5u)
 #define CALIBRATION_MAX_GYRO_STD_DPS 0.5f
 #define CALIBRATION_MAX_ACCEL_STD_G 0.05f
 #define CALIBRATION_MIN_ACCEL_NORM_G 0.75f
 #define CALIBRATION_MAX_ACCEL_NORM_G 1.25f
+// A steady slow rotation has a low variance, so the std gates above cannot see
+// it. Comparing mean gravity over the first and last third of the window can,
+// for any rotation that is not purely about gravity: 0.1 deg/s over a 10 s
+// window tilts it by about 0.7 deg. Yaw about gravity stays invisible to any
+// accelerometer-only test.
+#define CALIBRATION_MAX_GRAVITY_DRIFT_DEG 0.5f
+// Set to 0 to restore the previous behaviour — apply the measured bias even
+// when the window is rejected, and stream regardless. Only useful for a bench
+// comparison against old recordings; it is what produced the unverified bias
+// in the existing dataset.
+#define STARTUP_CALIBRATION_REQUIRE_ACCEPTED 1
 
 typedef struct imu_stream_slot_t {
     uint32_t sequence;
@@ -62,6 +86,13 @@ typedef struct calibration_stats_t {
     FusionVector accel_sum;
     FusionVector accel_sum_sq;
     float accel_norm_sum;
+    // Split accumulators for the gravity-drift gate: first and last third of
+    // the window, by wall clock rather than by sample index, so a window with
+    // read errors still compares the intended intervals.
+    FusionVector accel_head_sum;
+    FusionVector accel_tail_sum;
+    uint32_t accel_head_count;
+    uint32_t accel_tail_count;
 } calibration_stats_t;
 
 static sensor_runtime_t g_sensor_runtime = {0};
@@ -94,6 +125,27 @@ static inline FusionVector vector_std(FusionVector sum, FusionVector sum_sq, flo
     stddev.axis.y = sqrtf(fmaxf(variance.axis.y, 0.0f));
     stddev.axis.z = sqrtf(fmaxf(variance.axis.z, 0.0f));
     return stddev;
+}
+
+// Angle [deg] between two mean acceleration vectors, or -1 if either interval
+// is too sparse or too close to zero to give a direction.
+static inline float gravity_drift_deg(FusionVector head_sum, uint32_t head_count,
+                                      FusionVector tail_sum, uint32_t tail_count) {
+    if ((head_count == 0u) || (tail_count == 0u)) {
+        return -1.0f;
+    }
+    const FusionVector head = vector_divide(head_sum, (float)head_count);
+    const FusionVector tail = vector_divide(tail_sum, (float)tail_count);
+    const float head_norm = sqrtf((head.axis.x * head.axis.x) + (head.axis.y * head.axis.y) +
+                                  (head.axis.z * head.axis.z));
+    const float tail_norm = sqrtf((tail.axis.x * tail.axis.x) + (tail.axis.y * tail.axis.y) +
+                                  (tail.axis.z * tail.axis.z));
+    if ((head_norm < 0.1f) || (tail_norm < 0.1f)) {
+        return -1.0f;
+    }
+    const float dot = ((head.axis.x * tail.axis.x) + (head.axis.y * tail.axis.y) +
+                       (head.axis.z * tail.axis.z)) / (head_norm * tail_norm);
+    return (180.0f / (float)M_PI) * acosf(fmaxf(-1.0f, fminf(1.0f, dot)));
 }
 
 static inline float vector_norm(FusionVector vector) {
@@ -229,17 +281,23 @@ static void send_calibration_report_window(uint32_t duration_ms, uint8_t sensor_
     }
 }
 
-static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
+// Run one calibration window. Returns true if every sensor passed every gate.
+// The measured means land in `reports` either way, so the caller can log a
+// rejected window before deciding what to do about it.
+static bool startup_calibration_attempt(uint8_t sensor_count, calibration_report_sensor_t *reports) {
     calibration_stats_t stats[MAX_SENSORS] = {0};
-    calibration_report_sensor_t reports[MAX_SENSORS] = {0};
+    for (uint8_t i = 0; i < MAX_SENSORS; i++) {
+        reports[i] = (calibration_report_sensor_t){0};
+    }
 
-    // Let sensor ODR cycles fill output registers before collecting samples.
-    status_led_set(STATUS_CALIBRATE);
-    calibration_service_until(time_us_64() + ((uint64_t)STARTUP_CALIBRATION_SETTLE_MS * 1000u));
+    const uint64_t window_start_us = time_us_64();
+    const uint64_t window_us = (uint64_t)STARTUP_CALIBRATION_WINDOW_MS * 1000u;
+    const uint64_t head_end_us = window_start_us + (window_us / 3u);
+    const uint64_t tail_start_us = window_start_us + ((2u * window_us) / 3u);
+    const uint64_t window_end_us = window_start_us + window_us;
 
-    const uint64_t calibration_end_us = time_us_64() + ((uint64_t)STARTUP_CALIBRATION_DURATION_MS * 1000u);
-    uint64_t next_sample_us = time_us_64();
-    while (time_us_64() < calibration_end_us) {
+    uint64_t next_sample_us = window_start_us;
+    while (time_us_64() < window_end_us) {
         const uint64_t now_us = time_us_64();
         if (now_us < next_sample_us) {
             calibration_service_until(next_sample_us);
@@ -271,6 +329,14 @@ static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
             stats[i].accel_sum = FusionVectorAdd(stats[i].accel_sum, accelerometer);
             stats[i].accel_sum_sq = vector_add_square(stats[i].accel_sum_sq, accelerometer);
             stats[i].accel_norm_sum += accel_norm_sample;
+
+            if (now_us < head_end_us) {
+                stats[i].accel_head_sum = FusionVectorAdd(stats[i].accel_head_sum, accelerometer);
+                stats[i].accel_head_count++;
+            } else if (now_us >= tail_start_us) {
+                stats[i].accel_tail_sum = FusionVectorAdd(stats[i].accel_tail_sum, accelerometer);
+                stats[i].accel_tail_count++;
+            }
         }
     }
 
@@ -312,31 +378,82 @@ static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
             report->failure_flags |= CAL_FAIL_ACCEL_NORM;
         }
 
+        const float drift_deg = gravity_drift_deg(stats[i].accel_head_sum, stats[i].accel_head_count,
+                                                  stats[i].accel_tail_sum, stats[i].accel_tail_count);
+        if ((drift_deg < 0.0f) || (drift_deg > CALIBRATION_MAX_GRAVITY_DRIFT_DEG)) {
+            report->failure_flags |= CAL_FAIL_GRAVITY_DRIFT;
+        }
+
         if (report->failure_flags != 0u) {
             accepted = false;
         }
     }
 
-    send_calibration_report_window(
-        STARTUP_CALIBRATION_DURATION_MS,
-        sensor_count,
-        accepted ? CAL_REPORT_ACCEPTED : 0u,
-        reports);
+    return accepted;
+}
 
-    // Always apply the measured gyro bias and proceed — the report is
-    // informational. Threshold failures indicate noisy conditions but the
-    // bias mean is still valid and better than nothing.
+static bool startup_calibrate_gyro_biases(uint8_t sensor_count) {
+    calibration_report_sensor_t reports[MAX_SENSORS] = {0};
+    bool accepted = false;
+
+    status_led_set(STATUS_CALIBRATE);
+    // Let sensor ODR cycles fill output registers before collecting samples.
+    calibration_service_until(time_us_64() + ((uint64_t)STARTUP_CALIBRATION_SETTLE_MS * 1000u));
+
+    for (uint32_t attempt = 0; attempt < STARTUP_CALIBRATION_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 0u) {
+            // Give whatever disturbed the last window time to settle before
+            // starting the timer again.
+            calibration_service_until(time_us_64() +
+                                      ((uint64_t)STARTUP_CALIBRATION_RETRY_SETTLE_MS * 1000u));
+        }
+
+        accepted = startup_calibration_attempt(sensor_count, reports);
+
+        // Report every attempt, accepted or not, so a rejected window and its
+        // reason reach the host instead of only the final verdict.
+        send_calibration_report_window(
+            STARTUP_CALIBRATION_WINDOW_MS,
+            sensor_count,
+            accepted ? CAL_REPORT_ACCEPTED : 0u,
+            reports);
+
+        if (accepted) {
+            break;
+        }
+    }
+
+    if (!accepted) {
+#if STARTUP_CALIBRATION_REQUIRE_ACCEPTED
+        // No bias is applied. An unverified bias is indistinguishable from a
+        // good one downstream, and every later angle is built on it. The caller
+        // parks in calibration_error_forever(), which owns the LED from here.
+        return false;
+#else
+        cdc_write_line("Calibration rejected; applying it anyway (REQUIRE_ACCEPTED=0)");
+#endif
+    }
+
     for (uint8_t i = 0; i < sensor_count; i++) {
         FusionVector gyro_bias;
         gyro_bias.axis.x = reports[i].gyro_mean.x;
         gyro_bias.axis.y = reports[i].gyro_mean.y;
         gyro_bias.axis.z = reports[i].gyro_mean.z;
         set_active_sensor_gyro_bias(i, gyro_bias);
+        cdc_writef("Gyro bias %d: %d %d %d (milli-dps)\n", i,
+                   (int)(gyro_bias.axis.x * 1000.0f),
+                   (int)(gyro_bias.axis.y * 1000.0f),
+                   (int)(gyro_bias.axis.z * 1000.0f));
     }
 
     status_led_set(STATUS_INIT);
     return true;
 }
+
+// Terminal state: startup calibration was never accepted, so no bias was
+// applied and nothing is streamed. Fast full-brightness red so it cannot be
+// mistaken for the amber calibration state or for a slow heartbeat.
+#define CALIBRATION_ERROR_BLINK_MS 60u
 
 static void calibration_error_forever(void) {
     bool led_on = true;
@@ -351,12 +468,12 @@ static void calibration_error_forever(void) {
         }
 
         if (led_on) {
-            status_led_set_rgb(24, 0, 0);
+            status_led_set_rgb(255, 0, 0);
         } else {
             status_led_off();
         }
         led_on = !led_on;
-        sleep_ms(150);
+        sleep_ms(CALIBRATION_ERROR_BLINK_MS);
     }
 }
 
@@ -538,9 +655,9 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
             sensors[i].rollDeg = tilt_roll_deg_from_gravity(gravity);
 
             // Publish the calibrated, bias-corrected pair that FusionAhrsUpdate
-            // was just given — not a fresh sensor read. Replaying these two with
-            // the same deltaTime reproduces this quaternion exactly, which is
-            // what makes an offline gain sweep meaningful.
+            // was just given, not a fresh sensor read. The 200 Hz stream omits
+            // some 416 Hz AHRS updates and per-sensor deltaTime, so offline
+            // replay is approximate; it cannot reproduce every update exactly.
             write_sensor_output(sensors_data[i], quat, sensors[i].gyroscope, sensors[i].accelerometer);
         }
 
@@ -614,6 +731,8 @@ int main() {
     g_sensor_runtime.period_ms = 1000.0f / (float)SENSOR_INTERNAL_ODR_HZ;
     initialize_sensors_values(g_sensor_runtime.sensors, MAX_SENSORS);
     initialize_calibrations(g_sensor_runtime.sensors, MAX_SENSORS);
+    // Fusion recovery thresholds count AHRS updates, not USB output frames.
+    imu_reader_settings.ahrsRateHz = SENSOR_INTERNAL_ODR_HZ;
     initialize_algos(g_sensor_runtime.sensors, MAX_SENSORS);
 
     stream_publish_descriptor(SENSOR_OUTPUT_HZ, sensor_count, sensor_bus_ids, sensor_addrs);

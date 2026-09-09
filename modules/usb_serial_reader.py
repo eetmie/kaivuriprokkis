@@ -45,13 +45,21 @@ class USBSerialReader:
     MSG_TYPE_CAL_WAIT = 0x07
     MSG_TYPE_ERR_CAL = 0x08
 
-    STARTUP_CALIBRATION_DURATION_S = 30.0
+    # Worst case for the firmware's retried calibration: a 3 s settle plus
+    # three 10 s windows, each followed by a 0.5 s report burst, with a 1 s
+    # settle between attempts. A stationary boot is accepted on the first
+    # window and reaches the stream in about 13 s.
+    STARTUP_CALIBRATION_DURATION_S = 37.0
 
     CAL_REPORT_ACCEPTED = 0x01
     CAL_FAIL_INSUFFICIENT_SAMPLES = 0x0001
     CAL_FAIL_GYRO_STD = 0x0002
     CAL_FAIL_ACCEL_STD = 0x0004
     CAL_FAIL_ACCEL_NORM = 0x0008
+    # Mean gravity direction moved between the first and last third of the
+    # window. Catches a steady slow rotation, which the standard-deviation
+    # gates above cannot see.
+    CAL_FAIL_GRAVITY_DRIFT = 0x0010
 
     def __init__(self, baud_rate=115200, timeout=1.0,
                  log_level: str = "INFO", port: str | None = None, debug: bool = False,
@@ -567,6 +575,15 @@ class USBSerialReader:
             names.append("accel_std")
         if flags & self.CAL_FAIL_ACCEL_NORM:
             names.append("accel_norm")
+        if flags & self.CAL_FAIL_GRAVITY_DRIFT:
+            names.append("gravity_drift")
+        # Anything the firmware reports that this reader has no name for, so a
+        # newer image never produces a rejection with an empty reason.
+        known = (self.CAL_FAIL_INSUFFICIENT_SAMPLES | self.CAL_FAIL_GYRO_STD |
+                 self.CAL_FAIL_ACCEL_STD | self.CAL_FAIL_ACCEL_NORM |
+                 self.CAL_FAIL_GRAVITY_DRIFT)
+        if flags & ~known:
+            names.append(f"unknown_0x{flags & ~known:04x}")
         return names
 
     def _calibration_report_frame_len(self, sensor_count):

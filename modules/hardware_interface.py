@@ -450,9 +450,13 @@ class HardwareInterface:
                     rt_lock_memory=self._rt_lock_memory,
                     rt_cpu_core=self._usb_cpu_core,
                 )
-                # Firmware self-calibrates on power-on (~30 s stationary), then streams
-                # at 200 Hz autonomously. No config handshake needed.
-                self.logger.info("IMU connected; Pico firmware will self-calibrate (~30 s) then stream at 200 Hz")
+                # Firmware self-calibrates on power-on, then streams at 200 Hz
+                # autonomously. No config handshake needed. It retries the
+                # stationary window up to three times and refuses to stream if
+                # none is accepted, so a moving machine gets ERR_CAL rather than
+                # a silently wrong gyro bias.
+                self.logger.info("IMU connected; Pico firmware will self-calibrate "
+                                 "(~13 s stationary, up to ~37 s with retries) then stream at 200 Hz")
                 self.usb_reader.start_background_reader()
 
                 # Start background thread for IMU reading
@@ -569,8 +573,9 @@ class HardwareInterface:
                         new_base_imu_accel = None
 
                     # Validate quaternion magnitudes for all configured IMUs (should be ~1.0).
-                    # During the ~33 s power-on calibration phase (3 s settle + 30 s sampling)
-                    # the Pico sends MSG_TYPE_CAL_WAIT every 200 ms and emits no data frames,
+                    # During the power-on calibration phase (3 s settle plus one to
+                    # three 10 s windows) the Pico sends MSG_TYPE_CAL_WAIT every
+                    # 200 ms and emits no data frames,
                     # so _imu_state stays PENDING and this block is never reached. Magnitude
                     # validation only runs once streaming begins post-calibration.
                     valid_data = True

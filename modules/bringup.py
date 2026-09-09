@@ -53,7 +53,8 @@ def wait_for_hardware_ready(
     """
     log = logger or logging.getLogger(__name__)
     log.info(
-        "Waiting for hardware ready (Pico self-calibrates ~30 s stationary, timeout %.0f s)...",
+        "Waiting for hardware ready (Pico self-calibrates ~13 s stationary, "
+        "up to ~37 s if it retries; timeout %.0f s)...",
         timeout_s,
     )
 

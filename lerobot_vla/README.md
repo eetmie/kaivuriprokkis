@@ -47,7 +47,7 @@ transcode to read AV1 reliably.
 | `observation.state` | float32[3] | joint angles [lift, tilt, scoop], degrees. **Slew IMU feedback is dropped at the moment due to drift** — see below |
 | `observation.images.cam1` | uint8 480×640×3 | D435i **infrared left imager**, laser emitter DISABLED, gray→3ch |
 | `observation.images.cam2` | uint8 480×640×3 | D435i **color imager**, rgb8 |
-| `action` | float32[4] | normalized valve commands [-1, 1], [slew, lift, tilt, scoop] |
+| `action` | float32[4] | normalized valve commands [-1, 1], [slew, lift, tilt, scoop] — float32[6] with [trackL, trackR] appended under `--enable-tracks` |
 | `clock.loop` | float64 | seconds since episode start, `perf_counter` |
 | `clock.cam1_age` | float32 | seconds this cam1 frame had been sitting in the camera cache |
 | `clock.cam2_age` | float32 | same for cam2; equal to cam1 when both come off one `wait_for_frames()` |
@@ -67,6 +67,25 @@ same case, because int64 has no NaN and 0 is a real Pico timestamp. Measured on
 the bench at 30 Hz: camera age ~5 ms, state age ~6 ms (max 13, so the control
 thread does occasionally slip past its 10 ms period), device dt 26–41 ms.
 
+**Tracks ride inside `action`, not beside it.** `--enable-tracks` appends
+[trackL, trackR], making the action 6 wide; a track value carries the combined
+trigger+bumper sign, so its negative half is reverse. lerobot lays an action out
+as one flat vector with every actuator named in `names` (`hw_to_dataset_features`
+does exactly this, grippers included), and its tooling reads only that key: a
+sibling `action.tracks` column is prefix-matched into `FeatureType.ACTION` and
+put in the policy's `output_features`, yet never reaches the model, because the
+pipeline only ever transforms the literal key `action` — and `lerobot-dataset-viz`
+plots four series and drops it silently. `masi_digging_new_imu` and
+`masi_digging_new_imu_edge_cases` were recorded in that older layout and were
+converted in place by `lerobot_vla/tools/fold_tracks_into_action.py`.
+
+A 6-wide dataset cannot be resumed into, or co-trained with, a 4-wide one
+without padding — which is why the 493 episodes in `masi_digging`,
+`masi_digging_dry` and `masi_digging_dry_2` are still 4-wide and should stay
+that way. Also worth knowing before training on the track columns: they are
+nonzero in about 2% of frames, in 22 of the 156 episodes that have them, and no
+episode yet contains a reverse.
+
 **Slew IMU feedback is dropped at the moment due to drift.** Slew comes from
 `average_z_yaw` over the IMUs, an absolute world yaw with no magnetometer to
 anchor it and no zeroing anywhere in the stack — so the same physical pose can
@@ -77,8 +96,8 @@ episodes); the problem is the origin, not the noise. Episode-start zeroing does
 not fix it either — slew at episode start has std 4.05° across those episodes,
 a sixth of the ~24° working range.
 
-The cameras observe slew directly, so little is lost. **Actions stay 4-dim: slew
-is still commanded**, it just is not fed back. `--state-joints` on both
+The cameras observe slew directly, so little is lost. **The action keeps its slew
+column: slew is still commanded**, it just is not fed back. `--state-joints` on both
 `record_episodes.py` and `run_inference.py` overrides this; `run_inference`
 refuses to start when the joint count disagrees with `--dataset-stats`. Bring
 slew back only with a real yaw correction (magnetometer, visual heading, or a

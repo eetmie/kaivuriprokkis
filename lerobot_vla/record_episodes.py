@@ -10,8 +10,9 @@ Per frame (at --fps, default 30):
     observation.images.cam1  uint8 480x640x3  D435i infrared left imager (emitter OFF)
     observation.images.cam2  uint8 480x640x3  D435i color imager
     action                   float32[4]  normalized valve cmds actually sent [-1,1]
-    action.tracks            float32[2]  normalized [trackL, trackR] cmds actually
-                                         sent [-1,1] (--enable-tracks only)
+                                         [slew, lift, tilt, scoop], or float32[6]
+                                         with [trackL, trackR] appended under
+                                         --enable-tracks
     task                     the natural-language instruction (--task)
     clock.loop               float64     seconds since episode start (perf_counter)
     clock.cam1_age           float32     seconds this cam1 frame had been sitting
@@ -78,8 +79,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from lerobot_vla.excavator_robot import (
-    ACTION_KEY, ACTION_TRACKS_KEY, CAMERA_KEY, CAMERA_KEY_RGB, DEFAULT_STATE_JOINTS,
-    JOINT_NAMES, STATE_KEY, TRACK_NAMES, MasiExcavator,
+    ACTION_KEY, CAMERA_KEY, CAMERA_KEY_RGB, DEFAULT_STATE_JOINTS,
+    JOINT_NAMES, STATE_KEY, MasiExcavator, action_names,
 )
 from lerobot_vla.camera import CameraConfig
 from lerobot_vla.gamepad import (
@@ -126,6 +127,11 @@ def build_features(cam_h: int, cam_w: int,
     # dataset documents its own state layout, so training and inference cannot
     # silently disagree about whether slew is in there.
     state_joints = list(state_joints or DEFAULT_STATE_JOINTS)
+    # Tracks ride in the action vector rather than a column of their own: that
+    # is lerobot's convention (one flat action, every actuator listed in
+    # `names`) and the only layout its tooling reads -- a sibling action.*
+    # feature is dropped by the policy pipeline and by the dataset viewer alike.
+    act_names = action_names(enable_tracks)
     video = {"dtype": "video", "shape": (cam_h, cam_w, 3),
              "names": ["height", "width", "channels"]}
     features = {
@@ -136,8 +142,8 @@ def build_features(cam_h: int, cam_w: int,
         },
         ACTION_KEY: {
             "dtype": "float32",
-            "shape": (len(JOINT_NAMES),),
-            "names": list(JOINT_NAMES),
+            "shape": (len(act_names),),
+            "names": act_names,
         },
         CAMERA_KEY: dict(video),
         CAMERA_KEY_RGB: dict(video),
@@ -147,15 +153,6 @@ def build_features(cam_h: int, cam_w: int,
         CLOCK_STATE_AGE: {"dtype": "float32", "shape": (1,), "names": None},
         CLOCK_IMU_US: {"dtype": "int64", "shape": (1,), "names": None},
     }
-    # A separate feature, not folded into ACTION_KEY: most datasets never touch
-    # tracks, and an existing dataset's schema must not gain columns silently
-    # just because a later run happened to pass --enable-tracks.
-    if enable_tracks:
-        features[ACTION_TRACKS_KEY] = {
-            "dtype": "float32",
-            "shape": (len(TRACK_NAMES),),
-            "names": list(TRACK_NAMES),
-        }
     return features
 
 
@@ -183,27 +180,26 @@ def unresumable_reason(root: Path) -> str | None:
     return None
 
 
-def manual_action_from_axes(axes: dict) -> np.ndarray:
-    """Map gamepad axes to [slew, lift, tilt, scoop]."""
-    return np.array([
+def manual_action_from_axes(axes: dict, enable_tracks: bool = False) -> np.ndarray:
+    """Map gamepad axes to the action vector.
+
+    [slew, lift, tilt, scoop], with [trackL, trackR] appended when tracks are
+    enabled. right_paddle/left_paddle already carry the trigger+bumper
+    conversion to a single -1..1 value (LocalGamepadInput.poll), so the track
+    half is a rename rather than a second conversion.
+    """
+    action = [
         axes["left_rl"],    # slew
         axes["right_ud"],   # lift (boom)
         axes["left_ud"],    # tilt (arm)
         axes["right_rl"],   # scoop (bucket)
-    ], dtype=np.float32)
-
-
-def manual_tracks_from_axes(axes: dict) -> np.ndarray:
-    """Map gamepad axes to [trackL, trackR].
-
-    right_paddle/left_paddle already carry the trigger+bumper conversion to a
-    single -1..1 value (LocalGamepadInput.poll), so this is a pure rename, not
-    a second conversion.
-    """
-    return np.array([
-        axes["left_paddle"],   # trackL
-        axes["right_paddle"],  # trackR
-    ], dtype=np.float32)
+    ]
+    if enable_tracks:
+        action += [
+            axes["left_paddle"],   # trackL
+            axes["right_paddle"],  # trackR
+        ]
+    return np.array(action, dtype=np.float32)
 
 
 def main() -> int:
@@ -224,9 +220,11 @@ def main() -> int:
     p.add_argument("--no-slew", action="store_true",
                    help="Disable the slew ACTION channel (the machine will not slew)")
     p.add_argument("--enable-tracks", action="store_true",
-                   help="Record and drive tracks from the triggers/bumpers as an "
-                        "action.tracks feature (default: off — read but not driven "
-                        "or logged)")
+                   help="Drive the tracks from the triggers/bumpers and append "
+                        "[trackL, trackR] to the action, making it 6 wide "
+                        "(default: off — read but not driven or logged). A "
+                        "6-wide dataset cannot be resumed or co-trained with a "
+                        "4-wide one.")
     p.add_argument("--state-joints", default=",".join(DEFAULT_STATE_JOINTS),
                    help="Joints recorded into observation.state. Slew is out by "
                         "default: nothing zeroes its yaw and there is no "
@@ -288,17 +286,31 @@ def main() -> int:
         # validates every frame against the stored features, so appending to a
         # dataset recorded before the clock.* columns existed fails mid-episode
         # -- after the operator has already driven the take.
-        want = set(build_features(cam_cfg.height, cam_cfg.width,
-                                  state_joints=state_joints,
-                                  enable_tracks=args.enable_tracks))
-        have = set(dataset.meta.features) - {"timestamp", "frame_index",
-                                             "episode_index", "index", "task_index"}
-        if want != have:
+        want = build_features(cam_cfg.height, cam_cfg.width,
+                              state_joints=state_joints,
+                              enable_tracks=args.enable_tracks)
+        have = {k: v for k, v in dataset.meta.features.items()
+                if k not in ("timestamp", "frame_index", "episode_index",
+                             "index", "task_index")}
+        # Shapes, not just names: --enable-tracks now widens `action` from 4 to
+        # 6 instead of adding a column, so a mismatched track setting leaves the
+        # key set identical and would sail through a names-only check, then fail
+        # on the first add_frame -- after the operator has driven the take.
+        problems = [f"missing from it: {k}" for k in want if k not in have]
+        problems += [f"extra in it: {k}" for k in have if k not in want]
+        problems += [
+            f"{k}: recorded as {tuple(have[k]['shape'])}"
+            f"{' ' + ','.join(have[k]['names']) if have[k].get('names') else ''}"
+            f", this run wants {tuple(v['shape'])}"
+            f"{' ' + ','.join(v['names']) if v.get('names') else ''}"
+            for k, v in want.items()
+            if k in have and (tuple(have[k]["shape"]) != tuple(v["shape"])
+                              or (have[k].get("names") or []) != (v.get("names") or []))
+        ]
+        if problems:
             print(f"Cannot --resume: {root} was recorded with a different schema.")
-            for label, diff in (("missing from it", want - have),
-                                ("extra in it", have - want)):
-                if diff:
-                    print(f"  {label}: {', '.join(sorted(diff))}")
+            for line in problems:
+                print(f"  {line}")
             print("Record into a new --repo-id; the two shapes cannot share a dataset.")
             return 1
         print(f"[dataset] Resumed {root} at episode {dataset.meta.total_episodes}")
@@ -365,6 +377,9 @@ def main() -> int:
                           setpoint_hold_s=max(0.1, 4.0 / args.fps),
                           setpoint_decay_s=0.2,
                           state_joints=state_joints)
+    # Taken from the robot rather than recomputed, so the zero action sent while
+    # the pad is dead can never be a different width from the one it accepts.
+    action_width = len(robot.action_names)
     try:
         robot.connect()
     except BaseException:
@@ -493,20 +508,14 @@ def main() -> int:
                     print(f"\n[config] reload {'OK' if robot.reload_config() else 'FAILED'}")
                 mask_prev = mask
 
-                action = manual_action_from_axes(axes)
-                tracks = manual_tracks_from_axes(axes) if args.enable_tracks else None
+                action = manual_action_from_axes(axes, args.enable_tracks)
             else:
-                action = np.zeros(4, dtype=np.float32)
-                tracks = np.zeros(2, dtype=np.float32) if args.enable_tracks else None
+                action = np.zeros(action_width, dtype=np.float32)
 
             if not pad.is_live():
-                action = np.zeros(4, dtype=np.float32)
-                tracks = np.zeros(2, dtype=np.float32) if args.enable_tracks else None
+                action = np.zeros(action_width, dtype=np.float32)
 
-            if args.enable_tracks:
-                sent, sent_tracks = robot.send_action(action, tracks=tracks)
-            else:
-                sent = robot.send_action(action)
+            sent = robot.send_action(action)
 
             if recording and fresh:
                 obs = robot.get_observation()
@@ -521,8 +530,6 @@ def main() -> int:
                         ACTION_KEY: sent,
                         "task": args.task,
                     }
-                    if args.enable_tracks:
-                        frame[ACTION_TRACKS_KEY] = sent_tracks
                     frame.update({k: obs[k] for k in cam_keys})
                     frame.update(clock_fields(obs, tick, ep_perf0))
                     dataset.add_frame(frame)

@@ -1,7 +1,7 @@
 """simple_drive profile / wiring tests.
 
-simple_drive is now open-loop only and takes five args (--robot, --ip,
---enable-slew, --enable-tracks, --suffix). The per-run config overrides it used to
+simple_drive is open-loop with explicit recording/excitation options.
+The per-run hardware config overrides it used to
 carry (--config-file, --pwm-i2c-bus, --disable-imu, ...) are gone, so profile
 resolution is a straight delegation to modules.board.resolve_profile and is
 covered there; what remains worth testing here is that the resolved profile
@@ -220,18 +220,14 @@ class ArgSurfaceTests(unittest.TestCase):
         self.assertFalse(args.enable_tracks)
 
     def test_arg_surface_stays_small(self):
-        # The whole point of the cleanup. If an arg is added here on purpose,
-        # update this set — it exists so knobs do not creep back in one at a
-        # time. Per-run tuning belongs in the profile's control_config.yaml,
-        # and compensation belongs in control_prototype/drive_compensated.py.
-        #
-        # --suffix is admitted under that rule because it does not tune
-        # anything: it only labels the strips a run writes, which is not
-        # expressible in a config file that several runs share.
+        # Waveform settings describe the recording experiment. Hardware
+        # configuration stays in profiles and compensation in control_prototype.
         args = self._parse([])
         self.assertEqual(
             set(vars(args)),
-            {"robot", "ip", "enable_slew", "enable_tracks", "suffix"},
+            {"robot", "ip", "enable_slew", "enable_tracks", "suffix",
+             "excitation", "excitation_target", "excitation_seed", "excitation_amplitude",
+             "chirp_start_hz", "chirp_end_hz", "chirp_seconds"},
         )
 
     def test_suffix_defaults_to_unlabelled(self):

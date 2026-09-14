@@ -260,6 +260,24 @@ def _engine_cache_files(cache_dir: Path) -> list[dict]:
     ]
 
 
+def clear_engine_cache(cache_dir: str | Path, keep_timing: bool = False) -> None:
+    """Delete the manifest and TRT engines in `cache_dir`, and the timing cache
+    unless `keep_timing`.
+
+    Removes only the files this cache owns rather than the directory, because an
+    explicit --cache-dir may be a directory the user shares with other things.
+    """
+    cache_dir = Path(cache_dir)
+    if not cache_dir.is_dir():
+        return
+    for path in cache_dir.iterdir():
+        if not path.is_file():
+            continue
+        if (path.name == _ENGINE_CACHE_MANIFEST or path.suffix == ".engine"
+                or (path.suffix == ".timing" and not keep_timing)):
+            path.unlink()
+
+
 def _validate_engine_cache_manifest(cache_dir: Path, identity: dict) -> dict | None:
     path = cache_dir / _ENGINE_CACHE_MANIFEST
     if not path.exists():
@@ -267,16 +285,29 @@ def _validate_engine_cache_manifest(cache_dir: Path, identity: dict) -> dict | N
     try:
         document = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid engine-cache manifest {path}: {exc}") from exc
+        raise ValueError(f"invalid engine-cache manifest {path}: {exc}; "
+                         "rerun with --rebuild") from exc
     if document.get("identity") != identity:
         raise ValueError(
-            f"engine-cache manifest identity mismatch at {path}; use a new cache "
-            "directory for this bundle/runtime configuration")
+            f"engine-cache manifest identity mismatch at {path}; rerun with "
+            "--rebuild, or use a new cache directory for this bundle/runtime "
+            "configuration")
+    # Engines gone but the manifest left behind is what clear-build-caches does
+    # at every boot (it keeps *.timing). That is a cleared cache, not a broken
+    # one: drop the leftovers and rebuild warm from the kept timing cache.
+    listed = [item.get("name", "") for item in document.get("files") or []]
+    if any(name.endswith(".engine") and not (cache_dir / name).is_file()
+           for name in listed):
+        LOG.warning("engine cache %s lists engines that are no longer on disk "
+                    "(cleared at boot?); rebuilding, keeping the timing cache",
+                    cache_dir)
+        clear_engine_cache(cache_dir, keep_timing=True)
+        return None
     actual = _engine_cache_files(cache_dir)
     if document.get("files") != actual:
         raise ValueError(
-            f"engine-cache contents do not match {path}; the cache is missing, "
-            "truncated, or mixed")
+            f"engine-cache contents do not match {path}; the cache is "
+            "truncated or mixed — rerun with --rebuild")
     if not actual:
         raise ValueError(f"engine-cache manifest {path} records no engine files")
     return document

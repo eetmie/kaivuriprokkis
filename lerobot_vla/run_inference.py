@@ -776,6 +776,7 @@ def main() -> int:
         policy = make_policy(
             "xvla", args.split_dir,
             cache_dir=args.cache_dir if args.cache_dir != DEFAULT_CACHE_DIR else None,
+            rebuild=args.rebuild,
             num_steps=args.num_steps if args.num_steps != DEFAULT_NUM_STEPS else None,
             seed=args.seed,
             tokenizer_dir=args.tokenizer,

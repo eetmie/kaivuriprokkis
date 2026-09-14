@@ -228,6 +228,7 @@ class XVLAExcavatorPolicy:
     def __init__(self,
                  split_dir: str | Path,
                  cache_dir: str | Path | None = None,
+                 rebuild: bool = False,
                  precision: str = "fp16",
                  num_steps: int | None = None,
                  seed: int | None = None,
@@ -253,9 +254,15 @@ class XVLAExcavatorPolicy:
         # Keep the heavy ONNX Runtime import behind the bundle safety gate. A
         # base or incomplete bundle must be rejected from metadata alone, before
         # any inference dependency is required or a TensorRT engine can load.
-        from lerobot_vla.runtime.vendor.xvla_split_ort import XVLASplitPolicy, prebuild_engines
+        from lerobot_vla.runtime.vendor.xvla_split_ort import (
+            XVLASplitPolicy, clear_engine_cache, prebuild_engines)
 
         cache_dir = Path(cache_dir) if cache_dir else split_dir / ENGINE_CACHE_DIRNAME
+        if rebuild:
+            # A suspected cache is not trusted in any part, timing cache included,
+            # so this is the ~5 min cold build.
+            LOG.info("clearing engine cache %s (asked for a rebuild)", cache_dir)
+            clear_engine_cache(cache_dir)
 
         # Build every engine in its OWN subprocess before the sessions exist. Not
         # an optimization: two TRT builders resident in one process was enough to

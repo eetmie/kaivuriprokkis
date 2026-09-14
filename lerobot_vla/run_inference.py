@@ -78,13 +78,13 @@ proceeds exactly as it would without one. Takeover is live-only, but the D-pad's
 task selector is not: a multi-task run opens the pad without --live too, with A
 disabled, because picking the next inference's instruction never writes a valve.
 
---enable-tracks is the same flag as record_episodes.py --enable-tracks, and must
-match the checkpoint the same way --task does: a model trained on a track-enabled
-recording emits a 6-wide action, [slew, lift, tilt, scoop, trackL, trackR], and
-the last two drive the tracks. Unlike --fps it is not read from the bundle, but a
-mismatch with the stats (SmolVLA) or the bundle's action width (X-VLA) is refused
-before anything is driven. With it, gamepad takeover drives the tracks from the
-triggers/bumpers.
+--enable-tracks is the same flag as record_episodes.py --enable-tracks. A model
+trained on a track-enabled recording emits a 6-wide action, [slew, lift, tilt,
+scoop, trackL, trackR]; the flag decides whether the last two are DRIVEN. Without
+it (the default) a 6-wide model still runs, its track columns logged but never
+sent, so the tracks stay stopped. With it, gamepad takeover drives the tracks from
+the triggers/bumpers too. The flag on a 4-wide model is refused, checked against
+the stats (SmolVLA) or the bundle's action width (X-VLA) before anything is driven.
 
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds. The cache is per bundle — a second --split-dir builds
@@ -408,6 +408,29 @@ def load_norm(stats_path: str | None) -> NormStats:
     return norm
 
 
+def check_action_width(width: int, enable_tracks: bool, source: str) -> list[str]:
+    """The checkpoint's action layout, refused if the run cannot use it.
+
+    --enable-tracks decides only whether the tracks are DRIVEN. A 6-wide
+    checkpoint runs either way -- without the flag its track columns are simply
+    not sent -- but the flag on a 4-wide one is asking for columns the model
+    does not have.
+    """
+    for names in (action_names(False), action_names(True)):
+        if width == len(names):
+            break
+    else:
+        raise SystemExit(
+            f"{source} has a {width}-dim action, which is neither "
+            f"{action_names(False)} nor {action_names(True)}. Check the training "
+            f"dataset's meta/info.json -> features['action']['names'].")
+    if enable_tracks and names != action_names(True):
+        raise SystemExit(
+            f"--enable-tracks refused: {source} has a {width}-dim action "
+            f"{names}, with no track columns to drive. Drop the flag.")
+    return names
+
+
 class GamepadTeleop:
     """The pad's two jobs in a run: hand the machine over, and pick the task.
 
@@ -658,12 +681,11 @@ def main() -> int:
                         "both ends -- it needs chunk_size >= 2 * infer_s * fps "
                         "before any reserve is left for a late replan")
     p.add_argument("--enable-tracks", action="store_true",
-                   help="The checkpoint was trained on a --enable-tracks "
-                        "recording: its action is 6 wide, [slew, lift, tilt, "
-                        "scoop, trackL, trackR], and the last two drive the "
-                        "tracks. Gamepad takeover drives them from the "
-                        "triggers/bumpers, as in record_episodes. Must match "
-                        "the checkpoint; a width mismatch is refused")
+                   help="Drive the tracks from the checkpoint's [trackL, "
+                        "trackR] columns, and from the triggers/bumpers during "
+                        "gamepad takeover, as in record_episodes. Refused for a "
+                        "4-wide checkpoint. Without it a 6-wide checkpoint still "
+                        "runs, with its track columns logged but not driven")
     p.add_argument("--legacy-direct-write", action="store_true",
                    help="Drive valves from this thread instead of the control "
                         "thread (bench A/B only — has the 30 Hz rate problems)")
@@ -784,20 +806,12 @@ def main() -> int:
                 f"{len(norm.state_mean)}-dim observation.state.\n"
                 f"Check the training dataset's meta/info.json -> "
                 f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
-        # Same contract for the action. The model pads its action to 32, so a
-        # wrong width does not fail inside it: too narrow silently drops the track
-        # columns, and the stats then fail to broadcast on the first chunk.
-        if norm.action_mean is not None and len(norm.action_mean) != len(act_names):
-            raise SystemExit(
-                f"--dataset-stats {args.dataset_stats} was built from a "
-                f"{len(norm.action_mean)}-dim action, but this run expects "
-                f"{len(act_names)} {act_names}.\n"
-                + ("Pass --enable-tracks: the checkpoint drives the tracks."
-                   if len(norm.action_mean) == len(action_names(True))
-                   else "Drop --enable-tracks: the checkpoint has no track columns."
-                   if len(norm.action_mean) == len(JOINT_NAMES)
-                   else "Check the training dataset's meta/info.json -> "
-                        "features['action']['names']."))
+        # Same contract for the action. The model pads its action to 32, so its
+        # width is not visible in the engines -- the stats carry it. Without stats
+        # (identity normalization, plumbing only) assume the layout the flag asks for.
+        model_names = check_action_width(
+            len(norm.action_mean) if norm.action_mean is not None else len(act_names),
+            args.enable_tracks, f"--dataset-stats {args.dataset_stats}")
         if state_blind:
             check_state_blind_stats(norm, args.dataset_stats)
 
@@ -807,7 +821,7 @@ def main() -> int:
             cache_dir=args.cache_dir,
             rebuild=args.rebuild,
             num_steps=args.num_steps,
-            action_dim=len(act_names),
+            action_dim=len(model_names),
             norm=norm,
             seed=args.seed,
             projectors=args.projectors,
@@ -822,15 +836,19 @@ def main() -> int:
             "--live refused: this bundle is a model-only feasibility export whose "
             "action columns are not valve commands. Drop --live to watch it run "
             "against real observations.")
-    # X-VLA's width comes from the bundle's physical boundary, so check it here,
-    # once the policy is built. send_action_chunk would refuse it anyway, but only
-    # on the first live chunk.
-    if (not getattr(policy, "feasibility_only", False)
-            and policy.action_dim != len(act_names)):
-        raise SystemExit(
-            f"The bundle emits a {policy.action_dim}-wide action, but this run "
-            f"expects {len(act_names)} {act_names}. --enable-tracks must match "
-            f"the checkpoint: 6 wide with tracks, 4 without.")
+    # X-VLA's width comes from the bundle's physical boundary, so it can only be
+    # checked once the policy is built. A feasibility bundle's columns are arm
+    # dimensions with no layout to check; it never drives.
+    if architecture == "xvla":
+        model_names = (act_names if policy.feasibility_only else
+                       check_action_width(policy.action_dim, args.enable_tracks,
+                                          f"The bundle {args.split_dir}"))
+    ignored_tracks = len(model_names) > len(act_names) and not getattr(
+        policy, "feasibility_only", False)
+    if ignored_tracks:
+        LOG.info("The checkpoint also emits %s; without --enable-tracks they are "
+                 "logged but not driven, so the tracks stay stopped.",
+                 model_names[len(act_names):])
 
     robot = None
     if not args.synthetic:
@@ -900,7 +918,11 @@ def main() -> int:
     # even if the warmup is what blows up.
     action_log = None
     if args.log_actions:
-        channels = CONTROL_CHANNELS + (TRACK_CHANNELS if args.enable_tracks else [])
+        # The model's layout, not the driven one: an ignored track column is still
+        # what the policy asked for, and its emitted value reads 0 -- which is what
+        # the tracks got.
+        channels = CONTROL_CHANNELS + (TRACK_CHANNELS if len(model_names) > len(CONTROL_CHANNELS)
+                                       else [])
         action_log = ActionLogger(args.log_actions, channels, meta={
             "split_dir": args.split_dir,
             "task": tasks[0],
@@ -979,7 +1001,10 @@ def main() -> int:
             skipped = 0.0 if play_t0 is None else max(
                 0.0, (time.monotonic() - play_t0) * args.fps)
             if robot is not None and args.live:
-                robot.send_action_chunk(chunk, fps=args.fps, t0=play_t0)
+                # Only the driven columns: without --enable-tracks the robot has
+                # no track channel, and send_action_chunk refuses a wider chunk.
+                robot.send_action_chunk(chunk[:, :len(act_names)], fps=args.fps,
+                                        t0=play_t0)
             now = time.perf_counter()
             # Steps of the PREVIOUS chunk that actually played before this one
             # replaced it -- measured, not assumed. This is the real execution
@@ -999,9 +1024,12 @@ def main() -> int:
                      "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),
                      " ".join(f"{v:+.2f}" for v in chunk[0][:len(act_names)]),
-                     f" (+{chunk.shape[1] - len(act_names)} more columns; "
-                     "not valve commands)"
-                     if chunk.shape[1] > len(act_names) else "")
+                     (" tracks(ignored)=[%s]" % " ".join(
+                         f"{v:+.2f}" for v in chunk[0][len(act_names):])
+                      if ignored_tracks else
+                      f" (+{chunk.shape[1] - len(act_names)} more columns; "
+                      "not valve commands)"
+                      if chunk.shape[1] > len(act_names) else ""))
 
             if action_log is not None:
                 action_log.log_chunk(cycle, infer_s, played, state, chunk)

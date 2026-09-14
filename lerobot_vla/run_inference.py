@@ -78,6 +78,14 @@ proceeds exactly as it would without one. Takeover is live-only, but the D-pad's
 task selector is not: a multi-task run opens the pad without --live too, with A
 disabled, because picking the next inference's instruction never writes a valve.
 
+--enable-tracks is the same flag as record_episodes.py --enable-tracks, and must
+match the checkpoint the same way --task does: a model trained on a track-enabled
+recording emits a 6-wide action, [slew, lift, tilt, scoop, trackL, trackR], and
+the last two drive the tracks. Unlike --fps it is not read from the bundle, but a
+mismatch with the stats (SmolVLA) or the bundle's action width (X-VLA) is refused
+before anything is driven. With it, gamepad takeover drives the tracks from the
+triggers/bumpers.
+
 First run builds the TRT engines (minutes); later runs load from
 --cache-dir in seconds. The cache is per bundle — a second --split-dir builds
 its own engines beside the first one's rather than colliding with them, and
@@ -108,8 +116,9 @@ from lerobot_vla.runtime.action_log import ActionLogger
 # Control-layer channel names. Column-aligned with JOINT_NAMES (the dataset
 # order), and the keys the setpoint status dict uses — so an action-log
 # column means the same thing in the chunk stream and the emitted stream.
-from lerobot_vla.excavator_robot import JOINT_NAMES
+from lerobot_vla.excavator_robot import JOINT_NAMES, action_names
 from lerobot_vla.excavator_robot import _CONTROL_CHANNELS as CONTROL_CHANNELS
+from lerobot_vla.excavator_robot import _TRACK_CHANNELS as TRACK_CHANNELS
 from lerobot_vla.record_episodes import manual_action_from_axes
 from lerobot_vla.runtime import xvla
 from lerobot_vla.policy import (
@@ -487,11 +496,14 @@ class GamepadTeleop:
         """
         self._robot.stop_motion()
         period = 1.0 / TELEOP_HZ
+        # The robot's layout, not a flag of our own: send_action refuses a vector
+        # of any other width, so the sticks cannot disagree with the policy about it.
+        tracks = self._robot.enable_tracks
         while not self.pressed():
             axes, _ = self._pad.poll()
-            action = (manual_action_from_axes(axes)
+            action = (manual_action_from_axes(axes, tracks)
                       if axes is not None and self._pad.is_live()
-                      else np.zeros(len(JOINT_NAMES), dtype=np.float32))
+                      else np.zeros(len(self._robot.action_names), dtype=np.float32))
             self._robot.send_action(action)
             time.sleep(period)
         self._robot.stop_motion()
@@ -645,6 +657,13 @@ def main() -> int:
                         "historical behaviour. NOTE this consumes the chunk from "
                         "both ends -- it needs chunk_size >= 2 * infer_s * fps "
                         "before any reserve is left for a late replan")
+    p.add_argument("--enable-tracks", action="store_true",
+                   help="The checkpoint was trained on a --enable-tracks "
+                        "recording: its action is 6 wide, [slew, lift, tilt, "
+                        "scoop, trackL, trackR], and the last two drive the "
+                        "tracks. Gamepad takeover drives them from the "
+                        "triggers/bumpers, as in record_episodes. Must match "
+                        "the checkpoint; a width mismatch is refused")
     p.add_argument("--legacy-direct-write", action="store_true",
                    help="Drive valves from this thread instead of the control "
                         "thread (bench A/B only — has the 30 Hz rate problems)")
@@ -678,6 +697,7 @@ def main() -> int:
     LOG.info("Architecture: %s (detected from %s)", architecture, args.split_dir)
 
     camera_key = CAMERA_KEYS[args.camera]
+    act_names = action_names(args.enable_tracks)
     state_joints = [j.strip() for j in args.state_joints.split(",") if j.strip()]
     unknown = [j for j in state_joints if j not in JOINT_NAMES]
     if unknown:
@@ -764,6 +784,20 @@ def main() -> int:
                 f"{len(norm.state_mean)}-dim observation.state.\n"
                 f"Check the training dataset's meta/info.json -> "
                 f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
+        # Same contract for the action. The model pads its action to 32, so a
+        # wrong width does not fail inside it: too narrow silently drops the track
+        # columns, and the stats then fail to broadcast on the first chunk.
+        if norm.action_mean is not None and len(norm.action_mean) != len(act_names):
+            raise SystemExit(
+                f"--dataset-stats {args.dataset_stats} was built from a "
+                f"{len(norm.action_mean)}-dim action, but this run expects "
+                f"{len(act_names)} {act_names}.\n"
+                + ("Pass --enable-tracks: the checkpoint drives the tracks."
+                   if len(norm.action_mean) == len(action_names(True))
+                   else "Drop --enable-tracks: the checkpoint has no track columns."
+                   if len(norm.action_mean) == len(JOINT_NAMES)
+                   else "Check the training dataset's meta/info.json -> "
+                        "features['action']['names']."))
         if state_blind:
             check_state_blind_stats(norm, args.dataset_stats)
 
@@ -773,7 +807,7 @@ def main() -> int:
             cache_dir=args.cache_dir,
             rebuild=args.rebuild,
             num_steps=args.num_steps,
-            action_dim=4,
+            action_dim=len(act_names),
             norm=norm,
             seed=args.seed,
             projectors=args.projectors,
@@ -788,6 +822,15 @@ def main() -> int:
             "--live refused: this bundle is a model-only feasibility export whose "
             "action columns are not valve commands. Drop --live to watch it run "
             "against real observations.")
+    # X-VLA's width comes from the bundle's physical boundary, so check it here,
+    # once the policy is built. send_action_chunk would refuse it anyway, but only
+    # on the first live chunk.
+    if (not getattr(policy, "feasibility_only", False)
+            and policy.action_dim != len(act_names)):
+        raise SystemExit(
+            f"The bundle emits a {policy.action_dim}-wide action, but this run "
+            f"expects {len(act_names)} {act_names}. --enable-tracks must match "
+            f"the checkpoint: 6 wide with tracks, 4 without.")
 
     robot = None
     if not args.synthetic:
@@ -804,7 +847,8 @@ def main() -> int:
             setpoint_hold_s=args.setpoint_hold_s,
             setpoint_decay_s=args.setpoint_decay_s,
             setpoint_blend_s=args.blend_s,
-            state_joints=state_joints)
+            state_joints=state_joints,
+            enable_tracks=args.enable_tracks)
         robot.connect()
         if args.live:
             LOG.warning("LIVE MODE: actions will drive the valves. Pump is under "
@@ -856,7 +900,8 @@ def main() -> int:
     # even if the warmup is what blows up.
     action_log = None
     if args.log_actions:
-        action_log = ActionLogger(args.log_actions, CONTROL_CHANNELS, meta={
+        channels = CONTROL_CHANNELS + (TRACK_CHANNELS if args.enable_tracks else [])
+        action_log = ActionLogger(args.log_actions, channels, meta={
             "split_dir": args.split_dir,
             "task": tasks[0],
             "tasks": list(tasks),
@@ -953,9 +998,10 @@ def main() -> int:
                      played if played is not None else "-",
                      "(unused)" if state_blind else "",
                      " ".join(f"{v:+.1f}" for v in state),
-                     " ".join(f"{v:+.2f}" for v in chunk[0][:4]),
-                     f" (+{chunk.shape[1] - 4} more columns; not valve commands)"
-                     if chunk.shape[1] > 4 else "")
+                     " ".join(f"{v:+.2f}" for v in chunk[0][:len(act_names)]),
+                     f" (+{chunk.shape[1] - len(act_names)} more columns; "
+                     "not valve commands)"
+                     if chunk.shape[1] > len(act_names) else "")
 
             if action_log is not None:
                 action_log.log_chunk(cycle, infer_s, played, state, chunk)

@@ -261,7 +261,7 @@ def prebuild_engines(split_dir: str | Path, cache_dir: str,
             [_sys.executable, "-m", "lerobot_vla.runtime.smolvla",
              "--build-one", str(Path(split_dir) / name),
              "--cache-dir", str(cache_dir), "--precision", precision],
-            env=env, cwd=str(Path(__file__).resolve().parents[1]),
+            env=env, cwd=str(Path(__file__).resolve().parents[2]),
         )
         if r.returncode != 0:
             raise RuntimeError(f"engine build failed for {name}")

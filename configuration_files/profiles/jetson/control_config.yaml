@@ -64,8 +64,14 @@ imu:
   # Hardware layer removes these offsets before publishing quats/gyro.
   mounting_offsets_quat:
     base: [1.0, 0.0, 0.0, 0.0]
+    # Active correction: +13.850 deg about Y (hardware removes this rotation).
+    # Production CAD (2026-10-07): liftboom IMU mounting magnitude 13.832 deg;
+    # sign not yet confirmed. Keep active quaternion until sign is verified.
     boom: [0.9927048, 0.0, 0.12057, 0.0]
-    arm: [0.9999619, 0.0, 0.0087265, 0.0]
+    # Active correction: +0.612 deg about Y (hardware removes this rotation).
+    # Production CAD (2026-10-07): tiltboom IMU mounting magnitude 0.612 deg;
+    # Updated magnitude to CAD; retained existing positive sign (not independently verified).
+    arm: [0.999985738456, 0.0, 0.005340682122, 0.0]
     bucket: [1.0, 0.0, 0.0, 0.0]
 
 robot:

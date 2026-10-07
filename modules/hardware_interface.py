@@ -76,10 +76,11 @@ class _ImuSnapshot:
     __slots__ = (
         'imu_data', 'imu_by_role', 'base_imu_quat', 'base_imu_gyro',
         'imu_gyro', 'raw_quat', 'corrected_quat', 'device_ts',
+        'raw_gyro', 'raw_accel',
     )
 
     def __init__(self, *, imu_data, imu_by_role, base_imu_quat, base_imu_gyro,
-                 imu_gyro, raw_quat, corrected_quat, device_ts):
+                 imu_gyro, raw_quat, corrected_quat, device_ts, raw_gyro=None, raw_accel=None):
         self.imu_data = imu_data
         self.imu_by_role = imu_by_role
         self.base_imu_quat = base_imu_quat
@@ -88,6 +89,9 @@ class _ImuSnapshot:
         self.raw_quat = raw_quat
         self.corrected_quat = corrected_quat
         self.device_ts = device_ts
+        # Firmware-streamed sensor-frame values before host mounting rotations.
+        self.raw_gyro = raw_gyro  # deg/s; firmware startup bias already removed
+        self.raw_accel = raw_accel  # g, all three axes
 
 
 class HardwareFaultError(Exception):
@@ -618,6 +622,9 @@ class HardwareInterface:
                             raw_quat=new_raw_quat if capture_debug else None,
                             corrected_quat=new_corrected_quat if capture_debug else None,
                             device_ts=new_device_ts,
+                            raw_gyro=tuple(tuple(pkt[4:7]) for pkt in imu_packets[:self._expected_imu_count]),
+                            raw_accel=(tuple(tuple(pkt[7:10]) for pkt in imu_packets[:self._expected_imu_count])
+                                       if all(len(pkt) >= 10 for pkt in imu_packets[:self._expected_imu_count]) else None),
                         )
 
                     # Lock section: keep legacy fields alive for non-hot-path callers

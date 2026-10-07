@@ -64,7 +64,6 @@ from .solver import (
 from .excavator import (
     IMUChainStep,
     IMUConfig,
-    average_axis_twist_quaternion,
     build_imu_config,
     gravity_pitch_from_quat,
     joint_angles_from_imus,
@@ -110,7 +109,6 @@ __all__ = [
     # excavator / IMU
     "IMUChainStep",
     "IMUConfig",
-    "average_axis_twist_quaternion",
     "build_imu_config",
     "gravity_pitch_from_quat",
     "joint_angles_from_imus",

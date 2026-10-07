@@ -349,7 +349,7 @@ class HardwareInterface:
         _imu_chain = _imu_cfg.get('chain')
         if not isinstance(_imu_chain, list):
             _imu_chain = [
-                {'joint': 'slew', 'output_index': 0, 'source': 'all', 'axis': 'z', 'extraction': 'average_z_yaw'},
+                {'joint': 'slew', 'role': 'base', 'parent_role': None, 'output_index': 0, 'axis': 'z', 'extraction': 'relative_axis_twist'},
                 {'joint': 'lift', 'role': 'boom', 'parent_role': 'base', 'output_index': 1, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
                 {'joint': 'arm', 'role': 'arm', 'parent_role': 'boom', 'output_index': 2, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
                 {'joint': 'bucket', 'role': 'bucket', 'parent_role': 'arm', 'output_index': 3, 'axis': 'y', 'extraction': 'gravity_pitch_delta'},
@@ -364,7 +364,7 @@ class HardwareInterface:
         _sensor_roles = []
 
         def _add_sensor_role(role):
-            if role and role != 'all' and role in _imu_mapping and role not in _sensor_roles:
+            if role and role in _imu_mapping and role not in _sensor_roles:
                 _sensor_roles.append(role)
 
         for item in _imu_chain:

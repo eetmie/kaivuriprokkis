@@ -132,6 +132,16 @@ class D435iCamera:
     def color_enabled(self) -> bool:
         return bool(self.cfg.enable_color)
 
+    @property
+    def active_profile(self):
+        """The running pipeline's rs.pipeline_profile (device + IR/color streams).
+
+        For opening another sensor of the same camera beside this pipeline, e.g.
+        the motion module: while the pipeline holds the device, a fresh
+        rs.context() cannot enumerate it.
+        """
+        return self._pipeline.get_active_profile()
+
     def start(self) -> None:
         import pyrealsense2 as rs
 

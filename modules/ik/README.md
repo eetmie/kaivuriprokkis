@@ -58,7 +58,7 @@ not passed around independently.
   `state` if you already computed it for the same `q`.
 - `joint_angles_from_imus(imu_quats, imu_cfg, model)`: convert corrected
   absolute IMU quats to canonical joint angles. Extraction rules
-  (`average_z_yaw`, `gravity_pitch_delta`, `relative_axis_twist`) live in
+  (`gravity_pitch_delta`, `relative_axis_twist`) live in
   the YAML `imu.chain`.
 - `warmup_numba_functions()`: compile the numba hot path before the
   control loop starts so the first tick doesn't pay the JIT cost.

@@ -24,10 +24,11 @@ imu:
   # Use parent_role: null for a gravity/level parent.
   chain:
     - joint: slew
+      role: base
+      parent_role: null
       output_index: 0
-      source: all
       axis: z
-      extraction: average_z_yaw
+      extraction: relative_axis_twist
     - joint: lift
       role: boom
       parent_role: base

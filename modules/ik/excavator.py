@@ -9,9 +9,10 @@ already removed by the hardware layer) in a known role order. Output is
 
 Extraction rules supported in ``IMUConfig.chain``:
 
-  average_z_yaw          — average Z twist across all IMUs (slew yaw)
   gravity_pitch_delta    — pitch of child against gravity, minus parent pitch
-  relative_axis_twist    — twist of child relative to parent about a local axis
+  relative_axis_twist    — twist of child relative to parent about a local axis;
+                           with no parent, the child's world twist (slew = base
+                           IMU yaw about z)
 
 A joint without a chain entry remains zero.
 """
@@ -33,7 +34,6 @@ from .kinematics import (
 from .math import (
     extract_axis_rotation,
     quat_conjugate,
-    quat_from_axis_angle,
     quat_multiply,
     quat_normalize,
 )
@@ -48,8 +48,8 @@ from .model import ExcavatorModel
 class IMUChainStep:
     joint: str
     output_index: int
-    extraction: str                  # 'average_z_yaw' | 'gravity_pitch_delta' | 'relative_axis_twist'
-    role: Optional[str] = None       # sensor role for child link (None for slew)
+    extraction: str                  # 'gravity_pitch_delta' | 'relative_axis_twist'
+    role: Optional[str] = None       # sensor role for child link
     parent_role: Optional[str] = None
     axis: Optional[str] = None       # 'x' | 'y' | 'z' for twist extractions
 
@@ -91,10 +91,10 @@ def build_imu_config(imu_section: Mapping[str, Any]) -> IMUConfig:
         if not isinstance(item, Mapping):
             raise ValueError(f"imu.chain[{i}] must be a mapping")
         extraction = item.get("extraction")
-        if extraction not in ("average_z_yaw", "gravity_pitch_delta", "relative_axis_twist"):
+        if extraction not in ("gravity_pitch_delta", "relative_axis_twist"):
             raise ValueError(
                 f"imu.chain[{i}].extraction must be one of "
-                f"average_z_yaw/gravity_pitch_delta/relative_axis_twist, got {extraction!r}"
+                f"gravity_pitch_delta/relative_axis_twist, got {extraction!r}"
             )
         if "output_index" not in item:
             raise ValueError(f"imu.chain[{i}].output_index is required")
@@ -162,29 +162,6 @@ def load_imu_config(path: str | Path) -> IMUConfig:
 # Extraction primitives
 # ----------------------------
 
-def average_axis_twist_quaternion(quats: np.ndarray, axis: np.ndarray) -> np.ndarray:
-    """Hemisphere-aligned average of per-quaternion twists about ``axis``."""
-    quats = np.asarray(quats, dtype=np.float32)
-    axis = np.asarray(axis, dtype=np.float32)
-    axis = axis / (float(np.linalg.norm(axis)) + 1e-12)
-    if quats.ndim != 2 or quats.shape[1] != 4 or len(quats) == 0:
-        raise ValueError("Expected quats with shape (n, 4)")
-
-    accum = np.zeros(4, dtype=np.float32)
-    reference: Optional[np.ndarray] = None
-    for q in quats:
-        angle = extract_axis_rotation(q, axis)
-        twist = quat_from_axis_angle(axis, np.float32(angle))
-        if reference is None:
-            reference = twist.copy()
-        elif float(np.dot(reference, twist)) < 0.0:
-            twist = -twist
-        accum += twist
-    if float(np.linalg.norm(accum)) < 1e-9:
-        return reference if reference is not None else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    return quat_normalize(accum)
-
-
 def gravity_pitch_from_quat(quat: np.ndarray) -> np.float32:
     """Extract link pitch against gravity from a corrected IMU quaternion."""
     q = quat_normalize(np.asarray(quat, dtype=np.float32))
@@ -243,11 +220,6 @@ def joint_angles_from_imus(
 
     angles = np.zeros(model.num_joints, dtype=np.float32)
 
-    # Cache average-Z-yaw quat lazily (used by slew step).
-    slew_axis_local = model.axes[0]  # first joint axis in its parent frame
-    z_world = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    averaged_yaw_quat: Optional[np.ndarray] = None
-
     for step in imu_cfg.chain:
         i = step.output_index
         if i < 0 or i >= angles.shape[0]:
@@ -255,13 +227,6 @@ def joint_angles_from_imus(
                 f"imu.chain step for joint '{step.joint}' has output_index={i} "
                 f"out of range for model with {angles.shape[0]} joints"
             )
-
-        if step.extraction == "average_z_yaw":
-            axis = _axis_from_name(step.axis, z_world)
-            if averaged_yaw_quat is None:
-                averaged_yaw_quat = average_axis_twist_quaternion(imu_quats, axis)
-            angles[i] = extract_axis_rotation(averaged_yaw_quat, slew_axis_local if i == 0 else axis)
-            continue
 
         if step.role is None or step.role not in role_quats:
             raise ValueError(
@@ -327,7 +292,6 @@ __all__ = [
     "build_imu_config",
     "load_imu_config",
     "joint_angles_from_imus",
-    "average_axis_twist_quaternion",
     "gravity_pitch_from_quat",
     "warmup_numba_functions",
 ]

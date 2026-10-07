@@ -91,7 +91,7 @@ STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 
 # Which joints observation.state carries. Slew is excluded by default: its angle
-# is `average_z_yaw` over the IMUs (control_config.yaml), an absolute world yaw
+# is the base IMU's yaw (control_config.yaml), an absolute world yaw
 # with NO zeroing anywhere in the stack and no magnetometer to anchor it, so its
 # origin is whatever the AHRS converged to at power-on. Within one session it is
 # stable (measured 2026-08-19: dig/dump centroids drift -1.1/-1.5 deg over 31

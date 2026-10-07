@@ -87,7 +87,7 @@ nonzero in about 2% of frames, in 22 of the 156 episodes that have them, and no
 episode yet contains a reverse.
 
 **Slew IMU feedback is dropped at the moment due to drift.** Slew comes from
-`average_z_yaw` over the IMUs, an absolute world yaw with no magnetometer to
+the base IMU's yaw, an absolute world yaw with no magnetometer to
 anchor it and no zeroing anywhere in the stack — so the same physical pose can
 read any value in ±180° after a power cycle, and a policy trained on one
 session's origin gets fed angles it never saw. Within a session it is actually

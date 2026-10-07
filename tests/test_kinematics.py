@@ -197,10 +197,20 @@ class IMUExtractionTests(unittest.TestCase):
                 msg=f"arm {arm_deg}: recovered {recovered} vs {expected}",
             )
 
-    def test_yaw_average_handles_quaternion_sign_flip_at_wrap(self):
+    def test_slew_is_base_imu_yaw_only(self):
+        """Yaw error on the boom/arm/bucket IMUs must not leak into slew.
+
+        Their own AHRS yaw drifts independently of the base's; slew used to
+        average all four, which the D435i gyro reference showed was no better
+        than the base alone (2026-10-07).
+        """
         slew = math.radians(179.0)
         imu_quats = self._synthesize_imu_quats(slew, 0.0, -0.45, 0.35, -0.2)
-        imu_quats[2] *= -1.0  # Same physical orientation, opposite quaternion hemisphere.
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        for k in (1, 2, 3):
+            yaw_err = quat_from_axis_angle(z_axis, np.float32(math.radians(5.0 * k)))
+            imu_quats[k] = quat_normalize(quat_multiply(yaw_err, imu_quats[k]))
+        imu_quats[0] *= -1.0  # Same physical orientation, opposite quaternion hemisphere.
         recovered = joint_angles_from_imus(imu_quats, self.imu_cfg, self.rc)
         self.assertAlmostEqual(float(recovered[0]), float(slew), delta=2e-3)
 

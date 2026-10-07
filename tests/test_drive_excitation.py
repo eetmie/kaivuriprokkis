@@ -91,7 +91,9 @@ def test_chirp_limits_rest_interval_and_slew_isolation():
 
 @pytest.mark.parametrize('argv', [
     ['--chirp-start-hz', 'nan'], ['--chirp-end-hz', 'inf'],
-    ['--chirp-start-hz', '0'], ['--chirp-end-hz', '2'],
+    ['--chirp-start-hz', '0'], ['--chirp-end-hz', '20'],
+    ['--excitation', 'stroke', '--stroke-margin-deg', 'nan'],
+    ['--excitation', 'stroke', '--stroke-seconds', '0'],
     ['--chirp-start-hz', '.8', '--chirp-end-hz', '.1'],
     ['--chirp-seconds', '1'], ['--excitation-amplitude', '0'],
     ['--excitation-amplitude', '1.1'], ['--excitation-seed', '-1'],
@@ -234,3 +236,54 @@ def test_log_records_clipping_and_companion_parameters(tmp_path):
     assert meta['blocks'][0]['parameters']['seed'] == 42
     assert (tmp_path / f'imu_raw_{suffix}.csv').is_file()
     assert logger.n_samples() == 2
+
+
+LIMITS = {'boom': (-50.0, 30.0), 'arm': (28.0, 144.0), 'bucket': (-120.0, 20.0)}
+
+
+def _drive_stroke(gen, seconds, q0=(0.0, -20.0, 90.0, -50.0), rate_per_u=40.0):
+    """Close the stroke loop on an integrator joint model [deg/s per unit valve]."""
+    q = np.array(q0, dtype=float)
+    rows = []
+    for t in np.arange(0, seconds, .01):
+        gen.observe(q)
+        signal = gen.get_all(float(t))
+        for joint, index in gen.JOINT_INDEX.items():
+            q[index] += rate_per_u * signal[joint] * .01
+        rows.append((float(t), q.copy(), dict(signal), gen.metadata(float(t))['stage']))
+    return rows
+
+
+def test_stroke_sweeps_inside_margins_and_chirps_every_other_stroke():
+    gen = drive.StrokeExcitationGenerator(enabled=True, seed=7, joint_limits_deg=LIMITS, stroke_s=4.0)
+    gen.target_idx = [name for name, _ in gen.modes].index('lift')
+    rows = _drive_stroke(gen, 30.0)
+    boom = np.array([q[1] for _, q, _, _ in rows])
+    assert boom.min() > LIMITS['boom'][0] + 5 and boom.max() < LIMITS['boom'][1] - 5
+    assert boom.max() - boom.min() > 40          # it really strokes
+    assert all(signal['arm'] == 0 and signal['bucket'] == 0 for _, _, signal, _ in rows)
+    stages = {stage for *_, stage in rows}
+    assert stages == {'stroke', 'stroke+chirp'}
+    assert gen._strokes['boom'] >= 3
+    assert max(abs(signal['boom']) for _, _, signal, _ in rows) <= 1.0
+
+
+def test_stroke_outputs_nothing_without_angles_and_stops_outside_limits():
+    gen = drive.StrokeExcitationGenerator(enabled=True, seed=1, joint_limits_deg=LIMITS)
+    gen.observe(None)
+    assert all(v == 0 for v in gen.get_all(0.0).values())
+    gen.observe([0.0, 35.0, 90.0, -50.0])          # boom beyond its +30 deg limit
+    gen.get_all(0.01)
+    assert not gen.enabled
+    assert all(v == 0 for v in gen.get_all(0.02).values())
+
+
+def test_cli_builds_stroke_from_profile_limits(tmp_path):
+    config = tmp_path / 'control_config.yaml'
+    config.write_text('ik:\n  joint_limits_relative: [null, [-50, 30], [28, 144], [-120, 20]]\n')
+    with patch.object(sys, 'argv', ['simple_drive.py', '--excitation', 'stroke', '--excitation-target', 'tilt']):
+        args = drive._parse_args()
+    gen = drive.make_excitation(args, drive.load_joint_limits_deg(config))
+    assert isinstance(gen, drive.StrokeExcitationGenerator)
+    assert (gen.start_hz, gen.end_hz, gen.sweep_s, gen.amplitude) == (.5, 12.0, 20.0, .4)
+    assert gen.target_name == 'tilt' and gen.limits['arm'] == (28.0, 144.0)

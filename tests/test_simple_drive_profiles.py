@@ -227,7 +227,8 @@ class ArgSurfaceTests(unittest.TestCase):
             set(vars(args)),
             {"robot", "ip", "enable_slew", "enable_tracks", "suffix",
              "excitation", "excitation_target", "excitation_seed", "excitation_amplitude",
-             "chirp_start_hz", "chirp_end_hz", "chirp_seconds"},
+             "chirp_start_hz", "chirp_end_hz", "chirp_seconds",
+             "stroke_seconds", "stroke_margin_deg"},
         )
 
     def test_suffix_defaults_to_unlabelled(self):

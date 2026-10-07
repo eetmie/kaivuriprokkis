@@ -30,8 +30,12 @@ Button Controls:
 
 The default sine mode randomizes amplitude, frequencies and phases per joint
 and adds filtered noise. --excitation chirp selects clean logarithmic up/down
-sweeps: 0.05–0.9 Hz, 60 seconds each way, then 10 seconds of zero excitation.
---excitation-amplitude fixes the amplitude (chirp default: 0.35).
+sweeps: 0.05–0.9 Hz by default (up to 15 Hz), 60 seconds each way, then 10
+seconds of zero excitation. --excitation stroke reads the joint angles and
+sweeps each targeted joint across its range (ramps under P feedback), with a
+0.5–12 Hz chirp on every other stroke; see data_collection/EXCITATION.md.
+--excitation-amplitude fixes the amplitude (chirp default: 0.35, stroke
+overlay: 0.4).
 --excitation-seed repeats the session at each recording; otherwise a new seed
 is drawn. Block parameters and sample timing are saved for replay.
 
@@ -346,6 +350,9 @@ class SineExcitationGenerator:
         """Immediately remove excitation; a later enable starts a fresh block."""
         self.enabled = False
 
+    def observe(self, joint_angles_deg) -> None:
+        """Joint feedback for closed-loop waveforms; open-loop waveforms ignore it."""
+
     @property
     def target_name(self) -> str:
         return self.modes[self.target_idx][0]
@@ -413,15 +420,22 @@ class SineExcitationGenerator:
 
 
 class ChirpExcitationGenerator(SineExcitationGenerator):
-    """Clean log-frequency sweep up/down, followed by a neutral interval."""
+    """Clean log-frequency sweep up/down, followed by a neutral interval.
+
+    The sweep may reach CHIRP_MAX_HZ. Above ~1 Hz an open-loop chirp barely moves
+    the joint, but it records how the valves respond to fast command changes
+    and to sign flips across the spool deadband, which a closed-loop controller
+    produces and the 0.05-0.9 Hz sweeps never showed the actuator model.
+    """
 
     WAVEFORM = "chirp"
     HOLD_S = 10.0
+    CHIRP_MAX_HZ = 15.0
 
     def __init__(self, enabled=False, seed=None, enable_slew=False, amplitude=.35,
                  start_hz=.05, end_hz=.9, sweep_s=60.0):
-        if not (0 < start_hz <= end_hz <= self.MAX_INSTANT_FREQ_HZ):
-            raise ValueError("chirp frequencies must satisfy 0 < start <= end <= 0.9 Hz")
+        if not (0 < start_hz <= end_hz <= self.CHIRP_MAX_HZ):
+            raise ValueError(f"chirp frequencies must satisfy 0 < start <= end <= {self.CHIRP_MAX_HZ:g} Hz")
         if not np.isfinite(sweep_s) or sweep_s < 2:
             raise ValueError("chirp duration must be finite and at least 2 s per direction")
         self.start_hz, self.end_hz, self.sweep_s = start_hz, end_hz, sweep_s
@@ -467,6 +481,118 @@ class ChirpExcitationGenerator(SineExcitationGenerator):
         if self.enabled:
             meta['stage'] = 'up' if e < self.sweep_s else (
                 'down' if e < 2 * self.sweep_s else 'rest')
+        return meta
+
+
+class StrokeExcitationGenerator(ChirpExcitationGenerator):
+    """Full-stroke ramps with a fast chirp on every other stroke (Egli & Hutter, RA-L 2022).
+
+    Each targeted joint follows a position reference that sweeps between its
+    ``joint_limits_relative`` (minus ``margin_deg``) at a constant rate,
+    bouncing at the ends; a proportional valve command tracks it. Every other
+    stroke adds a log chirp (``start_hz`` -> ``end_hz`` -> ``start_hz``, one
+    ``sweep_s`` each way) on top of the valve command, so about half the data
+    is clean ramps and half is ramps under fast excitation. The paper found
+    that either kind alone gave a worse actuator model.
+
+    Unlike sine and chirp, this mode reads the joint angles, so it keeps itself
+    inside the stroke: :meth:`observe` must be called every tick. Without a
+    fresh angle it outputs zero, and a targeted joint found outside its hard
+    limits disables the excitation. Manual sticks still add on top.
+    """
+
+    WAVEFORM = "stroke"
+    VERSION = 1
+    HOLD_S = 0.0
+    JOINT_INDEX = {'boom': 1, 'arm': 2, 'bucket': 3}
+
+    def __init__(self, enabled=False, seed=None, enable_slew=False, amplitude=.4,
+                 start_hz=.5, end_hz=12.0, sweep_s=20.0, joint_limits_deg=None,
+                 stroke_s=8.0, margin_deg=10.0, gain_per_deg=.05, valve_limit=.5):
+        if enable_slew:
+            raise ValueError("stroke excitation drives boom/arm/bucket only")
+        if not joint_limits_deg:
+            raise ValueError("stroke excitation needs joint_limits_relative for boom/arm/bucket")
+        for name, value in (('stroke_s', stroke_s), ('margin_deg', margin_deg),
+                            ('gain_per_deg', gain_per_deg), ('valve_limit', valve_limit)):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if valve_limit > 1:
+            raise ValueError("valve_limit must be in (0, 1]")
+        self.limits = {}
+        for joint in self.JOINT_INDEX:
+            lo, hi = (float(x) for x in joint_limits_deg[joint])
+            if not hi - lo > 2 * margin_deg:
+                raise ValueError(f"{joint}: joint range does not fit the stroke margin")
+            self.limits[joint] = (lo, hi)
+        self.stroke_s, self.margin_deg = float(stroke_s), float(margin_deg)
+        self.gain_per_deg, self.valve_limit = float(gain_per_deg), float(valve_limit)
+        self._angles = None
+        super().__init__(enabled, seed, False, amplitude, start_hz, end_hz, sweep_s)
+
+    def randomize(self):
+        super().randomize()
+        self._ref = {}            # joint -> reference angle [deg], set from the first fresh angle
+        self._direction = {j: (1.0 if self._parameter_rng.uniform() < .5 else -1.0) for j in self.JOINT_INDEX}
+        self._strokes = {j: 0 for j in self.JOINT_INDEX}
+        self._last_t = None
+        self._block_parameters['stroke'] = {
+            'stroke_s': self.stroke_s, 'margin_deg': self.margin_deg,
+            'gain_per_deg': self.gain_per_deg, 'valve_limit': self.valve_limit,
+            'limits_deg': {j: list(v) for j, v in self.limits.items()},
+            'chirp_on': 'even strokes',
+        }
+
+    def observe(self, joint_angles_deg) -> None:
+        """Latest relative joint angles [deg] in controller order, or None if not fresh."""
+        self._angles = None if joint_angles_deg is None else np.asarray(joint_angles_deg, dtype=float)
+
+    def _advance(self, t: float) -> None:
+        dt = 0.0 if self._last_t is None else min(max(t - self._last_t, 0.0), .1)
+        self._last_t = t
+        for joint in self.target_joints:
+            if joint not in self.JOINT_INDEX:
+                continue
+            q = self._angles[self.JOINT_INDEX[joint]]
+            lo, hi = self.limits[joint]
+            if not lo <= q <= hi:
+                print(f"\n[EXC] {joint} at {q:+.1f} deg is outside [{lo:g}, {hi:g}]; stroke excitation OFF")
+                self.disable()
+                return
+            lo, hi = lo + self.margin_deg, hi - self.margin_deg
+            ref = self._ref.get(joint, min(max(q, lo), hi))
+            ref += self._direction[joint] * (hi - lo) / self.stroke_s * dt
+            if not lo <= ref <= hi:
+                ref = min(max(ref, lo), hi)
+                self._direction[joint] *= -1
+                self._strokes[joint] += 1
+            self._ref[joint] = ref
+
+    def get_all(self, t: float) -> dict:
+        if not self.enabled or self._angles is None:
+            self._last_t = None
+            return {name: 0.0 for name in JOINT_NAMES}
+        self._advance(t)
+        return {name: self.get_signal(name, t) for name in JOINT_NAMES}
+
+    def get_signal(self, joint: str, t: float) -> float:
+        if not self.enabled or joint not in self.target_joints or joint not in self._ref:
+            return 0.0
+        e = self._elapsed(t)
+        q = self._angles[self.JOINT_INDEX[joint]]
+        base = float(np.clip(self.gain_per_deg * (self._ref[joint] - q), -self.valve_limit, self.valve_limit))
+        overlay = 0.0
+        if self._strokes[joint] % 2 == 0:
+            p = self._params[joint]
+            phase = self.chirp_phase(e % (2 * self.sweep_s))
+            overlay = p['amp'] * self._ramp(e) * np.sin(phase + p['phi2'])
+        return float(np.clip(self._ramp(e) * base + overlay, -1.0, 1.0))
+
+    def metadata(self, t: float) -> dict:
+        meta = SineExcitationGenerator.metadata(self, t)
+        if self.enabled:
+            chirping = any(self._strokes[j] % 2 == 0 for j in self.target_joints if j in self._strokes)
+            meta['stage'] = 'stroke+chirp' if chirping else 'stroke'
         return meta
 
 
@@ -1065,8 +1191,10 @@ def _parse_args():
     p.add_argument("--suffix", default="", metavar="LABEL",
                    help="Append a label to every strip this run writes, e.g. "
                         "--suffix slew gives drive_log_<ts>_slew.csv")
-    p.add_argument("--excitation", choices=['sine', 'chirp'], default='sine',
-                   help="Button B waveform (default: randomized sine; initially OFF)")
+    p.add_argument("--excitation", choices=['sine', 'chirp', 'stroke'], default='sine',
+                   help="Button B waveform (default: randomized sine; initially OFF). "
+                        "stroke: full-stroke ramps under joint-angle feedback, a fast chirp "
+                        "on every other stroke")
     p.add_argument("--excitation-target", default='all',
                    choices=[name for name, _ in sine_target_modes(True)],
                    help="Initial excitation target; D-pad still changes it")
@@ -1075,26 +1203,64 @@ def _parse_args():
     p.add_argument("--excitation-amplitude", type=float, default=None,
                    help="Fixed normalized amplitude in (0, 1]; default: sine draws "
                         "0.35–1.0 per joint, chirp uses 0.35")
-    p.add_argument("--chirp-start-hz", type=float, default=.05)
-    p.add_argument("--chirp-end-hz", type=float, default=.9)
-    p.add_argument("--chirp-seconds", type=float, default=60.0,
-                   help="Seconds per sweep direction, followed by 10 s neutral excitation")
+    p.add_argument("--chirp-start-hz", type=float, default=None,
+                   help="Default 0.05 (chirp), 0.5 (stroke overlay)")
+    p.add_argument("--chirp-end-hz", type=float, default=None,
+                   help=f"Default 0.9 (chirp), 12 (stroke overlay); at most "
+                        f"{ChirpExcitationGenerator.CHIRP_MAX_HZ:g}")
+    p.add_argument("--chirp-seconds", type=float, default=None,
+                   help="Seconds per sweep direction. Default 60 (chirp, then 10 s neutral), "
+                        "20 (stroke overlay, no neutral)")
+    p.add_argument("--stroke-seconds", type=float, default=8.0,
+                   help="stroke: seconds for one sweep across the usable joint range")
+    p.add_argument("--stroke-margin-deg", type=float, default=10.0,
+                   help="stroke: stay this far inside joint_limits_relative")
     args = p.parse_args()
     if args.excitation_amplitude is not None and not (0 < args.excitation_amplitude <= 1):
         p.error('--excitation-amplitude must be finite and in (0, 1]')
     if args.excitation_seed is not None and not (0 <= args.excitation_seed < 2**32):
         p.error('--excitation-seed must be an unsigned 32-bit integer')
-    if not (0 < args.chirp_start_hz <= args.chirp_end_hz <= .9):
-        p.error('chirp frequencies must satisfy 0 < start <= end <= 0.9 Hz')
+    defaults = {'stroke': (.5, 12.0, 20.0)}.get(args.excitation, (.05, .9, 60.0))
+    for name, default in zip(('chirp_start_hz', 'chirp_end_hz', 'chirp_seconds'), defaults):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+    top = ChirpExcitationGenerator.CHIRP_MAX_HZ
+    if not (0 < args.chirp_start_hz <= args.chirp_end_hz <= top):
+        p.error(f'chirp frequencies must satisfy 0 < start <= end <= {top:g} Hz')
     if not np.isfinite(args.chirp_seconds) or args.chirp_seconds < 2:
         p.error('--chirp-seconds must be finite and at least 2')
+    for name in ('stroke_seconds', 'stroke_margin_deg'):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            p.error(f"--{name.replace('_', '-')} must be finite and positive")
+    if args.excitation == 'stroke' and args.excitation_target == 'slew':
+        p.error('stroke excitation drives boom/arm/bucket only')
     if args.excitation_target == 'slew' and not args.enable_slew:
         p.error('--excitation-target slew requires --enable-slew')
     return args
 
 
-def make_excitation(args) -> SineExcitationGenerator:
+def load_joint_limits_deg(control_config_file) -> dict:
+    """Boom/arm/bucket ``ik.joint_limits_relative`` [deg] from a control config."""
+    import yaml
+
+    raw = yaml.safe_load(Path(control_config_file).read_text())
+    limits = (raw.get('ik') or {}).get('joint_limits_relative')
+    if not limits or len(limits) != 4 or any(x is None for x in limits[1:]):
+        raise ValueError(f"{control_config_file}: ik.joint_limits_relative needs boom/arm/bucket limits")
+    return dict(zip(('boom', 'arm', 'bucket'), limits[1:]))
+
+
+def make_excitation(args, joint_limits_deg=None) -> SineExcitationGenerator:
     common = {'enable_slew': args.enable_slew, 'seed': args.excitation_seed}
+    if args.excitation == 'stroke':
+        gen = StrokeExcitationGenerator(
+            seed=args.excitation_seed,
+            amplitude=.4 if args.excitation_amplitude is None else args.excitation_amplitude,
+            start_hz=args.chirp_start_hz, end_hz=args.chirp_end_hz, sweep_s=args.chirp_seconds,
+            joint_limits_deg=joint_limits_deg, stroke_s=args.stroke_seconds,
+            margin_deg=args.stroke_margin_deg)
+        gen.target_idx = [name for name, _ in gen.modes].index(args.excitation_target)
+        return gen
     if args.excitation == 'chirp':
         gen = ChirpExcitationGenerator(
             **common, amplitude=.35 if args.excitation_amplitude is None else args.excitation_amplitude,
@@ -1185,7 +1351,10 @@ def main():
         pass
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    sine_gen = make_excitation(args)
+    sine_gen = make_excitation(
+        args, load_joint_limits_deg(profile['control_config_file']) if args.excitation == 'stroke' else None)
+    if args.excitation == 'stroke' and not imu_on:
+        raise SystemExit("stroke excitation needs the IMU joint angles")
 
     # Raw IMU strips are only meaningful when IMUs are actually streaming.
     imu_stream = hardware.imu_stream_info() if imu_on else {}
@@ -1227,6 +1396,11 @@ def main():
     if args.excitation == 'chirp':
         print(f"[EXC] {args.chirp_start_hz:g}→{args.chirp_end_hz:g}→{args.chirp_start_hz:g} Hz, "
               f"{args.chirp_seconds:g} s each way, 10 s neutral, amplitude={sine_gen.amplitude:g}")
+    if args.excitation == 'stroke':
+        print(f"[EXC] strokes of {args.stroke_seconds:g} s, {args.stroke_margin_deg:g} deg inside the "
+              f"joint limits, feedback <= {sine_gen.valve_limit:g}; chirp "
+              f"{args.chirp_start_hz:g}→{args.chirp_end_hz:g} Hz amplitude={sine_gen.amplitude:g} "
+              f"on every other stroke")
 
     # ── loop state ────────────────────────────────────────────────────────────
     loop_period     = 1.0 / SAMPLING_FREQUENCY
@@ -1347,6 +1521,10 @@ def main():
             cmd_age_s = source.command_age_s()
             cmd_stale = cmd_age_s > COMMAND_STALE_TIMEOUT_S or not source.is_live()
             t = time.perf_counter()
+            # Closed-loop waveforms (stroke) follow the angles; a pose without a
+            # sensor clock is the controller's pre-first-state zero vector.
+            angles, _, angles_us = controller.get_joint_angles() if imu_on else (None, None, None)
+            sine_gen.observe(None if angles_us is None else angles)
             manual, sine, combined = build_drive_commands(manual, sine_gen, t, cmd_stale)
 
             # ── 3. send ───────────────────────────────────────────────────────

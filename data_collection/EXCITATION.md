@@ -64,6 +64,31 @@ Keep some complete recordings without excitation. Include individual-axis
 steps, reversals and 5–10 second neutral holds, plus a stationary 30–60 second
 recording after startup calibration.
 
+## Stroke excitation (fast valve dynamics)
+
+The 0.05–0.9 Hz chirps never move the valves faster than about 1 Hz, so the
+actuator models cannot predict a closed-loop controller's fast corrections. The
+first MLP circle runs (2026-10-07) chattered at 6–7 Hz, and in that band the real
+joints moved 2–3x more than the model predicted. `stroke` records that band:
+
+```bash
+python simple_drive.py --excitation stroke --excitation-target lift --suffix boom_stroke
+```
+
+Each targeted joint follows a reference that ramps across its
+`ik.joint_limits_relative` range, minus `--stroke-margin-deg` (10), in
+`--stroke-seconds` (8) per sweep, under a P valve command capped at 0.5. Every
+other stroke adds a 0.5–12–0.5 Hz log chirp (20 s each way, amplitude 0.4), so
+about half the data is clean ramps and half is ramps under fast excitation, as
+in Egli & Hutter (RA-L 2022). The chirp crosses zero at reversals and slow
+parts, so it also records sign flips across the spool deadband.
+
+This mode reads the joint angles. It outputs nothing until an angle arrives and
+switches off if a targeted joint leaves its hard limits. Watch for
+self-collision when targeting pairs or `all`, because the limits are per
+joint. `excitation_stage` is `stroke` or `stroke+chirp`. `--chirp-*` changes
+the overlay, and plain `chirp` now also accepts up to 15 Hz.
+
 ## Files and reproducibility
 
 Copy the complete set sharing one timestamp and suffix:
@@ -78,7 +103,7 @@ Historical `sine_cmd_*`, `sine_enabled`, `sine_target` and `sine_seed` columns
 remain present for both waveforms. Read `excitation_mode` to distinguish them.
 The new fields include `excitation_version`, `excitation_block`,
 `excitation_elapsed_s`, `excitation_noise_tick` and `excitation_stage`
-(`off`, `run`, `up`, `down`, `rest`). The JSON records the target for each
+(`off`, `run`, `up`, `down`, `rest`, `stroke`, `stroke+chirp`). The JSON records the target for each
 block. Reseeding, enabling or changing targets starts a new parameter block.
 
 Sine version 2 uses separate parameter/noise streams and a fixed 100 Hz noise

@@ -23,8 +23,8 @@ From the repository root on the robot (`--bundle` is required):
 
 ```bash
 .venv-lerobot/bin/python learned_control/run_circle.py check --bundle learned_control/bundles/v6_jetson_bucket_dz0 --robot jetson_bucket_dz0
-.venv-lerobot/bin/python learned_control/run_circle.py run --controller pid_tuned --pid_gains learned_control/gains/pid_sim_tuned.yaml --log data_collection/circle_logs/circle_pid_ccw_01.csv
-.venv-lerobot/bin/python learned_control/run_circle.py run --controller mlp --log data_collection/circle_logs/circle_mlp_ccw_01.csv
+.venv-lerobot/bin/python learned_control/run_circle.py run --bundle learned_control/bundles/v6_jetson_bucket_dz0 --robot jetson_bucket_dz0 --controller pid_tuned --pid_gains learned_control/gains/pid_sim_tuned.yaml
+.venv-lerobot/bin/python learned_control/run_circle.py run --bundle learned_control/bundles/v6_jetson_bucket_dz0 --robot jetson_bucket_dz0 --controller mlp
 ```
 
 `check` is an offline geometry/actor check and opens no devices. `run` preflights
@@ -35,9 +35,22 @@ one lap, a one-second lead hold and two seconds of settling. Use `--direction cw
 for the opposite direction. Run each controller/direction three times, alternate
 controller order and return to the same starting pose between runs.
 
-Logs are exclusive CSV plus JSON files, with reference/measured tip positions,
-joint angles/rates, requested/emitted valves, timing, tracking and radial errors,
-and a completion/fault result. PID gains are loaded per run; `pid_robot` uses
+Each run writes the same pair as `simple_drive.py` (schema in
+`modules/drive_log.py`), so actuator-model training reads circle runs like
+operator recordings, plus a JSON summary under `--out_dir`
+(`data_collection/circle_logs` by default):
+
+    drive_log_<time>_circle_<controller>_<direction>[_<label>].csv
+    imu_raw_<time>_circle_<controller>_<direction>[_<label>].csv
+    drive_log_<...>.json     settings, checksums, per-pass scores, fault/result
+
+`combined_cmd_*` is the valve command written in that tick (neutral while not
+armed); rows with the pump off or the gate unarmed have `cmd_stale=1`, which the
+training loader cuts out. `excitation_mode` is `circle_<controller>` and
+`excitation_stage` is wait/approach/circle/stopped. Appended circle columns hold
+the controller's own IMU state (`q_*`, `v_*`), reference and measured tip pose,
+tracking and radial errors, requested valves and timing. `--label` adds a
+filename tail. Existing files are never overwritten. PID gains are loaded per run; `pid_robot` uses
 the profile gains and `pid_tuned` requires an explicit gains file. Software stops
 include stale sensors/controller, loop overruns, position/angle error, and
 joint/collision margins. Use the physical emergency stop and free-space motion.
@@ -47,7 +60,7 @@ is needed to establish physical accuracy. Hardware acceptance remains pending.
 After recording runs, compare matching profiles/speeds without opening hardware:
 
 ```bash
-.venv-lerobot/bin/python learned_control/run_circle.py compare --logs data_collection/circle_logs/circle_pid_ccw_01.csv data_collection/circle_logs/circle_mlp_ccw_01.csv --out data_collection/circle_logs/comparison --plot
+.venv-lerobot/bin/python learned_control/run_circle.py compare --logs data_collection/circle_logs/drive_log_<pid run>.csv data_collection/circle_logs/drive_log_<mlp run>.csv --out data_collection/circle_logs/comparison --plot
 ```
 
 This writes a comparison table and overlays the circles and timed errors.
@@ -58,7 +71,7 @@ once to start; it may then be released. **A stops motion and the pump**;
 **B starts logging** for the rest of the session. Gamepad disconnect and the
 existing fault limits still stop the robot. Passes reuse the original center,
 including the lead/settling holds. Warm-up samples are discarded until B;
-recorded samples stay in a compact preallocated RAM buffer. B starts a
+recorded samples stay in RAM. B starts a
 five-minute recording (`--record_seconds 300`); the pump shuts off at the end,
 then all passes are saved together with `pass_index`. A can stop and save early.
 The JSON `passes` list marks partially recorded passes. Continuous sessions
@@ -66,7 +79,7 @@ end on A; their session result is separate from individual pass scores.
 
 ```bash
 .venv-lerobot/bin/python learned_control/run_circle.py check --bundle learned_control/bundles/v6_jetson_bucket_dz0 --robot jetson_bucket_dz0
-.venv-lerobot/bin/python learned_control/run_circle.py run --continuous --log data_collection/circle_logs/circle_mlp_20hz_session_01.csv
+.venv-lerobot/bin/python learned_control/run_circle.py run --bundle learned_control/bundles/v6_jetson_bucket_dz0 --robot jetson_bucket_dz0 --continuous --label session_01
 ```
 
 The actor runs at its trained 20 Hz by default. `--policy_hz 100` is an
@@ -94,12 +107,12 @@ the stronger tested approach), followed by the selected circle controller.
 `--joint_margin_deg 0` removes the extra software margin within the pinned
 joint bounds; it does not expand those bounds. The approach and circle are
 checked independently before the pump starts.
-Recorded CSVs include sensor-frame acceleration XYZ [g] and gyro XYZ [deg/s]
-for every physical IMU (`imu0_...` through `imu3_...`), plus the role-corrected
-quaternions and gyro XYZ. These share the exact packet used by the controller;
-firmware startup gyro-bias removal precedes this capture. The JSON records the
-sensor-to-role mapping. CSV encoding, disk writes and per-pass scoring occur
-only after pump/output shutdown. No saving occurs during circle transitions.
+The imu_raw strip holds every 200 Hz firmware frame (quaternion, gyro [deg/s],
+accel [g]) for the logged span, joined to the drive log on the Pico clock
+(`state_imu_ts_us`; `policy_device_ts_us` is the packet the controller used).
+The JSON records the sensor-to-role mapping and any dropped raw frames. CSV
+encoding, disk writes and per-pass scoring occur only after pump/output
+shutdown. No saving occurs during circle transitions.
 For timing diagnostics, `--allow_timing_overruns` records and reschedules missed
 loop deadlines instead of aborting on 30 ms lateness / 40 ms computation.
 The independent sensor/controller freshness gate and operator stops remain

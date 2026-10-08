@@ -10,20 +10,6 @@ import numpy as np
 from learned_control.sensors import ROLES, aligned_rates, imu_positions
 
 
-def raw_imu_values(snapshot):
-    """Flatten same-packet sensor-frame accel [g] / gyro [deg/s] by physical index."""
-    accel = np.asarray(getattr(snapshot, "raw_accel", None), dtype=np.float64)
-    gyro = np.asarray(getattr(snapshot, "raw_gyro", None), dtype=np.float64)
-    if (
-        accel.shape != (4, 3)
-        or gyro.shape != (4, 3)
-        or not np.isfinite(accel).all()
-        or not np.isfinite(gyro).all()
-    ):
-        raise ValueError("Same-packet XYZ raw accelerometer/gyro data for all four IMUs is required")
-    return np.concatenate((accel, gyro), axis=1).ravel().tolist()
-
-
 class ImuReader:
     """Read one immutable same-packet snapshot from kaivuriprokkis.
 
@@ -87,6 +73,7 @@ class OutputGate:
         self.sensor_time = None
         self.policy_time = None
         self.last_command = np.zeros(3, dtype=np.float32)
+        self.write_time = None  # clock() of the last accepted write
         self.original_write = hardware.send_named_pwm_commands
 
     def arm(self):
@@ -137,4 +124,5 @@ class OutputGate:
                 self.stop("hardware rejected PWM write")
                 return False
             self.last_command[:] = values
+            self.write_time = self.clock()
             return True

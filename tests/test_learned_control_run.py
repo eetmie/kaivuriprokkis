@@ -1,6 +1,5 @@
-"""learned_control.run_circle run() end to end against a fake robot: bundles, valve write path, logging."""
+"""learned_control.run_circle run() end to end against a fake robot: bundles, valve write path, drive-log output."""
 
-import csv
 import json
 import sys
 import threading
@@ -11,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +62,23 @@ class FakeHardware:
     def shutdown(self):
         pass
 
+    # Raw capture: one 200 Hz frame per 5 ms of wall time, four sensors of 10 values.
+    def imu_stream_info(self):
+        return {"roles_by_index": ["boom", "arm", "bucket", "base"], "ranges": None, "capture_dropped": 0}
+
+    def start_imu_raw_capture(self):
+        self.capture_us = int(time.monotonic() * 1e6) // 5000 * 5000
+        return True
+
+    def drain_imu_raw_capture(self):
+        now = int(time.monotonic() * 1e6)
+        frames = [(ts, [[1.0] + [0.0] * 9] * 4) for ts in range(self.capture_us + 5000, now + 1, 5000)]
+        self.capture_us = frames[-1][0] if frames else self.capture_us
+        return frames
+
+    def try_read_imu_gyro(self):
+        return None
+
 
 class FakeReader:
     """Stands in for ImuReader: angles and rates straight from the fake plant."""
@@ -88,9 +105,23 @@ class FakeReader:
 
 
 class FakePad:
+    """Times are seconds after creation; None never presses. Continuous runs set B and A."""
+
+    press_b = press_a = None
+
     def __init__(self):
         self.created = time.monotonic()
-        self.A = self.B = False
+
+    def held(self, after):
+        return after is not None and time.monotonic() - self.created > after
+
+    @property
+    def A(self):
+        return self.held(self.press_a)
+
+    @property
+    def B(self):
+        return self.held(self.press_b)
 
     @property
     def LeftBumper(self):  # released at first, held from 1.2 s on
@@ -122,6 +153,14 @@ class FakeController:
     def give_direct_commands(self, commands):
         self.setpoint = dict(commands)
 
+    def get_joint_angles(self):
+        with self.hardware.lock:
+            q = self.hardware.q.copy()
+        return np.degrees(np.r_[0.0, q[:3]]), time.perf_counter(), FakeReader.stamp
+
+    def get_joint_velocities_with_age(self):
+        return list(np.degrees(np.r_[0.0, RATE * self.hardware.u])), 0.001
+
     def start(self):
         self.events.append("start")
         if "direct" in self.events:
@@ -135,7 +174,7 @@ class FakeController:
         self.stop_event.set()
 
 
-def drive_circle(monkeypatch, tmp_path, valve_writes, controller="pid_tuned"):
+def drive_circle(monkeypatch, tmp_path, valve_writes, controller="pid_tuned", extra=()):
     # The real board profiles and DirectController; fakes for everything that opens a device.
     fakes = {
         "bringup": {"wait_for_hardware_ready": lambda hardware: None},
@@ -148,9 +187,7 @@ def drive_circle(monkeypatch, tmp_path, valve_writes, controller="pid_tuned"):
         module.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, f"modules.{name}", module)
     monkeypatch.setattr(run_circle, "ImuReader", FakeReader)
-    monkeypatch.setattr(run_circle, "raw_imu_values", lambda snapshot: [0.0] * 24)
     FakeController.instances.clear()
-    log = tmp_path / f"circle_{valve_writes}.csv"
     argv = [
         "run_circle.py", "run",
         "--bundle", str(BUNDLES / f"proto_{PROFILE}"),
@@ -159,40 +196,71 @@ def drive_circle(monkeypatch, tmp_path, valve_writes, controller="pid_tuned"):
         "--pid_gains", str(GAINS),
         "--radius_mm", "5",
         "--valve_writes", valve_writes,
-        "--log", str(log),
+        "--out_dir", str(tmp_path),
+        "--label", valve_writes,
+        *extra,
     ]  # fmt: skip
     monkeypatch.setattr(sys, "argv", argv)
     run_circle.main()
-    with log.open(newline="") as stream:
-        table = list(csv.DictReader(stream))
-    rows = {
-        key: np.array(
-            [float(row[key] == "True") if row[key] in ("True", "False") else float(row[key]) for row in table]
-        )
-        for key in table[0]
-    }
+    (log,) = tmp_path.glob(f"drive_log_*_circle_{controller}_ccw_{valve_writes}.csv")
+    raw = tmp_path / log.name.replace("drive_log_", "imu_raw_", 1)
     report = json.loads(log.with_suffix(".json").read_text())
-    return rows, report, FakeController.instances[0]
+    return pd.read_csv(log), pd.read_csv(raw), report, FakeController.instances[0]
 
 
 def test_loop_writes_each_command_in_the_tick_it_is_computed(monkeypatch, tmp_path):
-    rows, report, controller = drive_circle(monkeypatch, tmp_path, "loop")
+    rows, _, report, controller = drive_circle(monkeypatch, tmp_path, "loop")
     assert report["result"]["completed"] and report["valve_writes"] == "loop"
     assert controller.events == ["suspend", "start"]
     writers = {name for name, _ in controller.hardware.writes}
     assert writers == {"MainThread"}  # only the measurement loop drives the valves
-    joints = ("boom", "arm", "bucket")
-    requested = np.stack([rows[f"{j}_requested_u"] for j in joints], 1)
-    emitted = np.stack([rows[f"{j}_emitted_u"] for j in joints], 1)
-    armed = rows["armed"] > 0
-    moving = armed[:-1] & armed[1:] & (np.abs(requested[:-1]).sum(1) > 0)
-    assert moving.sum() > 100
-    # The value read back at the start of a tick is exactly what the previous tick computed and wrote.
-    np.testing.assert_allclose(emitted[1:][moving], requested[:-1][moving], atol=1e-6)
+    requested = rows[[f"{j}_requested_u" for j in ("boom", "arm", "bucket")]].to_numpy()
+    written = rows[list(run_circle.VALVE_COLUMNS)].to_numpy()
+    armed = rows["armed"].to_numpy() > 0
+    assert (armed & (np.abs(requested).sum(1) > 0)).sum() > 100
+    # The logged valve command is what this tick computed and wrote, neutral while unarmed.
+    np.testing.assert_allclose(written[armed], requested[armed], atol=1e-6)
+    assert not written[~armed].any()
+    assert (rows["cmd_age_s"][armed] < 0.005).all()
+
+
+def test_circle_log_is_a_drive_log_the_training_loader_accepts(monkeypatch, tmp_path):
+    rows, raw, report, _ = drive_circle(monkeypatch, tmp_path, "loop")
+    # The training contract: Isaac-hydraulic-actuator training/dataset.py and gyro_transfer.py.
+    required = [
+        "timestamp", "sample_idx", "state_imu_ts_us", "cmd_stale", "cmd_age_s", "state_age_s", "vel_age_s",
+        *(f"combined_cmd_{c}" for c in ("lift", "tilt", "scoop")),
+        *(f"joint_pos_{j}" for j in ("boom", "arm", "bucket")),
+        *(f"joint_vel_{j}" for j in ("boom", "arm", "bucket")),
+    ]  # fmt: skip
+    assert not set(required) - set(rows.columns)
+    assert (np.diff(rows["sample_idx"]) == 1).all() and (np.diff(rows["timestamp"]) > 0).all()
+    np.testing.assert_array_equal(rows["cmd_stale"] > 0, rows["armed"] == 0)
+    assert set(rows["excitation_stage"]) <= {"wait", "approach", "circle", "stopped"}
+    assert (rows["excitation_mode"] == "circle_pid_tuned").all()
+    np.testing.assert_allclose(rows["joint_pos_boom"], rows["q_boom"], atol=0.02)
+    # Every 200 Hz frame of the run, joinable on the Pico clock.
+    assert (np.diff(raw["device_ts_us"]) == 5000).all()
+    assert len(raw) >= 1.9 * len(rows)
+    assert {"imu_base_qw", "imu_bucket_gy_dps"} <= set(raw.columns)
+    assert report["drive_log"].startswith("drive_log_") and report["imu_raw"].startswith("imu_raw_")
+
+
+def test_continuous_run_logs_from_b_and_scores_each_pass(monkeypatch, tmp_path):
+    monkeypatch.setattr(FakePad, "press_b", 2.5)
+    monkeypatch.setattr(FakePad, "press_a", 4.5)
+    rows, _, report, _ = drive_circle(monkeypatch, tmp_path, "loop", extra=["--continuous"])
+    assert report["result"]["stopped_by"] == "A"
+    # Only B onwards is recorded, with the drive-log clock starting at B.
+    assert rows["timestamp"].iloc[0] < 0.02 and rows["run_t_s"].iloc[0] == pytest.approx(
+        report["logging_started_at_s"], abs=0.02
+    )
+    assert 1.5 < rows["timestamp"].iloc[-1] < 2.5
+    assert report["passes"] and all(p["pass_index"] in set(rows["pass_index"]) for p in report["passes"])
 
 
 def test_thread_mode_keeps_the_direct_command_path(monkeypatch, tmp_path):
-    rows, report, controller = drive_circle(monkeypatch, tmp_path, "thread")
+    rows, _, report, controller = drive_circle(monkeypatch, tmp_path, "thread")
     assert report["result"]["completed"] and report["valve_writes"] == "thread"
     assert controller.events == ["direct", "start"]
     assert any(name == "controller" for name, _ in controller.hardware.writes)

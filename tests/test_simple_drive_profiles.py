@@ -36,6 +36,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import simple_drive  # noqa: E402
 import modules.board as board_module  # noqa: E402
+from modules.drive_log import clean_suffix  # noqa: E402
 
 
 def _args(robot="rpi"):
@@ -255,7 +256,7 @@ class SuffixNamingTests(unittest.TestCase):
             self.assertEqual(simple_drive.DataLogger(Path("/tmp"), suffix=raw).suffix, "")
 
     def test_path_separators_cannot_escape_the_output_dir(self):
-        cleaned = simple_drive._clean_suffix("../../etc/passwd")
+        cleaned = clean_suffix("../../etc/passwd")
         self.assertNotIn("/", cleaned)
         self.assertNotIn("..", cleaned)
         out = Path("/tmp") / f"drive_log_20260101_000000{cleaned}.csv"
@@ -264,10 +265,10 @@ class SuffixNamingTests(unittest.TestCase):
     def test_unusable_label_falls_back_to_the_plain_name(self):
         # All-punctuation collapses to nothing; better a plain name than a
         # file called drive_log_<ts>_.csv.
-        self.assertEqual(simple_drive._clean_suffix("!!!"), "")
+        self.assertEqual(clean_suffix("!!!"), "")
 
     def test_whitespace_and_case_survive_as_a_readable_label(self):
-        self.assertEqual(simple_drive._clean_suffix(" Slew Test "), "_Slew-Test")
+        self.assertEqual(clean_suffix(" Slew Test "), "_Slew-Test")
 
 
 if __name__ == "__main__":

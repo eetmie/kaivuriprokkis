@@ -5,6 +5,10 @@ Isaac-hydraulic-actuator's export_robot_bundle.py, which also generates their ro
 Hold local gamepad Left Bumper to enable a finite run. Continuous mode starts
 with LB, runs until A, and uses B to enable measurement logging. Gamepad
 disconnect always stops. Slew, tracks and auxiliaries remain neutral.
+
+A run records the same drive_log/imu_raw pair as simple_drive.py
+(modules/drive_log.py), plus the circle columns in CIRCLE_FIELDS and a JSON
+summary, so actuator-model training can read circle runs like operator data.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import gc
 import itertools
 import json
 import logging
@@ -31,19 +36,25 @@ if str(ROOT) not in sys.path:
 
 from learned_control.bundle import PolicyBundle  # noqa: E402
 from learned_control.circle import CircleJointPID, CircleTrajectory, StartMove, load_robot_gains  # noqa: E402
-from learned_control.hardware import ImuReader, OutputGate, raw_imu_values  # noqa: E402
-from learned_control.recording import BufferedRecording  # noqa: E402
+from learned_control.hardware import ImuReader, OutputGate  # noqa: E402
 from learned_control.robot_geometry import policy_twist  # noqa: E402
-from learned_control.sensors import ROLES, policy_joint_offset  # noqa: E402
+from learned_control.sensors import policy_joint_offset  # noqa: E402
 from learned_control.settings import HOME, sha256  # noqa: E402
+from modules.drive_log import COMMAND_CHANNELS, DriveLog, clean_suffix  # noqa: E402
 
 PROFILES = ROOT / "configuration_files/profiles"
 JOINTS = ("boom", "arm", "bucket")
-FIELDS = [
-    "t_s",
+CHANNELS = dict(COMMAND_CHANNELS)
+VALVE_COLUMNS = tuple(f"combined_cmd_{CHANNELS[joint]}" for joint in JOINTS)
+# Circle columns appended to each drive-log row. q/v and policy_device_ts_us are
+# the run's own IMU state (what the controllers acted on); joint_pos_*/joint_vel_*
+# come from the robot controller, as in simple_drive.py recordings.
+CIRCLE_FIELDS = (
+    "run_t_s",
     "motion_t_s",
-    "device_ts_us",
     "armed",
+    "pass_index",
+    "policy_device_ts_us",
     "q_boom",
     "q_arm",
     "q_bucket",
@@ -67,23 +78,9 @@ FIELDS = [
     "boom_requested_u",
     "arm_requested_u",
     "bucket_requested_u",
-    "boom_emitted_u",
-    "arm_emitted_u",
-    "bucket_emitted_u",
     "compute_ms",
     "lateness_ms",
-    "pass_index",
-]
-FIELDS += [
-    f"{role}_{channel}"
-    for role in ROLES
-    for channel in ("qw", "qx", "qy", "qz", "gx_dps", "gy_dps", "gz_dps")
-]
-FIELDS += [
-    f"imu{index}_{channel}"
-    for index in range(4)
-    for channel in ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps")
-]
+)
 
 
 def load_configuration(args):
@@ -219,7 +216,7 @@ def summarize(rows: list[dict], path: CircleTrajectory, fault: str | None) -> di
     if moving:
         errors = np.array([r["error_m"] for r in moving]) * 1000
         radial = np.array([r["radial_error_m"] for r in moving]) * 1000
-        valves = np.array([[r[f"{j}_emitted_u"] for j in JOINTS] for r in moving])
+        valves = np.array([[r[column] for column in VALVE_COLUMNS] for r in moving])
         duration = max(0.01, moving[-1]["motion_t_s"] - moving[0]["motion_t_s"])
         result.update(
             tracking_rmse_mm=float(np.sqrt(np.mean(errors**2))),
@@ -252,10 +249,14 @@ def run(args) -> None:
         raise ValueError("Carriage pitch bound must be in (0, 3] degrees, within the model geometry")
     if not math.isfinite(args.max_joint_velocity_rad_s) or args.max_joint_velocity_rad_s <= 0:
         raise ValueError("Driven joint velocity bound must be finite and positive")
-    # Reserve both artifacts before touching hardware. Existing runs are never overwritten.
-    args.log.parent.mkdir(parents=True, exist_ok=True)
-    summary_path = args.log.with_suffix(".json")
-    with args.log.open("x", newline="") as log_stream, summary_path.open("x") as summary_stream:
+    if not math.isfinite(args.record_seconds) or not 0 < args.record_seconds <= 600:
+        raise ValueError("Recording duration must be in (0, 600] seconds")
+    # Reserve the summary before touching hardware; no artifact is ever overwritten.
+    log_path, raw_path = run_paths(args)
+    summary_path = log_path.with_suffix(".json")
+    if log_path.exists() or raw_path.exists():
+        raise FileExistsError(log_path)
+    with summary_path.open("x") as summary_stream:
         from modules.board import resolve_profile
         from modules.bringup import wait_for_hardware_ready
         from modules.direct_controller import DirectController
@@ -271,7 +272,8 @@ def run(args) -> None:
             raise ValueError("Resolved board profile must use the checksum-pinned files")
         hardware = controller = direct = pad = gate = monitor = path = None
         monitor_stop = threading.Event()
-        rows, fault = [], None
+        log, fault = DriveLog(), None
+        imu_roles, stream_info = [], {}
         metadata = {
             "controller": args.controller,
             "robot": args.robot,
@@ -297,16 +299,13 @@ def run(args) -> None:
             "approach_output_limit": args.approach_output_limit,
             "passes": [],
             "imu_mapping": bundle.robot_kin.profile["imu"]["imu_mapping"],
-            "raw_imu_source": "firmware packet, sensor frame before host mounting rotation; startup gyro bias removed",
+            "drive_log": log_path.name,
+            "imu_raw": raw_path.name,
             "allow_timing_overruns": args.allow_timing_overruns,
         }
-        writer = csv.DictWriter(log_stream, fieldnames=FIELDS)
-        writer.writeheader()
-        log_stream.flush()
         pass_index, stopped_by_a = 0, False
         recording = not args.continuous
         logging_started_at = None
-        buffer = BufferedRecording(FIELDS, args.record_seconds) if args.continuous else None
         recording_complete = False
         metadata["record_seconds"] = args.record_seconds
         metadata["saving"] = "buffer in RAM; write and score after hardware shutdown"
@@ -390,7 +389,12 @@ def run(args) -> None:
             pid.reset()
             reader = ImuReader(hardware)
             reader.read()
-            raw_imu_values(reader.snapshot)
+            imu_roles = list(hardware.imu_stream_info()["roles_by_index"])
+            if not hardware.start_imu_raw_capture():
+                raise RuntimeError("Raw IMU capture is unavailable; the run would record no imu_raw strip")
+            # Exempt the start-up heap (torch alone is large) from collection: a full pass over it
+            # paused this loop for 20-40 ms. Later objects are still collected.
+            gc.freeze()
             started = next_tick = previous_tick = time.monotonic()
             motion_start, released, step, compute_ms = None, False, 0, 0.0
             circle_start = None
@@ -420,7 +424,6 @@ def run(args) -> None:
                 }
                 with gate.lock:
                     gate.sensor_time = reader.fresh_time
-                    emitted = gate.last_command.copy()
                 if args.continuous and pad.A:
                     stopped_by_a = True
                     break
@@ -429,6 +432,7 @@ def run(args) -> None:
                 if args.continuous and pad.B and not recording:
                     recording = True
                     logging_started_at = tick - started
+                    hardware.drain_imu_raw_capture()  # frames before B are warm-up
                     print(
                         f"B: recording {args.record_seconds:g}s into memory; saving after pump-off.",
                         flush=True,
@@ -532,43 +536,72 @@ def run(args) -> None:
                     # Every tick, held between actor updates; the gate zeroes it unless armed.
                     direct.give_commands(dict(zip(JOINTS, requested.tolist(), strict=True)))
                     direct.send_pending()
-                radial = float(np.linalg.norm(pose[:2] - path.center) - path.radius)
-                values = [
-                    elapsed,
-                    motion_t,
-                    stamp,
-                    gate.armed,
-                    *q,
-                    *v,
-                    *pose,
-                    *target,
-                    *feedforward,
-                    error,
-                    radial,
-                    angle_error,
-                    *requested,
-                    *emitted,
-                    compute_ms,
-                    lateness * 1000,
-                    pass_index,
-                ]
                 if recording:
-                    snapshot = reader.snapshot
-                    gyros = dict(zip(hardware._imu_joint_roles, snapshot.imu_gyro, strict=True))
-                    gyros["base"] = snapshot.base_imu_gyro
-                    for role in ROLES:
-                        values.extend(float(x) for x in snapshot.imu_by_role[role])
-                        values.extend(float(x) for x in gyros[role])
-                    values.extend(raw_imu_values(snapshot))
-                    if buffer is not None:
-                        buffer.append(values)
-                    else:
-                        rows.append(
-                            {
-                                name: value.item() if isinstance(value, np.generic) else value
-                                for name, value in zip(FIELDS, values, strict=True)
-                            }
+                    with gate.lock:
+                        written, written_at = gate.last_command.copy(), gate.write_time
+                    stage = (
+                        "wait"
+                        if motion_start is None
+                        else "approach"
+                        if approaching
+                        else "circle"
+                        if gate.armed
+                        else "stopped"
+                    )
+                    radial = float(np.linalg.norm(pose[:2] - path.center) - path.radius)
+                    vels, vel_age = controller.get_joint_velocities_with_age()
+                    row = log.build_row(
+                        tick - started - logging_started_at if args.continuous else tick - started,
+                        {},
+                        {},
+                        dict(zip(JOINTS, written.tolist(), strict=True)),
+                        *controller.get_joint_angles(),
+                        vels,
+                        vel_age,
+                        hardware.try_read_imu_gyro(),
+                        # Command age is that of the last valve write; unarmed rows hold neutral valves
+                        # with the pump off and are marked stale so training cuts them out.
+                        float("inf") if written_at is None else time.monotonic() - written_at,
+                        not gate.armed,
+                        gate.armed,
+                        "all",
+                        -1,
+                        {
+                            "mode": f"circle_{args.controller}",
+                            "version": 1,
+                            "block_id": pass_index,
+                            "elapsed_s": motion_t,
+                            "stage": stage,
+                        },
+                    )
+                    row.update(
+                        zip(
+                            CIRCLE_FIELDS,
+                            (
+                                tick - started,
+                                motion_t,
+                                int(gate.armed),
+                                pass_index,
+                                stamp,
+                                *q.tolist(),
+                                *v.tolist(),
+                                *pose.tolist(),
+                                *target.tolist(),
+                                *feedforward.tolist(),
+                                error,
+                                radial,
+                                angle_error,
+                                *requested.tolist(),
+                                compute_ms,
+                                lateness * 1000,
+                            ),
+                            strict=True,
                         )
+                    )
+                    log.append(row)
+                    log.log_imu_raw(hardware.drain_imu_raw_capture(), len(imu_roles))
+                else:
+                    hardware.drain_imu_raw_capture()
                 if step % 100 == 0:
                     print(
                         f"t={elapsed:.1f}s error={error * 1000:.1f}mm compute={compute_ms:.1f}ms "
@@ -611,21 +644,31 @@ def run(args) -> None:
                     finally:
                         try:
                             if hardware is not None:
-                                hardware.shutdown()
+                                try:
+                                    if recording:
+                                        log.log_imu_raw(hardware.drain_imu_raw_capture(), len(imu_roles))
+                                    stream_info = hardware.imu_stream_info()
+                                except Exception as exc:  # keep the run's own fault; save what exists
+                                    metadata["imu_raw_error"] = f"{type(exc).__name__}: {exc}"
+                                finally:
+                                    hardware.shutdown()
                         finally:
+                            print(f"Pump off. Saving {log.n_samples()} samples...", flush=True)
+                            if log.n_samples():
+                                log.write_drive_log(log_path)
+                                log.write_imu_raw(raw_path, imu_roles, stream_info)
+                            dropped = stream_info.get("capture_dropped", 0) or 0
+                            metadata["imu_raw_dropped_frames"] = int(dropped)
                             metadata["result"] = (
-                                summarize(rows, path, fault)
-                                if path is not None
+                                summarize(list(scoring_rows(log_path)), path, fault)
+                                if path is not None and log.n_samples()
                                 else {
                                     "completed": False,
                                     "fault": fault,
                                 }
                             )
                             if args.continuous:
-                                print(f"Pump off. Saving {buffer.count} buffered samples...", flush=True)
-                                buffer.write_to(writer)
-                                log_stream.flush()
-                                score_recorded_passes(args.log, path, metadata["passes"], fault)
+                                score_recorded_passes(log_path, path, metadata["passes"], fault)
                                 metadata["logging_started_at_s"] = logging_started_at
                                 metadata["result"] = {
                                     "completed": recording_complete,
@@ -638,36 +681,42 @@ def run(args) -> None:
                                     "passes_completed": pass_index,
                                     "logged_passes": len(metadata["passes"]),
                                 }
-                            else:
-                                writer.writerows(rows)
                             json.dump(metadata, summary_stream, indent=2)
                             summary_stream.write("\n")
-                            print(f"Saved {args.log} and {summary_path}", flush=True)
+                            print(f"Saved {summary_path}", flush=True)
+
+
+def run_paths(args):
+    """drive_log/imu_raw names in simple_drive.py's pattern, labelled as a circle run."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    tail = f"{stamp}_circle_{args.controller}_{args.direction}{clean_suffix(args.label)}"
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    return args.out_dir / f"drive_log_{tail}.csv", args.out_dir / f"imu_raw_{tail}.csv"
+
+
+def scoring_rows(csv_path):
+    """Yield the numeric fields summarize() needs, one drive-log row at a time."""
+    numeric = ("motion_t_s", "error_m", "radial_error_m", "angle_error_rad", "compute_ms", *VALVE_COLUMNS)
+    with csv_path.open(newline="") as stream:
+        for row in csv.DictReader(stream):
+            yield {
+                **{key: float(row[key]) for key in numeric},
+                "armed": float(row["armed"]) > 0,
+                "pass_index": int(row["pass_index"]),
+            }
 
 
 def score_recorded_passes(csv_path, path, reports, fault=None):
     """Score a CSV one pass at a time after hardware stops, keeping memory bounded."""
 
-    if path is None:
+    if path is None or not csv_path.exists():
         return
-    numeric = (
-        "motion_t_s",
-        "error_m",
-        "radial_error_m",
-        "angle_error_rad",
-        "compute_ms",
-        *(f"{joint}_emitted_u" for joint in JOINTS),
-    )
-    with csv_path.open(newline="") as stream:
-        for index, group in itertools.groupby(csv.DictReader(stream), lambda row: int(row["pass_index"])):
-            rows = [
-                {**{key: float(row[key]) for key in numeric}, "armed": row["armed"] == "True"}
-                for row in group
-            ]
-            partial = rows[0]["motion_t_s"] > 0.02 or rows[-1]["motion_t_s"] < path.duration - 0.03
-            reports.append(
-                {"pass_index": index, "partial": partial, **summarize(rows, path, fault if partial else None)}
-            )
+    for index, group in itertools.groupby(scoring_rows(csv_path), lambda row: row["pass_index"]):
+        rows = list(group)
+        partial = rows[0]["motion_t_s"] > 0.02 or rows[-1]["motion_t_s"] < path.duration - 0.03
+        reports.append(
+            {"pass_index": index, "partial": partial, **summarize(rows, path, fault if partial else None)}
+        )
 
 
 def compare_runs(args) -> None:
@@ -726,7 +775,7 @@ def compare_runs(args) -> None:
         for path, report in zip(args.logs, reports, strict=True):
             with path.open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
-            moving = [r for r in rows if r["armed"] == "True" and float(r["motion_t_s"]) >= 1]
+            moving = [r for r in rows if float(r["armed"]) > 0 and float(r["motion_t_s"]) >= 1]
             if not rows or not moving:
                 continue
             center = np.array([float(rows[0]["ref_x_m"]) - radius / 1000, float(rows[0]["ref_z_m"])])
@@ -757,7 +806,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="mode", required=True)
     comparison = commands.add_parser("compare", help="Compare recorded CSV/JSON runs; opens no hardware")
-    comparison.add_argument("--logs", type=Path, nargs="+", required=True)
+    comparison.add_argument("--logs", type=Path, nargs="+", required=True, help="Circle drive_log_ CSVs")
     comparison.add_argument(
         "--out", type=Path, required=True, help="New output prefix for CSV/JSON and optional PNG"
     )
@@ -836,7 +885,14 @@ def main() -> None:
                 default=2,
                 help="Boom/arm/bucket measured-rate bound; excludes passive carriage rate",
             )
-            cmd.add_argument("--log", type=Path, required=True)
+            cmd.add_argument(
+                "--out_dir",
+                type=Path,
+                default=ROOT / "data_collection/circle_logs",
+                help="Writes drive_log_<time>_circle_<controller>_<direction>[_label].csv, its imu_raw_ "
+                "strip and a .json summary",
+            )
+            cmd.add_argument("--label", help="Optional filename tail, e.g. v6_20hz")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(1)

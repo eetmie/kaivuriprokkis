@@ -1,6 +1,5 @@
-"""learned_control without hardware: circle timing, PID path, recording, IMU reading and the latched output gate."""
+"""learned_control without hardware: circle timing, PID path, scoring, IMU reading and the latched output gate."""
 
-import csv
 import json
 import math
 import sys
@@ -13,8 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from learned_control.circle import CircleJointPID, CircleTrajectory, PidGains, StartMove  # noqa: E402
-from learned_control.hardware import ImuReader, OutputGate, raw_imu_values  # noqa: E402
-from learned_control.recording import BufferedRecording  # noqa: E402
+from learned_control.hardware import ImuReader, OutputGate  # noqa: E402
 from learned_control.run_circle import (  # noqa: E402
     check_motion_envelope,
     compare_runs,
@@ -23,38 +21,6 @@ from learned_control.run_circle import (  # noqa: E402
     summarize,
 )
 from learned_control.sensors import MOUNT_PITCH, aligned_rates, imu_positions, policy_joint_offset  # noqa: E402
-
-
-def test_buffer_keeps_multiple_passes_and_writes_only_when_requested(tmp_path):
-    fields = ["armed", "pass_index", "device_ts_us", "sample"]
-    buffer = BufferedRecording(fields, 300)
-    path = tmp_path / "passes.csv"
-    with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        stream.flush()
-        buffer.append([True, 0, 1234567890, 1.2])
-        buffer.append([True, 1, 1234567891, 2.3])
-        assert len(path.read_text().splitlines()) == 1
-        buffer.write_to(writer)
-    with path.open() as stream:
-        rows = list(csv.DictReader(stream))
-    assert [r["pass_index"] for r in rows] == ["0", "1"]
-    assert rows[0]["armed"] == "True"
-    assert rows[0]["device_ts_us"] == "1234567890"
-    assert buffer.samples.nbytes < 30_000_000
-
-
-def test_raw_imu_logs_all_axes_in_physical_sensor_order():
-    snapshot = SimpleNamespace(
-        raw_accel=[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
-        raw_gyro=[[21, 22, 23], [24, 25, 26], [27, 28, 29], [30, 31, 32]],
-    )
-    values = np.array(raw_imu_values(snapshot)).reshape(4, 6)
-    np.testing.assert_array_equal(values[1], [4, 5, 6, 24, 25, 26])
-    snapshot.raw_accel = None
-    with pytest.raises(ValueError, match="raw accelerometer/gyro"):
-        raw_imu_values(snapshot)
 
 
 def test_rocking_does_not_trip_the_driven_joint_rate_guard():
@@ -154,9 +120,9 @@ def test_summary_distinguishes_radial_error_from_timing_error_and_keeps_faults()
             error_m=0.01,
             radial_error_m=0.0,
             angle_error_rad=0,
-            boom_emitted_u=0.2,
-            arm_emitted_u=0.2,
-            bucket_emitted_u=0.0,
+            combined_cmd_lift=0.2,
+            combined_cmd_tilt=0.2,
+            combined_cmd_scoop=0.0,
             compute_ms=1.0,
         )
         for i in range(3)

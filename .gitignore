@@ -217,6 +217,7 @@ logs*/
 *.db3
 *.mcap
 data_collection/hydraulic_data/
+data_collection/circle_logs/
 data_collection/test_results/
 /old
 

@@ -7,7 +7,8 @@ inference against the real machine.
 
 Start with `simple_drive.py` (open-loop gamepad driving + hydraulic data
 collection). Closed-loop and compensated driving live in `control_prototype/`,
-and the LeRobot/SmolVLA workflow in `lerobot_vla/`.
+the LeRobot/SmolVLA workflow in `lerobot_vla/`, and the learned and sim-tuned
+arm controllers from Isaac-hydraulic-actuator in [`learned_control/`](learned_control/README.md).
 
 ```bash
 .venv/bin/python simple_drive.py --robot jetson
@@ -47,6 +48,9 @@ The controller has four mutually exclusive output modes: IK (`give_pose`),
 velocity (`enter_velocity_command_mode`), direct
 (`enter_direct_command_mode`), and suspended (`suspend_ik_output`, which hands
 the bus to a caller-owned `DirectController`).
+A caller-owned `DirectController` must itself write every tick at a fixed rate,
+as `simple_drive.py` and `learned_control/run_circle.py` do from their 100 Hz
+loops.
 
 ## Platform Setup And Privileges
 

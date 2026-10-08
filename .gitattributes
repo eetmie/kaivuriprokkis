@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Exported controller bundles are hash-pinned by their contract.json, byte for byte.
+learned_control/bundles/** -text

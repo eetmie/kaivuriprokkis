@@ -1,0 +1,100 @@
+{
+  "version": 2,
+  "settings": {
+    "dt": 0.01,
+    "decimation": 5,
+    "speed_max": 0.12,
+    "pitch_rate_max": 0.3,
+    "joint_margin": 0.06,
+    "lookahead": 0.8,
+    "velocity_limit": 2.0
+  },
+  "policy_hz": 20.0,
+  "model_files": {
+    "model_meta.json": "38aa39124c534afb6aaad62d404cd452fc49ab5a6580bb729f9d0c0de968f46e",
+    "mlp_state_dict.pt": "325fee07327d34acc50544027274eaf43aeda8da5289cf3eb9455753d79db753",
+    "x_mean.npy": "d3c9b56e36d25275cbd2ae67f7045f37c2c898a9ffa718ae2d68549f7c3ca382",
+    "x_std.npy": "7bc3a90783b94256d6c187c2196d2c3c24147564802cf318c0db80e307b2281a",
+    "y_mean.npy": "f6de3c44d9a68b92f177301b329900aa282b977016e2b09ddb298e62d86c6f8c",
+    "y_std.npy": "9ea5025cdac62ede1358dbf313b35feaeb67a687d001aca9005d886a2934c32b"
+  },
+  "extra_model_paths": [
+    "models/arm_v4",
+    "models/arm_v5"
+  ],
+  "asset_sha256": "65ab510bcd62f708cbf861451d45ab495b0f04909c6f69490eb2fd2708993f21",
+  "joint_names": [
+    "revolute_lift",
+    "revolute_tilt",
+    "revolute_tool",
+    "revolute_carriage_pitch"
+  ],
+  "tip_path": "/excavator/bucket/ee_tip",
+  "command_frame": "lower_carriage_XZ_pitch_about_positive_Y",
+  "tracked_twist": "arm_joints_only",
+  "action_transform": "tanh",
+  "observation_dim": 164,
+  "observation_fields": [
+    "q",
+    "current_and_past_v_every_20ms",
+    "past_commanded_u",
+    "tip_xz",
+    "sin_pitch",
+    "cos_pitch",
+    "arm_tip_twist",
+    "admitted_command",
+    "command_minus_arm_tip_twist"
+  ],
+  "sensors": {
+    "version": 1,
+    "roles": [
+      "base",
+      "boom",
+      "arm",
+      "bucket"
+    ],
+    "velocity_source": "aligned_y_child_minus_parent",
+    "software_filter": "none",
+    "sampling": "latest_complete_packet_not_after_tick",
+    "bias": "firmware_startup_correction_only",
+    "carriage_pitch_zero_rad": -0.004821687005460262,
+    "mount_pitch_rad": [
+      0.0,
+      0.241728109123881,
+      0.017453221928437734,
+      0.0
+    ]
+  },
+  "sensor_randomization": {
+    "gyro_noise_std": 0.005,
+    "gyro_bias_max": 0.003,
+    "angle_noise_std": 0.003,
+    "delay_max_steps": 2
+  },
+  "bundle_version": 2,
+  "checkpoint_sha256": "c5bda487e73d7ce0ed6ff22e3b2d0f487ad0c98e7e1c531ea39162dbb1873b9d",
+  "sensor_trained": true,
+  "velocity_samples": 41,
+  "command_samples": 61,
+  "u_stride": 3,
+  "geometry_source": "training_usd_bucket",
+  "policy_joint_offset_rad": [
+    0.0,
+    -0.0067718070931732655,
+    0.0067718070931732655,
+    0.0
+  ],
+  "robot_profile_sha256": {
+    "servo_config.yaml": "519c36423a43adb0fafe8d826e36d6e51ecc6465a2662fb1001d5b21c8d17c6c",
+    "control_config.yaml": "5b7042d6eafac5cfb05625ddf2533aaa0889843e4da27cf2d1f92b038daf6039",
+    "profile.yaml": "35a2828dfd0a0126c49c3eef916e0eb2d71d67d088a61bb89ecfc01828da82c1"
+  },
+  "files": {
+    "actor.pt": "7ef12edc9b1d54e38d77c5886d7a0aa11235aaaa5858627dac52ead06157d602",
+    "geometry.json": "592b5f403d51c225e9beac033776fed2c06a84fb7535cf854a4f415348bfa68a",
+    "robot_geometry.json": "bec27f3141ad689e76e731be4e9b4fb7829d51ab5b60aad67fb390cee9419cac",
+    "bucket_control_config.yaml": "5b7042d6eafac5cfb05625ddf2533aaa0889843e4da27cf2d1f92b038daf6039",
+    "collision_grid.npy": "c248686b037056b059353981bd1e270aa0816eaa7377e9638b11f69b3334caa0",
+    "reference_io.npz": "be976ce54fca4d41e128bff0b519172f28ab832bb1c66345613b8c2ddad90532"
+  }
+}

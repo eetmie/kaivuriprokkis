@@ -33,8 +33,10 @@ import numpy as np
 # Samples per packed block. Long Python lists of floats make every full garbage
 # collection walk each logged value -- 30+ ms once a recording holds minutes of
 # data, long enough to stall a 100 Hz loop. numpy arrays are not walked, so the
-# buffers are packed into them block by block.
+# buffers are packed into them block by block, a few columns per sample so no
+# single tick pays for a whole block (~3 ms on the Orin).
 PACK_ROWS = 250
+PACK_COLUMNS_PER_ROW = 16
 PACK_IMU_FRAMES = 500
 
 JOINT_NAMES = ['slew', 'boom', 'arm', 'bucket']
@@ -91,10 +93,12 @@ class DriveLog:
     """
 
     def __init__(self):
-        # The open block, one list per column, and the blocks already packed.
+        # The open block, one list per column; a closed block still being
+        # packed; and the packed blocks. Order per column: packed, closing, open.
         self._cols: dict[str, list] = {}
+        self._closing: dict[str, list] = {}
         self._packed: dict[str, list[np.ndarray]] = {}
-        self._packed_rows = 0
+        self._closed_rows = 0
         self._clear_imu_raw()
 
     def append(self, row: dict) -> None:
@@ -113,20 +117,28 @@ class DriveLog:
             raise RuntimeError(f"log row changed shape mid-recording: {drift}")
         for name, value in row.items():
             self._cols[name].append(value)
+        for name in list(self._closing)[:PACK_COLUMNS_PER_ROW]:
+            self._packed[name].append(np.asarray(self._closing.pop(name)))
         if len(self._cols['timestamp']) >= PACK_ROWS:
-            for name, values in self._cols.items():
+            # Normally long done; finish it so only one block is ever closing.
+            for name, values in self._closing.items():
                 self._packed[name].append(np.asarray(values))
-                self._cols[name] = []
-            self._packed_rows += PACK_ROWS
+            self._closing = self._cols
+            self._cols = {name: [] for name in self._closing}
+            self._closed_rows += PACK_ROWS
 
     def n_samples(self) -> int:
-        return self._packed_rows + len(self._cols.get('timestamp', ()))
+        return self._closed_rows + len(self._cols.get('timestamp', ()))
 
     def columns(self) -> dict[str, np.ndarray]:
         """Every logged column as one array, in build_row's order."""
-        return {name: np.concatenate([*self._packed[name], np.asarray(values)])
-                if self._packed[name] else np.asarray(values)
-                for name, values in self._cols.items()}
+        out = {}
+        for name, values in self._cols.items():
+            parts = [*self._packed[name]]
+            if name in self._closing:
+                parts.append(np.asarray(self._closing[name]))
+            out[name] = np.concatenate([*parts, np.asarray(values)]) if parts else np.asarray(values)
+        return out
 
     @staticmethod
     def _imu_vectors(gyro: dict | None) -> dict:

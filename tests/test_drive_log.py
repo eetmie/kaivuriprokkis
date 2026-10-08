@@ -10,9 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from modules import drive_log  # noqa: E402
 
 
-def record(monkeypatch, tmp_path, rows, frames):
+def record(monkeypatch, tmp_path, rows, frames, columns=16):
     """Log a mixed-type row stream and raw frames; write both strips."""
     monkeypatch.setattr(drive_log, "PACK_ROWS", rows)
+    monkeypatch.setattr(drive_log, "PACK_COLUMNS_PER_ROW", columns)
     monkeypatch.setattr(drive_log, "PACK_IMU_FRAMES", frames)
     log = drive_log.DriveLog()
     for k in range(23):
@@ -24,7 +25,7 @@ def record(monkeypatch, tmp_path, rows, frames):
         row["pass_index"] = k // 10
         log.append(row)
         log.log_imu_raw([(2 * k, [[1.0, 0.5 * k]] * 2), (2 * k + 1, [[1.0] + [0.0] * 9] * 2)], 2)
-    tag = f"{rows}_{frames}"
+    tag = f"{rows}_{frames}_{columns}"
     log.write_drive_log(tmp_path / f"drive_{tag}.csv")
     log.write_imu_raw(tmp_path / f"raw_{tag}.csv", ["boom", "base"], {})
     assert log.n_samples() == 23 and log.n_imu_raw_samples() == 46
@@ -33,8 +34,9 @@ def record(monkeypatch, tmp_path, rows, frames):
 
 def test_packed_blocks_write_the_same_files(monkeypatch, tmp_path):
     whole = record(monkeypatch, tmp_path, 10**6, 10**6)
-    packed = record(monkeypatch, tmp_path, 4, 7)
-    assert packed == whole
-    table = pd.read_csv(tmp_path / "drive_4_7.csv")
+    assert record(monkeypatch, tmp_path, 4, 7) == whole
+    # Written mid-pack: a closed block whose columns are only partly packed.
+    assert record(monkeypatch, tmp_path, 20, 7, columns=3) == whole
+    table = pd.read_csv(tmp_path / "drive_4_7_16.csv")
     assert (table["sample_idx"] == np.arange(23)).all()
     assert table["cmd_stale"].sum() == 1 and table["joint_vel_boom"].isna().sum() == 1

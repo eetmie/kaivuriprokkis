@@ -18,6 +18,10 @@ For repeatable single-axis chirps and the data collection button workflow, see
 [excitation recordings](data_collection/EXCITATION.md). Sine remains the default;
 `--excitation chirp` selects a clean frequency sweep.
 
+Inspect recorded poses before collecting more actuator data with the separate
+[pose coverage plotter](data_collection/COVERAGE.md). It saves workspace and
+joint-angle heatmaps from existing drive logs without opening robot hardware.
+
 ## Control Architecture
 
 Three layers, and the boundary between them matters:

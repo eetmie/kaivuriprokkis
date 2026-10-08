@@ -37,7 +37,7 @@ import numpy as np
 # single tick pays for a whole block (~3 ms on the Orin).
 PACK_ROWS = 250
 PACK_COLUMNS_PER_ROW = 16
-PACK_IMU_FRAMES = 500
+PACK_IMU_FRAMES = 100
 
 JOINT_NAMES = ['slew', 'boom', 'arm', 'bucket']
 G_TO_MS2          = 9.80665   # firmware reports accel in g; the dataset is SI

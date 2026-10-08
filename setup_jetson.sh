@@ -12,17 +12,23 @@
 #   1 MHz is opt-in (SETUP_I2C_1MHZ=1). The RPi dtparam=i2c_arm_baudrate path
 #   does NOT apply to Jetson; when opted in, the 1 MHz speed is set with a
 #   device-tree overlay that bumps clock-frequency on that node and is applied
-#   through Jetson-IO (step [4/5]), taking effect after reboot. Before going to
+#   through Jetson-IO (step [5/6]), taking effect after reboot. Before going to
 #   1 MHz, check pull-ups / rise time on a scope. See the I2C7 guide section 4.
 #
 # RT (PREEMPT_RT) kernel:
-#   Not handled here. NVIDIA's prebuilt RT kernel packages were published for
-#   JetPack 6.2.1 / Jetson Linux r36.4.x only; there is no equivalent for
-#   JetPack 7 / r39.x, so the old auto-install step could never do anything but
-#   print a skip notice. If you need PREEMPT_RT on a supported release, install
-#   it deliberately rather than as a side effect of this script.
-#   Note that rt-tests (cyclictest) is still installed below -- it is useful for
-#   latency baselining on the stock PREEMPT kernel.
+#   Not installed here. NVIDIA publishes a prebuilt RT kernel for r39.2 in a
+#   separate apt repo ("deb https://repo.download.nvidia.com/jetson/rt-kernel
+#   r39.2 main": nvidia-l4t-rt-kernel, -headers, -oot-modules, -nvgpu,
+#   nvidia-l4t-display-rt-kernel); it installs as /boot/Image.real-time next to
+#   the stock kernel. Install it deliberately, matching the stock kernel's
+#   release, rather than as a side effect of this script. rt-tests (cyclictest)
+#   is installed below for latency baselining on the stock PREEMPT kernel.
+#
+# Scheduling (step [4/6]), small and reversible:
+#   - realtime limits for the user: without them SCHED_FIFO requests (simple_drive.py
+#     main loop, the GUIs' --fifo-priority) fail silently with ulimit -r = 0.
+#   - CPU frequency governor "performance" at boot, so the 100 Hz loops never
+#     wait for schedutil to ramp the clock up. Opt out with SETUP_CPU_PERFORMANCE=0.
 #
 # It installs basic OS packages, creates/updates a lightweight project .venv,
 # and grants the invoking user access to serial/I2C/GPIO device groups where
@@ -30,7 +36,8 @@
 # are intentionally not installed here. After group/overlay changes, reboot.
 #
 # Optional toggles (env vars):
-#   SETUP_I2C_1MHZ=1   enable the I2C-7 1 MHz overlay (default: off => stock 400 kHz)
+#   SETUP_I2C_1MHZ=1          enable the I2C-7 1 MHz overlay (default: off => stock 400 kHz)
+#   SETUP_CPU_PERFORMANCE=0   keep the stock schedutil CPU governor (default: performance)
 
 set -e
 
@@ -53,7 +60,7 @@ USER_HOME=$(getent passwd "$USERNAME" | cut -d: -f6)
 VENV_DIR="${SCRIPT_DIR}/.venv"
 
 echo ""
-echo "[1/5] Installing system packages..."
+echo "[1/6] Installing system packages..."
 apt-get update -qq
 apt-get install -y \
     python3-pip python3-venv git \
@@ -62,7 +69,7 @@ echo "  OK: System packages installed"
 echo "  NOTE: Jetson PCA9685 is expected on I2C bus ${I2C_BUS}; run 'i2cdetect -y ${I2C_BUS}' to check."
 
 echo ""
-echo "[2/5] Creating/updating project virtualenv..."
+echo "[2/6] Creating/updating project virtualenv..."
 if [ ! -d "$VENV_DIR" ]; then
     sudo -u "$USERNAME" python3 -m venv "$VENV_DIR"
 fi
@@ -81,13 +88,13 @@ echo "  OK: Python packages installed into ${VENV_DIR}"
 echo "  NOTE: Skipped Raspberry Pi OLED/display packages."
 # inputs is pure Python and tiny; it backs modules/gamepad.py (XboxController).
 # It reads /dev/input/event* directly, so the user also needs the 'input' group
-# granted in step [3/5] -- without it, get_gamepad() raises PermissionError.
+# granted in step [3/6] -- without it, get_gamepad() raises PermissionError.
 # pandas is NOT analysis-only on this robot: simple_drive.py --record buffers
 # samples in memory and writes the CSV via pandas in DataLogger.save(). Without
 # it, stopping a recording raises ModuleNotFoundError and the segment is lost.
 
 echo ""
-echo "[3/5] Granting device group access..."
+echo "[3/6] Granting device group access..."
 for group in dialout i2c gpio plugdev input; do
     if getent group "$group" > /dev/null; then
         usermod -aG "$group" "$USERNAME"
@@ -98,7 +105,39 @@ for group in dialout i2c gpio plugdev input; do
 done
 
 echo ""
-echo "[4/5] I2C bus ${I2C_BUS} speed (1 MHz overlay is opt-in)..."
+echo "[4/6] Realtime scheduling limits and CPU governor..."
+LIMITS_FILE=/etc/security/limits.d/90-kaivuri-realtime.conf
+cat > "$LIMITS_FILE" <<EOF_LIMITS
+# Written by kaivuriprokkis setup_jetson.sh: let the robot user run SCHED_FIFO
+# control loops and lock their memory. Takes effect at the next login.
+${USERNAME} - rtprio 90
+${USERNAME} - memlock unlimited
+EOF_LIMITS
+echo "  OK: ${LIMITS_FILE} (rtprio 90, memlock unlimited for ${USERNAME})"
+if [ "${SETUP_CPU_PERFORMANCE:-1}" = "1" ]; then
+    cat > /etc/systemd/system/kaivuri-cpu-performance.service <<'EOF_UNIT'
+[Unit]
+Description=kaivuriprokkis: CPU frequency governor performance for the control loops
+After=nvpmodel.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$g"; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+    systemctl daemon-reload
+    systemctl enable --now kaivuri-cpu-performance.service > /dev/null
+    echo "  OK: CPU governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) (kaivuri-cpu-performance.service)"
+else
+    systemctl disable --now kaivuri-cpu-performance.service > /dev/null 2>&1 || true
+    echo "  SKIP: CPU governor left at $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+fi
+
+echo ""
+echo "[5/6] I2C bus ${I2C_BUS} speed (1 MHz overlay is opt-in)..."
 if [ "${SETUP_I2C_1MHZ:-0}" != "1" ]; then
     echo "  SKIP: 1 MHz overlay not requested; bus stays at stock 400 kHz."
     echo "        Set SETUP_I2C_1MHZ=1 to build and apply the 1 MHz overlay."
@@ -196,7 +235,7 @@ EOF_DTS
 fi
 
 echo ""
-echo "[5/5] Adding shell helper..."
+echo "[6/6] Adding shell helper..."
 BASHRC="${USER_HOME}/.bashrc"
 if ! grep -q "kaivuri-venv" "$BASHRC" 2>/dev/null; then
     cat >> "$BASHRC" << EOF
@@ -222,9 +261,11 @@ echo "  # I2C bus ${I2C_BUS} clock-frequency (400000 stock, 1000000 if 1 MHz ove
 echo "  python3 -c \"import struct; print(struct.unpack('>I', open('/proc/device-tree${I2C_NODE_PATH}/clock-frequency','rb').read(4))[0])\""
 echo "  # PCA9685 should answer at 0x40 (0x70 is its All-Call address):"
 echo "  i2cdetect -y ${I2C_BUS}"
+echo "  # Realtime limit for this user (expect 90) and the CPU governor (expect performance):"
+echo "  ulimit -r; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
 echo "  # IMU Pico should enumerate as a USB serial device:"
 echo "  ls -l /dev/serial/by-id/"
 echo "  # Gamepad (optional) should enumerate and be readable via the 'input' group:"
 echo "  .venv/bin/python -c \"import inputs; print([g.name for g in inputs.devices.gamepads])\""
 echo ""
-echo ">>> REBOOT REQUIRED for group changes and the I2C 1 MHz overlay <<<"
+echo ">>> REBOOT REQUIRED for group changes, realtime limits and the I2C 1 MHz overlay <<<"

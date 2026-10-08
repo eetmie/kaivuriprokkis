@@ -362,6 +362,14 @@ def run(args) -> None:
 
             monitor = threading.Thread(target=supervise, daemon=True)
             monitor.start()
+            # The same SCHED_FIFO priority simple_drive.py asks for when recording; it needs the realtime
+            # limits from setup_jetson.sh and is recorded either way.
+            from modules.rt_utils import SCHED_FIFO, apply_rt_to_thread
+
+            metadata["realtime_fifo"] = bool(
+                apply_rt_to_thread(priority=75, policy=SCHED_FIFO, lock_memory=False, quiet=True)
+            )
+            print(f"Measurement loop SCHED_FIFO 75: {'on' if metadata['realtime_fifo'] else 'unavailable'}")
             q, _, _ = ImuReader(hardware).read()
             qt = torch.tensor(q[None])
             bundle.history.reset(torch.tensor([0]), qt + policy_offset)

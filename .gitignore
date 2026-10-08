@@ -238,3 +238,6 @@ infer_*.jsonl
 
 # Export bundles (GB of ONNX graphs + weights); they live on the board, not in git
 lerobot_vla/model/
+!learned_control/bundles/**/actor.pt
+!learned_control/bundles/**/collision_grid.npy
+!learned_control/bundles/**/reference_io.npz

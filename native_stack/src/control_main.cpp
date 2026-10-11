@@ -1,0 +1,436 @@
+#include "kaivuri/core.hpp"
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <linux/i2c-dev.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdexcept>
+#include <string>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <termios.h>
+#include <unistd.h>
+using namespace kaivuri;
+static volatile sig_atomic_t stopped = 0;
+static void stop_signal(int) {
+    stopped = 1;
+}
+static void check(bool ok, const char *what) {
+    if (!ok)
+        throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
+}
+struct Fd {
+    int n = -1;
+    Fd() = default;
+    explicit Fd(int x) : n(x) {}
+    ~Fd() {
+        if (n >= 0)
+            ::close(n);
+    }
+    Fd(const Fd &) = delete;
+    Fd &operator=(const Fd &) = delete;
+};
+class Pwm {
+    Config cfg_;
+    Fd fd_;
+    bool live_;
+    void reg(uint8_t r, uint8_t value) {
+        uint8_t bytes[]{r, value};
+        check(::write(fd_.n, bytes, 2) == 2, "PCA9685 register write");
+    }
+
+  public:
+    std::array<double, 16> pulses{};
+    Pwm(const Config &c, bool live) : cfg_(c), live_(live) {
+        for (const auto &v : c.valves)
+            pulses[v.channel] = v.center;
+        pulses[c.pump_channel] = c.pump_min;
+        if (!live)
+            return;
+        fd_.n = ::open(("/dev/i2c-" + std::to_string(c.i2c_bus)).c_str(), O_RDWR | O_CLOEXEC);
+        check(fd_.n >= 0, "open I2C");
+        check(ioctl(fd_.n, I2C_SLAVE, c.address) >= 0, "select PCA9685");
+        // Stage neutral register values while asleep, then wake. AI enables bursts.
+        reg(0x00, 0x30);
+        reg(0x01, 0x04);
+        reg(0xfe,
+            static_cast<uint8_t>(std::clamp(int(25000000. / (4096 * c.frequency) - 1), 3, 255)));
+        flush();
+        reg(0x00, 0x20);
+        usleep(5000);
+        reg(0x00, 0xa0);
+        flush();
+    }
+    void flush() {
+        if (!live_)
+            return;
+        int lo = 15, hi = 0;
+        for (const auto &v : cfg_.valves) {
+            lo = std::min(lo, v.channel);
+            hi = std::max(hi, v.channel);
+        }
+        lo = std::min(lo, cfg_.pump_channel);
+        hi = std::max(hi, cfg_.pump_channel);
+        std::array<uint8_t, 65> bytes{};
+        bytes[0] = static_cast<uint8_t>(0x06 + 4 * lo);
+        for (int i = lo; i <= hi; ++i) {
+            const auto count = pulse_count(pulses[i], cfg_.frequency);
+            size_t j = 1 + 4 * (i - lo);
+            bytes[j + 2] = count & 255;
+            bytes[j + 3] = count >> 8;
+            if (count == 0)
+                bytes[j + 3] = 0x10;
+        }
+        const size_t size = 1 + 4 * (hi - lo + 1);
+        check(::write(fd_.n, bytes.data(), size) == static_cast<ssize_t>(size),
+              "PCA9685 burst write");
+    }
+    void neutral() {
+        for (const auto &v : cfg_.valves)
+            pulses[v.channel] = v.center;
+        pulses[cfg_.pump_channel] = cfg_.pump_min;
+        flush();
+    }
+    ~Pwm() {
+        if (live_ && fd_.n >= 0)
+            try {
+                neutral();
+            } catch (...) {
+                std::fputs("Neutral write failed; physical stop required.\n", stderr);
+            }
+    }
+};
+struct Client {
+    int fd = -1;
+    uint64_t sequence = 0;
+    bool seen = false;
+};
+int main(int argc, char **argv) {
+    try {
+        std::string profile = "../configuration_files/profiles/jetson",
+                    safety = "config/safety.yaml", serial = "/dev/ttyACM0";
+        std::string runtime = "/tmp/kaivuri-native-" + std::to_string(geteuid()), socket_path;
+        bool simulate = false, live = false, neutralize = false, slew = false, tracks = false,
+             lock_memory = false;
+        double duration = 0;
+        int cpu = -1, priority = 0;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            auto value = [&]() {
+                if (++i == argc)
+                    throw std::runtime_error("missing argument: " + a);
+                return std::string(argv[i]);
+            };
+            if (a == "--profile")
+                profile = value();
+            else if (a == "--safety")
+                safety = value();
+            else if (a == "--socket")
+                socket_path = value();
+            else if (a == "--serial")
+                serial = value();
+            else if (a == "--simulate-imu")
+                simulate = true;
+            else if (a == "--live-pwm")
+                live = true;
+            else if (a == "--neutralize")
+                neutralize = true;
+            else if (a == "--enable-slew")
+                slew = true;
+            else if (a == "--enable-tracks")
+                tracks = true;
+            else if (a == "--lock-memory")
+                lock_memory = true;
+            else if (a == "--duration-s")
+                duration = std::stod(value());
+            else if (a == "--cpu")
+                cpu = std::stoi(value());
+            else if (a == "--rt-priority")
+                priority = std::stoi(value());
+            else if (a == "--help") {
+                std::puts("kaivuri-control --profile DIR --safety FILE [--serial DEVICE | "
+                          "--simulate-imu]\n  [--socket PATH] [--live-pwm] [--neutralize] "
+                          "[--enable-slew] [--enable-tracks]\n  [--duration-s SEC] [--cpu N] "
+                          "[--rt-priority 1..80] [--lock-memory]\nDefaults: dry PWM, real IMUs, "
+                          "disarmed; simulation is forbidden with live PWM.");
+                return 0;
+            } else
+                throw std::runtime_error("unknown option: " + a);
+        }
+        if (simulate && live)
+            throw std::runtime_error("simulated IMUs cannot drive physical PWM");
+        if (duration < 0 || !std::isfinite(duration) || cpu >= CPU_SETSIZE || cpu < -1 ||
+            priority < 0 || priority > 80)
+            throw std::runtime_error("invalid runtime option");
+        Config cfg = load_config(profile, safety);
+        cfg.enable_slew = slew;
+        cfg.enable_tracks = tracks;
+        ControlCore core(cfg);
+        if (socket_path.empty())
+            socket_path = runtime + "/control.sock";
+        std::filesystem::create_directories(runtime);
+        struct stat runtime_stat{};
+        check(lstat(runtime.c_str(), &runtime_stat) == 0 && S_ISDIR(runtime_stat.st_mode) &&
+                  runtime_stat.st_uid == geteuid(),
+              "unsafe runtime directory");
+        check(chmod(runtime.c_str(), 0700) == 0, "runtime permissions");
+        // Hardware lock is independent of the socket path: two native daemons cannot own PWM.
+        Fd ownership(::open((runtime + "/control.lock").c_str(),
+                            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
+        check(ownership.n >= 0 && flock(ownership.n, LOCK_EX | LOCK_NB) == 0,
+              "another native controller is running");
+        Pwm pwm(cfg, live);
+        if (neutralize) {
+            pwm.neutral();
+            std::puts(live ? "Physical neutral written."
+                           : "Dry neutral only; use --live-pwm for hardware.");
+            return 0;
+        }
+        Fd imu;
+        if (!simulate) {
+            imu.n = ::open(serial.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+            check(imu.n >= 0, "open IMU serial");
+            check(ioctl(imu.n, TIOCEXCL) == 0, "exclusive IMU serial");
+            termios t{};
+            check(tcgetattr(imu.n, &t) == 0, "get serial settings");
+            cfmakeraw(&t);
+            cfsetispeed(&t, B115200);
+            cfsetospeed(&t, B115200);
+            t.c_cflag |= CLOCAL | CREAD;
+            check(tcsetattr(imu.n, TCSANOW, &t) == 0, "set serial settings");
+        }
+        Fd server(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+        check(server.n >= 0, "socket");
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        if (socket_path.size() >= sizeof(addr.sun_path))
+            throw std::runtime_error("socket path too long");
+        std::strcpy(addr.sun_path, socket_path.c_str());
+        ::unlink(socket_path.c_str());
+        check(bind(server.n, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0,
+              "bind socket");
+        check(chmod(socket_path.c_str(), 0600) == 0, "socket permissions");
+        check(listen(server.n, 8) == 0, "listen");
+        struct SocketCleanup {
+            std::string path;
+            ~SocketCleanup() { ::unlink(path.c_str()); }
+        } socket_cleanup{socket_path};
+        if (cpu >= 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpu, &set);
+            check(sched_setaffinity(0, sizeof(set), &set) == 0, "CPU affinity");
+        }
+        if (priority) {
+            sched_param p{};
+            p.sched_priority = priority;
+            check(sched_setscheduler(0, SCHED_FIFO, &p) == 0, "realtime priority");
+        }
+        if (lock_memory)
+            check(mlockall(MCL_CURRENT | MCL_FUTURE) == 0, "lock memory");
+        signal(SIGINT, stop_signal);
+        signal(SIGTERM, stop_signal);
+        signal(SIGPIPE, SIG_IGN);
+        std::fprintf(stderr, "Control %s; %s; socket %s; slew=%d tracks=%d\n",
+                     live ? "LIVE PWM" : "DRY PWM", simulate ? "SIMULATED IMU" : "real IMU",
+                     socket_path.c_str(), slew, tracks);
+        ImuParser parser(4);
+        std::array<Client, 8> clients{};
+        std::array<RampState, 8> ramps{};
+        std::array<uint8_t, max_packet> bytes{};
+        int owner = -1;
+        uint64_t ticks = 0, last_resets = 0, last_invalid = 0, last_command = 0;
+        double worst_lateness = 0, begin = monotonic_seconds(), next = begin, previous = begin;
+        auto close_client = [&](int index) {
+            if (owner == index) {
+                core.fault("producer_disconnected");
+                owner = -1;
+            }
+            ::close(clients[index].fd);
+            clients[index] = Client{};
+        };
+        while (!stopped) {
+            double now = monotonic_seconds();
+            if (duration > 0 && now - begin >= duration)
+                break;
+            worst_lateness = std::max(worst_lateness, std::max(0., now - next));
+            if (now - previous > cfg.deadline)
+                core.fault("control_deadline_missed");
+            previous = now;
+            if (!simulate) {
+                uint8_t chunk[512];
+                for (int j = 0; j < 4; ++j) {
+                    ssize_t n = ::read(imu.n, chunk, sizeof(chunk));
+                    if (n > 0)
+                        parser.feed(chunk, n, now);
+                    else {
+                        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                            core.fault("serial_io_error");
+                        break;
+                    }
+                }
+            }
+            const auto &sample = parser.sample();
+            bool healthy = simulate || (!parser.firmware_blocked && sample.valid &&
+                                        now - sample.received <= cfg.imu_timeout);
+            if (parser.resets != last_resets || parser.invalid_frames != last_invalid) {
+                if (core.state() != SafetyState::Disarmed)
+                    core.fault("imu_reset_or_invalid_sample");
+                last_resets = parser.resets;
+                last_invalid = parser.invalid_frames;
+            }
+            // Check expiry before processing a renewal arriving on this tick.
+            core.tick(now, healthy);
+            for (int accepted = 0; accepted < 8; ++accepted) {
+                int fd = accept4(server.n, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                if (fd < 0)
+                    break;
+                ucred cred{};
+                socklen_t len = sizeof(cred);
+                bool placed = false;
+                if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
+                    cred.uid == geteuid())
+                    for (auto &client : clients)
+                        if (client.fd < 0) {
+                            client.fd = fd;
+                            placed = true;
+                            break;
+                        }
+                if (!placed)
+                    ::close(fd);
+            }
+            for (int ci = 0; ci < 8; ++ci)
+                if (clients[ci].fd >= 0)
+                    for (int message = 0; message < 8; ++message) {
+                        ssize_t n = recv(clients[ci].fd, bytes.data(), bytes.size(),
+                                         MSG_DONTWAIT | MSG_TRUNC);
+                        if (n == 0) {
+                            close_client(ci);
+                            break;
+                        }
+                        if (n < 0) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                                close_client(ci);
+                            break;
+                        }
+                        Packet p;
+                        if (static_cast<size_t>(n) > bytes.size() ||
+                            !decode_packet(bytes.data(), n, now, cfg, p) ||
+                            (clients[ci].seen && p.sequence <= clients[ci].sequence)) {
+                            if (owner == ci)
+                                core.fault("invalid_or_replayed_packet");
+                            continue;
+                        }
+                        clients[ci].seen = true;
+                        clients[ci].sequence = p.sequence;
+                        if (p.op == Operation::Status) {
+                            std::array<Quat, 4> raw = sample.quats;
+                            if (simulate)
+                                for (auto &q : raw)
+                                    q = {1, 0, 0, 0};
+                            std::array<double, 4> angles{};
+                            Pose pose;
+                            if (healthy) {
+                                angles = joint_angles(cfg, raw);
+                                pose = forward_kinematics(cfg, angles);
+                            }
+                            char reply[2048];
+                            int length = std::snprintf(
+                                reply, sizeof(reply),
+                                "{\"state\":\"%s\",\"reason\":\"%s\",\"live_pwm\":%s,\"simulated_"
+                                "imu\":%s,\"imu_healthy\":%s,\"imu_age_s\":%.6f,\"imu_sequence\":%"
+                                "llu,\"imu_device_us\":%llu,\"checksum_errors\":%llu,\"invalid_imu_"
+                                "frames\":%llu,\"pump_on\":%s,\"command_sequence\":%llu,\"ticks\":%"
+                                "llu,\"worst_lateness_s\":%.6f,\"host_monotonic_ns\":%llu,\"imu_"
+                                "host_monotonic_ns\":%llu,\"firmware_blocked\":%s,\"angles_rad\":[%"
+                                ".9f,%.9f,%.9f,%.9f]"
+                                ",\"fk_xyz_m\":[%.9f,%.9f,%.9f],\"fk_quat_wxyz\":[%.9f,%.9f,%.9f,%."
+                                "9f],\"pulses_us\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]}",
+                                state_name(core.state()), core.reason(), live ? "true" : "false",
+                                simulate ? "true" : "false", healthy ? "true" : "false",
+                                simulate          ? 0
+                                : sample.received ? now - sample.received
+                                                  : -1.,
+                                (unsigned long long)sample.sequence,
+                                (unsigned long long)sample.device_us,
+                                (unsigned long long)parser.checksum_errors,
+                                (unsigned long long)parser.invalid_frames,
+                                core.pump_on() ? "true" : "false", (unsigned long long)last_command,
+                                (unsigned long long)ticks, worst_lateness,
+                                (unsigned long long)(now * 1e9),
+                                (unsigned long long)((simulate ? now : sample.received) * 1e9),
+                                parser.firmware_blocked ? "true" : "false", angles[0], angles[1],
+                                angles[2], angles[3], pose.position[0], pose.position[1],
+                                pose.position[2], pose.orientation[0], pose.orientation[1],
+                                pose.orientation[2], pose.orientation[3], pwm.pulses[0],
+                                pwm.pulses[1], pwm.pulses[2], pwm.pulses[3], pwm.pulses[4],
+                                pwm.pulses[5], pwm.pulses[6], pwm.pulses[7], pwm.pulses[8]);
+                            if (length > 0 && length < int(sizeof(reply)))
+                                send(clients[ci].fd, reply, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+                            continue;
+                        }
+                        if (p.op == Operation::Drive) {
+                            if (owner >= 0 && owner != ci)
+                                continue;
+                            owner = ci;
+                            last_command = p.sequence;
+                        }
+                        core.receive(p, now, healthy);
+                        if (p.op == Operation::Disarm)
+                            owner = -1;
+                    }
+            const Commands command = core.tick(now, healthy);
+            const bool active =
+                core.state() == SafetyState::Armed || core.state() == SafetyState::Decaying;
+            for (size_t i = 0; i < cfg.valves.size(); ++i) {
+                const auto &v = cfg.valves[i];
+                double value = 0;
+                for (int j = 0; j < 6; ++j)
+                    if (v.name == command_names[j])
+                        value = command[j];
+                if (active)
+                    pwm.pulses[v.channel] = valve_pulse(v, value, now, ramps[i]);
+                else {
+                    pwm.pulses[v.channel] = v.center;
+                    ramps[i] = {v.center, now, true};
+                }
+            }
+            pwm.pulses[cfg.pump_channel] = core.pump_on() ? cfg.pump_run : cfg.pump_min;
+            try {
+                pwm.flush();
+            } catch (...) {
+                core.fault("pwm_io_error");
+                pwm.neutral();
+                throw;
+            }
+            ++ticks;
+            next += 1 / cfg.control_hz;
+            if (next < now)
+                next = now + 1 / cfg.control_hz;
+            timespec wake{static_cast<time_t>(next),
+                          static_cast<long>((next - std::floor(next)) * 1e9)};
+            int result;
+            do {
+                result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
+            } while (result == EINTR && !stopped);
+        }
+        core.disarm();
+        pwm.neutral();
+        for (auto &client : clients)
+            if (client.fd >= 0)
+                ::close(client.fd);
+        return 0;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "Control failed: %s\n", e.what());
+        return 1;
+    }
+}

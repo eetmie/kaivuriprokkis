@@ -1,0 +1,11 @@
+# Independent from the Python IK/PID configuration. Seconds unless indicated.
+control_hz: 100.0
+imu_timeout_s: 0.100
+command_lease_s: 0.500
+arming_s: 0.250
+decay_s: 0.250
+deadline_fault_s: 0.040
+max_packet_age_s: 0.100
+max_observation_age_s: 1.500
+max_chunk_horizon_s: 5.0
+# Features still require explicit daemon CLI flags.

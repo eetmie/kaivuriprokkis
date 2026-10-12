@@ -1,121 +1,129 @@
-# MASI Robot — Jetson Setup & Test Runbook
+# MASI Jetson manual bring-up
 
-Board: NVIDIA Jetson Orin Nano Super 8GB
-Script: `setup_jetson.sh`
-RT requirement: **JetPack 6.2.1 / Jetson Linux r36.4.x** (last release with prebuilt RT kernel packages)
+Validated on `pikkumasi2tb` on 2026-10-12: Orin Nano, Ubuntu 24.04.4,
+L4T R39.2.1, kernel `6.8.12-1021-tegra`, Python 3.12.3.
+Repository: `/home/joel/kaivuriprokkis`.
 
-This is the bring-up procedure for the Jetson. Run the stages in order and verify each before moving on.
+`setup_jetson.sh` installs a Python environment, device groups, realtime limits,
+an optional CPU governor service and an opt-in I2C overlay. It does **not** install
+an RT kernel. Its defaults leave I2C speed unchanged. This runbook records the
+manual configuration used alongside the previously validated VLA installation.
 
-## What the script does
+## Packages and Python environment
 
-1. Installs OS packages: `python3-pip`, `python3-venv`, `git`, `i2c-tools`, `device-tree-compiler`, `rt-tests`.
-2. Creates/updates the project `.venv` and installs `numpy`, `scipy`, `numba`, `pandas`, `pyyaml`, `pyserial`, `smbus2`. `pandas` is required at runtime — `simple_drive.py --record` writes its CSV through it.
-3. Adds the invoking user to `dialout`, `i2c`, `gpio`, `plugdev` (where present).
-4. **I2C bus 7 → 1 MHz**: builds and applies a device-tree overlay (`clock-frequency = <1000000>` on `/bus@0/i2c@c250000`) via Jetson-IO. Static single speed — correct for a single-device bus.
-5. **RT kernel**: installs NVIDIA prebuilt RT packages from the r36.4 repo, but only after force-checking the board is on r36.4. Skips otherwise.
-6. Adds the `kaivuri-venv` shell alias.
-
-Boot config (`/boot/extlinux/extlinux.conf`) is backed up before steps 4 and 5. Nothing reboots automatically.
-
-## Toggles (env vars)
-
-| Var | Default | Effect |
-|---|---|---|
-| `SETUP_I2C_1MHZ` | `1` | Set `0` to skip the I2C overlay |
-| `SETUP_RT_KERNEL` | `1` | Set `0` to skip the RT kernel install |
-| `FORCE_RT` | `0` | Set `1` to install RT even if not on r36.4 (**not recommended**) |
-
-## Pre-flight
+Install missing native build dependencies without upgrading existing packages:
 
 ```bash
-cat /proc/device-tree/model
-cat /etc/nv_tegra_release            # expect: # R36 (release), REVISION: 4.x  (== JetPack 6.2.1)
-uname -a
-tr -d '\0' < /proc/device-tree/aliases/i2c7; echo
-readlink -f /sys/bus/i2c/devices/i2c-7/of_node   # expect: .../i2c@c250000
+sudo apt-get update
+sudo apt-get install --no-upgrade --no-install-recommends \
+  python3-pip python3-venv git i2c-tools device-tree-compiler rt-tests \
+  build-essential cmake pkg-config libyaml-cpp-dev libusb-1.0-0-dev libssl-dev
 ```
 
-If `/etc/nv_tegra_release` is not R36 REVISION 4.x, the RT step will skip by design.
+The validated host uses CMake `3.31.9-0kitware1ubuntu24.04.1`; retain it rather
+than implicitly upgrading to a different major version. CUDA/TensorRT development
+files were already supplied by the VLA host setup.
 
-## Staged run
-
-Run each stage, reboot, verify, then continue. Staging keeps a boot failure attributable to one change.
+For the existing Python robot stack, create an independent environment:
 
 ```bash
-# Stage 1 — base provisioning only (robot still at 400 kHz)
-sudo SETUP_I2C_1MHZ=0 SETUP_RT_KERNEL=0 ./setup_jetson.sh
-# log out / back in (or reboot) for group membership, then sanity-check the robot
-
-# Stage 2 — add 1 MHz I2C overlay
-sudo SETUP_RT_KERNEL=0 ./setup_jetson.sh
-sudo reboot
-# verify clock + scope the bus (below)
-
-# Stage 3 — RT kernel last
-sudo SETUP_I2C_1MHZ=0 ./setup_jetson.sh
-sudo reboot
-# verify RT + cyclictest (below)
+cd ~/kaivuriprokkis
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install numpy scipy numba pandas pyyaml pyserial smbus2 inputs
+.venv/bin/python -m pip check
+.venv/bin/python -m pip freeze > /tmp/kaivuri-python-requirements.txt
 ```
 
-## Verify
-
-I2C bus 7 clock (expect `1000000`):
+The board's installed versions are saved in
+`native_stack/results/manual-bringup/python-requirements.txt`. This environment
+is separate from `/home/joel/vla-clean-install-20261012/source/.venv-*`.
+The C++ inference process does not use it. The shell helper added to `~/.bashrc` is:
 
 ```bash
-python3 -c "import struct; print(struct.unpack('>I', open('/proc/device-tree/bus@0/i2c@c250000/clock-frequency','rb').read(4))[0])"
-i2cdetect -l | grep -E 'i2c-7|c250000'
-sudo i2cdetect -y 7        # PCA9685 should answer at 0x40
+alias kaivuri-venv='cd /home/joel/kaivuriprokkis && source .venv/bin/activate'
 ```
 
-Confirm the 1 MHz waveform on a scope/logic analyzer at the device pins — a correct device-tree value does not guarantee a clean bus (pull-ups, cable length, Fast-Mode-Plus support).
+## Device access and realtime limits
 
-RT kernel:
+Add `joel` to the groups present on this image:
 
 ```bash
-uname -a
-grep -E 'PREEMPT_RT' /boot/config-$(uname -r) | head
-dpkg -l | grep nvidia-l4t-rt-kernel
-sudo cyclictest -p 80 -t$(nproc) -n -i 1000 -l 100000   # run under real workload for a true number
+sudo usermod -aG dialout,i2c,gpio,plugdev,input joel
 ```
 
-Make RT the default boot entry (or revert):
+`/etc/security/limits.d/90-kaivuri-realtime.conf`:
+
+```text
+joel - rtprio 90
+joel - memlock unlimited
+```
+
+A new SSH login confirms the groups and `ulimit -r` = 90. Reconnecting is enough
+for these settings; no reboot was performed.
+
+`/etc/udev/rules.d/99-kaivuri-realsense.rules` grants access to the two D435i devices:
+
+```text
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b3a", MODE="0660", GROUP="plugdev"
+```
 
 ```bash
-sudo sed -i 's/^DEFAULT .*/DEFAULT real-time/' /boot/extlinux/extlinux.conf   # use RT
-sudo sed -i 's/^DEFAULT .*/DEFAULT primary/'   /boot/extlinux/extlinux.conf   # back to stock
-sudo reboot
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=change --subsystem-match=usb \
+  --attr-match=idVendor=8086 --attr-match=idProduct=0b3a
+sudo udevadm settle --timeout=10
 ```
 
-## Run the robot
+The native RealSense build uses RSUSB, so this bench needs no UVC kernel patches
+or Python camera bindings. USB autosuspend remains at its original settings.
+
+## Clocks, kernel and I2C
+
+The validated VLA setup already enabled `jetson-perf.service`. Its verifier
+confirms MAXN_SUPER, all six CPUs fixed at 1728 MHz, GPU at 1020 MHz and EMC at
+3199 MHz:
 
 ```bash
-cd <project-dir>
-source .venv/bin/activate          # or: kaivuri-venv
-python run_hw_v2.py --robot jetson ...
+sudo /usr/local/sbin/jetson-perf.sh --verify
 ```
 
-Avoid plain `sudo python ...` for serial — it bypasses the venv. Serial works after the group reboot.
+The CPU governor reports `schedutil`, but its frequency floor equals its ceiling;
+no additional `kaivuri-cpu-performance.service` was installed.
+The stock kernel and boot configuration were retained. I2C bus 7 remains 400 kHz.
+There is no 1 MHz overlay or RT kernel installation in this session.
 
-## Rollback
+The PCA9685 is expected at `0x40` on bus 7. This controller does not support SMBus
+Quick Write, so plain `i2cdetect -y 7` skips some addresses, including `0x40`.
+A targeted register read is a better presence check:
 
 ```bash
-ls -lt /boot/extlinux/extlinux.conf.bak-*
-sudo cp /boot/extlinux/extlinux.conf.bak-YYYY-MM-DD-HHMMSS /boot/extlinux/extlinux.conf
-sudo reboot
+cd ~/kaivuriprokkis
+.venv/bin/python - <<'PY'
+from smbus2 import SMBus
+with SMBus(7) as bus:
+    print('PCA9685 MODE1:', hex(bus.read_byte_data(0x40, 0)))
+PY
 ```
 
-Remove RT packages:
+Use the native hardware runbook for neutral writes, bounded exercises and
+instrumented waveform checks. Register readback verifies programmed counts;
+it does not establish physical pulse accuracy or valve/pump behavior.
 
-```bash
-sudo apt remove -y nvidia-l4t-rt-kernel nvidia-l4t-rt-kernel-headers \
-  nvidia-l4t-rt-kernel-oot-modules nvidia-l4t-display-rt-kernel
-sudo reboot
-```
+## Native control, cameras and inference
 
-If the board will not boot: restore `/boot/extlinux/extlinux.conf` from the backup via serial console or by mounting the boot partition from another Linux machine.
+Build instructions and the five-minute dual-IR OpenPI pi0.5 bench are in
+[`native_stack/README.md`](native_stack/README.md). Hardware checks are in
+[`native_stack/notes/HARDWARE_RUNBOOK.md`](native_stack/notes/HARDWARE_RUNBOOK.md).
 
-## Watch-fors during testing
+Both D435i cameras have firmware `5.17.3.10` and negotiate 5 Gbit/s on the
+10 Gbit/s hub:
 
-- Stage 2: the script greps Jetson-IO for the `HDR40 I2C7 1MHz` entry and prints a WARN if the board's compatible string did not match. If you see that WARN, the overlay was staged but may not apply.
-- Stage 3: the RT gate reads `/etc/nv_tegra_release`. Wrong release → it skips and tells you, rather than installing the r36.4 repo onto the wrong base.
-- Running stages 2 and 3 separately produces one `extlinux.conf` backup each — expected.
+| SDK serial | Linux USB path | SDK port | Link |
+| --- | --- | --- | --- |
+| 233522073919 | 2-1.3 | 2-1.3-3 | 5 Gbit/s |
+| 141722076647 | 2-1.4 | 2-1.4-4 | 5 Gbit/s |
+
+Pico startup calibration normally takes about 13 seconds and can retry for
+roughly 35 seconds. Wait for `imu_healthy` and `firmware_blocked=false` before
+arming; an initial calibration-wait report is not a permanent failure.

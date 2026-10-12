@@ -61,12 +61,63 @@ int main(int argc, char **argv) {
         p = forward_kinematics(c, {pi / 2, 0, 0, 0});
         expect(close(p.position[0], 0) && close(p.position[1], .7655),
                "slew rotates child offsets");
+        const auto zero = forward_kinematic_state(c, {0, 0, 0, 0});
+        expect(close(zero.upper.position[0], .7655) && close(zero.upper.position[1], 0) &&
+                   close(zero.upper.position[2], -.0775),
+               "upper frame origin is the slew pivot, not the ground origin");
+        expect(close(zero.joint_positions_base[0][2], .07) &&
+                   close(zero.joint_positions_base[1][0], .0165) &&
+                   close(zero.joint_positions_base[1][2], .1345) &&
+                   close(zero.joint_positions_upper[2][0], .4845) &&
+                   close(zero.joint_positions_upper[3][0], .7345),
+               "FK reports joint pivots, before the tool-tip offset");
+        for (const auto &arm :
+             std::vector<std::array<double, 3>>{{0, 0, 0}, {.3, -.8, 2.4}, {-.7, .2, -2.0}}) {
+            const double b = arm[0], a = b + arm[1], tip_angle = a + arm[2];
+            const double x = .0165 + .468 * std::cos(b) + .250 * std::cos(a) +
+                             .031 * std::cos(tip_angle) - .142 * std::sin(tip_angle);
+            const double z = .0645 - .468 * std::sin(b) - .250 * std::sin(a) -
+                             .031 * std::sin(tip_angle) - .142 * std::cos(tip_angle);
+            for (double yaw : {0., pi / 2, pi, 3 * pi / 2, -2 * pi, 2 * pi + .37}) {
+                const auto fk = forward_kinematic_state(c, {yaw, arm[0], arm[1], arm[2]});
+                expect(close(fk.upper.position[0], x) && close(fk.upper.position[1], 0) &&
+                           close(fk.upper.position[2], z),
+                       "upper tool position is independent of slew");
+                expect(close(fk.base.position[0], x * std::cos(yaw)) &&
+                           close(fk.base.position[1], x * std::sin(yaw)) &&
+                           close(fk.base.position[2], z + .07),
+                       "base tool position follows the cylindrical path");
+                expect(close(fk.bucket_pitch, wrap(tip_angle)) && close(fk.slew_yaw, yaw),
+                       "bucket pitch keeps its signed full range; slew is stored separately");
+                const auto tool_x = rotate(fk.upper.orientation, {1, 0, 0});
+                expect(close(tool_x[0], std::cos(tip_angle)) &&
+                           close(tool_x[2], -std::sin(tip_angle)),
+                       "upper quaternion represents the calibrated bucket +X axis");
+                for (int i = 0; i < 4; ++i) {
+                    const auto &u = fk.joint_positions_upper[i];
+                    const auto &v = fk.joint_positions_base[i];
+                    expect(close(v[0], u[0] * std::cos(yaw) - u[1] * std::sin(yaw)) &&
+                               close(v[1], u[0] * std::sin(yaw) + u[1] * std::cos(yaw)) &&
+                               close(v[2], u[2] + .07),
+                           "all joint pivots share the documented carriage-to-base transform");
+                    const auto expected =
+                        multiply(axis_angle({0, 0, 1}, yaw), fk.link_orientations_upper[i]);
+                    for (int j = 0; j < 4; ++j)
+                        expect(close(fk.link_orientations_base[i][j], expected[j]),
+                               "base and upper link quaternion frames agree");
+                }
+            }
+        }
         std::array<Quat, 4> mounted{};
         for (int i = 0; i < 4; ++i)
             mounted[i] = conjugate(c.offsets_inv[i]);
         auto angles = joint_angles(c, mounted);
         for (double a : angles)
             expect(close(a, 0), "mounting correction right multiplies");
+        const auto corrected = corrected_imu_quaternions(c, mounted);
+        for (const auto &q : corrected)
+            expect(close(q[0], 1) && close(q[1], 0) && close(q[2], 0) && close(q[3], 0),
+                   "corrected IMU quaternions remove configured mounting rotations");
         mounted[c.joints[1].sensor] =
             multiply(axis_angle({0, 1, 0}, .3), conjugate(c.offsets_inv[c.joints[1].sensor]));
         angles = joint_angles(c, mounted);

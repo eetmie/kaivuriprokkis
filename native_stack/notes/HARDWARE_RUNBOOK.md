@@ -1,6 +1,6 @@
 # Hardware session: 2026-10-12
 
-All tests completed so far are on Spark. Nothing has been deployed to, built on, or exercised on Jetson for this phase. Rebuild on Jetson from this folder using the README; start with ordinary scheduling and the current conservative safety timings.
+The 2026-10-12 Jetson bench now covers native builds, five OpenPI pi0.5 policy fixtures, dual IR1/IR2 capture, a five-minute inference/real-IMU load run, and unpowered PCA9685 register-level control checks. See the README and `results/` for evidence. Physical waveform, calibrated known-pose FK, powered hydraulic behavior and watchdog acceptance remain pending. Start with ordinary scheduling and the current conservative safety timings.
 
 ## 1. Establish one hardware owner
 

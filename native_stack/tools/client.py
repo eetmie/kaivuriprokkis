@@ -31,7 +31,10 @@ class Client:
 
     def status(self):
         self.send(STATUS)
-        return json.loads(self.socket.recv(4096))
+        data, _, flags, _ = self.socket.recvmsg(8192)
+        if flags & socket.MSG_TRUNC:
+            raise RuntimeError("native status reply exceeds the 8192-byte receive buffer")
+        return json.loads(data)
 
     def arm(self, *, pump=False, timeout=2):
         deadline = time.monotonic() + timeout

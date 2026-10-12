@@ -1,5 +1,6 @@
 """Linux process/IPC tests. Uses dry PWM and simulated or PTY IMUs, never hardware."""
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -48,11 +49,36 @@ def finish(process):
     assert process.returncode == 0, (process.returncode, stdout, stderr)
 
 
+def check_kinematic_status(status):
+    assert status["fk_valid"] and status["imu_healthy"]
+    assert status["fk_frame"] == "base" and status["fk_upper_frame"] == "upper_carriage"
+    assert status["joint_names"] == ["slew", "boom", "arm", "bucket"]
+    assert status["imu_sensor_indices"] == [1, 2, 0, 3]
+    for key, width in (("fk_joint_xyz_m", 3), ("fk_joint_xyz_upper_m", 3),
+                       ("fk_joint_quat_wxyz", 4), ("fk_link_quat_wxyz", 4),
+                       ("fk_link_quat_upper_wxyz", 4), ("imu_quat_wxyz", 4),
+                       ("imu_corrected_quat_wxyz", 4), ("imu_gyro_dps", 3), ("imu_accel_g", 3)):
+        assert len(status[key]) == 4
+        for row in status[key]:
+            assert len(row) == width and all(math.isfinite(value) for value in row)
+            if "quat" in key:
+                assert math.isclose(sum(value * value for value in row), 1, abs_tol=1e-8)
+    assert status["fk_upper_xz_m"] == [status["fk_upper_xyz_m"][0], status["fk_upper_xyz_m"][2]]
+    assert math.isclose(status["fk_xyz_m"][2], status["fk_upper_xyz_m"][2] + .07, abs_tol=2e-9)
+    assert status["slew_yaw_rad"] == status["angles_rad"][0]
+    assert math.isclose(status["bucket_pitch_rad"], sum(status["angles_rad"][1:]), abs_tol=2e-9)
+    assert status["fk_link_quat_wxyz"][-1] == status["fk_quat_wxyz"]
+    assert status["fk_link_quat_upper_wxyz"][-1] == status["fk_upper_quat_wxyz"]
+
+
 def control_test(temp):
-    process, path = launch(temp, "--simulate-imu")
+    process, path = launch(temp, "--simulate-imu", "--control-hz", "200")
     try:
         with Client(path) as owner, Client(path) as other:
-            assert owner.status()["state"] == "disarmed"
+            status = owner.status()
+            assert status["state"] == "disarmed"
+            assert status["control_hz"] == 200
+            check_kinematic_status(status)
             owner.arm(pump=True)
             owner.send(DRIVE, [(1, .1, 0, 0, 1, 1)], flags=DEADMAN | PUMP)
             time.sleep(.03)
@@ -115,6 +141,7 @@ def serial_test(temp):
         process, path = launch(temp, "--serial", os.ttyname(slave))
         with Client(path) as client:
             wait_until(lambda: client.status()["imu_healthy"])
+            check_kinematic_status(client.status())
             client.arm()
             stop.set()
             thread.join()
@@ -122,6 +149,13 @@ def serial_test(temp):
             status = client.status()
             assert status["state"] == "fault" and status["reason"] == "imu_unhealthy"
             assert not status["pump_on"] and status["imu_sequence"] > 20
+            assert not status["fk_valid"]
+            for key in ("fk_upper_xyz_m", "fk_upper_xz_m", "fk_upper_quat_wxyz",
+                        "slew_yaw_rad", "bucket_pitch_rad", "fk_joint_xyz_m",
+                        "fk_joint_xyz_upper_m", "fk_joint_quat_wxyz", "fk_link_quat_wxyz",
+                        "fk_link_quat_upper_wxyz", "imu_quat_wxyz", "imu_corrected_quat_wxyz",
+                        "imu_gyro_dps", "imu_accel_g"):
+                assert status[key] is None, key
     finally:
         stop.set()
         thread.join()

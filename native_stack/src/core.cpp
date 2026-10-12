@@ -219,10 +219,14 @@ Config load_config(const std::string &profile_dir, const std::string &safety_fil
         throw std::runtime_error("invalid safety timing");
     return c;
 }
-std::array<double, 4> joint_angles(const Config &c, const std::array<Quat, 4> &raw) {
+std::array<Quat, 4> corrected_imu_quaternions(const Config &c, const std::array<Quat, 4> &raw) {
     std::array<Quat, 4> corrected{};
     for (int i = 0; i < 4; ++i)
         corrected[i] = normalized(multiply(normalized(raw[i]), c.offsets_inv[i]));
+    return corrected;
+}
+std::array<double, 4> joint_angles(const Config &c, const std::array<Quat, 4> &raw) {
+    const auto corrected = corrected_imu_quaternions(c, raw);
     std::array<double, 4> out{};
     for (int i = 0; i < 4; ++i) {
         const auto &j = c.joints[i];
@@ -238,19 +242,43 @@ std::array<double, 4> joint_angles(const Config &c, const std::array<Quat, 4> &r
     }
     return out;
 }
-Pose forward_kinematics(const Config &c, const std::array<double, 4> &angles) {
-    Pose p;
-    for (int i = 0; i < 4; ++i) {
-        auto d = rotate(p.orientation, c.joints[i].offset);
+KinematicState forward_kinematic_state(const Config &c, const std::array<double, 4> &angles) {
+    KinematicState state;
+    // Evaluate the arm in the carriage frame directly: slew drift never enters this chain.
+    const Quat slew = axis_angle(c.joints[0].axis, angles[0]);
+    state.joint_rotations[0] = slew;
+    state.link_orientations_upper[0] = {1, 0, 0, 0};
+    for (int i = 1; i < 4; ++i) {
+        const auto d = rotate(state.upper.orientation, c.joints[i].offset);
         for (int j = 0; j < 3; ++j)
-            p.position[j] += d[j];
-        p.orientation =
-            normalized(multiply(p.orientation, axis_angle(c.joints[i].axis, angles[i])));
+            state.upper.position[j] += d[j];
+        state.joint_positions_upper[i] = state.upper.position;
+        state.joint_rotations[i] = axis_angle(c.joints[i].axis, angles[i]);
+        state.upper.orientation =
+            normalized(multiply(state.upper.orientation, state.joint_rotations[i]));
+        state.link_orientations_upper[i] = state.upper.orientation;
     }
-    auto tip = rotate(p.orientation, c.tip);
+    const auto tip = rotate(state.upper.orientation, c.tip);
     for (int j = 0; j < 3; ++j)
-        p.position[j] += tip[j];
-    return p;
+        state.upper.position[j] += tip[j];
+    state.base.orientation = normalized(multiply(slew, state.upper.orientation));
+    const auto base_tip = rotate(slew, state.upper.position);
+    for (int j = 0; j < 3; ++j)
+        state.base.position[j] = c.joints[0].offset[j] + base_tip[j];
+    for (int i = 0; i < 4; ++i) {
+        const auto base_origin = rotate(slew, state.joint_positions_upper[i]);
+        for (int j = 0; j < 3; ++j)
+            state.joint_positions_base[i][j] = c.joints[0].offset[j] + base_origin[j];
+        state.link_orientations_base[i] =
+            normalized(multiply(slew, state.link_orientations_upper[i]));
+    }
+    state.slew_yaw = angles[0];
+    // Signed planar tool-axis angle, including angles beyond Euler pitch's +/-90 deg range.
+    state.bucket_pitch = gravity_pitch(state.upper.orientation);
+    return state;
+}
+Pose forward_kinematics(const Config &c, const std::array<double, 4> &angles) {
+    return forward_kinematic_state(c, angles).base;
 }
 double valve_pulse(const Valve &v, double command, double now, RampState &state) {
     if (!std::isfinite(command) || !std::isfinite(now))

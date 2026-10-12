@@ -16,15 +16,14 @@ static double monotonic_seconds() {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 static volatile sig_atomic_t stopped = 0;
-static void stop_signal(int) {
-    stopped = 1;
-}
+static void stop_signal(int) { stopped = 1; }
 struct Camera {
     std::string serial, path;
     int index = 1, sync = 0;
     rs2::sensor sensor;
     std::unique_ptr<FrameWriter> writer;
     std::atomic<uint64_t> received{0}, dropped{0}, last_ns{0};
+    std::atomic<uint64_t> last_device_counter{0}, counter_gaps{0}, counter_resets{0};
     std::atomic<int> error{0};
     bool started = false, opened = false;
     ~Camera() {
@@ -37,9 +36,7 @@ struct Camera {
         }
     }
 };
-static uint64_t mono_ns() {
-    return static_cast<uint64_t>(monotonic_seconds() * 1e9);
-}
+static uint64_t mono_ns() { return static_cast<uint64_t>(monotonic_seconds() * 1e9); }
 int main(int argc, char **argv) {
     try {
         int width = 640, height = 480, fps = 30;
@@ -101,15 +98,28 @@ int main(int argc, char **argv) {
         // Context is not constructed in synthetic mode, avoiding USB enumeration and SDK worker
         // threads.
         std::unique_ptr<rs2::context> context;
+        std::vector<rs2::device> devices;
         if (!synthetic)
             context = std::make_unique<rs2::context>();
+        // Keep one enumeration alive for both cameras. Re-enumerating after
+        // starting the first RSUSB stream can reopen its claimed USB interfaces.
+        if (context)
+            for (auto device : context->query_devices())
+                devices.push_back(device);
         if (list) {
             if (synthetic)
                 throw std::runtime_error("--list requires real devices");
-            for (auto d : context->query_devices())
-                std::printf("%s  %s  firmware=%s\n", d.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER),
+            for (auto d : devices)
+                std::printf("%s  %s  firmware=%s usb=%s port=%s\n",
+                            d.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER),
                             d.get_info(RS2_CAMERA_INFO_NAME),
-                            d.get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION));
+                            d.get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION),
+                            d.supports(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR)
+                                ? d.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR)
+                                : "unknown",
+                            d.supports(RS2_CAMERA_INFO_PHYSICAL_PORT)
+                                ? d.get_info(RS2_CAMERA_INFO_PHYSICAL_PORT)
+                                : "unknown");
             return 0;
         }
         if (specs.empty() || specs.size() > 2)
@@ -145,7 +155,7 @@ int main(int argc, char **argv) {
             if (!synthetic) {
                 rs2::device selected;
                 bool found = false;
-                for (auto device : context->query_devices())
+                for (auto device : devices)
                     if (camera->serial == device.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER)) {
                         selected = device;
                         found = true;
@@ -233,6 +243,13 @@ int main(int argc, char **argv) {
                                     static_cast<uint64_t>(frame.get_frame_metadata(keys[i]));
                                 m.valid_metadata |= 1ULL << i;
                             }
+                        if (m.valid_metadata & 4) {
+                            const auto previous = c->last_device_counter.exchange(m.frame_counter);
+                            if (previous && m.frame_counter > previous + 1)
+                                c->counter_gaps += m.frame_counter - previous - 1;
+                            else if (previous && m.frame_counter <= previous)
+                                ++c->counter_resets;
+                        }
                         if (require_metadata && (m.valid_metadata & 3) != 3) {
                             c->error = 1;
                             return;
@@ -338,9 +355,12 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         for (auto &c : cameras)
-            std::fprintf(stderr, "serial=%s received=%llu busy_drops=%llu\n", c->serial.c_str(),
-                         (unsigned long long)c->received.load(),
-                         (unsigned long long)c->dropped.load());
+            std::fprintf(
+                stderr,
+                "serial=%s received=%llu busy_drops=%llu counter_gaps=%llu counter_resets=%llu\n",
+                c->serial.c_str(), (unsigned long long)c->received.load(),
+                (unsigned long long)c->dropped.load(), (unsigned long long)c->counter_gaps.load(),
+                (unsigned long long)c->counter_resets.load());
         return failed ? 1 : 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Camera failed: %s\n", e.what());

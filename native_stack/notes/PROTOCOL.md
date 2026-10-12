@@ -22,6 +22,30 @@ Values must be finite and in `[-1,1]`. The packet cannot be over 100 ms old or o
 
 Status includes safety state/reason, actual current tick pulses, pump authorization, IMU health/age/sequence/device time/arrival time, host monotonic time, angles in radians, FK position in meters and quaternion `[w,x,y,z]`, counters, command sequence, and maximum observed loop lateness. FK fields are zeros/identity if IMUs are unhealthy; always check the health flag. A status response can precede the PWM write for an operation received in the same tick; verify physical stop with instrumentation, not just a JSON response.
 
+### Kinematic observation fields
+
+One complete kinematic snapshot is computed per healthy control tick and reused by all status readers on that tick. It uses one Pico sample for joint extraction, the full FK chain and IMU output. `--control-hz 200` overrides the profile's default 100 Hz loop; it changes neither the PCA9685 carrier frequency nor the safety timeouts. `control_hz` reports the selected rate, and `fk_work_us` measures mounting correction, joint extraction, FK and sensor-array preparation together (excluding JSON, serial reads and PWM writes). Timing CSV includes that phase for every tick, even without a status reader.
+
+Status JSON is bounded to 8192 bytes; clients must receive a whole `SOCK_SEQPACKET` message and reject truncation. All four-row arrays below follow `joint_names = [slew, boom, arm, bucket]`. IMU rows correspond to the base, boom, arm and bucket sensors, respectively; `imu_sensor_indices` gives their physical Pico indices. Quaternions use `[w,x,y,z]`, distances meters and derived angles radians. No Euler angles are required.
+
+| Field | Meaning |
+| --- | --- |
+| `fk_xyz_m`, `fk_quat_wxyz` | Existing tool-tip position and bucket/tool-frame orientation in the nominal fixed base frame |
+| `fk_upper_xyz_m`, `fk_upper_xz_m`, `fk_upper_quat_wxyz` | Tool-tip pose in the rotating upper-carriage frame, and its explicit `[X,Z]` view |
+| `slew_yaw_rad` | Estimated slew joint angle; IMU-derived and subject to heading drift |
+| `bucket_pitch_rad` | Signed bucket/tool +X-axis pitch about upper +Y, wrapped to `[-pi,pi)`; positive +Y rotation tips +X downward toward -Z |
+| `fk_joint_xyz_m`, `fk_joint_xyz_upper_m` | Each joint pivot position before that joint's rotation, in base and upper frames |
+| `fk_joint_quat_wxyz` | Each joint's local axis-angle rotation relative to its pre-rotation joint frame; excludes fixed translations |
+| `fk_link_quat_wxyz`, `fk_link_quat_upper_wxyz` | Orientation after each joint's rotation, in base and upper frames; final row equals the corresponding tool quaternion |
+| `imu_quat_wxyz` | Firmware AHRS sensor quaternions before host mounting correction, reordered into named rows |
+| `imu_corrected_quat_wxyz` | Those AHRS quaternions after right-multiplying the configured inverse mounting correction and normalizing |
+| `imu_gyro_dps`, `imu_accel_g` | Corresponding firmware measurements in sensor axes, preserving degrees/second and g; synthetic mode reports zeros |
+| `fk_valid` | True only with healthy IMUs; every new pose/sensor field above is `null` when false (legacy FK fields retain zeros/identity) |
+
+The base origin is the geometry model's ground reference, with the slew pivot at the first joint's `parent_to_joint_xyz` (currently `[0,0,0.07]` m). The upper origin is that pivot, with axes following the carriage: +X forward in the boom plane, +Y left, +Z along the slew axis. Upper FK is calculated directly from the arm chain without the estimated slew angle. With the current coplanar Y-axis joints, upper Y is zero, and upper XZ, bucket pitch, all upper pivot positions and upper link orientations remain unchanged during pure slew. The base-frame positions rotate along circular arcs; changing arm extension changes their radius.
+
+The tool quaternion describes the configured bucket frame, not the direction of the pivot-to-tip position vector. A cutting-edge orientation needs its own calibrated fixed angular offset. This four-joint FK constrains the arm to its model plane; it does not measure chassis roll/pitch, terrain-relative height, machine travel or independent tool roll. Sensor AHRS quaternions retain their sensor/filter reference frames and individual heading drift; mounting correction alone does not establish a common world heading. Save the active geometry, IMU mapping, mounting offsets and code revision with datasets so all derived quantities can be reproduced.
+
 For arming, send one centered row with deadman and arm flags repeatedly for at least 250 ms while IMUs are healthy. Pump permission may be included, but the pump stays at minimum until armed. To recover from a fault, explicitly disarm, fix its cause, and perform the centered arming hold again. Task/manual-policy switching should disarm first.
 
 ## Integration skeleton

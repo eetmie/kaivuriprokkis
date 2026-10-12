@@ -55,7 +55,15 @@ struct Pose {
     Vec3 position{};
     Quat orientation{1, 0, 0, 0};
 };
+struct KinematicState {
+    Pose base, upper; // Upper frame: slew pivot origin, axes rotate with the carriage.
+    std::array<Vec3, 4> joint_positions_base{}, joint_positions_upper{};
+    std::array<Quat, 4> joint_rotations{}, link_orientations_base{}, link_orientations_upper{};
+    double slew_yaw = 0, bucket_pitch = 0; // radians; pitch is positive about upper +Y.
+};
+std::array<Quat, 4> corrected_imu_quaternions(const Config &cfg, const std::array<Quat, 4> &raw);
 std::array<double, 4> joint_angles(const Config &cfg, const std::array<Quat, 4> &raw);
+KinematicState forward_kinematic_state(const Config &cfg, const std::array<double, 4> &angles);
 Pose forward_kinematics(const Config &cfg, const std::array<double, 4> &angles);
 struct RampState {
     double pulse = 0, time = 0;

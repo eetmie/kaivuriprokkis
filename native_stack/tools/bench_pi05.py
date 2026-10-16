@@ -205,6 +205,8 @@ def run(args):
                "--warmup", str(args.warmup), "--out", output / "inference.json"]
     if args.rate_hz:
         command += ["--rate-hz", str(args.rate_hz)]
+    if args.parity_cosine is not None:
+        command += ["--parity-cosine", str(args.parity_cosine), "--parity-max-abs", str(args.parity_max_abs)]
     frame_files = []
     for spec in args.camera:
         serial, index = spec.split(":")
@@ -351,6 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("--task", default="pick up the red block")
     parser.add_argument("--duration-s", type=float, default=300)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--parity-cosine", type=float, help="fixture gate override (pi05_openpi_state); needs --parity-max-abs")
+    parser.add_argument("--parity-max-abs", type=float)
     args = parser.parse_args()
     if len(args.camera) != 2 or any(len(c.split(":")) != 2 for c in args.camera):
         parser.error("select two cameras using SERIAL:IR_INDEX")

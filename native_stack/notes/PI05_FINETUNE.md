@@ -45,9 +45,12 @@ tensors (both cameras, state, 50-step action chunks with padding, tasks) equal l
    forking OpenPI):
    - repack: `observation.images.cam1` → `base_0_rgb`, `observation.images.cam2` →
      `left_wrist_0_rgb` (third slot masked), `observation.state`, `action`, prompt from task
-   - `Pi0Config(pi05=True, action_horizon=50, discrete_state_input=?)`. **Decide state:**
-     `False` = camera + prompt only, fixed prompt tokens, the current C++ runtime contract;
-     `True` (OpenPI's pi0.5 default) = `Task: T, State: <256 bins>;\nAction: ` rebuilt every step
+   - `Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True)`. **Decided
+     2026-10-16: dual IR + joint angles.** pi0.5 has no continuous state input, so `False`
+     would drop the angles entirely; `True` (OpenPI's pi0.5 default) writes them into the
+     prompt, `Task: T, State: <256 bins>;\nAction: `, rebuilt every step.
+     Possible later A/B: append FK tool pose (`feedback.fk.fk_upper_xz_m`,
+     `feedback.fk.bucket_pitch_rad`, already in every exported frame) to the state.
    - output transform: first 4 dims (slew, lift, tilt, scoop), 6 with tracks
    - quantile norm (pi0.5); `scripts/compute_norm_stats.py` on the v2.1 copy
 5. Smoke run, then a real run. `fps` stays the dataset's 30.
@@ -95,7 +98,7 @@ The camera/profile checks are new compared to the Python stack: the native recor
 
 - `kaivuri-inference`: accept the fine-tune bundle (drop the `pi05_libero` check at
   `inference_pi05.cpp:324`), read the contract above, feed live state from `kaivuri-control`;
-  with `discrete_state_input=True`, assemble the prompt per step.
+  with `discrete_state_input=True` (the decided contract), assemble the prompt per step.
 - A policy → controller producer: send chunks through the `PROTOCOL.md` socket with the
   oldest observation time, delay-aware chunk start, and lease renewal that never refreshes
   observation age.
@@ -104,5 +107,5 @@ The camera/profile checks are new compared to the Python stack: the native recor
 ## Before real data collection (open from `TODO.md`)
 
 Real Xbox pad dry check (only the virtual pad has driven the C++ recorder); hydraulics-on
-pulse/stop checks; lock IR exposure/gain (`--exposure-us`, `--gain`); IMU calibration and
-known-pose FK. The jetson profile's valve deadzone is now 0%.
+pulse/stop checks; lock IR exposure/gain (`--exposure-us`, `--gain`). IMU readout and FK
+are expected to be correct as of 2026-10-16. The jetson profile's valve deadzone is now 0%.

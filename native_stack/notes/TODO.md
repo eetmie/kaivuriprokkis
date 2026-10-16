@@ -15,7 +15,7 @@
 ## Tomorrow: hardware acceptance
 
 - [x] Build on Jetson and record versions/permissions/profile.
-- [ ] Validate Pico startup calibration, mounting signs, angles and known-pose FK.
+- [x] Validate Pico startup calibration, mounting signs, angles and known-pose FK. As of 2026-10-16, IMU readout and FK are expected to be correct (user).
 - [ ] Measure neutral/pump/active pulse widths and compare with legacy output.
 - [ ] Confirm physical stop behavior for deadman/lease/IMU/producer failures, with an independent stop available.
 - [x] Verify IR-only streaming and sensor/readout timestamps through RSUSB on the installed firmware.

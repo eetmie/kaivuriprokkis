@@ -144,6 +144,14 @@ is sent (`bench_pi05.py` never passes it).
   one latency (~1.0 s at 500 ms). 50 rows at 30 fps last 1.63 s from the observation; a shorter
   export must keep `(rows - 1) / fps` above that, which the arming check enforces.
 
+**Jetson end-to-end, 2026-10-17** (pikkumasi2tb, TRT 10.16, native cache from
+`tools/build_pi05_cache.py`; smoke checkpoint, servos/pump unpowered): real IMUs, 200 Hz control
+with live PWM and slew, both IR cameras, `--drive --rate-hz 2`, 120 s. Inference p50/p99
+434.0/437.5 ms (vision 61, language 264, denoise 109, prompt 3.3), camera arrival to plan
+458/479 ms, 240/240 plans, 956 renewals, start interval 500.03-500.07 ms, 0 overruns, control
+lateness max 1.7 ms, 6.4 GB used / 1.1 GB available. Board parity gate: `--parity-cosine 0.9998
+--parity-max-abs 0.02` (fixture 3 max 0.0119). ~60 ms per 2 Hz cycle is spare.
+
 Dry end-to-end on the Spark (simulated-IMU control, replayed fixture frames, GB10): 60 plans at
 2 Hz (start interval 500.05-500.30 ms), 239 renewals, max send gap 107 ms, armed 30 s, clean
 disarm. Simulated IMU angles are out of distribution (all bins -1); smoke9 then outputs up to

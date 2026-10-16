@@ -2,13 +2,14 @@
 
 Built on Spark on 2026-10-11 for the next hardware session. Everything new lives in this folder. The existing Python stack and Pico firmware remain the reference and are unchanged.
 
-This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR-only RealSense service. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, recording pipeline, or GPU context. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
+This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR-only RealSense service. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
 
 | Component | Current behavior |
 | --- | --- |
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory |
 | `kaivuri-inference` | Optional OpenPI pi0.5 LIBERO TensorRT + AOT CUDA graph; five-fixture parity gate; two fresh IR inputs; normalized actions recorded without actuator IPC |
+| `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `tools/client.py` | Status, disarm, emergency stop, bounded bench exercise; reusable IPC client for later TRT integration |
 | `tools/frame_reader.py` | Coherent Y8 snapshot through the native C ABI; rejects stale frames |
 | `tools/measure.py` | Per-process RSS, PSS, swap, CPU; no model or hardware imports |
@@ -22,6 +23,10 @@ For a full-stack stress run, add `--control-hz 200 --status-hz 200 --live-pwm` t
 Optional `--rate-hz 2` on the inference executable or bench tool limits inference starts to one per 500 ms. Warm-up remains unrestricted. It sleeps on the host before reading the latest camera frames, then runs inference and records the result immediately; it does not retain an image across the pacing wait. Overruns start one fresh job when ready and schedule the following job from that actual start, so there is no catch-up burst or observation backlog. Shutdown interrupts the wait. CSV reports `rate_wait_ms` and `rate_lateness_ms`, and the inference summary includes the configured rate and work-overrun count. Pacing frees compute time between jobs; resident model weights/buffers remain allocated.
 
 Prediction horizon, execution FPS and inference refresh rate are separate settings. OpenPI's default prediction horizon is 50, but this validated LIBERO bundle exports **10 action rows** with 10 denoising steps. The measured latency belongs to that 10-row export. At a future 30 Hz excavator action rate, 10 rows cover only 333 ms, which is insufficient for continuous execution at the measured latency. A 30–50-row excavator export is a starting point to evaluate: 50 rows span 1.67 s, 2 Hz replanning advances about 15 rows per update, and the current inference delay consumes about 13 additional 30 Hz steps. Longer exports may change inference latency; verify the resulting timing and plan coverage together. Switching chunks requires explicit delay handling and overlapping execution, rather than replaying an old chunk from its first row. Changing prediction horizon requires a new export and quality/performance validation. The inference bench currently publishes no actuator commands and does not implement RTC.
+
+## Episode recording
+
+The native recorder pairs camera `233522073919:2` (rotated 180°) with `141722076647:1`, runs teleoperation independently of its bounded disk writer, and exports committed takes to LeRobot 0.5.1/v3 after capture. See [recording instructions, controls and data fields](notes/RECORDING.md). Capture requires no LeRobot, Torch or Python loop.
 
 ## Build
 

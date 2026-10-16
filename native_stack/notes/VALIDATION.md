@@ -44,3 +44,39 @@ python3 -B native_stack/tests/spark_benchmark.py --seconds 20
 ```
 
 Raw report is in ignored `results/spark-synthetic.json`. Hardware acceptance is deliberately pending: actual waveform, serial calibration, camera metadata/profile support, global time behavior, sync, USB disconnect handling, and Jetson memory/jitter under model load.
+
+## Native episode recorder — 2026-10-14
+
+Built on `pikkumasi2tb` in `/home/joel/kaivuriprokkis-recorder`, independently of
+its existing checkout. CTest: core, frame-store, service-integration and new
+recorder-integration all pass. The new suite checks applied-command attribution
+and disabled channels; save/discard; SIGINT finalization; limited-file-size disk
+failure; camera loss; retained incomplete takes; disarming; and export rejection
+of truncated pixels or inaccurate FPS. An interrupted IPC poll originally failed
+SIGINT save; retrying EINTR fixed it and the signal test now passes.
+
+Real IMUs plus physical `233522073919:IR1` and `141722076647:IR2`, 30 seconds,
+**dry PWM**, 200 Hz control and 100 Hz full-status capture: 897 frame pairs at
+29.981 Hz, 3,002 telemetry rows. Maximum master arrival interval 33.450 ms; both
+cameras reported zero capture-counter gaps/resets. Controller wake-up lateness
+p99/max: 0.063/1.364 ms; controller work p99/max: 0.105/0.173 ms, including startup
+and shutdown. These are dry timings, without inference or video encoding. Session
+and per-tick CSV: `results/recorder-real-dual-ir-timing-2/` on the board. The previous
+sampler-arrival timing gate could skip pairs; gating on master camera arrivals
+fixed it. Export validation rejects the earlier affected take rather than
+silently accepting an incorrect timebase.
+
+A separate 10-second real session yielded 298 pairs at 29.990 Hz. Exported with
+LeRobot 0.5.1 into two H.264 videos plus v3 Parquet. The actual LeRobot reader
+successfully reopened it; first/middle/last views, IR indices, exact host
+nanoseconds, applied actions, full/upper FK and corrected IMU fields round-trip.
+All 100 Hz JSONL bytes are preserved in the exported sidecar. The optional
+`tests/recorder_export.py SESSION` performs this test in an export environment.
+Local artifacts: `results/recorder-validation/lerobot-real-10s/`,
+`roundtrip-result.txt`, and `validation-summary.json`.
+
+The IMU USB connection needed replugging before stable real capture resumed.
+No physical gamepad was present, and no live PWM/pump/motion was enabled. Physical
+pad direction checks, live teleoperation, and long-session/inference-load tests
+remain explicit follow-up acceptance work; they are not inferred from this dry
+capture test.

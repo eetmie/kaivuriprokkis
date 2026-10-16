@@ -337,6 +337,8 @@ int main(int argc, char **argv) {
         std::array<RampState, 8> ramps{};
         std::array<uint8_t, max_packet> bytes{};
         int owner = -1;
+        Commands applied_command{};
+        uint64_t applied_sequence = 0, applied_monotonic_ns = 0;
         uint64_t ticks = 0, last_resets = 0, last_invalid = 0, last_command = 0;
         double worst_lateness = 0, begin = monotonic_seconds(), next = begin, previous = begin;
         auto close_client = [&](int index) {
@@ -487,6 +489,14 @@ int main(int argc, char **argv) {
                                          cfg.control_hz, fk_work_us, healthy ? "true" : "false",
                                          cfg.joints[0].sensor, cfg.joints[1].sensor,
                                          cfg.joints[2].sensor, cfg.joints[3].sensor);
+                            reply.vector("applied_action", applied_command, true);
+                            reply.append(
+                                ",\"applied_command_sequence\":%llu,\"applied_host_monotonic_ns\":%"
+                                "llu,\"enable_slew\":%s,\"enable_tracks\":%s",
+                                (unsigned long long)applied_sequence,
+                                (unsigned long long)applied_monotonic_ns,
+                                cfg.enable_slew ? "true" : "false",
+                                cfg.enable_tracks ? "true" : "false");
                             reply.vector("fk_upper_xyz_m", fk.upper.position, healthy);
                             reply.vector(
                                 "fk_upper_xz_m",
@@ -548,6 +558,9 @@ int main(int argc, char **argv) {
                 pwm.neutral();
                 throw;
             }
+            applied_command = active ? command : Commands{};
+            applied_sequence = last_command;
+            applied_monotonic_ns = static_cast<uint64_t>(monotonic_seconds() * 1e9);
             if (timing_count < timings.size())
                 timings[timing_count++] = {next, now, monotonic_seconds(), fk_work_us};
             ++ticks;

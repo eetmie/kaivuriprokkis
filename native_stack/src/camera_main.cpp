@@ -1,4 +1,5 @@
 #include "kaivuri/frame_store.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -16,7 +17,9 @@ static double monotonic_seconds() {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 static volatile sig_atomic_t stopped = 0;
-static void stop_signal(int) { stopped = 1; }
+static void stop_signal(int) {
+    stopped = 1;
+}
 struct Camera {
     std::string serial, path;
     int index = 1, sync = 0;
@@ -25,7 +28,8 @@ struct Camera {
     std::atomic<uint64_t> received{0}, dropped{0}, last_ns{0};
     std::atomic<uint64_t> last_device_counter{0}, counter_gaps{0}, counter_resets{0};
     std::atomic<int> error{0};
-    bool started = false, opened = false;
+    bool started = false, opened = false, rotate_180 = false;
+    std::vector<uint8_t> rotated;
     ~Camera() {
         try {
             if (started)
@@ -36,7 +40,9 @@ struct Camera {
         }
     }
 };
-static uint64_t mono_ns() { return static_cast<uint64_t>(monotonic_seconds() * 1e9); }
+static uint64_t mono_ns() {
+    return static_cast<uint64_t>(monotonic_seconds() * 1e9);
+}
 int main(int argc, char **argv) {
     try {
         int width = 640, height = 480, fps = 30;
@@ -44,7 +50,7 @@ int main(int argc, char **argv) {
         bool list = false, synthetic = false, global_time = true, require_metadata = true;
         std::string output = "/tmp/kaivuri-native-" + std::to_string(geteuid()) + "/cameras",
                     csv_path;
-        std::vector<std::string> specs;
+        std::vector<std::string> specs, rotate_serials;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             auto value = [&]() {
@@ -54,6 +60,8 @@ int main(int argc, char **argv) {
             };
             if (a == "--camera")
                 specs.push_back(value());
+            else if (a == "--rotate-180")
+                rotate_serials.push_back(value());
             else if (a == "--width")
                 width = std::stoi(value());
             else if (a == "--height")
@@ -148,6 +156,10 @@ int main(int argc, char **argv) {
             for (const auto &previous : cameras)
                 if (previous->serial == camera->serial)
                     throw std::runtime_error("select one IR stream per physical camera");
+            camera->rotate_180 = std::find(rotate_serials.begin(), rotate_serials.end(),
+                                           camera->serial) != rotate_serials.end();
+            if (camera->rotate_180)
+                camera->rotated.resize(size_t(width) * height);
             camera->path =
                 output + "/" + camera->serial + "-ir" + std::to_string(camera->index) + ".frame";
             camera->writer =
@@ -254,7 +266,17 @@ int main(int argc, char **argv) {
                             c->error = 1;
                             return;
                         }
-                        if (!c->writer->publish(m, v.get_data()))
+                        const void *pixels = v.get_data();
+                        if (c->rotate_180) {
+                            if (m.stride != m.width || m.pixel_bytes != c->rotated.size()) {
+                                c->error = 2;
+                                return;
+                            }
+                            const auto *source = static_cast<const uint8_t *>(pixels);
+                            std::reverse_copy(source, source + m.pixel_bytes, c->rotated.begin());
+                            pixels = c->rotated.data();
+                        }
+                        if (!c->writer->publish(m, pixels))
                             ++c->dropped;
                     } catch (...) {
                         c->error = 2;
@@ -262,11 +284,16 @@ int main(int argc, char **argv) {
                 });
                 camera->started = true;
             }
-            std::fprintf(stderr, "%sIR%d serial=%s -> %s (Y8 %dx%d@%d, sync=%d)\n",
+            std::fprintf(stderr, "%sIR%d serial=%s -> %s (Y8 %dx%d@%d, sync=%d, rotation=%d)\n",
                          synthetic ? "SYNTHETIC " : "", camera->index, camera->serial.c_str(),
-                         camera->path.c_str(), width, height, fps, camera->sync);
+                         camera->path.c_str(), width, height, fps, camera->sync,
+                         camera->rotate_180 ? 180 : 0);
             cameras.push_back(std::move(camera));
         }
+        for (const auto &serial : rotate_serials)
+            if (std::none_of(cameras.begin(), cameras.end(),
+                             [&](const auto &c) { return c->serial == serial; }))
+                throw std::runtime_error("rotation serial is not a selected camera: " + serial);
         signal(SIGINT, stop_signal);
         signal(SIGTERM, stop_signal);
         std::ofstream csv;
@@ -319,7 +346,12 @@ int main(int argc, char **argv) {
                     m.ir_index = c->index;
                     m.pixel_bytes = pixels.size();
                     std::fill(pixels.begin(), pixels.end(), static_cast<uint8_t>(m.sequence % 256));
-                    if (!c->writer->publish(m, pixels.data()))
+                    const uint8_t *image = pixels.data();
+                    if (c->rotate_180) {
+                        std::reverse_copy(pixels.begin(), pixels.end(), c->rotated.begin());
+                        image = c->rotated.data();
+                    }
+                    if (!c->writer->publish(m, image))
                         ++c->dropped;
                 }
             }

@@ -41,4 +41,5 @@
 - [ ] Evaluate beta GPU-frame APIs only when profiling shows selected-frame host copies matter; current capture does not enable CUDA zero-copy.
 - [ ] Compare native total system memory with the legacy stack under the same model/device load before stating an actual Jetson memory saving.
 - [ ] Fine-tuned 30 Hz action contract: benchmark a 30–50-step prediction export and delay-aware overlapping execution. Current LIBERO performance bundle has only 10 action rows.
-- [ ] Migrate the Python recorder to the native backend and repeat timing/memory checks with real LeRobot video encoding; retain camera timestamps and pair skew with USB-only free-running capture.
+- [x] Add a native C++ dual-IR episode spool with bounded asynchronous disk writes, full FK/IMU and applied/requested actions, calibration provenance, failure/discard lifecycle and offline LeRobot 0.5.1/v3 export. See RECORDING.md.
+- [ ] Validate physical gamepad mapping, live teleoperation/stop behavior and long-session memory/disk stability; video encoding is offline and has not been tested concurrently with inference.

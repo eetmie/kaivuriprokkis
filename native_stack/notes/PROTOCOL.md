@@ -46,6 +46,8 @@ The base origin is the geometry model's ground reference, with the slew pivot at
 
 The tool quaternion describes the configured bucket frame, not the direction of the pivot-to-tip position vector. A cutting-edge orientation needs its own calibrated fixed angular offset. This four-joint FK constrains the arm to its model plane; it does not measure chassis roll/pitch, terrain-relative height, machine travel or independent tool roll. Sensor AHRS quaternions retain their sensor/filter reference frames and individual heading drift; mounting correction alone does not establish a common world heading. Save the active geometry, IMU mapping, mounting offsets and code revision with datasets so all derived quantities can be reproduced.
 
+`applied_action` is the six normalized, slew/track-gated commands from the previous successfully written PWM tick. `applied_command_sequence` identifies that command and `applied_host_monotonic_ns` is its post-write timestamp. These accompany the already exposed pulse snapshot, rather than claiming a newly received command was physically emitted. `enable_slew` and `enable_tracks` expose the runtime gates. A fresh IMU/FK snapshot can be newer than the applied output; retain both times when recording.
+
 For arming, send one centered row with deadman and arm flags repeatedly for at least 250 ms while IMUs are healthy. Pump permission may be included, but the pump stays at minimum until armed. To recover from a fault, explicitly disarm, fix its cause, and perform the centered arming hold again. Task/manual-policy switching should disarm first.
 
 ## Integration skeleton

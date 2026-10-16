@@ -1,0 +1,672 @@
+// Native teleoperation and bounded, lossless episode spool. No encoder or Python in this process.
+#include "kaivuri/core.hpp"
+#include "kaivuri/frame_store.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <linux/input.h>
+#include <memory>
+#include <mutex>
+#include <poll.h>
+#include <signal.h>
+#include <sstream>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
+#include <yaml-cpp/yaml.h>
+using namespace kaivuri;
+namespace fs = std::filesystem;
+static volatile sig_atomic_t stopped = 0;
+static void stop_signal(int) {
+    stopped = 1;
+}
+static uint64_t ns() {
+    timespec t{};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return uint64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
+}
+static std::string quote(const std::string &s) {
+    std::ostringstream o;
+    o << '"';
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\')
+            o << '\\' << c;
+        else if (c < 32)
+            o << "\\u" << std::hex << std::setw(4) << std::setfill('0') << int(c) << std::dec;
+        else
+            o << c;
+    }
+    o << '"';
+    return o.str();
+}
+struct Control {
+    int fd = -1;
+    uint64_t sequence = 0;
+    explicit Control(const std::string &path) {
+        fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            throw std::runtime_error("control socket failed");
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        if (path.size() >= sizeof(address.sun_path)) {
+            close(fd);
+            throw std::runtime_error("socket path too long");
+        }
+        std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+        if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
+            close(fd);
+            throw std::runtime_error("cannot connect to controller");
+        }
+    }
+    void send(Operation op, const Commands &action = {}, uint32_t flags = 0) {
+        std::array<uint8_t, 76> data{};
+        std::memcpy(data.data(), "KVR1", 4);
+        auto put = [&](size_t offset, auto value) {
+            std::memcpy(data.data() + offset, &value, sizeof(value));
+        };
+        put(4, uint16_t(1));
+        put(6, uint16_t(op));
+        put(8, flags);
+        put(12, ++sequence);
+        put(20, ns());
+        bool drive = op == Operation::Drive;
+        put(28, uint32_t(drive));
+        put(32, float(100));
+        if (drive)
+            for (size_t i = 0; i < 6; ++i)
+                put(52 + i * 4, float(action[i]));
+        const size_t size = drive ? 76 : 52;
+        if (::send(fd, data.data(), size, MSG_DONTWAIT | MSG_NOSIGNAL) != ssize_t(size))
+            throw std::runtime_error("control send failed");
+    }
+    std::string status() {
+        send(Operation::Status);
+        pollfd p{fd, POLLIN, 0};
+        int ready;
+        do {
+            ready = poll(&p, 1, 100);
+        } while (ready < 0 && errno == EINTR);
+        if (ready != 1)
+            throw std::runtime_error("controller status timeout");
+        char bytes[8192];
+        ssize_t count;
+        do {
+            count = recv(fd, bytes, sizeof(bytes), MSG_TRUNC);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0 || count > ssize_t(sizeof(bytes)))
+            throw std::runtime_error("invalid/truncated status");
+        return std::string(bytes, count);
+    }
+    ~Control() {
+        if (fd >= 0) {
+            try {
+                send(Operation::Disarm);
+                status(); // Drain acknowledgement before closing the owning connection.
+            } catch (...) {
+            }
+            close(fd);
+        }
+    }
+};
+// Linux evdev uses X/Y labels BTN_NORTH/BTN_WEST, matching modules/gamepad.py.
+struct Pad {
+    int fd = -1;
+    std::array<input_absinfo, ABS_CNT> axes{};
+    std::array<bool, KEY_CNT> keys{};
+    explicit Pad(const std::string &path) {
+        fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            throw std::runtime_error("cannot open gamepad: " + path);
+        for (int code : {ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ})
+            if (ioctl(fd, EVIOCGABS(code), &axes[code]) < 0 ||
+                axes[code].maximum <= axes[code].minimum) {
+                close(fd);
+                throw std::runtime_error("gamepad must expose Xbox X/Y/RX/RY/Z/RZ axes");
+            }
+        unsigned char bits[(KEY_CNT + 7) / 8]{};
+        if (ioctl(fd, EVIOCGKEY(sizeof(bits)), bits) < 0) {
+            close(fd);
+            throw std::runtime_error("cannot read gamepad buttons");
+        }
+        for (int i = 0; i < KEY_CNT; ++i)
+            keys[i] = (bits[i / 8] >> (i % 8)) & 1;
+    }
+    ~Pad() {
+        if (fd >= 0)
+            close(fd);
+    }
+    void poll_events() {
+        input_event e{};
+        for (;;) {
+            ssize_t n = read(fd, &e, sizeof(e));
+            if (n < 0 && (errno == EAGAIN || errno == EINTR))
+                return;
+            if (n != sizeof(e))
+                throw std::runtime_error("gamepad disconnected");
+            if (e.type == EV_SYN && e.code == SYN_DROPPED)
+                throw std::runtime_error("gamepad event queue overrun");
+            if (e.type == EV_ABS && e.code < ABS_CNT)
+                axes[e.code].value = e.value;
+            if (e.type == EV_KEY && e.code < KEY_CNT)
+                keys[e.code] = e.value != 0;
+        }
+    }
+    double axis(int code, bool trigger = false) const {
+        auto a = axes[code];
+        double x = trigger
+                       ? double(a.value - a.minimum) / (a.maximum - a.minimum)
+                       : double(a.value) / std::max(std::abs(a.minimum), std::abs(a.maximum) + 1);
+        x = std::clamp(x, trigger ? 0. : -1., 1.);
+        return std::abs(x) < .25 ? 0 : std::copysign((std::abs(x) - .25) / .75, x);
+    }
+    Commands action(bool slew, bool tracks) const {
+        // Same signs and deadzone as the existing LocalGamepadInput/manual_action_from_axes.
+        return {slew ? -axis(ABS_X) : 0,
+                -axis(ABS_RY),
+                axis(ABS_Y),
+                -axis(ABS_RX),
+                tracks ? axis(ABS_Z, true) * (keys[BTN_TL] ? -1 : 1) : 0,
+                tracks ? axis(ABS_RZ, true) * (keys[BTN_TR] ? -1 : 1) : 0};
+    }
+};
+struct Image {
+    void *handle = nullptr;
+    FrameMetadata m{};
+    std::vector<uint8_t> pixels;
+    explicit Image(const std::string &path) {
+        handle = kaivuri_frame_open(path.c_str());
+        if (!handle)
+            throw std::runtime_error("cannot open camera store: " + path);
+    }
+    ~Image() { kaivuri_frame_close(handle); }
+    bool read() {
+        FrameMetadata info{};
+        if (kaivuri_frame_read(handle, &info, nullptr, 0) != 1)
+            return false;
+        if (!info.pixel_bytes || info.pixel_bytes > 16 * 1024 * 1024)
+            throw std::runtime_error("invalid camera size");
+        if (!pixels.empty() && info.pixel_bytes != pixels.size())
+            throw std::runtime_error("camera size changed");
+        if (info.sequence == m.sequence && !pixels.empty())
+            return true;
+        pixels.resize(info.pixel_bytes);
+        int r = kaivuri_frame_read(handle, &m, pixels.data(), pixels.size());
+        if (r < 0)
+            throw std::runtime_error("invalid camera frame");
+        return r == 1;
+    }
+};
+static std::string metadata(const FrameMetadata &m) {
+    std::ostringstream o;
+    o << "{\"sequence\":" << m.sequence << ",\"host_monotonic_ns\":" << m.host_monotonic_ns
+      << ",\"sensor_timestamp_us\":" << m.sensor_timestamp_us
+      << ",\"frame_timestamp_us\":" << m.frame_timestamp_us
+      << ",\"frame_counter\":" << m.frame_counter
+      << ",\"actual_exposure_us\":" << m.actual_exposure_us << ",\"gain_level\":" << m.gain_level
+      << ",\"valid_metadata\":" << m.valid_metadata
+      << ",\"sdk_timestamp_ms\":" << std::setprecision(17) << m.sdk_timestamp_ms
+      << ",\"timestamp_domain\":" << m.timestamp_domain << ",\"width\":" << m.width
+      << ",\"height\":" << m.height << ",\"stride\":" << m.stride << ",\"ir_index\":" << m.ir_index
+      << ",\"pixel_bytes\":" << m.pixel_bytes << "}";
+    return o.str();
+}
+struct Record {
+    std::string json;
+    std::array<std::vector<uint8_t>, 2> images;
+};
+class Writer {
+    fs::path path_;
+    std::ofstream rows_, cam1_, cam2_;
+    std::deque<Record> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread thread_;
+    bool done_ = false;
+    std::atomic<bool> failed_{false};
+    size_t limit_;
+    uint64_t written_ = 0;
+    void run() {
+        try {
+            for (;;) {
+                Record r;
+                {
+                    std::unique_lock<std::mutex> l(mutex_);
+                    cv_.wait(l, [&] { return done_ || !queue_.empty(); });
+                    if (queue_.empty())
+                        break;
+                    r = std::move(queue_.front());
+                    queue_.pop_front();
+                }
+                if (!r.images[0].empty()) {
+                    cam1_.write(reinterpret_cast<const char *>(r.images[0].data()),
+                                r.images[0].size());
+                    cam2_.write(reinterpret_cast<const char *>(r.images[1].data()),
+                                r.images[1].size());
+                    ++written_;
+                }
+                rows_ << r.json << '\n';
+                if (!rows_ || !cam1_ || !cam2_)
+                    throw std::runtime_error("episode disk write failed");
+            }
+            rows_.flush();
+            cam1_.flush();
+            cam2_.flush();
+            if (!rows_ || !cam1_ || !cam2_)
+                throw std::runtime_error("episode flush failed");
+        } catch (...) {
+            failed_ = true;
+        }
+    }
+
+  public:
+    Writer(const fs::path &root, size_t limit) : limit_(limit) {
+        path_ = root / ("episode-" + std::to_string(ns()) + ".partial");
+        if (!fs::create_directory(path_))
+            throw std::runtime_error("episode directory exists");
+        rows_.open(path_ / "samples.jsonl");
+        cam1_.open(path_ / "cam1.y8", std::ios::binary);
+        cam2_.open(path_ / "cam2.y8", std::ios::binary);
+        if (!rows_ || !cam1_ || !cam2_)
+            throw std::runtime_error("cannot create episode files");
+        thread_ = std::thread([this] { run(); });
+    }
+    bool push(Record r) {
+        std::lock_guard<std::mutex> l(mutex_);
+        if (failed_ || queue_.size() >= limit_)
+            return false;
+        queue_.push_back(std::move(r));
+        cv_.notify_one();
+        return true;
+    }
+    void join() {
+        {
+            std::lock_guard<std::mutex> l(mutex_);
+            done_ = true;
+        }
+        cv_.notify_one();
+        if (thread_.joinable())
+            thread_.join();
+    }
+    ~Writer() { join(); }
+    void finish(bool save, uint64_t frames, uint64_t start, uint64_t end,
+                const std::string &reason) {
+        join();
+        rows_.close();
+        cam1_.close();
+        cam2_.close();
+        if (failed_ || written_ != frames)
+            throw std::runtime_error("incomplete episode retained at " + path_.string());
+        if (!save || !frames) {
+            fs::remove_all(path_);
+            std::cout << "Episode discarded\n";
+            return;
+        }
+        std::ofstream summary(path_ / "episode.json");
+        summary << "{\"frames\":" << frames << ",\"start_ns\":" << start << ",\"end_ns\":" << end
+                << ",\"reason\":" << quote(reason) << "}\n";
+        summary.close();
+        if (!summary)
+            throw std::runtime_error("episode summary write failed");
+        for (const char *file : {"samples.jsonl", "cam1.y8", "cam2.y8", "episode.json"}) {
+            int fd = open((path_ / file).c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                throw std::runtime_error("episode sync open failed");
+            int result = fsync(fd);
+            close(fd);
+            if (result)
+                throw std::runtime_error("episode fsync failed");
+        }
+        int dir = open(path_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir < 0)
+            throw std::runtime_error("episode directory sync open failed");
+        int result = fsync(dir);
+        close(dir);
+        if (result)
+            throw std::runtime_error("episode directory fsync failed");
+        fs::path ready = path_;
+        ready.replace_extension(".ready");
+        fs::rename(path_, ready);
+        dir = open(ready.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir < 0)
+            throw std::runtime_error("session sync open failed");
+        result = fsync(dir);
+        close(dir);
+        if (result)
+            throw std::runtime_error("session fsync failed");
+        std::cout << "Saved " << frames << " frames: " << ready << std::endl;
+    }
+};
+int main(int argc, char **argv) {
+    try {
+        std::string runtime = "/tmp/kaivuri-native-" + std::to_string(geteuid());
+        std::string socket = runtime + "/control.sock", gamepad, task, root, revision;
+        std::vector<std::string> camera_paths;
+        int fps = 30, queue = 64;
+        double max_episode = 180, auto_seconds = 0, max_skew_ms = 40, max_age_ms = 200;
+        bool scripted = false, allow_live = false, tracks = false, slew = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            auto val = [&]() {
+                if (++i == argc)
+                    throw std::runtime_error("missing argument");
+                return std::string(argv[i]);
+            };
+            if (a == "--socket")
+                socket = val();
+            else if (a == "--root")
+                root = val();
+            else if (a == "--task")
+                task = val();
+            else if (a == "--gamepad")
+                gamepad = val();
+            else if (a == "--camera-file")
+                camera_paths.push_back(val());
+            else if (a == "--fps")
+                fps = std::stoi(val());
+            else if (a == "--queue-frames")
+                queue = std::stoi(val());
+            else if (a == "--max-episode-s")
+                max_episode = std::stod(val());
+            else if (a == "--auto-record-s")
+                auto_seconds = std::stod(val());
+            else if (a == "--max-pair-skew-ms")
+                max_skew_ms = std::stod(val());
+            else if (a == "--max-age-ms")
+                max_age_ms = std::stod(val());
+            else if (a == "--revision")
+                revision = val();
+            else if (a == "--scripted")
+                scripted = true;
+            else if (a == "--allow-live")
+                allow_live = true;
+            else if (a == "--enable-tracks")
+                tracks = true;
+            else if (a == "--enable-slew")
+                slew = true;
+            else if (a == "--help") {
+                std::cout
+                    << "kaivuri-record --root NEW_SESSION --task TEXT --gamepad /dev/input/eventN\n"
+                       "  --camera-file .../SERIAL1-ir1.frame --camera-file .../SERIAL2-ir2.frame\n"
+                       "  [--socket PATH --fps 30 --enable-slew --enable-tracks --allow-live]\n"
+                       "  [--max-episode-s 180 --queue-frames 64 --max-pair-skew-ms 40 "
+                       "--max-age-ms 200]\n"
+                       "A=start/save B=discard X=pump Y=centered arm/recover; Ctrl+C=save and "
+                       "disarm.\n"
+                       "No automatic config reload: disarm and restart services after "
+                       "configuration changes.\n"
+                       "--scripted [--auto-record-s SEC] is dry-only; stdin: "
+                       "arm/start/save/discard/pump/quit.\n";
+                return 0;
+            } else
+                throw std::runtime_error("unknown option: " + a);
+        }
+        if (root.empty() || task.empty() || camera_paths.size() != 2 ||
+            camera_paths[0] == camera_paths[1] || fps < 1 || fps > 90 || queue < 2 ||
+            queue > 1024 || !std::isfinite(max_episode) || max_episode <= 0 ||
+            !std::isfinite(auto_seconds) || auto_seconds < 0 || (!scripted && auto_seconds > 0) ||
+            !std::isfinite(max_age_ms) || max_age_ms <= 0 || !std::isfinite(max_skew_ms) ||
+            max_skew_ms < 0 || (!scripted && gamepad.empty()))
+            throw std::runtime_error("invalid recorder arguments");
+        Control control(socket);
+        auto initial = YAML::Load(control.status());
+        if (initial["live_pwm"].as<bool>() && (scripted || !allow_live))
+            throw std::runtime_error("live controller requires --allow-live and a real gamepad");
+        if (!initial["applied_action"])
+            throw std::runtime_error("rebuild controller: applied_action metadata missing");
+        if (initial["enable_slew"].as<bool>() != slew ||
+            initial["enable_tracks"].as<bool>() != tracks)
+            throw std::runtime_error("recorder/controller slew/track flags differ");
+        std::unique_ptr<Pad> pad;
+        if (!scripted)
+            pad = std::make_unique<Pad>(gamepad);
+        Image cam1(camera_paths[0]), cam2(camera_paths[1]);
+        if (!fs::create_directory(root))
+            throw std::runtime_error("session root must be new");
+        fs::permissions(root, fs::perms::owner_all, fs::perm_options::replace);
+        std::ofstream manifest(fs::path(root) / "session.json");
+        manifest << "{\"format\":\"kaivuri-native-episode-v1\",\"task\":" << quote(task)
+                 << ",\"fps\":" << fps << ",\"revision\":" << quote(revision)
+                 << ",\"enable_slew\":" << (slew ? "true" : "false")
+                 << ",\"enable_tracks\":" << (tracks ? "true" : "false")
+                 << ",\"live_pwm\":" << initial["live_pwm"].as<bool>()
+                 << ",\"simulated_imu\":" << initial["simulated_imu"].as<bool>()
+                 << ",\"camera_files\":[" << quote(camera_paths[0]) << "," << quote(camera_paths[1])
+                 << "],\"initial_status\":" << control.status() << "}\n";
+        manifest.close();
+        if (!manifest)
+            throw std::runtime_error("manifest write failed");
+        control.send(Operation::Disarm);
+        signal(SIGINT, stop_signal);
+        signal(SIGTERM, stop_signal);
+        std::unique_ptr<Writer> writer;
+        uint64_t begin = 0, frames = 0, last1 = 0, last2 = 0, last_frame = 0, last_master_ns = 0;
+        bool pump = false, arm = false, pending_start = auto_seconds > 0;
+        bool imu_ready = initial["imu_healthy"].as<bool>(), was_armed = false;
+        std::string last_fault;
+        arm = pending_start;
+        std::array<bool, 4> previous{};
+        if (pad)
+            previous = {pad->keys[BTN_SOUTH], pad->keys[BTN_EAST], pad->keys[BTN_NORTH],
+                        pad->keys[BTN_WEST]};
+        uint64_t next = ns(), session_start = next;
+        const uint64_t period = 10000000;
+        if (scripted)
+            fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+        std::string input;
+        bool quit = false;
+        auto finish = [&](bool save, const std::string &reason) {
+            control.send(Operation::Disarm);
+            arm = false;
+            was_armed = false;
+            pump = false;
+            pending_start = false;
+            if (writer) {
+                writer->finish(save, frames, begin, ns(), reason);
+                writer.reset();
+            }
+        };
+        std::cout << "A=start/save B=discard X=pump Y=centered arm; native spool ready\n"
+                  << std::flush;
+        try {
+            while (!stopped && !quit) {
+                uint64_t now = ns();
+                double late_ms = double(now - next) / 1e6;
+                Commands action{};
+                bool start = false, save = false, discard = false, toggle = false, rearm = false;
+                if (pad) {
+                    pad->poll_events();
+                    action = pad->action(slew, tracks);
+                    std::array<bool, 4> buttons{pad->keys[BTN_SOUTH], pad->keys[BTN_EAST],
+                                                pad->keys[BTN_NORTH], pad->keys[BTN_WEST]};
+                    start = buttons[0] && !previous[0];
+                    discard = buttons[1] && !previous[1];
+                    toggle = buttons[2] && !previous[2];
+                    rearm = buttons[3] && !previous[3];
+                    previous = buttons;
+                } else {
+                    char b[256];
+                    ssize_t n;
+                    while ((n = read(0, b, sizeof(b))) > 0)
+                        input.append(b, n);
+                    size_t pos;
+                    while ((pos = input.find('\n')) != std::string::npos) {
+                        auto cmd = input.substr(0, pos);
+                        input.erase(0, pos + 1);
+                        if (cmd == "arm")
+                            rearm = true;
+                        else if (cmd == "start")
+                            start = true;
+                        else if (cmd == "save")
+                            save = true;
+                        else if (cmd == "discard")
+                            discard = true;
+                        else if (cmd == "pump")
+                            toggle = true;
+                        else if (cmd == "quit")
+                            quit = true;
+                        else
+                            throw std::runtime_error("unknown scripted command");
+                    }
+                }
+                bool centered = std::all_of(action.begin(), action.end(),
+                                            [](double a) { return std::abs(a) < .02; });
+                if (save || (start && writer)) {
+                    finish(true, "save");
+                    start = false;
+                }
+                if (discard) {
+                    finish(false, "discard");
+                    start = false;
+                }
+                if (quit)
+                    break;
+                if (rearm && was_armed) {
+                    std::cout << "Already armed; driving/recording continues\n" << std::flush;
+                    rearm = false;
+                }
+                if (rearm && !centered) {
+                    std::cerr << "Center sticks before arming\n";
+                    rearm = false;
+                }
+                if (rearm) {
+                    control.send(Operation::Disarm);
+                    arm = true;
+                    pump = false;
+                }
+                if (start && !was_armed && !centered) {
+                    std::cerr << "Center sticks before arming/starting an episode\n";
+                    start = false;
+                }
+                if (start) {
+                    arm = true;
+                    pending_start = true;
+                }
+                if (toggle)
+                    pump = !pump;
+                if (arm && imu_ready)
+                    control.send(Operation::Drive, action,
+                                 deadman_flag | arm_flag | (pump ? pump_flag : 0));
+                auto raw = control.status();
+                auto status = YAML::Load(raw);
+                if (status["state"].as<std::string>() == "fault") {
+                    const auto reason = status["reason"].as<std::string>();
+                    if (writer || auto_seconds > 0)
+                        throw std::runtime_error("controller fault: " + reason);
+                    arm = false;
+                    pump = false;
+                    pending_start = false;
+                    if (reason != last_fault)
+                        std::cerr << "Controller fault: " << reason
+                                  << "; Y recovers after correction\n";
+                    last_fault = reason;
+                } else
+                    last_fault.clear();
+                imu_ready = status["imu_healthy"].as<bool>();
+                bool healthy = status["fk_valid"].as<bool>();
+                bool armed = status["state"].as<std::string>() == "armed";
+                was_armed = armed;
+                if (pending_start && armed && healthy) {
+                    writer = std::make_unique<Writer>(root, queue);
+                    frames = 0;
+                    begin = ns();
+                    last_frame = begin;
+                    last1 = last2 = 0;
+                    pending_start = false;
+                    std::cout << "Recording\n" << std::flush;
+                }
+                if (writer) {
+                    if (!healthy || !armed)
+                        throw std::runtime_error("recording lost healthy armed controller");
+                    Record record;
+                    bool fresh = cam1.read() && cam2.read();
+                    uint64_t capture = ns();
+                    auto valid = [&](const FrameMetadata &m) {
+                        return m.host_monotonic_ns <= capture &&
+                               double(capture - m.host_monotonic_ns) / 1e6 <= max_age_ms;
+                    };
+                    double skew = std::abs(double(cam1.m.host_monotonic_ns) -
+                                           double(cam2.m.host_monotonic_ns)) /
+                                  1e6;
+                    fresh = fresh && valid(cam1.m) && valid(cam2.m) && cam1.m.sequence != last1 &&
+                            cam2.m.sequence != last2 && skew <= max_skew_ms;
+                    // FPS is an upper bound; sample each new master frame without a second capture
+                    // clock.
+                    if (fresh && (frames == 0 || cam1.m.host_monotonic_ns - last_master_ns >=
+                                                     uint64_t(.7e9 / fps))) {
+                        for (Image *im : {&cam1, &cam2})
+                            if (!im->m.width || !im->m.height || im->m.stride != im->m.width ||
+                                im->m.pixel_bytes != uint64_t(im->m.width) * im->m.height)
+                                throw std::runtime_error("only packed Y8 images supported");
+                        record.images[0].assign(cam1.pixels.begin(),
+                                                cam1.pixels.begin() + cam1.m.pixel_bytes);
+                        record.images[1].assign(cam2.pixels.begin(),
+                                                cam2.pixels.begin() + cam2.m.pixel_bytes);
+                        last1 = cam1.m.sequence;
+                        last2 = cam2.m.sequence;
+                        last_frame = capture;
+                        last_master_ns = cam1.m.host_monotonic_ns;
+                    }
+                    if (capture - last_frame > uint64_t(max_age_ms * 1e6))
+                        throw std::runtime_error(
+                            "camera stalled, stale, duplicated or pair skew exceeds limit");
+                    std::ostringstream row;
+                    row << std::setprecision(17) << "{\"sample_ns\":" << capture
+                        << ",\"episode_ns\":" << capture - begin
+                        << ",\"teleop_lateness_ms\":" << late_ms << ",\"requested_action\":[";
+                    for (size_t i = 0; i < action.size(); ++i)
+                        row << (i ? "," : "") << action[i];
+                    row << "],\"requested_sequence\":" << control.sequence - 1
+                        << ",\"status\":" << raw;
+                    if (!record.images[0].empty()) {
+                        row << ",\"frame_index\":" << frames++ << ",\"cam1\":" << metadata(cam1.m)
+                            << ",\"cam2\":" << metadata(cam2.m);
+                    }
+                    row << "}";
+                    record.json = row.str();
+                    if (!writer->push(std::move(record)))
+                        throw std::runtime_error(
+                            "recording disk queue full/write failed; episode retained incomplete");
+                    double duration = double(capture - begin) / 1e9;
+                    if (duration >= max_episode || (auto_seconds > 0 && duration >= auto_seconds)) {
+                        finish(true, "duration");
+                        if (auto_seconds > 0)
+                            quit = true;
+                    }
+                }
+                if (auto_seconds > 0 && !writer && double(ns() - session_start) / 1e9 > 20 &&
+                    pending_start)
+                    throw std::runtime_error("automatic arming timeout");
+                next += period;
+                if (next < ns())
+                    next = ns() + period;
+                timespec wake{time_t(next / 1000000000), long(next % 1000000000)};
+                while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr) == EINTR &&
+                       !stopped) {
+                }
+            }
+            finish(true, "session_end");
+        } catch (...) {
+            try {
+                control.send(Operation::Disarm);
+            } catch (...) {
+            }
+            writer.reset();
+            throw;
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        std::cerr << "Recorder failed: " << e.what() << std::endl;
+        return 1;
+    }
+}

@@ -244,3 +244,5 @@ lerobot_vla/model/
 
 # Generated offline pose coverage figures
 data_collection/coverage_plots/
+.venv-lerobot061/
+.venv-rerun/

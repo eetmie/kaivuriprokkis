@@ -1,4 +1,4 @@
-"""Optional LeRobot 0.5.1 round trip of a recorded fixture (requires export environment).
+"""Optional LeRobot 0.6.1 round trip of a recorded fixture (requires export environment).
 
 python tests/recorder_export.py /path/to/native-session
 """
@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='kvr-export-roundtrip-') as temp:
             width = 6 if session['enable_tracks'] else 4
             np.testing.assert_allclose(frame['action'].numpy(), row['status']['applied_action'][:width], atol=1e-7)
             for name, prefix in (('fk_joint_xyz_m', 'fk'), ('fk_upper_quat_wxyz', 'fk'), ('imu_corrected_quat_wxyz', 'imu')):
-                np.testing.assert_allclose(frame[f'observation.{prefix}.{name}'].numpy(),
+                np.testing.assert_allclose(frame[f'feedback.{prefix}.{name}'].numpy(),
                                            np.asarray(row['status'][name]).reshape(-1), atol=1e-7)
     assert (root / 'native/episode-000000/samples.jsonl').read_bytes() == (episodes[0] / 'samples.jsonl').read_bytes()
-print(f'LeRobot 0.5.1 round trip passed: {len(rows)} frames; both videos, timestamps, applied actions and FK/IMU')
+print(f'LeRobot round trip passed: {len(rows)} frames; both videos, timestamps, applied actions and FK/IMU')

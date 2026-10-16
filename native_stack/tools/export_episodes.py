@@ -1,7 +1,14 @@
-"""Convert committed native Y8 episodes to LeRobot 0.5.1/v3, outside capture/control.
+"""Convert committed native Y8 episodes to a LeRobot v3 dataset, outside capture/control.
 
-Keeps original high-rate samples, camera metadata and calibration snapshots beside
-LeRobot's nominal FPS timeline. Refuses interrupted takes and inaccurate rates.
+Written with LeRobot 0.6.1 (0.5.1 also works). One or more sessions go into one dataset;
+each session keeps its own task. Keeps original high-rate samples, camera metadata and
+calibration snapshots beside LeRobot's nominal FPS timeline. Refuses interrupted takes
+and inaccurate rates.
+
+Only `observation.state` and `observation.images.*` are policy inputs. FK and IMU go
+under `feedback.*`, like the Python recorder's `feedback.imu_quaternion`: LeRobot types
+every other `observation.*` key as a STATE input feature too, so a policy would silently
+pick them up. Build a state from them on purpose instead.
 """
 import argparse
 import hashlib
@@ -28,6 +35,10 @@ STATUS_INT_FIELDS = ('imu_sequence', 'imu_device_us', 'imu_host_monotonic_ns',
                      'host_monotonic_ns', 'ticks', 'applied_command_sequence',
                      'applied_host_monotonic_ns')
 JOINTS = {'slew': 0, 'lift': 1, 'tilt': 2, 'scoop': 3}
+
+
+def feedback_key(field):
+    return f"feedback.{'imu' if field.startswith('imu_') else 'fk'}.{field}"
 
 
 def frame_rows(episode):
@@ -100,8 +111,7 @@ def build_features(shapes, tracks=False, state_joints=('lift', 'tilt', 'scoop'))
         for field in ('age_s', 'sdk_timestamp_ms'):
             features[f'clock.{key}.{field}'] = {'dtype': 'float64', 'shape': (1,), 'names': None}
     for key, size in POSE_FIELDS.items():
-        prefix = 'imu' if key.startswith('imu_') else 'fk'
-        features[f'observation.{prefix}.{key}'] = {'dtype': 'float32', 'shape': (size,), 'names': None}
+        features[feedback_key(key)] = {'dtype': 'float32', 'shape': (size,), 'names': None}
     for key in STATUS_INT_FIELDS:
         features[f'clock.{key}'] = {'dtype': 'int64', 'shape': (1,), 'names': None}
     for key in ('sample_ns', 'episode_ns', 'requested_sequence'):
@@ -132,8 +142,7 @@ def convert_frame(row, pixels, session, state_joints):
         scalar(f'clock.{key}.sdk_timestamp_ms', m['sdk_timestamp_ms'], np.float64)
         scalar(f'clock.{key}.age_s', (row['sample_ns'] - m['host_monotonic_ns']) / 1e9, np.float64)
     for key in POSE_FIELDS:
-        prefix = 'imu' if key.startswith('imu_') else 'fk'
-        frame[f'observation.{prefix}.{key}'] = np.asarray(s[key], dtype=np.float32).reshape(-1)
+        frame[feedback_key(key)] = np.asarray(s[key], dtype=np.float32).reshape(-1)
     for key in STATUS_INT_FIELDS:
         scalar(f'clock.{key}', s[key], np.int64)
     for key in ('sample_ns', 'episode_ns', 'requested_sequence'):
@@ -148,45 +157,72 @@ def convert_frame(row, pixels, session, state_joints):
     return frame
 
 
-def export(session_path, root, repo_id, state_joints=('lift', 'tilt', 'scoop')):
-    if root.exists():
-        raise ValueError(f'dataset root already exists: {root}; choose a new destination')
+def load_session(session_path):
     session = json.loads((session_path / 'session.json').read_text())
     if session['format'] != 'kaivuri-native-episode-v1':
-        raise ValueError('unsupported native episode format')
+        raise ValueError(f'{session_path}: unsupported native episode format')
     episodes = sorted(session_path.glob('episode-*.ready'))
     if not episodes:
-        raise ValueError('no committed episodes; .partial takes are intentionally excluded')
-    checked = [validate_episode(ep, session) for ep in episodes]
-    if any(item[0] != checked[0][0] for item in checked):
+        raise ValueError(f'{session_path}: no committed episodes; .partial takes are intentionally excluded')
+    return session, episodes
+
+
+def create_dataset(repo_id, root, fps, features):
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    common = dict(repo_id=repo_id, root=root, fps=fps, features=features,
+                  robot_type='masi_excavator_native', use_videos=True, streaming_encoding=True)
+    try:  # LeRobot 0.6: the encoder is a config object
+        from lerobot.configs.video import RGBEncoderConfig
+    except ImportError:  # LeRobot 0.5
+        return LeRobotDataset.create(**common, vcodec='h264')
+    return LeRobotDataset.create(**common, rgb_encoder=RGBEncoderConfig(vcodec='h264'))
+
+
+def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop')):
+    if isinstance(session_paths, (str, Path)):
+        session_paths = [session_paths]
+    session_paths = [Path(p) for p in session_paths]
+    if root.exists():
+        raise ValueError(f'dataset root already exists: {root}; choose a new destination')
+    sessions = [load_session(p) for p in session_paths]
+    first = sessions[0][0]
+    for path, (session, _) in zip(session_paths, sessions):
+        if session['fps'] != first['fps'] or session['enable_tracks'] != first['enable_tracks']:
+            raise ValueError(f'{path}: fps/track layout differs from {session_paths[0]}')
+    checked = [[validate_episode(ep, session) for ep in episodes] for session, episodes in sessions]
+    shapes = {tuple(item[0]) for group in checked for item in group}
+    if len(shapes) != 1:
         raise ValueError('camera shapes differ between episodes')
     # Heavy dependencies are imported only after all takes pass validation.
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    features = build_features(checked[0][0], session['enable_tracks'], state_joints)
-    dataset = LeRobotDataset.create(repo_id=repo_id, root=root, fps=session['fps'],
-                                    features=features, robot_type='masi_excavator_native',
-                                    use_videos=True, vcodec='h264', streaming_encoding=True)
+    features = build_features(checked[0][0][0], first['enable_tracks'], state_joints)
+    dataset = create_dataset(repo_id, root, first['fps'], features)
+    index = 0
     try:
         native = root / 'native'
         native.mkdir()
-        shutil.copy2(session_path / 'session.json', native / 'session.json')
-        if (session_path / 'provenance').exists():
-            shutil.copytree(session_path / 'provenance', native / 'provenance')
-        if (session_path / 'control-timing.csv').exists():
-            shutil.copy2(session_path / 'control-timing.csv', native / 'control-timing.csv')
-        for index, (episode, (_, count, hz)) in enumerate(zip(episodes, checked)):
-            with (episode / 'cam1.y8').open('rb') as c1, (episode / 'cam2.y8').open('rb') as c2:
-                for row in frame_rows(episode):
-                    pixels = [stream.read(row[key]['pixel_bytes']) for stream, key in zip((c1, c2), ('cam1', 'cam2'))]
-                    dataset.add_frame(convert_frame(row, pixels, session, state_joints))
-            dataset.save_episode()
-            target = native / f'episode-{index:06d}'
-            target.mkdir()
-            for name in ('samples.jsonl', 'episode.json'):
-                shutil.copy2(episode / name, target / name)
-            (target / 'source.json').write_text(json.dumps({'source': str(episode.resolve()), 'frames': count,
-                'achieved_hz': hz, 'samples_sha256': hashlib.sha256((episode/'samples.jsonl').read_bytes()).hexdigest()}) + '\n')
-            print(f'Exported episode {index}: {count} frames, {hz:.3f} Hz')
+        for number, (session_path, (session, episodes), group) in enumerate(zip(session_paths, sessions, checked)):
+            target_session = native / f'session-{number:03d}'
+            target_session.mkdir()
+            shutil.copy2(session_path / 'session.json', target_session / 'session.json')
+            if (session_path / 'provenance').exists():
+                shutil.copytree(session_path / 'provenance', target_session / 'provenance')
+            if (session_path / 'control-timing.csv').exists():
+                shutil.copy2(session_path / 'control-timing.csv', target_session / 'control-timing.csv')
+            for episode, (_, count, hz) in zip(episodes, group):
+                with (episode / 'cam1.y8').open('rb') as c1, (episode / 'cam2.y8').open('rb') as c2:
+                    for row in frame_rows(episode):
+                        pixels = [stream.read(row[key]['pixel_bytes']) for stream, key in zip((c1, c2), ('cam1', 'cam2'))]
+                        dataset.add_frame(convert_frame(row, pixels, session, state_joints))
+                dataset.save_episode()
+                target = native / f'episode-{index:06d}'
+                target.mkdir()
+                for name in ('samples.jsonl', 'episode.json'):
+                    shutil.copy2(episode / name, target / name)
+                (target / 'source.json').write_text(json.dumps({'source': str(episode.resolve()), 'session': number,
+                    'task': session['task'], 'frames': count, 'achieved_hz': hz,
+                    'samples_sha256': hashlib.sha256((episode/'samples.jsonl').read_bytes()).hexdigest()}) + '\n')
+                print(f'Exported episode {index}: {count} frames, {hz:.3f} Hz, task {session["task"]!r}')
+                index += 1
     finally:
         dataset.finalize()
     (root / 'native' / 'EXPORT_COMPLETE').write_text('kaivuri-native-episode-v1\n')
@@ -195,7 +231,7 @@ def export(session_path, root, repo_id, state_joints=('lift', 'tilt', 'scoop')):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('session', type=Path)
+    p.add_argument('session', type=Path, nargs='+', help='one or more native sessions, in episode order')
     p.add_argument('--root', type=Path)
     p.add_argument('--repo-id')
     p.add_argument('--state-joints', default='lift,tilt,scoop')
@@ -205,13 +241,11 @@ def main():
     if not joints or len(set(joints)) != len(joints) or any(j not in JOINTS for j in joints):
         p.error('--state-joints must be a unique subset of slew,lift,tilt,scoop')
     if args.validate_only:
-        session = json.loads((args.session / 'session.json').read_text())
-        episodes = sorted(args.session.glob('episode-*.ready'))
-        if not episodes:
-            p.error('no committed episodes')
-        for ep in episodes:
-            shape, count, hz = validate_episode(ep, session)
-            print(f'{ep.name}: {count} frames, {hz:.3f} Hz, shapes={shape}')
+        for path in args.session:
+            session, episodes = load_session(path)
+            for ep in episodes:
+                shape, count, hz = validate_episode(ep, session)
+                print(f'{ep.name}: {count} frames, {hz:.3f} Hz, shapes={shape}')
     else:
         if not args.root or not args.repo_id:
             p.error('--root and --repo-id required for export')

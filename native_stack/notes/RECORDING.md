@@ -150,14 +150,19 @@ request. Dither/deadband/ramp effects remain visible in `diagnostics.pulses_us`.
 
 ## Export
 
-Use an existing environment with `lerobot==0.5.1`, or install that version in a
-separate export environment. The recording runtime does not need it. On a
-workstation, copy the native session first, keeping its layout intact.
+Use an environment with `lerobot[dataset]==0.6.1` (0.5.1 also works; both write
+dataset format v3.0). On the Jetson it is `~/kaivuriprokkis/.venv-lerobot061`. The
+recording runtime does not need it. On a workstation, copy the native sessions
+first, keeping their layout intact.
 
 ```bash
-python native_stack/tools/export_episodes.py /path/to/native-session \
+.venv-lerobot061/bin/python native_stack/tools/export_episodes.py \
+  /path/to/session-a /path/to/session-b \
   --root /path/to/new-lerobot-dataset --repo-id masi/excavator_dual_ir_v1
 ```
+
+Several sessions go into one dataset in the order given, each episode keeping its
+session's task. Sessions must share FPS, track layout and camera resolution.
 
 Exporter validates every committed take **before creating** a dataset: counts,
 packed pixel sizes, consistent resolution, healthy armed FK, applied action
@@ -171,12 +176,17 @@ State defaults to `[lift,tilt,scoop]` in degrees, preserving the legacy conventi
 and avoiding unanchored slew yaw. Use `--state-joints slew,lift,tilt,scoop` to include
 it. FK stays in meters/radians and `[w,x,y,z]`; IMU gyro stays degrees/s and
 acceleration g. Matrix fields flatten joint-major in `[slew,boom,arm,bucket]` order.
-All FK/IMU features are exported under `observation.fk.*` and `observation.imu.*`.
+All FK/IMU features are exported under `feedback.fk.*` and `feedback.imu.*` (like the Python
+recorder's `feedback.imu_quaternion`), not
+`observation.*`: LeRobot types every non-image `observation.*` key as a STATE input
+feature, so policies would pick them up silently. Derive a policy state from them
+deliberately.
 Camera/IMU host/device times remain separate `clock.*` columns. Do not mix them as
 a common exposure clock without calibration.
 
 The output is LeRobot v3 Parquet + two H.264 videos, plus the complete 100 Hz JSONL
-and provenance under `native/`. `native/EXPORT_COMPLETE` is written only after
-successful dataset finalization. Export currently creates a fresh dataset per
-session; it does not append to an existing dataset. Keep the original IR+RGB
+and provenance under `native/` (`session-NNN/` per source session, `episode-NNNNNN/` per
+episode). `native/EXPORT_COMPLETE` is written only after successful dataset
+finalization. Export always creates a fresh dataset; it does not append to an
+existing one. Keep the original IR+RGB
 Python recorder for old datasets and workflows that need its resume behavior.

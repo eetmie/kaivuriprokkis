@@ -18,7 +18,10 @@ pwm_frequency: 100
 # the threshold goes to center, and what is left is stretched so 1.0 still
 # reaches pulse_max. Nothing at the top of the range is lost.
 #
-# slew/boom/arm/bucket run 2.0 (= |v| < 0.02 -> center) because ANY non-zero
+# All channels run 0.0 since 2026-10-16. The four VLA channels previously ran
+# 2.0; the reasoning below is kept for when a policy needs the gate again.
+#
+# slew/boom/arm/bucket ran 2.0 (= |v| < 0.02 -> center) because ANY non-zero
 # command jumps the spool straight to the deadband edge -- 130-160 us on the
 # working joints, which on arm and bucket is more than the 115 us of pulse
 # width covering the entire rest of the command range. A command dithering
@@ -94,7 +97,7 @@ CHANNEL_CONFIGS:
         direction: -1  # was 1 on Jetson
         pulse_min: 1560 #1550
         pulse_max: 1715 # 1725
-        deadzone: 2.0      # % — see the header note on the gate
+        deadzone: 0.0      # % — see the header note on the gate
         deadband_us_pos: 44.0 #44 CW
         deadband_us_neg: 45.0 # 45
         dither_enable: False
@@ -115,7 +118,7 @@ CHANNEL_CONFIGS:
         direction: -1  # -1
         pulse_min: 1330
         pulse_max: 1980
-        deadzone: 2.0      # % — see the header note on the gate
+        deadzone: 0.0      # % — see the header note on the gate
         deadband_us_pos: 130.0 #140
         deadband_us_neg: 150.0 #150
         dither_enable: True
@@ -136,7 +139,7 @@ CHANNEL_CONFIGS:
         direction: -1 #-1
         pulse_min: 1300
         pulse_max: 1850
-        deadzone: 2.0      # % — see the header note on the gate
+        deadzone: 0.0      # % — see the header note on the gate
         deadband_us_pos: 160.0 #160
         deadband_us_neg: 150.0
         dither_enable: True
@@ -157,7 +160,7 @@ CHANNEL_CONFIGS:
         direction: -1
         pulse_min: 1330
         pulse_max: 1880
-        deadzone: 2.0      # % — see the header note on the gate
+        deadzone: 0.0      # % — see the header note on the gate
         deadband_us_pos: 160.0 #160
         deadband_us_neg: 150.0 #160
         dither_enable: True

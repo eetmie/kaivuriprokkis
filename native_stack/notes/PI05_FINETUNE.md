@@ -15,7 +15,7 @@ runtime code here.
 | Test dataset (v3 + v2.1) | Jetson `~/kaivuriprokkis/data_collection/lerobot_datasets/masi_native_test_{v3,v21}`: 8 episodes, 4,606 frame pairs, 2 tasks, virtual pad, live PWM into unpowered servos |
 | Jetson envs | `~/kaivuriprokkis/.venv-lerobot061` (lerobot 0.6.1 export); `~/venvs/openpi-lerobot` (lerobot 0cf8648 + datasets 3.6.0 + torch 2.7.1 + av 13.1.0, OpenPI loader test) |
 | OpenPI pi0.5 export reference | jetson-orin-nano-vla `export/pi05/` (OpenPI commit c23745b, NGC container) — reference only |
-| C++ runtime | `native_stack/src/inference_pi05.cpp` (OpenPI pi05_libero contract today) |
+| C++ runtime | `native_stack/src/inference_pi05.cpp` + `pi05_policy.cpp` (pi05_libero and pi05_openpi_state) |
 
 ## Dataset format: decided
 
@@ -94,15 +94,59 @@ and the training dataset:
 The camera/profile checks are new compared to the Python stack: the native recorder's
 `native/` provenance makes them possible.
 
-## Runtime work here afterwards
+## Runtime (branch `feat/pi05-finetune-runtime`)
 
-- `kaivuri-inference`: accept the fine-tune bundle (drop the `pi05_libero` check at
-  `inference_pi05.cpp:324`), read the contract above, feed live state from `kaivuri-control`;
-  with `discrete_state_input=True` (the decided contract), assemble the prompt per step.
-- A policy → controller producer: send chunks through the `PROTOCOL.md` socket with the
-  oldest observation time, delay-aware chunk start, and lease renewal that never refreshes
-  observation age.
-- Benchmark recording + inference + control together.
+`kaivuri-inference` accepts `pi05_openpi_state` bundles (`vla-onnx/pi05/BUNDLE.md`) next to
+`pi05_libero`. CUDA-free parts are in `src/pi05_policy.cpp` (`pi05-tests` in CTest).
+
+- **Cache**: `candidate.json` = AOT attention cache (LIBERO); otherwise the native template
+  cache, `<kind>.engine` + `<kind>.onnx.sha256` (ONNX hash checked). The Euler `op_axpy_*`
+  engine is optional: without one it is built in-process; its constant is checked numerically.
+- **Layout**: `language_residual: float32` (FP32 prefix, prompt rows rounded to FP16 then
+  widened) and a K/V-only last `language_kv` layer.
+- **Per step**: `angles_rad` from a status-only control connection (IMU healthy, FK valid,
+  IMU sample <= 50 ms old) -> float32 degrees -> OpenPI float64 quantile norm -> bins ->
+  bundle pieces -> `set_prompt`. Rows upload every step, masks/RoPE only when the token count
+  changes, CUDA graph captured once. Host cost on GB10: ~1.1 ms with a length change, a
+  few microseconds when the prompt is unchanged. Observation time = oldest of both camera
+  arrivals and the IMU sample.
+- **Preprocessing**: OpenPI's `ResizeImages` is Pillow BILINEAR (`openpi_client`), not the JAX
+  resize the LIBERO path emulates; `pil_bilinear` reproduces Pillow's fixed-point taps exactly.
+- **Actions**: first `robot_action_dim` columns, `(x + 1) / 2` in float32 then float64 stats
+  (numpy promotion), `[slew, lift, tilt, scoop]` = controller order.
+- **Parity gate** (`prepare_pi05.py` maps the fixture npz): prompt from `raw_state` == the
+  fixture tokens, normalized state and unnormalized FP16 reference bit-exact, Pillow
+  preprocessing bit-exact (and gray == replicated RGB), full chunk vs `fp16_actions_normalized`
+  cosine >= 0.9998 and max |diff| <= 0.01 (override `--parity-cosine/--parity-max-abs`).
+  smoke9 on GB10 (TRT 10.14, native): worst 0.99990 / 0.0070; graph == eager.
+- **Cameras**: frame files must be the bundle's `kaivuri.cameras` in slot order; rotation
+  comes from `kaivuri-camera --rotate-180` (`bench_pi05.py --rotate-180`), not checkable here.
+
+### Driving (`--drive`)
+
+`pi05::Producer` owns its own control connection on its own thread. Without `--drive` nothing
+is sent (`bench_pi05.py` never passes it).
+
+- Refuses to start unless control is disarmed; live PWM needs `--allow-live`; `--enable-slew`
+  / `--enable-tracks` need the same daemon flag, otherwise those columns are sent as 0.
+  `--pump` is the only pump permission.
+- Arms after warm-up (centered hold, renewed) once the worst warm-up observation-to-plan
+  time plus the start period fits inside both the chunk length and the observation limit.
+- Each chunk: `t0` = observation time (+ `--action-offset-ms`), so the controller starts at
+  the row matching its clock and the inference delay is skipped; replaces the previous plan;
+  only newer observations are accepted. Values beyond 1 + `--action-tolerance` (0.05) or
+  non-finite stop the run; within it they are clamped.
+- Renewal every 100 ms with the same rows, `t0` and observation time. Stops (disarms) at
+  `--max-observation-age-ms` (1400, daemon faults at 1500), on chunk exhaustion, on any
+  controller state other than armed, on any inference error. Never re-arms.
+- Timing: at 2 Hz pacing a chunk must last until the next one lands, about one period plus
+  one latency (~1.0 s at 500 ms). 50 rows at 30 fps last 1.63 s from the observation; a shorter
+  export must keep `(rows - 1) / fps` above that, which the arming check enforces.
+
+Dry end-to-end on the Spark (simulated-IMU control, replayed fixture frames, GB10): 60 plans at
+2 Hz (start interval 500.05-500.30 ms), 239 renewals, max send gap 107 ms, armed 30 s, clean
+disarm. Simulated IMU angles are out of distribution (all bins -1); smoke9 then outputs up to
+1.06 and stops at the default tolerance.
 
 ## Before real data collection (open from `TODO.md`)
 

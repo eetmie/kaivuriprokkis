@@ -8,7 +8,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | --- | --- |
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory |
-| `kaivuri-inference` | Optional OpenPI pi0.5 LIBERO TensorRT + AOT CUDA graph; five-fixture parity gate; two fresh IR inputs; normalized actions recorded without actuator IPC |
+| `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `tools/client.py` | Status, disarm, emergency stop, bounded bench exercise; reusable IPC client for later TRT integration |
 | `tools/frame_reader.py` | Coherent Y8 snapshot through the native C ABI; rejects stale frames |

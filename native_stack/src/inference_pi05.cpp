@@ -1,7 +1,10 @@
-// OpenPI pi05_libero bench runtime. The device chain follows the validated
-// jetson-orin-nano-vla/bench/vendor/pi05_trt.py implementation.
-// This executable has no actuator IPC or I2C path: model actions are recorded only.
+// OpenPI pi0.5 TensorRT runtime: the pi05_libero bench bundle and the fine-tuned
+// pi05_openpi_state excavator bundle (joint angles in a per-step prompt). The device chain
+// follows the validated jetson-orin-nano-vla/bench/vendor/pi05_trt.py implementation.
+// Without --drive, model actions are recorded only. With --drive (pi05_openpi_state only),
+// chunks go to kaivuri-control as drive plans through pi05::Producer; no I2C path here.
 #include "kaivuri/frame_store.hpp"
+#include "kaivuri/pi05_policy.hpp"
 #include <NvInfer.h>
 #include <NvInferPlugin.h>
 #include <algorithm>
@@ -23,6 +26,7 @@
 #include <openssl/evp.h>
 #include <random>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -109,7 +113,7 @@ struct Npy {
         dtype = match[1];
         size_t item = dtype == "<f2"                       ? 2
                       : dtype == "<f4"                     ? 4
-                      : dtype == "<i8"                     ? 8
+                      : (dtype == "<i8" || dtype == "<f8") ? 8
                       : (dtype == "|b1" || dtype == "|u1") ? 1
                                                            : 0;
         require(item != 0, "unsupported NPY dtype " + dtype);
@@ -218,12 +222,14 @@ class Pi05 {
         *p_sin{}, *expert[2]{}, *s_mask{}, *s_cos{}, *s_sin{}, *actions[2]{}, *velocity{},
         *styles{};
     std::vector<std::pair<Buffer *, Buffer *>> kv;
-    int vision_layers, language_layers, action_layers, horizon, width, steps, prefix_tokens;
+    std::map<std::string, std::string> kinds; // component label -> template kind
+    int vision_layers = 0, language_layers = 0, action_layers = 0, horizon, width, steps,
+        prefix_tokens, valid_tokens = -1;
     int style_sites;
     size_t style_row_bytes = 0, prompt_bytes = 0;
     std::vector<int64_t> current_tokens;
-    bool graph_enabled, capturing = false;
-    std::string euler;
+    bool graph_enabled, capturing = false, primed = false, native = false;
+    std::string euler, policy;
     Buffer *make(std::vector<int64_t> shape, DataType type) {
         storage.push_back(std::make_unique<Buffer>(std::move(shape), type));
         return storage.back().get();
@@ -281,14 +287,23 @@ class Pi05 {
         }
         copy(offset(prefix[0], 2 * features->bytes), rows->ptr, prompt_bytes);
         record(1);
-        for (int i = 0; i < language_layers; ++i)
-            run(layer("language", i), {{"hidden", prefix[i % 2]->ptr},
-                                       {"output", prefix[1 - i % 2]->ptr},
-                                       {"mask", p_mask->ptr},
-                                       {"cos", p_cos->ptr},
-                                       {"sin", p_sin->ptr},
-                                       {"key", kv[i].first->ptr},
-                                       {"value", kv[i].second->ptr}});
+        for (int i = 0; i < language_layers; ++i) {
+            auto name = layer("language", i);
+            if (kinds.at(name) == "language_kv") // last layer: K/V only, no attention/MLP
+                run(name, {{"hidden", prefix[i % 2]->ptr},
+                           {"cos", p_cos->ptr},
+                           {"sin", p_sin->ptr},
+                           {"key", kv[i].first->ptr},
+                           {"value", kv[i].second->ptr}});
+            else
+                run(name, {{"hidden", prefix[i % 2]->ptr},
+                           {"output", prefix[1 - i % 2]->ptr},
+                           {"mask", p_mask->ptr},
+                           {"cos", p_cos->ptr},
+                           {"sin", p_sin->ptr},
+                           {"key", kv[i].first->ptr},
+                           {"value", kv[i].second->ptr}});
+        }
         record(2);
         for (int s = 0; s < steps; ++s) {
             run("action_input", {{"actions", actions[s % 2]->ptr}, {"hidden", expert[0]->ptr}});
@@ -315,48 +330,110 @@ class Pi05 {
         record(3);
     }
 
+    // Euler update out = a + c * b in FP32, as bench/vendor/trt_ops.py build_op("axpy").
+    std::vector<char> build_axpy(const Dims &shape, float c) {
+        std::cerr << "[load] building the Euler axpy op (no cached op engine)\n";
+        std::unique_ptr<IBuilder> builder(createInferBuilder(logger));
+        require(bool(builder), "TensorRT builder");
+        std::unique_ptr<INetworkDefinition> net(
+            builder->createNetworkV2(1U << int(NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)));
+        Dims ones = shape;
+        for (int i = 0; i < ones.nbDims; ++i)
+            ones.d[i] = 1;
+        auto a = net->addInput("a", DataType::kFLOAT, shape);
+        auto b = net->addInput("b", DataType::kFLOAT, shape);
+        auto k = net->addConstant(ones, Weights{DataType::kFLOAT, &c, 1});
+        auto cb = net->addElementWise(*b, *k->getOutput(0), ElementWiseOperation::kPROD);
+        auto out = net->addElementWise(*a, *cb->getOutput(0), ElementWiseOperation::kSUM);
+        out->getOutput(0)->setName("out");
+        net->markOutput(*out->getOutput(0));
+        std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());
+        std::unique_ptr<IHostMemory> plan(builder->buildSerializedNetwork(*net, *config));
+        require(plan && plan->size(), "axpy op build failed");
+        auto bytes = static_cast<const char *>(plan->data());
+        return std::vector<char>(bytes, bytes + plan->size());
+    }
+
   public:
     explicit Pi05(const fs::path &bundle, const fs::path &cache, bool use_graph)
         : info(YAML::LoadFile((bundle / "bundle.json").string())),
           embedding(bundle / "embedding_fp16.npy", info["embedding_sha256"].as<std::string>()),
           rope_cos(bundle / "rope_cos_fp16.npy"), rope_sin(bundle / "rope_sin_fp16.npy"),
-          conditioning(bundle / "conditioning_10step_fp16.npy"), graph_enabled(use_graph) {
-        require(info["complete"].as<bool>() && info["policy"].as<std::string>() == "pi05_libero" &&
-                    info["valid_camera_compute_only"].as<bool>(),
-                "requires compact OpenPI pi05_libero bundle");
-        vision_layers = info["vision_layers"].as<int>();
-        language_layers = info["language_layers"].as<int>();
-        action_layers = info["action_layers"].as<int>();
+          conditioning(bundle / (info["conditioning"]
+                                     ? info["conditioning"].as<std::string>()
+                                     : std::string("conditioning_10step_fp16.npy"))),
+          graph_enabled(use_graph) {
+        policy = info["policy"].as<std::string>();
+        require(info["complete"].as<bool>() &&
+                    (policy == "pi05_libero" || policy == "pi05_openpi_state") &&
+                    ((info["valid_camera_compute_only"] &&
+                      info["valid_camera_compute_only"].as<bool>()) ||
+                     (info["layout"] && info["layout"].as<std::string>() == "compact")),
+                "requires a compact OpenPI pi05_libero or pi05_openpi_state bundle");
+        const std::string residual =
+            info["language_residual"] ? info["language_residual"].as<std::string>() : "float16";
+        require(residual == "float16" || residual == "float32", "language_residual");
         horizon = info["action_horizon"].as<int>();
         width = info["action_dim"].as<int>();
         steps = info["num_steps"].as<int>();
         prefix_tokens = info["prefix_tokens"].as<int>();
-        require(info["valid_cameras"].as<int>() == 2 && prefix_tokens >= 512 &&
+        std::set<std::string> needed;
+        for (auto component : info["components"]) {
+            auto label = component["label"].as<std::string>(),
+                 kind = component["kind"].as<std::string>();
+            kinds[label] = kind;
+            needed.insert(kind);
+            vision_layers += kind == "vision";
+            action_layers += kind == "action";
+            language_layers += label.rfind("language_", 0) == 0;
+        }
+        for (int i = 0; i < language_layers; ++i) {
+            auto kind = kinds.count(layer("language", i)) ? kinds.at(layer("language", i)) : "";
+            require(kind == "language" || (kind == "language_kv" && i == language_layers - 1),
+                    "language layers must be language_00.. with an optional K/V-only last layer");
+        }
+        require(info["valid_cameras"].as<int>() == 2 && prefix_tokens >= 512 && vision_layers > 0 &&
                     action_layers == language_layers && steps > 0 && horizon > 0 && width > 0,
                 "unsupported bundle dimensions");
-        auto candidate = YAML::LoadFile((cache / "candidate.json").string());
-        require(fs::canonical(candidate["bundle"].as<std::string>()) == fs::canonical(bundle),
-                "engine cache belongs to another bundle");
-        for (auto entry : candidate["template_sha256"])
-            require(hash_file(bundle / "templates" / entry.first.as<std::string>()) ==
-                        entry.second.as<std::string>(),
-                    "template checksum mismatch");
+        std::map<std::string, std::vector<char>> plans;
+        // AOT cache (candidate.json, attention plugin compiled into the action plan), or the
+        // native template cache: one <kind>.engine per kind, keyed by <kind>.onnx.sha256.
+        native = !fs::exists(cache / "candidate.json");
+        if (!native) {
+            auto candidate = YAML::LoadFile((cache / "candidate.json").string());
+            require(fs::canonical(candidate["bundle"].as<std::string>()) == fs::canonical(bundle),
+                    "engine cache belongs to another bundle");
+            for (auto entry : candidate["template_sha256"])
+                require(hash_file(bundle / "templates" / entry.first.as<std::string>()) ==
+                            entry.second.as<std::string>(),
+                        "template checksum mismatch");
+            for (auto entry : candidate["engine_sha256"]) {
+                auto name = entry.first.as<std::string>();
+                auto bytes = read_file(cache / name);
+                require(hash_bytes(bytes.data(), bytes.size()) == entry.second.as<std::string>(),
+                        "engine checksum mismatch");
+                plans[fs::path(name).stem().string()] = std::move(bytes);
+            }
+        } else
+            for (auto &kind : needed) {
+                std::ifstream key(cache / (kind + ".onnx.sha256"));
+                std::string onnx_sha;
+                require(bool(key >> onnx_sha), "native cache lacks " + kind + ".onnx.sha256");
+                require(onnx_sha == hash_file(bundle / "templates" / (kind + ".onnx")),
+                        "native " + kind + " plan was built from another template");
+                plans[kind] = read_file(cache / (kind + ".engine"));
+            }
+        std::cerr << "[load] " << (native ? "native TensorRT" : "AOT attention") << " cache, "
+                  << residual << " language residual\n";
         require(initLibNvInferPlugins(&logger, ""), "plugin registration failed");
         runtime.reset(createInferRuntime(logger));
         require(bool(runtime), "TensorRT runtime");
         runtime->setGpuAllocator(&allocator);
-        std::map<std::string, std::vector<char>> plans;
-        for (auto entry : candidate["engine_sha256"]) {
-            auto name = entry.first.as<std::string>();
-            auto bytes = read_file(cache / name);
-            require(hash_bytes(bytes.data(), bytes.size()) == entry.second.as<std::string>(),
-                    "engine checksum mismatch");
-            plans[fs::path(name).stem().string()] = std::move(bytes);
-        }
         size_t scratch_bytes = 0;
         for (auto component : info["components"]) {
             auto name = component["label"].as<std::string>(),
                  kind = component["kind"].as<std::string>();
+            require(plans.count(kind), "cache lacks the " + kind + " plan");
             auto &plan = plans.at(kind);
             auto &item = engines[name];
             item.engine.reset(runtime->deserializeCudaEngine(plan.data(), plan.size()));
@@ -391,19 +468,31 @@ class Pi05 {
             std::cerr << "[load] " << name << '\n';
         }
         plans.clear();
+        // The cached Euler op must match this bundle's action shape; its constant is
+        // checked numerically below. Without one, it is built here (seconds, FP32).
+        const auto action_shape = engines.at("action_input").engine->getTensorShape("actions");
+        const float euler_dt = float(-1.0 / steps);
+        std::vector<std::pair<std::string, std::vector<char>>> ops;
         for (auto &path : fs::directory_iterator(cache))
             if (path.path().filename().string().find("op_axpy_") == 0 &&
-                path.path().extension() == ".engine") {
-                require(euler.empty(), "ambiguous Euler op cache");
-                euler = path.path().stem().string();
-                auto bytes = read_file(path.path());
-                engines[euler].engine.reset(
-                    runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
-                require(bool(engines[euler].engine), "cannot deserialize Euler op");
-                scratch_bytes =
-                    std::max(scratch_bytes, size_t(engines[euler].engine->getDeviceMemorySizeV2()));
-            }
-        require(!euler.empty(), "missing cached Euler op");
+                path.path().extension() == ".engine")
+                ops.emplace_back(path.path().stem().string(), read_file(path.path()));
+        if (ops.empty())
+            ops.emplace_back("op_axpy_built", build_axpy(action_shape, euler_dt));
+        for (auto &op : ops) {
+            std::unique_ptr<ICudaEngine> engine(
+                runtime->deserializeCudaEngine(op.second.data(), op.second.size()));
+            require(bool(engine), "cannot deserialize Euler op " + op.first);
+            auto shape = engine->getTensorShape("a");
+            if (shape.nbDims != action_shape.nbDims ||
+                !std::equal(shape.d, shape.d + shape.nbDims, action_shape.d))
+                continue;
+            require(euler.empty(), "ambiguous Euler op cache");
+            euler = op.first;
+            scratch_bytes = std::max(scratch_bytes, size_t(engine->getDeviceMemorySizeV2()));
+            engines[euler].engine = std::move(engine);
+        }
+        require(!euler.empty(), "no cached Euler op matches the action shape");
         scratch = std::make_unique<Buffer>(
             std::vector<int64_t>{int64_t(std::max(size_t(1), scratch_bytes))}, DataType::kUINT8);
         for (auto &entry : engines) {
@@ -422,12 +511,17 @@ class Pi05 {
             expert[i] = for_tensor("action_00", "hidden");
             actions[i] = for_tensor("action_input", "actions");
         }
+        features = for_tensor("vision_tail", "output");
+        const auto prefix_type = residual == "float32" ? DataType::kFLOAT : DataType::kHALF;
         require(images[0]->type == DataType::kHALF &&
                     images[0]->shape == std::vector<int64_t>({1, 3, 224, 224}) &&
-                    prefix[0]->type == DataType::kHALF,
-                "unsupported image/prefix types");
-        features = for_tensor("vision_tail", "output");
-        rows = make({1, prefix_tokens, prefix[0]->shape.back()}, DataType::kHALF);
+                    prefix[0]->type == prefix_type && features->type == prefix_type,
+                "image/prefix types do not match the bundle's language_residual");
+        // Prompt rows only; the zero tail stays zero. Copied into the prefix before every pass.
+        rows = make({1, prefix_tokens - 512, prefix[0]->shape.back()}, prefix_type);
+        prompt_bytes = rows->bytes;
+        require(2 * features->bytes + rows->bytes == prefix[0]->bytes,
+                "prefix is not two 256-token cameras plus the prompt capacity");
         p_mask = for_tensor("language_00", "mask");
         p_cos = for_tensor("language_00", "cos");
         p_sin = for_tensor("language_00", "sin");
@@ -437,6 +531,9 @@ class Pi05 {
         for (int i = 0; i < language_layers; ++i)
             kv.emplace_back(for_tensor("language_00", "key"), for_tensor("language_00", "value"));
         velocity = for_tensor("action_output", "velocity");
+        require(actions[0]->type == DataType::kFLOAT && velocity->type == DataType::kFLOAT &&
+                    velocity->bytes == actions[0]->bytes,
+                "action/velocity buffers");
         require(conditioning.shape.size() == 3 && conditioning.shape[0] == steps &&
                     conditioning.shape[1] == 2 * action_layers + 1 && conditioning.dtype == "<f2",
                 "conditioning contract");
@@ -444,7 +541,19 @@ class Pi05 {
         style_row_bytes = conditioning.shape[2] * 2;
         styles = make(conditioning.shape, DataType::kHALF);
         upload(styles, conditioning.data, conditioning.bytes);
+        // Euler op check: 0 + c * 1 must give exactly the bundle's -1/num_steps.
+        std::vector<float> zero(noise_count(), 0.f), one(noise_count(), 1.f);
+        require(zero.size() * 4 == actions[0]->bytes, "action buffer size");
+        upload(actions[0], zero.data(), actions[0]->bytes);
+        upload(velocity, one.data(), velocity->bytes);
+        run(euler, {{"a", actions[0]->ptr}, {"b", velocity->ptr}, {"out", actions[1]->ptr}});
+        ck(cudaMemcpyAsync(actions[1]->staging(), actions[1]->ptr, actions[1]->bytes,
+                           cudaMemcpyDeviceToHost, stream),
+           "Euler check download");
         ck(cudaStreamSynchronize(stream), "initial uploads");
+        auto check = static_cast<const float *>(actions[1]->host);
+        for (int i = 0; i < noise_count(); ++i)
+            require(check[i] == euler_dt, "Euler op constant is not -1/num_steps");
         std::cerr << "[load] shared scratch MiB=" << scratch_bytes / 1048576.0 << '\n';
     }
     ~Pi05() {
@@ -462,6 +571,9 @@ class Pi05 {
         if (stream)
             cudaStreamDestroy(stream);
     }
+    // Called every step for pi05_openpi_state. Uploads the prompt rows (~hidden*4 bytes per
+    // token), masks/RoPE only when the valid token count changes. The CUDA graph reads these
+    // buffers by address, so it is captured once and never rebuilt for a new prompt.
     void set_prompt(const std::vector<int64_t> &tokens) {
         if (tokens == current_tokens)
             return;
@@ -470,52 +582,65 @@ class Pi05 {
         require(embedding.shape.size() == 2 && embedding.shape[1] == prefix[0]->shape.back() &&
                     embedding.dtype == "<f2",
                 "embedding contract");
-        if (graph) {
-            ck(cudaGraphExecDestroy(graph), "destroy old graph");
-            graph = nullptr;
-        }
         int hidden = embedding.shape[1], valid = 512 + tokens.size();
-        std::vector<__half> prompt(size_t(prefix_tokens) * hidden, __float2half(0));
-        for (size_t i = 0; i < tokens.size(); ++i) {
+        const float scale = std::sqrt(float(hidden));
+        // Rounded to FP16 as the export does, then widened for an FP32 residual stream.
+        auto row_value = [&](size_t i, int j) {
             require(tokens[i] >= 0 && tokens[i] < embedding.shape[0], "token outside embedding");
             auto source = reinterpret_cast<const __half *>(embedding.data) + tokens[i] * hidden;
-            float scale = std::sqrt(float(hidden));
-            for (int j = 0; j < hidden; ++j)
-                prompt[i * hidden + j] = __float2half_rn(__half2float(source[j]) * scale);
-        }
-        upload(rows, prompt.data(), rows->bytes);
-        prompt_bytes = size_t(prefix_tokens - 512) * hidden * 2;
-        std::vector<float> mask(size_t(prefix_tokens) * prefix_tokens);
-        constexpr float negative = -2.3819763e38f;
-        for (int i = 0; i < prefix_tokens; ++i)
-            for (int j = 0; j < prefix_tokens; ++j)
-                mask[size_t(i) * prefix_tokens + j] = (i < valid && j < valid) ? 0.f : negative;
-        upload(p_mask, mask.data(), mask.size() * 4);
-        mask.resize(size_t(horizon) * (prefix_tokens + horizon));
-        for (int i = 0; i < horizon; ++i)
-            for (int j = 0; j < prefix_tokens + horizon; ++j)
-                mask[size_t(i) * (prefix_tokens + horizon) + j] =
-                    (j < valid || j >= prefix_tokens) ? 0.f : negative;
-        upload(s_mask, mask.data(), mask.size() * 4);
-        require(rope_cos.dtype == "<f2" && rope_sin.dtype == "<f2" &&
-                    rope_cos.shape == rope_sin.shape && rope_cos.shape.size() == 2,
-                "RoPE contract");
-        auto rope = [&](Buffer *target, const Npy &table, bool suffix) {
-            size_t row_bytes = size_t(table.shape[1]) * 2;
-            int n = suffix ? horizon : prefix_tokens;
-            std::vector<uint8_t> bytes(size_t(n) * row_bytes);
-            for (int i = 0; i < n; ++i) {
-                int row = suffix ? valid + i + 1 : std::min(i + 1, valid);
-                require(row < table.shape[0], "RoPE position outside table");
-                std::memcpy(bytes.data() + size_t(i) * row_bytes,
-                            table.data + size_t(row) * row_bytes, row_bytes);
-            }
-            upload(target, bytes.data(), bytes.size());
+            return __float2half_rn(__half2float(source[j]) * scale);
         };
-        rope(p_cos, rope_cos, false);
-        rope(p_sin, rope_sin, false);
-        rope(s_cos, rope_cos, true);
-        rope(s_sin, rope_sin, true);
+        const size_t count = size_t(prefix_tokens - 512) * hidden;
+        if (rows->type == DataType::kHALF) {
+            std::vector<__half> prompt(count, __float2half(0));
+            for (size_t i = 0; i < tokens.size(); ++i)
+                for (int j = 0; j < hidden; ++j)
+                    prompt[i * hidden + j] = row_value(i, j);
+            upload(rows, prompt.data(), rows->bytes);
+        } else {
+            std::vector<float> prompt(count, 0.f);
+            for (size_t i = 0; i < tokens.size(); ++i)
+                for (int j = 0; j < hidden; ++j)
+                    prompt[i * hidden + j] = __half2float(row_value(i, j));
+            upload(rows, prompt.data(), rows->bytes);
+        }
+        if (valid != valid_tokens) {
+            std::vector<float> mask(size_t(prefix_tokens) * prefix_tokens);
+            constexpr float negative = -2.3819763e38f;
+            for (int i = 0; i < prefix_tokens; ++i)
+                for (int j = 0; j < prefix_tokens; ++j)
+                    mask[size_t(i) * prefix_tokens + j] = (i < valid && j < valid) ? 0.f : negative;
+            upload(p_mask, mask.data(), mask.size() * 4);
+            mask.resize(size_t(horizon) * (prefix_tokens + horizon));
+            for (int i = 0; i < horizon; ++i)
+                for (int j = 0; j < prefix_tokens + horizon; ++j)
+                    mask[size_t(i) * (prefix_tokens + horizon) + j] =
+                        (j < valid || j >= prefix_tokens) ? 0.f : negative;
+            upload(s_mask, mask.data(), mask.size() * 4);
+            require(rope_cos.dtype == "<f2" && rope_sin.dtype == "<f2" &&
+                        rope_cos.shape == rope_sin.shape && rope_cos.shape.size() == 2,
+                    "RoPE contract");
+            auto rope = [&](Buffer *target, const Npy &table, bool suffix) {
+                size_t row_bytes = size_t(table.shape[1]) * 2;
+                int n = suffix ? horizon : prefix_tokens;
+                std::vector<uint8_t> bytes(size_t(n) * row_bytes);
+                for (int i = 0; i < n; ++i) {
+                    int row = suffix ? valid + i + 1 : std::min(i + 1, valid);
+                    require(row < table.shape[0], "RoPE position outside table");
+                    std::memcpy(bytes.data() + size_t(i) * row_bytes,
+                                table.data + size_t(row) * row_bytes, row_bytes);
+                }
+                upload(target, bytes.data(), bytes.size());
+            };
+            rope(p_cos, rope_cos, false);
+            rope(p_sin, rope_sin, false);
+            rope(s_cos, rope_cos, true);
+            rope(s_sin, rope_sin, true);
+            valid_tokens = valid;
+        }
+        current_tokens = tokens;
+        if (primed)
+            return; // Uploads are stream-ordered before the next launch.
         ck(cudaStreamSynchronize(stream), "prompt uploads");
         enqueue();
         ck(cudaStreamSynchronize(stream), "prime chain");
@@ -538,8 +663,12 @@ class Pi05 {
             cudaGraphDestroy(captured);
             ck(result, "instantiate graph");
         }
-        current_tokens = tokens;
+        primed = true;
     }
+    const YAML::Node &bundle_info() const { return info; }
+    const std::string &policy_name() const { return policy; }
+    bool native_cache() const { return native; }
+    int prefix_size() const { return prefix_tokens; }
     std::vector<int64_t> task_tokens(const std::string &task) const {
         auto entry = info["tasks"][task];
         require(bool(entry), "task missing from bundle token table");
@@ -646,6 +775,41 @@ static std::vector<__half> preprocess(const uint8_t *input, int width, int heigh
             }
     return result;
 }
+// pi05_openpi_state: OpenPI's ResizeImages data transform (openpi_client image_tools: Pillow
+// BILINEAR, black padding), then the model's x/255*2-1. Gray IR is replicated.
+static std::vector<__half> preprocess_pil(const uint8_t *input, int width, int height, int stride,
+                                          int channels) {
+    require(width > 0 && height > 0 && (channels == 1 || channels == 3) &&
+                stride >= width * channels,
+            "invalid image");
+    double ratio = std::max(width / 224., height / 224.);
+    int rh = int(height / ratio), rw = int(width / ratio);
+    require(rh > 0 && rw > 0, "image aspect ratio");
+    const bool same = width == 224 && height == 224;
+    if (same)
+        rh = rw = 224;
+    int top = std::max(0, int((224 - rh) / 2.)), left = std::max(0, int((224 - rw) / 2.));
+    std::vector<__half> result(3 * 224 * 224, __float2half(-1));
+    for (int c = 0; c < channels; ++c) {
+        std::vector<uint8_t> resized;
+        if (same) {
+            resized.resize(224 * 224);
+            for (int y = 0; y < 224; ++y)
+                for (int x = 0; x < 224; ++x)
+                    resized[y * 224 + x] = input[size_t(y) * stride + x * channels + c];
+        } else
+            resized =
+                kaivuri::pi05::pil_bilinear(input + c, width, height, stride, channels, rw, rh);
+        for (int y = 0; y < rh; ++y)
+            for (int x = 0; x < rw; ++x) {
+                __half normalized =
+                    __float2half_rn((float(resized[size_t(y) * rw + x]) / 255.f) * 2.f - 1.f);
+                for (int ch = channels == 1 ? 0 : c; ch < (channels == 1 ? 3 : c + 1); ++ch)
+                    result[ch * 224 * 224 + (y + top) * 224 + x + left] = normalized;
+            }
+    }
+    return result;
+}
 struct Comparison {
     double cosine = 0, max_abs = 0, mean_abs = 0;
     bool finite = true;
@@ -674,17 +838,44 @@ static std::string comparison_json(const Comparison &c) {
         << ",\"mean_abs\":" << c.mean_abs << '}';
     return out.str();
 }
-static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path &prepared) {
+static std::string join(const std::vector<int> &values) {
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size(); ++i)
+        out << (i ? " " : "") << values[i];
+    return out.str();
+}
+static std::vector<float> floats(const Npy &array) {
+    require(array.dtype == "<f4", "float32 array required");
+    auto begin = reinterpret_cast<const float *>(array.data);
+    return {begin, begin + array.count};
+}
+// Full normalized chunk vs the exporter's FP16 split reference. pi05_libero (AOT kernel in
+// the exported order) keeps 0.99999 / 0.005. pi05_openpi_state on native TensorRT attention
+// defaults to 0.9998 / 0.01: the exporter's own compact-vs-padded FP16 paths already differ
+// by 0.99994 / 0.004, and GB10 TRT 10.14 measured 0.99990 / 0.0070 worst on smoke9.
+struct StateGate {
+    double cosine = .99999, max_abs = .005;
+    bool overridden = false;
+};
+static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path &prepared,
+                            const kaivuri::pi05::Contract *contract, const StateGate &gate) {
     auto manifest = YAML::LoadFile((prepared / "manifest.json").string());
     require(fs::canonical(manifest["bundle"].as<std::string>()) == fs::canonical(bundle) &&
                 hash_file(bundle / "bundle.json") == manifest["bundle_sha256"].as<std::string>() &&
                 hash_file(bundle / "MANIFEST.sha256") ==
                     manifest["source_manifest_sha256"].as<std::string>(),
             "prepared fixtures belong to another bundle");
+    const std::string policy =
+        manifest["policy"] ? manifest["policy"].as<std::string>() : "pi05_libero";
+    require(policy == model.policy_name(), "prepared fixtures are for another policy");
+    const bool state = contract != nullptr;
     std::ostringstream report;
     report << "[";
     bool first = true;
-    require(manifest["fixtures"].size() == 5, "all five OpenPI fixtures required");
+    if (state)
+        require(manifest["fixtures"].size() >= 1, "pi05_openpi_state fixtures required");
+    else
+        require(manifest["fixtures"].size() == 5, "all five OpenPI fixtures required");
     for (auto entry : manifest["fixtures"]) {
         std::string name = entry["directory"].as<std::string>();
         require(hash_file(bundle / "fixtures" / (name + ".npz")) ==
@@ -701,7 +892,28 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
         for (size_t i = 0; i < tokens.count; ++i)
             if (mask.data[i])
                 valid.push_back(reinterpret_cast<const int64_t *>(tokens.data)[i]);
-        model.set_prompt(valid);
+        std::ostringstream extra;
+        if (state) {
+            // The board composes the prompt from the raw state; it must equal the tokenizer's,
+            // and its float64 normalization must equal OpenPI's exactly.
+            auto values = floats(*arrays.at("state.npy"));
+            auto &normalized = *arrays.at("state_normalized.npy");
+            require(normalized.dtype == "<f8" && normalized.count == values.size(),
+                    "fixture normalized state");
+            auto mine = kaivuri::pi05::normalize(values, contract->state);
+            require(std::memcmp(mine.data(), normalized.data, normalized.bytes) == 0,
+                    "state normalization differs from OpenPI: " + name);
+            auto composed = contract->tokens(entry["task"].as<std::string>(), values);
+            require(composed == valid, "board-composed state prompt differs from the "
+                                       "tokenizer's: " +
+                                           name);
+            extra << ",\"task\":" << std::quoted(entry["task"].as<std::string>()) << ",\"bins\":\""
+                  << join(contract->bins(values)) << "\",\"prompt_tokens\":" << valid.size()
+                  << ",\"prompt_matches_tokenizer\":true";
+        }
+        const uint64_t prompt_start = mono_ns();
+        model.set_prompt(valid); // first fixture also primes and captures the CUDA graph
+        extra << ",\"set_prompt_ms\":" << (mono_ns() - prompt_start) / 1e6;
         auto &noise = *arrays.at("noise.npy");
         require(noise.dtype == "<f4" && noise.count == size_t(model.noise_count()),
                 "fixture noise contract");
@@ -712,32 +924,72 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
         Sample timing;
         auto actions = model.infer(image0.data, image1.data,
                                    reinterpret_cast<const float *>(noise.data), timing);
-        auto fp16 = compare(actions, *arrays.at("reference.npy"));
-        auto mixed = compare(actions, *arrays.at("mixed_reference.npy"));
-        require(fp16.finite && mixed.finite && fp16.cosine >= .99999 && fp16.max_abs <= .005,
+        auto &reference = *arrays.at("reference.npy"),
+             &mixed_reference = *arrays.at("mixed_reference.npy");
+        auto fp16 = compare(actions, reference);
+        auto mixed = compare(actions, mixed_reference);
+        require(fp16.finite && mixed.finite && fp16.cosine >= gate.cosine &&
+                    fp16.max_abs <= gate.max_abs,
                 "C++ action parity failed: " + name + " " + comparison_json(fp16));
+        if (state) {
+            // OpenPI Unnormalize of the FP16 reference, first robot_action_dim columns.
+            auto ref = floats(reference);
+            auto &robot = *arrays.at("robot_reference.npy");
+            const int h = model.action_horizon(), w = model.action_dim(), r = contract->robot_dim;
+            require(robot.dtype == "<f8" && robot.count == size_t(h) * r, "robot reference shape");
+            auto expected = reinterpret_cast<const double *>(robot.data);
+            double worst = 0;
+            for (int i = 0; i < h; ++i)
+                for (int j = 0; j < r; ++j)
+                    worst = std::max(worst,
+                                     std::abs(kaivuri::pi05::unnormalize(ref[size_t(i) * w + j],
+                                                                         contract->actions.q01[j],
+                                                                         contract->actions.q99[j]) -
+                                              expected[size_t(i) * r + j]));
+            require(worst <= 1e-12, "action unnormalization differs from OpenPI: " + name);
+            extra << ",\"unnormalize_max_abs\":" << worst;
+        }
         size_t different = 0;
+        bool gray_identical = true;
         for (int i = 0; i < 2; ++i) {
             auto &raw = *arrays.at("raw" + std::to_string(i) + ".npy");
             auto &expected = *arrays.at("image" + std::to_string(i) + ".npy");
-            require(raw.dtype == "|u1" && raw.shape.size() == 3 && raw.shape[2] == 3,
+            const int channels = raw.shape.size() == 3 ? int(raw.shape[2]) : 1;
+            require(raw.dtype == "|u1" && (raw.shape.size() == 2 || raw.shape.size() == 3) &&
+                        (channels == 1 || channels == 3),
                     "fixture raw image");
-            auto image = preprocess(raw.data, raw.shape[1], raw.shape[0], raw.shape[1] * 3, 3);
+            const int h = raw.shape[0], w = raw.shape[1];
+            auto prep = state ? preprocess_pil : preprocess;
+            auto image = prep(raw.data, w, h, w * channels, channels);
             auto ref = reinterpret_cast<const uint16_t *>(expected.data);
             for (size_t j = 0; j < image.size(); ++j) {
                 uint16_t bits;
                 std::memcpy(&bits, &image[j], 2);
                 different += bits != ref[j];
             }
+            if (state && channels == 3) {
+                // Live IR is one Y8 channel; with equal channels the gray path must match.
+                std::vector<uint8_t> gray(size_t(h) * w);
+                bool equal = true;
+                for (size_t p = 0; p < gray.size(); ++p) {
+                    gray[p] = raw.data[p * 3];
+                    equal &= raw.data[p * 3 + 1] == gray[p] && raw.data[p * 3 + 2] == gray[p];
+                }
+                require(equal, "fixture raw image is not replicated gray IR");
+                auto from_gray = prep(gray.data(), w, h, w, 1);
+                gray_identical &=
+                    std::memcmp(from_gray.data(), image.data(), image.size() * 2) == 0;
+            }
         }
         require(different == 0, "C++ OpenPI image preprocessing differs: " + name + " (" +
                                     std::to_string(different) + " pixels)");
+        require(gray_identical, "gray Y8 preprocessing differs from its 3-channel copy: " + name);
         if (!first)
             report << ',';
         first = false;
         report << "{\"fixture\":" << std::quoted(name) << ",\"fp16\":" << comparison_json(fp16)
                << ",\"mixed\":" << comparison_json(mixed)
-               << ",\"preprocess_different_elements\":" << different << '}';
+               << ",\"preprocess_different_elements\":" << different << extra.str() << '}';
         std::cerr << "[parity] " << name << " PASS " << comparison_json(fp16) << '\n';
     }
     report << ']';
@@ -769,14 +1021,31 @@ struct FrameReader {
         throw std::runtime_error("camera source missing/stale for one second");
     }
 };
+// norm_stats.json must be the bundle's own (listed in MANIFEST.sha256).
+static YAML::Node bundle_norm_stats(const fs::path &bundle) {
+    std::ifstream manifest(bundle / "MANIFEST.sha256");
+    require(bool(manifest), "bundle lacks MANIFEST.sha256");
+    std::string digest, name;
+    while (manifest >> digest >> name)
+        if (name == "norm_stats.json" || name == "*norm_stats.json") {
+            require(hash_file(bundle / "norm_stats.json") == digest, "norm_stats.json checksum");
+            return YAML::LoadFile((bundle / "norm_stats.json").string());
+        }
+    throw std::runtime_error("norm_stats.json missing from MANIFEST.sha256");
+}
 int main(int argc, char **argv) {
     try {
+        namespace kp = kaivuri::pi05;
         fs::path bundle, cache, fixtures, out;
         std::vector<fs::path> frames;
         std::string task = "pick up the red block";
-        double duration = 60, rate_hz = 0;
+        std::string control_socket =
+            "/tmp/kaivuri-native-" + std::to_string(geteuid()) + "/control.sock";
+        double duration = 60, rate_hz = 0, max_state_age_ms = 50, action_offset_ms = 0;
         int warmup = 5;
-        bool only = false, graph = true;
+        bool only = false, graph = true, drive = false;
+        kp::ProducerOptions producer_options;
+        StateGate gate;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             auto value = [&]() {
@@ -805,16 +1074,48 @@ int main(int argc, char **argv) {
                 only = true;
             else if (arg == "--no-graph")
                 graph = false;
+            else if (arg == "--control-socket")
+                control_socket = value();
+            else if (arg == "--max-state-age-ms")
+                max_state_age_ms = std::stod(value());
+            else if (arg == "--parity-cosine")
+                gate.cosine = std::stod(value()), gate.overridden = true;
+            else if (arg == "--parity-max-abs")
+                gate.max_abs = std::stod(value()), gate.overridden = true;
+            else if (arg == "--drive")
+                drive = true;
+            else if (arg == "--allow-live")
+                producer_options.allow_live = true;
+            else if (arg == "--pump")
+                producer_options.pump = true;
+            else if (arg == "--enable-slew")
+                producer_options.gate.slew = true;
+            else if (arg == "--enable-tracks")
+                producer_options.gate.tracks = true;
+            else if (arg == "--action-tolerance")
+                producer_options.gate.tolerance = std::stod(value());
+            else if (arg == "--renew-ms")
+                producer_options.supervisor.renew_ns = uint64_t(std::stod(value()) * 1e6);
+            else if (arg == "--max-observation-age-ms")
+                producer_options.supervisor.max_observation_age_ns =
+                    uint64_t(std::stod(value()) * 1e6);
+            else if (arg == "--action-offset-ms")
+                action_offset_ms = std::stod(value());
             else if (arg == "--help") {
                 std::cout
                     << "kaivuri-inference --bundle OPENPI_BUNDLE --cache "
-                       "VALIDATED_OPTIMIZED_CACHE\n"
+                       "VALIDATED_ENGINE_CACHE\n"
                        "  --fixtures PREPARED_FIXTURES --out NEW_REPORT.json [--validate-only]\n"
                        "  [--camera-frame FIRST.frame --camera-frame SECOND.frame]\n"
                        "  [--task EXPORTED_TASK --duration-s 60 --warmup 5 --no-graph]\n"
                        "  [--rate-hz 2] (0 = unrestricted; wait before reading fresh frames)\n"
-                       "Bench only: records normalized LIBERO actions, never drives robot "
-                       "hardware.\n";
+                       "  pi05_openpi_state: [--control-socket PATH --max-state-age-ms 50]\n"
+                       "    [--parity-cosine 0.9998 --parity-max-abs 0.01]\n"
+                       "  Driving (pi05_openpi_state only; nothing is enabled implicitly):\n"
+                       "    --drive [--allow-live] [--pump] [--enable-slew] [--enable-tracks]\n"
+                       "    [--action-tolerance 0.05 --renew-ms 100 --max-observation-age-ms "
+                       "1400 --action-offset-ms 0]\n"
+                       "Without --drive, actions are recorded only and never drive hardware.\n";
                 return 0;
             } else
                 throw std::runtime_error("unknown option " + arg);
@@ -827,30 +1128,85 @@ int main(int argc, char **argv) {
         require(std::isfinite(rate_hz) && rate_hz >= 0 && rate_hz <= 500 &&
                     (rate_hz == 0 || rate_hz >= .001),
                 "rate must be 0 (unrestricted) or 0.001..500 Hz");
+        require(max_state_age_ms > 0 && max_state_age_ms <= 200, "state age limit 0..200 ms");
+        require(std::abs(action_offset_ms) <= 100, "action offset must be within +-100 ms");
+        const auto &sup = producer_options.supervisor;
+        require(sup.renew_ns >= 10000000ULL && sup.renew_ns <= 250000000ULL &&
+                    sup.max_observation_age_ns >= 200000000ULL &&
+                    sup.max_observation_age_ns <= 1450000000ULL,
+                "renewal 10..250 ms (lease 500 ms); observation age 200..1450 ms (daemon 1500)");
         require(!fs::exists(out), "report already exists; choose a new path");
         signal(SIGINT, stop_signal);
         signal(SIGTERM, stop_signal);
         uint64_t load_start = mono_ns();
         Pi05 model(bundle, cache, graph);
         double load_ms = (mono_ns() - load_start) / 1e6;
-        std::string parity = validate(model, bundle, fixtures);
+        std::unique_ptr<kp::Contract> contract;
+        if (model.policy_name() == "pi05_openpi_state") {
+            contract = std::make_unique<kp::Contract>(
+                kp::load_contract(model.bundle_info(), bundle_norm_stats(bundle)));
+            require(contract->prompt.longest(contract->state_dim) + 512 <=
+                        size_t(model.prefix_size()),
+                    "longest state prompt exceeds the compact prefix");
+        }
+        require(contract || !gate.overridden, "parity overrides apply to pi05_openpi_state only");
+        if (contract && !gate.overridden)
+            gate = {.9998, .01, false};
+        require(!drive || contract, "--drive requires a pi05_openpi_state bundle");
+        require(!drive || contract->fps > 0, "--drive requires kaivuri.fps in bundle.json");
+        require(!drive || warmup >= 1, "--drive needs warm-up runs to check plan coverage");
+        std::string parity = validate(model, bundle, fixtures, contract.get(), gate);
         if (!out.parent_path().empty())
             fs::create_directories(out.parent_path());
         std::ofstream summary(out);
         require(bool(summary), "cannot create report");
-        summary << std::setprecision(12)
-                << "{\"model\":\"pi05_libero\",\"runtime\":\"C++ TensorRT + AOT\","
-                   "\"actuator_output\":false,\"cuda_graph\":"
-                << (graph ? "true" : "false") << ",\"load_ms\":" << load_ms
+        summary << std::setprecision(12) << "{\"model\":" << std::quoted(model.policy_name())
+                << ",\"runtime\":\"C++ TensorRT " << (model.native_cache() ? "native" : "+ AOT")
+                << "\",\"actuator_output\":" << (drive ? "true" : "false")
+                << ",\"cuda_graph\":" << (graph ? "true" : "false") << ",\"load_ms\":" << load_ms
                 << ",\"action_horizon\":" << model.action_horizon()
                 << ",\"action_dim\":" << model.action_dim()
                 << ",\"denoising_steps\":" << model.denoising_steps() << ",\"parity\":" << parity;
+        summary << ",\"parity_gate\":{\"cosine\":" << gate.cosine << ",\"max_abs\":" << gate.max_abs
+                << '}';
         if (only) {
             summary << ",\"status\":\"PASS\"}\n";
             return 0;
         }
-        model.set_prompt(model.task_tokens(task));
+        std::vector<uint32_t> ir_indices;
+        if (contract) {
+            require(contract->prompt.heads.count(task), "task has no token head in this bundle");
+            // Training camera order: frame files are <serial>-ir<index>.frame (kaivuri-camera).
+            // Rotation is applied by kaivuri-camera --rotate-180 and cannot be read back here.
+            auto cameras = model.bundle_info()["kaivuri"]["cameras"];
+            require(cameras && cameras.size() == 2, "bundle lacks kaivuri.cameras");
+            for (size_t k = 0; k < 2; ++k) {
+                auto spec = cameras[k]["camera"].as<std::string>();
+                auto colon = spec.find(':');
+                require(colon != std::string::npos, "camera spec SERIAL:IR_INDEX");
+                auto expected = spec.substr(0, colon) + "-ir" + spec.substr(colon + 1);
+                require(frames[k].stem().string() == expected,
+                        "camera " + std::to_string(k) + " must be " + spec + " (" + expected +
+                            ".frame) in the bundle's slot order");
+                ir_indices.push_back(std::stoul(spec.substr(colon + 1)));
+                if (cameras[k]["rotation_deg"] && cameras[k]["rotation_deg"].as<int>() != 0)
+                    std::cerr << "[cameras] " << spec << " was trained rotated "
+                              << cameras[k]["rotation_deg"].as<int>()
+                              << " deg: kaivuri-camera must run with --rotate-180 "
+                              << spec.substr(0, colon) << '\n';
+            }
+        } else
+            model.set_prompt(model.task_tokens(task));
         FrameReader first(frames[0]), second(frames[1]);
+        // Status-only connection for live state; the producer owns a separate one.
+        std::unique_ptr<kp::ControlLink> state_link;
+        if (contract)
+            state_link = std::make_unique<kp::ControlLink>(control_socket);
+        std::unique_ptr<kp::Producer> producer;
+        if (drive) {
+            producer_options.socket = control_socket;
+            producer = std::make_unique<kp::Producer>(producer_options);
+        }
         std::mt19937 random(42);
         std::normal_distribution<float> gaussian(0, 1);
         std::vector<float> noise(model.noise_count());
@@ -864,14 +1220,16 @@ int main(int argc, char **argv) {
                "valid_bits,frame1_valid_bits,"
                "preprocess_ms,vision_ms,language_ms,denoise_ms,inference_ms,iteration_ms,"
                "observation_age_start_ms,observation_to_result_ms,camera_arrival_skew_ms,"
-               "rate_wait_ms,rate_lateness_ms\n";
-        std::vector<double> latencies, delays;
+               "rate_wait_ms,rate_lateness_ms,state_imu_ns,state_age_ms,state_deg,state_bins,"
+               "prompt_tokens,prompt_ms,plan_t0_ns,plan_observation_ns,plan_sent,plan_clamped\n";
+        std::vector<double> latencies, delays, prompt_times, warmup_delays;
         int count = 0;
         uint64_t begin = 0;
         const uint64_t period_ns = rate_hz ? static_cast<uint64_t>(std::llround(1e9 / rate_hz)) : 0;
         uint64_t next_start = 0, rate_overruns = 0;
         std::vector<double> waits;
         std::vector<float> last_action;
+        std::vector<double> last_robot;
         while (!stopped && (!begin || (mono_ns() - begin) / 1e9 < duration)) {
             const uint64_t wait_begin = mono_ns();
             if (next_start && wait_begin > next_start)
@@ -886,6 +1244,22 @@ int main(int argc, char **argv) {
             }
             if (stopped || (begin && (mono_ns() - begin) / 1e9 >= duration))
                 break;
+            // Arm after warm-up, then hold centered until the first chunk.
+            if (producer && count == warmup) {
+                // Each chunk must outlive the gap until the next one lands: one start period
+                // (the rate, or back-to-back) plus the slowest warm-up observation-to-plan time.
+                const double worst = *std::max_element(warmup_delays.begin(), warmup_delays.end());
+                const double gap = (period_ns ? period_ns / 1e6 : worst) + worst;
+                const double plan_ms = (model.action_horizon() - 1) * 1000. / contract->fps;
+                const double age_ms = producer_options.supervisor.max_observation_age_ns / 1e6;
+                std::cerr << "[drive] next chunk after <= " << gap << " ms; plan covers " << plan_ms
+                          << " ms; observation limit " << age_ms << " ms\n";
+                require(gap + 100 < plan_ms && gap + 50 < age_ms,
+                        "chunk coverage too short for this latency/rate; refusing to arm");
+                producer->arm();
+            }
+            if (producer && count > warmup && !producer->running())
+                throw std::runtime_error("producer stopped: " + producer->stop_reason());
             uint64_t start = mono_ns();
             const double rate_wait_ms = (start - wait_begin) / 1e6;
             const double rate_lateness_ms =
@@ -897,12 +1271,32 @@ int main(int argc, char **argv) {
                         a.stride == a.width && b.stride == b.width && (a.valid_metadata & 3) == 3 &&
                         (b.valid_metadata & 3) == 3,
                     "640x480 Y8 with timestamp metadata required");
-            uint64_t oldest = std::min(a.host_monotonic_ns, b.host_monotonic_ns),
-                     observed = mono_ns();
+            require(ir_indices.empty() ||
+                        (a.ir_index == ir_indices[0] && b.ir_index == ir_indices[1]),
+                    "camera IR index differs from the bundle's");
+            uint64_t oldest = std::min(a.host_monotonic_ns, b.host_monotonic_ns);
+            kp::RobotState robot;
+            std::vector<int> bins;
+            size_t prompt_tokens = 0;
+            double prompt_ms = 0;
+            if (contract) {
+                // State sampled right after the frames; never older than max_state_age_ms.
+                robot = kp::robot_state(state_link->status(), contract->state_joints, mono_ns(),
+                                        uint64_t(max_state_age_ms * 1e6));
+                oldest = std::min(oldest, robot.imu_ns);
+                const uint64_t prompt_start = mono_ns();
+                bins = contract->bins(robot.degrees);
+                auto tokens = contract->prompt.compose(task, bins);
+                prompt_tokens = tokens.size();
+                model.set_prompt(tokens);
+                prompt_ms = (mono_ns() - prompt_start) / 1e6;
+            }
+            uint64_t observed = mono_ns();
             require(observed >= oldest && observed - oldest <= 200000000ULL,
                     "oldest observation exceeds 200ms freshness limit");
-            auto image0 = preprocess(first.pixels.data(), a.width, a.height, a.stride, 1);
-            auto image1 = preprocess(second.pixels.data(), b.width, b.height, b.stride, 1);
+            auto prep = contract ? preprocess_pil : preprocess;
+            auto image0 = prep(first.pixels.data(), a.width, a.height, a.stride, 1);
+            auto image1 = prep(second.pixels.data(), b.width, b.height, b.stride, 1);
             double preprocess_ms = (mono_ns() - observed) / 1e6;
             for (auto &value : noise)
                 value = gaussian(random);
@@ -910,7 +1304,41 @@ int main(int argc, char **argv) {
             last_action = model.infer(image0.data(), image1.data(), noise.data(), timing);
             for (auto value : last_action)
                 require(std::isfinite(value), "nonfinite model action");
+            kp::Plan plan;
+            int clamped = 0;
+            bool sent = false;
+            if (contract) {
+                const int h = model.action_horizon(), w = model.action_dim(),
+                          r = contract->robot_dim;
+                last_robot.assign(size_t(h) * r, 0);
+                for (int i = 0; i < h; ++i)
+                    for (int j = 0; j < r; ++j)
+                        last_robot[size_t(i) * r + j] =
+                            kp::unnormalize(last_action[size_t(i) * w + j],
+                                            contract->actions.q01[j], contract->actions.q99[j]);
+                // Row 0 belongs to the observation instant; the controller starts at the
+                // row matching its own clock, which skips the inference delay.
+                const double fps = contract->fps > 0 ? contract->fps : 30;
+                const uint64_t t0 = uint64_t(int64_t(oldest) + int64_t(action_offset_ms * 1e6));
+                if (producer)
+                    plan = kp::make_plan(last_robot, h, r, fps, t0, oldest, producer_options.gate,
+                                         clamped);
+                else
+                    try { // Record-only: report an out-of-range chunk as -1 instead of stopping.
+                        plan = kp::make_plan(last_robot, h, r, fps, t0, oldest,
+                                             producer_options.gate, clamped);
+                    } catch (const std::runtime_error &) {
+                        clamped = -1;
+                    }
+                if (producer && count >= warmup) {
+                    std::string reason;
+                    require(producer->post(plan, reason), "drive plan refused: " + reason);
+                    sent = true;
+                }
+            }
             uint64_t finish = mono_ns();
+            if (count < warmup)
+                warmup_delays.push_back((finish - oldest) / 1e6);
             if (count++ < warmup)
                 continue;
             if (!begin) {
@@ -921,7 +1349,11 @@ int main(int argc, char **argv) {
             latencies.push_back(timing.total_ms);
             delays.push_back(delay);
             waits.push_back(rate_wait_ms);
+            prompt_times.push_back(prompt_ms);
             double skew = std::abs(double(a.host_monotonic_ns) - double(b.host_monotonic_ns)) / 1e6;
+            std::ostringstream degrees;
+            for (size_t i = 0; i < robot.degrees.size(); ++i)
+                degrees << (i ? " " : "") << std::setprecision(9) << robot.degrees[i];
             csv << std::setprecision(12) << latencies.size() << ',' << start << ',' << finish << ','
                 << a.sequence << ',' << b.sequence << ',' << a.host_monotonic_ns << ','
                 << b.host_monotonic_ns << ',' << a.sensor_timestamp_us << ','
@@ -930,8 +1362,24 @@ int main(int argc, char **argv) {
                 << preprocess_ms << ',' << timing.vision_ms << ',' << timing.language_ms << ','
                 << timing.denoise_ms << ',' << timing.total_ms << ',' << iteration << ','
                 << (observed - oldest) / 1e6 << ',' << delay << ',' << skew << ',' << rate_wait_ms
-                << ',' << rate_lateness_ms << '\n';
+                << ',' << rate_lateness_ms << ',' << robot.imu_ns << ','
+                << (robot.imu_ns ? (observed - std::min(observed, robot.imu_ns)) / 1e6 : 0) << ','
+                << degrees.str() << ',' << join(bins) << ',' << prompt_tokens << ',' << prompt_ms
+                << ',' << plan.t0_ns << ',' << plan.observation_ns << ',' << sent << ',' << clamped
+                << '\n';
             require(bool(csv), "timing write failed");
+        }
+        std::string producer_json;
+        if (producer) {
+            producer->stop(stopped ? "signal" : "duration complete");
+            auto c = producer->counters();
+            std::ostringstream p;
+            p << std::setprecision(12) << ",\"producer\":{\"plans\":" << c.plans
+              << ",\"renewals\":" << c.renewals << ",\"holds\":" << c.holds
+              << ",\"max_send_gap_ms\":" << c.max_send_gap_ms
+              << ",\"stop_reason\":" << std::quoted(producer->stop_reason()) << '}';
+            producer_json = p.str();
+            producer.reset();
         }
         require(!latencies.empty(), "no inference samples");
         auto percentile = [](std::vector<double> values, double p) {
@@ -940,25 +1388,35 @@ int main(int argc, char **argv) {
             size_t lo = size_t(pos), hi = std::min(lo + 1, values.size() - 1);
             return values[lo] + (values[hi] - values[lo]) * (pos - lo);
         };
-        summary << ",\"task\":" << std::quoted(task)
-                << ",\"views\":2,\"input\":\"IR Y8 replicated to RGB; unfinetuned LIBERO bench\","
-                   "\"samples\":"
-                << latencies.size() << ",\"elapsed_s\":" << (mono_ns() - begin) / 1e9
-                << ",\"rate_hz\":" << rate_hz << ",\"rate_overruns\":" << rate_overruns
+        summary << ",\"task\":" << std::quoted(task) << ",\"views\":2,\"input\":"
+                << (contract ? "\"IR Y8 replicated to RGB; joint-angle state prompt\""
+                             : "\"IR Y8 replicated to RGB; unfinetuned LIBERO bench\"")
+                << ",\"samples\":" << latencies.size()
+                << ",\"elapsed_s\":" << (mono_ns() - begin) / 1e9 << ",\"rate_hz\":" << rate_hz
+                << ",\"rate_overruns\":" << rate_overruns
                 << ",\"rate_wait_p50_ms\":" << percentile(waits, .5)
                 << ",\"inference_p50_ms\":" << percentile(latencies, .5)
                 << ",\"inference_p95_ms\":" << percentile(latencies, .95)
                 << ",\"inference_p99_ms\":" << percentile(latencies, .99)
                 << ",\"inference_max_ms\":" << percentile(latencies, 1)
+                << ",\"prompt_p50_ms\":" << percentile(prompt_times, .5)
+                << ",\"prompt_max_ms\":" << percentile(prompt_times, 1)
                 << ",\"arrival_to_result_p50_ms\":" << percentile(delays, .5)
-                << ",\"arrival_to_result_p99_ms\":" << percentile(delays, .99)
+                << ",\"arrival_to_result_p99_ms\":" << percentile(delays, .99) << producer_json
                 << ",\"last_normalized_chunk\":[";
         for (size_t i = 0; i < last_action.size(); ++i) {
             if (i)
                 summary << ',';
             summary << last_action[i];
         }
-        summary << "],\"status\":\"PASS\"}\n";
+        summary << "]";
+        if (contract) {
+            summary << ",\"last_robot_chunk\":[";
+            for (size_t i = 0; i < last_robot.size(); ++i)
+                summary << (i ? "," : "") << last_robot[i];
+            summary << "]";
+        }
+        summary << ",\"status\":\"PASS\"}\n";
         require(bool(summary), "summary write failed");
         std::cout << "PASS samples=" << latencies.size() << " p50_ms=" << percentile(latencies, .5)
                   << " p99_ms=" << percentile(latencies, .99) << " report=" << out << '\n';

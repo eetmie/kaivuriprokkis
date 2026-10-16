@@ -1,7 +1,8 @@
 """Bench C++ pi0.5 with two real IR cameras and disarmed native control.
 
-Only owns the processes it launches. No DRIVE/ARM packets. Optional live PWM
-writes neutral only; otherwise the controller uses dry PWM.
+Only owns the processes it launches. No DRIVE/ARM packets (kaivuri-inference runs
+without --drive). Optional live PWM writes neutral only; otherwise the controller
+uses dry PWM. A pi05_openpi_state bundle reads its joint-angle state from control.
 Memory samples include load and warm-up; steady samples are marked separately.
 """
 import argparse
@@ -95,7 +96,8 @@ def summarize(output, samples):
     window = (int(timings[0]["start_ns"]), int(timings[-1]["finish_ns"]))
     metrics = {key: distribution([float(row[key]) for row in timings]) for key in (
         "preprocess_ms", "vision_ms", "language_ms", "denoise_ms", "inference_ms",
-        "iteration_ms", "observation_age_start_ms", "observation_to_result_ms", "camera_arrival_skew_ms")}
+        "iteration_ms", "observation_age_start_ms", "observation_to_result_ms", "camera_arrival_skew_ms",
+        "state_age_ms", "prompt_ms") if key in timings[0]}
     starts = [int(row["start_ns"]) for row in timings]
     metrics["inference_start_interval_ms"] = distribution([(b - a) / 1e6 for a, b in zip(starts, starts[1:])])
     for key in ("rate_wait_ms", "rate_lateness_ms"):
@@ -194,7 +196,10 @@ def run(args):
               "--metadata-csv", output / "camera-timestamps.csv"]
     for spec in args.camera:
         camera += ["--camera", spec]
+    for serial in args.rotate_180:
+        camera += ["--rotate-180", serial]
     command = [build / "kaivuri-inference", "--bundle", args.bundle.resolve(),
+               "--control-socket", socket_path,
                "--cache", args.cache.resolve(), "--fixtures", args.fixtures.resolve(),
                "--task", args.task, "--duration-s", str(args.duration_s),
                "--warmup", str(args.warmup), "--out", output / "inference.json"]
@@ -334,6 +339,8 @@ if __name__ == "__main__":
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--camera", action="append", required=True, help="SERIAL:IR_INDEX, twice")
+    parser.add_argument("--rotate-180", action="append", default=[], metavar="SERIAL",
+                        help="kaivuri-camera rotation; must match the bundle's training cameras")
     parser.add_argument("--serial", default="/dev/ttyACM0")
     parser.add_argument("--simulate-imu", action="store_true")
     parser.add_argument("--live-pwm", action="store_true", help="disarmed neutral writes to PCA9685; real IMUs required")

@@ -35,9 +35,11 @@
 - [ ] Optional deployment/supervision files only after hardware paths/timings are established; none are installed now.
 - [ ] Add a clock mapper for camera exposure timestamps, host monotonic time, and Pico device time; characterize latency/drift before fusion.
 - [x] Port the validated OpenPI pi0.5 GPU chain to a separate C++ TensorRT runtime, with full fixture parity and live IR consumption through the frame C ABI.
-- [ ] Integrate the fine-tuned runtime with the command interface; preserve actual training FPS, normalization, state/action meaning and observation timestamps. The LIBERO bench records actions only.
+- [x] Integrate the fine-tuned runtime with the command interface (`--drive`, PI05_FINETUNE.md); Spark dry end-to-end only.
+- [ ] Jetson: native template cache for the fine-tune, `--validate-only`, then a dry `--drive` run against real IMUs/cameras; measure the FP32-residual 50-row latency against the 500 ms budget.
+- [ ] Operator deadman for the policy producer (today `--drive` sets the deadman flag itself; stop is `client.py estop`/`disarm` from another terminal).
 - [ ] Rebuild operator deadman/manual/task-switch supervision in that producer, disarming on source/task changes.
-- [ ] Set lease/observation limits from measured worst inference latency and required stop time. Do not silently refresh old observation timestamps.
+- [ ] Set lease/observation limits from measured worst inference latency and required stop time. Do not silently refresh old observation timestamps. (Producer side done: renewals keep the observation time; limits still need Jetson numbers.)
 - [ ] Evaluate beta GPU-frame APIs only when profiling shows selected-frame host copies matter; current capture does not enable CUDA zero-copy.
 - [ ] Compare native total system memory with the legacy stack under the same model/device load before stating an actual Jetson memory saving.
 - [ ] Fine-tuned 30 Hz action contract: benchmark a 30–50-step prediction export and delay-aware overlapping execution. Current LIBERO performance bundle has only 10 action rows.

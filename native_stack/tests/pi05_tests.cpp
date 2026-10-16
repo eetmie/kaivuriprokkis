@@ -336,10 +336,14 @@ static void plan_tests() {
     expect(plan.rows[0][0] == 0.5, "explicit slew flag passes slew");
     expect(plan.end_ns() == 5000000000ULL + 1633333333ULL, "49 rows at 30 fps");
     robot[7] = 1.06;
+    auto overshoot = make_plan(robot, 50, 4, 30, 1, 1, gate, clamped);
+    expect(clamped == 3 && overshoot.rows[1][3] == 1, "default clamps any overshoot");
+    gate.tolerance = 0.05;
     expect_throw([&] { make_plan(robot, 50, 4, 30, 1, 1, gate, clamped); }, "beyond tolerance");
     robot[7] = NAN;
     expect_throw([&] { make_plan(robot, 50, 4, 30, 1, 1, gate, clamped); }, "nonfinite action");
     robot[7] = 0;
+    gate.tolerance = ActionGate{}.tolerance;
     // Wire format: the controller's own decoder accepts the plan unchanged.
     Config cfg;
     const uint64_t now = 5300000000ULL;

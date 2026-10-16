@@ -2,6 +2,7 @@
 // CUDA-free parts of the fine-tuned OpenPI pi0.5 runtime (bundle policy pi05_openpi_state):
 // per-step state prompt, OpenPI quantile normalization, controller state, and the
 // policy -> controller drive-plan producer. See notes/PI05_FINETUNE.md.
+#include <limits>
 #include "kaivuri/core.hpp"
 #include <array>
 #include <condition_variable>
@@ -76,10 +77,12 @@ struct Plan {
 };
 struct ActionGate {
     bool slew = false, tracks = false; // producer-side flags; also required by the daemon
-    double tolerance = 0.05;           // |v| <= 1 + tolerance is clamped to [-1, 1]
+    // Out-of-range values are clamped to [-1, 1] (the controller clamps too); a finite
+    // tolerance turns |v| > 1 + tolerance into a stop instead.
+    double tolerance = std::numeric_limits<double>::infinity();
 };
 // Robot-unit chunk [horizon][robot_dim] in [slew, lift, tilt, scoop(, trackL, trackR)].
-// Throws on non-finite values or values beyond 1 + tolerance; disabled joints become 0.
+// Throws on non-finite values (or beyond a finite 1 + tolerance); disabled joints become 0.
 Plan make_plan(const std::vector<double> &robot, int horizon, int robot_dim, double fps,
                uint64_t t0_ns, uint64_t observation_ns, const ActionGate &gate, int &clamped);
 // One PROTOCOL.md packet. plan == nullptr encodes a non-drive operation.

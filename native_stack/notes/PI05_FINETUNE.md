@@ -134,8 +134,9 @@ is sent (`bench_pi05.py` never passes it).
   time plus the start period fits inside both the chunk length and the observation limit.
 - Each chunk: `t0` = observation time (+ `--action-offset-ms`), so the controller starts at
   the row matching its clock and the inference delay is skipped; replaces the previous plan;
-  only newer observations are accepted. Values beyond 1 + `--action-tolerance` (0.05) or
-  non-finite stop the run; within it they are clamped.
+  only newer observations are accepted. Out-of-range values are clamped to [-1, 1] with a
+  `[drive] warning` (the controller clamps too); non-finite values stop the run. A finite
+  `--action-tolerance X` makes |v| > 1 + X a stop instead.
 - Renewal every 100 ms with the same rows, `t0` and observation time. Stops (disarms) at
   `--max-observation-age-ms` (1400, daemon faults at 1500), on chunk exhaustion, on any
   controller state other than armed, on any inference error. Never re-arms.

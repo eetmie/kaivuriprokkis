@@ -1113,7 +1113,7 @@ int main(int argc, char **argv) {
                        "    [--parity-cosine 0.9998 --parity-max-abs 0.01]\n"
                        "  Driving (pi05_openpi_state only; nothing is enabled implicitly):\n"
                        "    --drive [--allow-live] [--pump] [--enable-slew] [--enable-tracks]\n"
-                       "    [--action-tolerance 0.05 --renew-ms 100 --max-observation-age-ms "
+                       "    [--action-tolerance inf --renew-ms 100 --max-observation-age-ms "
                        "1400 --action-offset-ms 0]\n"
                        "Without --drive, actions are recorded only and never drive hardware.\n";
                 return 0;
@@ -1320,9 +1320,17 @@ int main(int argc, char **argv) {
                 // row matching its own clock, which skips the inference delay.
                 const double fps = contract->fps > 0 ? contract->fps : 30;
                 const uint64_t t0 = uint64_t(int64_t(oldest) + int64_t(action_offset_ms * 1e6));
-                if (producer)
+                if (producer) {
                     plan = kp::make_plan(last_robot, h, r, fps, t0, oldest, producer_options.gate,
                                          clamped);
+                    if (clamped > 0) {
+                        double worst = 0;
+                        for (auto v : last_robot)
+                            worst = std::max(worst, std::abs(v));
+                        std::cerr << "[drive] warning: sample " << count << " clamped " << clamped
+                                  << " actions to [-1,1] (max |v| " << worst << ")\n";
+                    }
+                }
                 else
                     try { // Record-only: report an out-of-range chunk as -1 instead of stopping.
                         plan = kp::make_plan(last_robot, h, r, fps, t0, oldest,

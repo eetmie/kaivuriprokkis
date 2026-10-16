@@ -262,8 +262,7 @@ Plan make_plan(const std::vector<double> &robot, int horizon, int robot_dim, dou
                 robot.size() == size_t(horizon) * robot_dim,
             "chunk shape");
     require(std::isfinite(fps) && fps > 0 && fps <= 500, "plan fps");
-    require(std::isfinite(gate.tolerance) && gate.tolerance >= 0 && gate.tolerance <= 0.2,
-            "action tolerance must be 0..0.2");
+    require(gate.tolerance >= 0, "action tolerance must be >= 0");
     Plan plan;
     plan.fps = fps;
     plan.t0_ns = t0_ns;

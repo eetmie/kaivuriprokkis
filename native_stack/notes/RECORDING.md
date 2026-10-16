@@ -93,6 +93,26 @@ Default maximum take length is 180 s, with automatic save and disarm.
 The recorder requests no physical permissions itself. Live PWM cannot be combined
 with scripted/automatic capture or simulated IMUs. All automated tests are dry.
 
+## Test sessions without an operator
+
+`--bench-seconds S` records automatically with zero commands (dry only). `--bench-episodes N`
+records N takes in one session and `--bench-sine A` replaces the zero commands with a per-joint
+sine of amplitude A, so a test dataset has non-constant actions.
+
+For the full teleop path, `tools/virtual_gamepad.py` plays an operator through a FIFO given to
+`--gamepad`. This L4T kernel has no uinput, so `kaivuri-record` reads raw `input_event` structs
+from a FIFO with xpad Xbox ranges; deadzone, signs, buttons, arming, pump permission and
+`--live-pwm` all run unchanged. `session.json` records `"virtual_gamepad": true`.
+
+```bash
+F=/tmp/kvr-pad.fifo
+python3 tools/record_native.py --session results/vpad-test --task "scoop sand" \
+  --gamepad $F --enable-slew [--live-pwm] &
+python3 tools/virtual_gamepad.py $F --episodes 5 --seconds 20 --discard-every 4 --stop-pid $!
+```
+
+Use `--live-pwm` only with servo and pump power physically disconnected.
+
 ## Native spool and additional data
 
 Every new session contains `session.json` and calibration/source snapshots with

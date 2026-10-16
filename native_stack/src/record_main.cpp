@@ -21,6 +21,7 @@
 #include <sstream>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
@@ -122,12 +123,25 @@ struct Control {
 // Linux evdev uses X/Y labels BTN_NORTH/BTN_WEST, matching modules/gamepad.py.
 struct Pad {
     int fd = -1;
+    bool virtual_pad = false;
     std::array<input_absinfo, ABS_CNT> axes{};
     std::array<bool, KEY_CNT> keys{};
     explicit Pad(const std::string &path) {
         fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             throw std::runtime_error("cannot open gamepad: " + path);
+        struct stat st{};
+        if (fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            // Virtual pad (tools/virtual_gamepad.py): raw input_event structs through a FIFO,
+            // with the xpad Xbox ranges, because this kernel has no uinput. Everything after
+            // the event read is the real path.
+            virtual_pad = true;
+            for (int code : {ABS_X, ABS_Y, ABS_RX, ABS_RY})
+                axes[code] = input_absinfo{0, -32768, 32767, 16, 128, 0};
+            for (int code : {ABS_Z, ABS_RZ})
+                axes[code] = input_absinfo{0, 0, 1023, 0, 0, 0};
+            return;
+        }
         for (int code : {ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ})
             if (ioctl(fd, EVIOCGABS(code), &axes[code]) < 0 ||
                 axes[code].maximum <= axes[code].minimum) {
@@ -354,6 +368,8 @@ int main(int argc, char **argv) {
         std::vector<std::string> camera_paths;
         int fps = 30, queue = 64;
         double max_episode = 180, auto_seconds = 0, max_skew_ms = 40, max_age_ms = 200;
+        double auto_sine = 0;
+        int auto_episodes = 1;
         bool scripted = false, allow_live = false, tracks = false, slew = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
@@ -380,6 +396,10 @@ int main(int argc, char **argv) {
                 max_episode = std::stod(val());
             else if (a == "--auto-record-s")
                 auto_seconds = std::stod(val());
+            else if (a == "--auto-episodes")
+                auto_episodes = std::stoi(val());
+            else if (a == "--auto-sine")
+                auto_sine = std::stod(val());
             else if (a == "--max-pair-skew-ms")
                 max_skew_ms = std::stod(val());
             else if (a == "--max-age-ms")
@@ -405,8 +425,10 @@ int main(int argc, char **argv) {
                        "disarm.\n"
                        "No automatic config reload: disarm and restart services after "
                        "configuration changes.\n"
-                       "--scripted [--auto-record-s SEC] is dry-only; stdin: "
-                       "arm/start/save/discard/pump/quit.\n";
+                       "--scripted [--auto-record-s SEC [--auto-episodes N] [--auto-sine AMP]] "
+                       "is dry-only; stdin: arm/start/save/discard/pump/quit.\n"
+                       "--auto-sine drives each enabled joint with an AMP-amplitude sine while "
+                       "recording, so test datasets have non-constant actions.\n";
                 return 0;
             } else
                 throw std::runtime_error("unknown option: " + a);
@@ -416,7 +438,9 @@ int main(int argc, char **argv) {
             queue > 1024 || !std::isfinite(max_episode) || max_episode <= 0 ||
             !std::isfinite(auto_seconds) || auto_seconds < 0 || (!scripted && auto_seconds > 0) ||
             !std::isfinite(max_age_ms) || max_age_ms <= 0 || !std::isfinite(max_skew_ms) ||
-            max_skew_ms < 0 || (!scripted && gamepad.empty()))
+            max_skew_ms < 0 || (!scripted && gamepad.empty()) || auto_episodes < 1 ||
+            (auto_episodes > 1 && auto_seconds <= 0) || !std::isfinite(auto_sine) ||
+            auto_sine < 0 || auto_sine > 1 || (auto_sine > 0 && auto_seconds <= 0))
             throw std::runtime_error("invalid recorder arguments");
         Control control(socket);
         auto initial = YAML::Load(control.status());
@@ -441,6 +465,7 @@ int main(int argc, char **argv) {
                  << ",\"enable_tracks\":" << (tracks ? "true" : "false")
                  << ",\"live_pwm\":" << initial["live_pwm"].as<bool>()
                  << ",\"simulated_imu\":" << initial["simulated_imu"].as<bool>()
+                 << ",\"virtual_gamepad\":" << (pad && pad->virtual_pad ? "true" : "false")
                  << ",\"camera_files\":[" << quote(camera_paths[0]) << "," << quote(camera_paths[1])
                  << "],\"initial_status\":" << control.status() << "}\n";
         manifest.close();
@@ -452,6 +477,7 @@ int main(int argc, char **argv) {
         std::unique_ptr<Writer> writer;
         uint64_t begin = 0, frames = 0, last1 = 0, last2 = 0, last_frame = 0, last_master_ns = 0;
         bool pump = false, arm = false, pending_start = auto_seconds > 0;
+        int auto_done = 0;
         bool imu_ready = initial["imu_healthy"].as<bool>(), was_armed = false;
         std::string last_fault;
         arm = pending_start;
@@ -517,6 +543,13 @@ int main(int argc, char **argv) {
                             quit = true;
                         else
                             throw std::runtime_error("unknown scripted command");
+                    }
+                    if (auto_sine > 0 && writer) {
+                        // Distinct per-joint frequencies; sin(0) = 0 keeps arming centered.
+                        const double t = double(now - begin) / 1e9;
+                        const double hz[4] = {0.2, 0.3, 0.45, 0.7};
+                        for (int j = slew ? 0 : 1; j < 4; ++j)
+                            action[j] = auto_sine * std::sin(2 * M_PI * hz[j] * t);
                     }
                 }
                 bool centered = std::all_of(action.begin(), action.end(),
@@ -640,7 +673,11 @@ int main(int argc, char **argv) {
                     double duration = double(capture - begin) / 1e9;
                     if (duration >= max_episode || (auto_seconds > 0 && duration >= auto_seconds)) {
                         finish(true, "duration");
-                        if (auto_seconds > 0)
+                        if (auto_seconds > 0 && ++auto_done < auto_episodes) {
+                            arm = true;
+                            pending_start = true;
+                            session_start = ns();
+                        } else if (auto_seconds > 0)
                             quit = true;
                     }
                 }

@@ -29,6 +29,9 @@ def wait_for(path, process, timeout=15):
 
 
 def main():
+    # A launcher started in the background by a non-interactive shell inherits an ignored
+    # SIGINT; restore it so a scripted stop still saves the active take and shuts down.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--session', type=Path, required=True, help='new raw session directory')
     p.add_argument('--task', required=True)
@@ -57,6 +60,9 @@ def main():
     p.add_argument('--gain', type=float)
     p.add_argument('--synthetic', action='store_true', help='simulated cameras and IMUs, dry only')
     p.add_argument('--bench-seconds', type=float, help='automatic zero-command recording, dry only')
+    p.add_argument('--bench-episodes', type=int, default=1, help='automatic takes in one bench session')
+    p.add_argument('--bench-sine', type=float, default=0,
+                   help='dry bench only: per-joint sine command amplitude in (0, 1] instead of zero commands')
     args = p.parse_args()
     if args.session.exists():
         p.error('--session must be a new directory')
@@ -66,6 +72,10 @@ def main():
         p.error('--gamepad required outside --bench-seconds mode')
     if args.bench_seconds is not None and args.bench_seconds <= 0:
         p.error('--bench-seconds must be positive')
+    if args.bench_seconds is None and (args.bench_episodes != 1 or args.bench_sine):
+        p.error('--bench-episodes/--bench-sine require --bench-seconds')
+    if args.bench_episodes < 1 or not 0 <= args.bench_sine <= 1:
+        p.error('--bench-episodes must be >= 1 and --bench-sine in [0, 1]')
     if args.synthetic and not args.bench_seconds:
         p.error('--synthetic requires --bench-seconds')
     specs = [args.camera1, args.camera2]
@@ -105,7 +115,9 @@ def main():
             control_args = [str(args.build / 'kaivuri-control'), '--profile', str(args.profile), '--safety', str(args.safety),
                             '--socket', str(runtime / 'control.sock'), '--control-hz', str(args.control_hz), *flags]
             if args.bench_seconds is not None:
-                control_args += ['--duration-s', str(args.bench_seconds + 60), '--timing-csv', str(runtime / 'control-timing.csv')]
+                # Each take also waits for arming and its disk flush.
+                bench_total = (args.bench_seconds + 30) * args.bench_episodes + 30
+                control_args += ['--duration-s', str(bench_total), '--timing-csv', str(runtime / 'control-timing.csv')]
             control_args += ['--simulate-imu'] if args.synthetic else ['--serial', args.serial]
             if args.live_pwm:
                 control_args.append('--live-pwm')
@@ -136,7 +148,10 @@ def main():
             if args.live_pwm:
                 recorder_args.append('--allow-live')
             if args.bench_seconds is not None:
-                recorder_args += ['--scripted', '--auto-record-s', str(args.bench_seconds)]
+                recorder_args += ['--scripted', '--auto-record-s', str(args.bench_seconds),
+                                  '--auto-episodes', str(args.bench_episodes)]
+                if args.bench_sine:
+                    recorder_args += ['--auto-sine', str(args.bench_sine)]
             else:
                 recorder_args += ['--gamepad', args.gamepad]
             recorder = subprocess.Popen(recorder_args, stdin=subprocess.DEVNULL, start_new_session=True)

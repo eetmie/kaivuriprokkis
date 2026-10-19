@@ -10,11 +10,12 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory |
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
+| `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
 | `tools/client.py` | Status, disarm, emergency stop, bounded bench exercise; reusable IPC client for later TRT integration |
 | `tools/frame_reader.py` | Coherent Y8 snapshot through the native C ABI; rejects stale frames |
 | `tools/measure.py` | Per-process RSS, PSS, swap, CPU; no model or hardware imports |
 
-The default control mode reads real IMUs but **does not open I2C**. `--simulate-imu` gives a completely hardware-free control run. `--live-pwm` enables physical output and refuses simulated IMUs. Slew and tracks also require their own daemon flags. The pump requires an explicit command flag and an armed state.
+The default `kaivuri-control` mode reads real IMUs but **does not open I2C**. `--simulate-imu` gives a completely hardware-free control run. `--live-pwm` enables physical output and refuses simulated IMUs. Slew and tracks also require their own daemon flags. The pump requires an explicit command flag and an armed state.
 
 FK status includes tool XYZ/quaternion, upper-carriage XZ/XYZ/quaternion and bucket pitch, separate slew yaw, every joint pivot XYZ and link quaternion in both frames, local joint rotation quaternions, and firmware/corrected IMU quaternions plus gyro/acceleration. One snapshot is computed per healthy tick, without heap allocation, and reused by status readers. `fk_valid` and IMU timing distinguish valid observations from stale data. See [field names and frame conventions](notes/PROTOCOL.md#kinematic-observation-fields).
 
@@ -27,6 +28,13 @@ Prediction horizon, execution FPS and inference refresh rate are separate settin
 ## Episode recording
 
 The native recorder pairs camera `233522073919:2` (rotated 180°) with `141722076647:1`, runs teleoperation independently of its bounded disk writer, and exports committed takes to LeRobot 0.5.1/v3 after capture. See [recording instructions, controls and data fields](notes/RECORDING.md). Capture requires no LeRobot, Torch or Python loop.
+
+`kaivuri-mlp-collect` implements the [native MLP logging plan](notes/MLP_LOGGING_PLAN.md):
+100 Hz manual/excitation control, shared calibration/PWM/gamepad modules, direct
+live-by-default PWM and asynchronous `drive_log`/`imu_raw`/excitation output.
+It is a separate tool from the VLA recorder. See the
+[MLP runbook](notes/MLP_RECORDING.md) for build, controls, schema and training
+preparation. IK/MLP driving, circle tests and training remain deferred.
 
 ## Build
 

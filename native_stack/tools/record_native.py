@@ -1,7 +1,9 @@
 """Launch native controller, dual-IR camera and recorder; no Python capture loop.
 
-A=start/save, B=discard, X=pump, Y=centered arm/recover. Export is a separate
-post-session step, after controller shutdown. Defaults never open physical PWM.
+A=start/save, B=discard, X=pump, Y=re-arm. The recorder arms itself and re-arms
+after controller faults; sticks drive at all times. PWM is live by default (the
+servo/pump power switch is the cut-off); --dry and --synthetic never open I2C.
+Export is a separate post-session step, after controller shutdown.
 """
 import argparse
 import hashlib
@@ -53,7 +55,8 @@ def main():
     p.add_argument('--view-fps', type=float, default=10, help='preview rate cap; recording FPS is unchanged')
     p.add_argument('--view-python', type=Path, default=PROJECT / '.venv-rerun/bin/python')
     p.add_argument('--serial', default='/dev/ttyACM0')
-    p.add_argument('--live-pwm', action='store_true')
+    p.add_argument('--dry', action='store_true', help='do not open I2C; implied by --synthetic')
+    p.add_argument('--live-pwm', action='store_true', help=argparse.SUPPRESS)  # old flag; live is the default
     p.add_argument('--enable-slew', action='store_true')
     p.add_argument('--enable-tracks', action='store_true')
     p.add_argument('--exposure-us', type=float)
@@ -66,8 +69,7 @@ def main():
     args = p.parse_args()
     if args.session.exists():
         p.error('--session must be a new directory')
-    if args.live_pwm and (args.synthetic or args.bench_seconds is not None):
-        p.error('synthetic/automatic bench recording cannot use live PWM')
+    live_pwm = not (args.dry or args.synthetic)
     if not args.bench_seconds and not args.gamepad:
         p.error('--gamepad required outside --bench-seconds mode')
     if args.bench_seconds is not None and args.bench_seconds <= 0:
@@ -119,7 +121,7 @@ def main():
                 bench_total = (args.bench_seconds + 30) * args.bench_episodes + 30
                 control_args += ['--duration-s', str(bench_total), '--timing-csv', str(runtime / 'control-timing.csv')]
             control_args += ['--simulate-imu'] if args.synthetic else ['--serial', args.serial]
-            if args.live_pwm:
+            if live_pwm:
                 control_args.append('--live-pwm')
             controller = subprocess.Popen(control_args, start_new_session=True)
             processes.append(controller)
@@ -145,8 +147,6 @@ def main():
                              '--max-pair-skew-ms', str(args.max_pair_skew_ms), *flags]
             for file in files:
                 recorder_args += ['--camera-file', str(file)]
-            if args.live_pwm:
-                recorder_args.append('--allow-live')
             if args.bench_seconds is not None:
                 recorder_args += ['--scripted', '--auto-record-s', str(args.bench_seconds),
                                   '--auto-episodes', str(args.bench_episodes)]
@@ -215,7 +215,7 @@ def main():
                 'files': {name: hashlib.sha256(data).hexdigest() for name, data in snapshots.items()},
                 'executables': executable_hashes, 'camera_order': specs, 'controller_arguments': control_args,
                 'camera_arguments': camera_args, 'camera_rotations_deg': [180 if args.rotate_camera1 else 0, 0],
-                'live_view': args.live_view, 'view_fps': args.view_fps if args.live_view else None,
+                'live_pwm': live_pwm, 'live_view': args.live_view, 'view_fps': args.view_fps if args.live_view else None,
                 'view_camera1_rotation_deg': 180 if args.view_rotate_camera1 else 0}, indent=2) + '\n')
     if rc == 0:
         print(f'Native recording complete: {args.session}\nExport with export_episodes.py after recording.')

@@ -1,4 +1,5 @@
 #include "kaivuri/core.hpp"
+#include "kaivuri/pwm.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -41,76 +42,6 @@ struct Fd {
     }
     Fd(const Fd &) = delete;
     Fd &operator=(const Fd &) = delete;
-};
-class Pwm {
-    Config cfg_;
-    Fd fd_;
-    bool live_;
-    void reg(uint8_t r, uint8_t value) {
-        uint8_t bytes[]{r, value};
-        check(::write(fd_.n, bytes, 2) == 2, "PCA9685 register write");
-    }
-
-  public:
-    std::array<double, 16> pulses{};
-    Pwm(const Config &c, bool live) : cfg_(c), live_(live) {
-        for (const auto &v : c.valves)
-            pulses[v.channel] = v.center;
-        pulses[c.pump_channel] = c.pump_min;
-        if (!live)
-            return;
-        fd_.n = ::open(("/dev/i2c-" + std::to_string(c.i2c_bus)).c_str(), O_RDWR | O_CLOEXEC);
-        check(fd_.n >= 0, "open I2C");
-        check(ioctl(fd_.n, I2C_SLAVE, c.address) >= 0, "select PCA9685");
-        // Stage neutral register values while asleep, then wake. AI enables bursts.
-        reg(0x00, 0x30);
-        reg(0x01, 0x04);
-        reg(0xfe,
-            static_cast<uint8_t>(std::clamp(int(25000000. / (4096 * c.frequency) - 1), 3, 255)));
-        flush();
-        reg(0x00, 0x20);
-        usleep(5000);
-        reg(0x00, 0xa0);
-        flush();
-    }
-    void flush() {
-        if (!live_)
-            return;
-        int lo = 15, hi = 0;
-        for (const auto &v : cfg_.valves) {
-            lo = std::min(lo, v.channel);
-            hi = std::max(hi, v.channel);
-        }
-        lo = std::min(lo, cfg_.pump_channel);
-        hi = std::max(hi, cfg_.pump_channel);
-        std::array<uint8_t, 65> bytes{};
-        bytes[0] = static_cast<uint8_t>(0x06 + 4 * lo);
-        for (int i = lo; i <= hi; ++i) {
-            const auto count = pulse_count(pulses[i], cfg_.frequency);
-            size_t j = 1 + 4 * (i - lo);
-            bytes[j + 2] = count & 255;
-            bytes[j + 3] = count >> 8;
-            if (count == 0)
-                bytes[j + 3] = 0x10;
-        }
-        const size_t size = 1 + 4 * (hi - lo + 1);
-        check(::write(fd_.n, bytes.data(), size) == static_cast<ssize_t>(size),
-              "PCA9685 burst write");
-    }
-    void neutral() {
-        for (const auto &v : cfg_.valves)
-            pulses[v.channel] = v.center;
-        pulses[cfg_.pump_channel] = cfg_.pump_min;
-        flush();
-    }
-    ~Pwm() {
-        if (live_ && fd_.n >= 0)
-            try {
-                neutral();
-            } catch (...) {
-                std::fputs("Neutral write failed; physical stop required.\n", stderr);
-            }
-    }
 };
 struct Client {
     int fd = -1;
@@ -273,10 +204,7 @@ int main(int argc, char **argv) {
               "unsafe runtime directory");
         check(chmod(runtime.c_str(), 0700) == 0, "runtime permissions");
         // Hardware lock is independent of the socket path: two native daemons cannot own PWM.
-        Fd ownership(::open((runtime + "/control.lock").c_str(),
-                            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
-        check(ownership.n >= 0 && flock(ownership.n, LOCK_EX | LOCK_NB) == 0,
-              "another native controller is running");
+        ControlLock ownership(runtime);
         Pwm pwm(cfg, live);
         if (neutralize) {
             pwm.neutral();

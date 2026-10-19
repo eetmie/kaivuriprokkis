@@ -1,5 +1,6 @@
 // Native teleoperation and bounded, lossless episode spool. No encoder or Python in this process.
 #include "kaivuri/core.hpp"
+#include "kaivuri/gamepad.hpp"
 #include "kaivuri/frame_store.hpp"
 #include <algorithm>
 #include <atomic>
@@ -121,79 +122,6 @@ struct Control {
     }
 };
 // Linux evdev uses X/Y labels BTN_NORTH/BTN_WEST, matching modules/gamepad.py.
-struct Pad {
-    int fd = -1;
-    bool virtual_pad = false;
-    std::array<input_absinfo, ABS_CNT> axes{};
-    std::array<bool, KEY_CNT> keys{};
-    explicit Pad(const std::string &path) {
-        fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0)
-            throw std::runtime_error("cannot open gamepad: " + path);
-        struct stat st{};
-        if (fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
-            // Virtual pad (tools/virtual_gamepad.py): raw input_event structs through a FIFO,
-            // with the xpad Xbox ranges, because this kernel has no uinput. Everything after
-            // the event read is the real path.
-            virtual_pad = true;
-            for (int code : {ABS_X, ABS_Y, ABS_RX, ABS_RY})
-                axes[code] = input_absinfo{0, -32768, 32767, 16, 128, 0};
-            for (int code : {ABS_Z, ABS_RZ})
-                axes[code] = input_absinfo{0, 0, 1023, 0, 0, 0};
-            return;
-        }
-        for (int code : {ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ})
-            if (ioctl(fd, EVIOCGABS(code), &axes[code]) < 0 ||
-                axes[code].maximum <= axes[code].minimum) {
-                close(fd);
-                throw std::runtime_error("gamepad must expose Xbox X/Y/RX/RY/Z/RZ axes");
-            }
-        unsigned char bits[(KEY_CNT + 7) / 8]{};
-        if (ioctl(fd, EVIOCGKEY(sizeof(bits)), bits) < 0) {
-            close(fd);
-            throw std::runtime_error("cannot read gamepad buttons");
-        }
-        for (int i = 0; i < KEY_CNT; ++i)
-            keys[i] = (bits[i / 8] >> (i % 8)) & 1;
-    }
-    ~Pad() {
-        if (fd >= 0)
-            close(fd);
-    }
-    void poll_events() {
-        input_event e{};
-        for (;;) {
-            ssize_t n = read(fd, &e, sizeof(e));
-            if (n < 0 && (errno == EAGAIN || errno == EINTR))
-                return;
-            if (n != sizeof(e))
-                throw std::runtime_error("gamepad disconnected");
-            if (e.type == EV_SYN && e.code == SYN_DROPPED)
-                throw std::runtime_error("gamepad event queue overrun");
-            if (e.type == EV_ABS && e.code < ABS_CNT)
-                axes[e.code].value = e.value;
-            if (e.type == EV_KEY && e.code < KEY_CNT)
-                keys[e.code] = e.value != 0;
-        }
-    }
-    double axis(int code, bool trigger = false) const {
-        auto a = axes[code];
-        double x = trigger
-                       ? double(a.value - a.minimum) / (a.maximum - a.minimum)
-                       : double(a.value) / std::max(std::abs(a.minimum), std::abs(a.maximum) + 1);
-        x = std::clamp(x, trigger ? 0. : -1., 1.);
-        return std::abs(x) < .25 ? 0 : std::copysign((std::abs(x) - .25) / .75, x);
-    }
-    Commands action(bool slew, bool tracks) const {
-        // Same signs and deadzone as the existing LocalGamepadInput/manual_action_from_axes.
-        return {slew ? -axis(ABS_X) : 0,
-                -axis(ABS_RY),
-                axis(ABS_Y),
-                -axis(ABS_RX),
-                tracks ? axis(ABS_Z, true) * (keys[BTN_TL] ? -1 : 1) : 0,
-                tracks ? axis(ABS_RZ, true) * (keys[BTN_TR] ? -1 : 1) : 0};
-    }
-};
 struct Image {
     void *handle = nullptr;
     FrameMetadata m{};
@@ -295,6 +223,14 @@ class Writer {
             throw std::runtime_error("cannot create episode files");
         thread_ = std::thread([this] { run(); });
     }
+    // Stop writing without committing: the take stays as .partial, which export skips.
+    void abandon(const std::string &reason) {
+        join();
+        rows_.close();
+        cam1_.close();
+        cam2_.close();
+        std::cerr << "Take stopped (" << reason << "); kept incomplete at " << path_ << std::endl;
+    }
     bool push(Record r) {
         std::lock_guard<std::mutex> l(mutex_);
         if (failed_ || queue_.size() >= limit_)
@@ -370,7 +306,7 @@ int main(int argc, char **argv) {
         double max_episode = 180, auto_seconds = 0, max_skew_ms = 40, max_age_ms = 200;
         double auto_sine = 0;
         int auto_episodes = 1;
-        bool scripted = false, allow_live = false, tracks = false, slew = false;
+        bool scripted = false, tracks = false, slew = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             auto val = [&]() {
@@ -408,8 +344,6 @@ int main(int argc, char **argv) {
                 revision = val();
             else if (a == "--scripted")
                 scripted = true;
-            else if (a == "--allow-live")
-                allow_live = true;
             else if (a == "--enable-tracks")
                 tracks = true;
             else if (a == "--enable-slew")
@@ -418,15 +352,16 @@ int main(int argc, char **argv) {
                 std::cout
                     << "kaivuri-record --root NEW_SESSION --task TEXT --gamepad /dev/input/eventN\n"
                        "  --camera-file .../SERIAL1-ir1.frame --camera-file .../SERIAL2-ir2.frame\n"
-                       "  [--socket PATH --fps 30 --enable-slew --enable-tracks --allow-live]\n"
+                       "  [--socket PATH --fps 30 --enable-slew --enable-tracks]\n"
                        "  [--max-episode-s 180 --queue-frames 64 --max-pair-skew-ms 40 "
                        "--max-age-ms 200]\n"
-                       "A=start/save B=discard X=pump Y=centered arm/recover; Ctrl+C=save and "
-                       "disarm.\n"
-                       "No automatic config reload: disarm and restart services after "
-                       "configuration changes.\n"
+                       "Arms automatically and re-arms after controller faults; sticks drive at "
+                       "all times.\n"
+                       "A=start/save B=discard X=pump Y=re-arm now; Ctrl+C=save and exit.\n"
+                       "No automatic config reload: restart services after configuration "
+                       "changes.\n"
                        "--scripted [--auto-record-s SEC [--auto-episodes N] [--auto-sine AMP]] "
-                       "is dry-only; stdin: arm/start/save/discard/pump/quit.\n"
+                       "reads stdin: arm/start/save/discard/pump/quit.\n"
                        "--auto-sine drives each enabled joint with an AMP-amplitude sine while "
                        "recording, so test datasets have non-constant actions.\n";
                 return 0;
@@ -444,8 +379,6 @@ int main(int argc, char **argv) {
             throw std::runtime_error("invalid recorder arguments");
         Control control(socket);
         auto initial = YAML::Load(control.status());
-        if (initial["live_pwm"].as<bool>() && (scripted || !allow_live))
-            throw std::runtime_error("live controller requires --allow-live and a real gamepad");
         if (!initial["applied_action"])
             throw std::runtime_error("rebuild controller: applied_action metadata missing");
         if (initial["enable_slew"].as<bool>() != slew ||
@@ -476,11 +409,13 @@ int main(int argc, char **argv) {
         signal(SIGTERM, stop_signal);
         std::unique_ptr<Writer> writer;
         uint64_t begin = 0, frames = 0, last1 = 0, last2 = 0, last_frame = 0, last_master_ns = 0;
-        bool pump = false, arm = false, pending_start = auto_seconds > 0;
+        // No operator arming: the controller's centered arming hold is sent automatically
+        // (zero commands with the arm flag) whenever it is not armed, then sticks take over.
+        bool pump = false, pending_start = auto_seconds > 0;
         int auto_done = 0;
         bool imu_ready = initial["imu_healthy"].as<bool>(), was_armed = false;
         std::string last_fault;
-        arm = pending_start;
+        uint64_t last_recovery = 0;
         std::array<bool, 4> previous{};
         if (pad)
             previous = {pad->keys[BTN_SOUTH], pad->keys[BTN_EAST], pad->keys[BTN_NORTH],
@@ -491,18 +426,25 @@ int main(int argc, char **argv) {
             fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
         std::string input;
         bool quit = false;
+        // Ends the take only; the controller stays armed and the pump keeps its setting.
         auto finish = [&](bool save, const std::string &reason) {
-            control.send(Operation::Disarm);
-            arm = false;
-            was_armed = false;
-            pump = false;
             pending_start = false;
             if (writer) {
                 writer->finish(save, frames, begin, ns(), reason);
                 writer.reset();
             }
         };
-        std::cout << "A=start/save B=discard X=pump Y=centered arm; native spool ready\n"
+        auto abandon = [&](const std::string &reason) {
+            if (auto_seconds > 0)
+                throw std::runtime_error(reason);
+            pending_start = false;
+            if (writer) {
+                writer->abandon(reason);
+                writer.reset();
+            }
+        };
+        std::cout << "A=start/save B=discard X=pump Y=re-arm; arms automatically; native spool "
+                     "ready\n"
                   << std::flush;
         try {
             while (!stopped && !quit) {
@@ -552,8 +494,6 @@ int main(int argc, char **argv) {
                             action[j] = auto_sine * std::sin(2 * M_PI * hz[j] * t);
                     }
                 }
-                bool centered = std::all_of(action.begin(), action.end(),
-                                            [](double a) { return std::abs(a) < .02; });
                 if (save || (start && writer)) {
                     finish(true, "save");
                     start = false;
@@ -568,46 +508,39 @@ int main(int argc, char **argv) {
                     std::cout << "Already armed; driving/recording continues\n" << std::flush;
                     rearm = false;
                 }
-                if (rearm && !centered) {
-                    std::cerr << "Center sticks before arming\n";
-                    rearm = false;
-                }
-                if (rearm) {
+                if (rearm)
                     control.send(Operation::Disarm);
-                    arm = true;
-                    pump = false;
-                }
-                if (start && !was_armed && !centered) {
-                    std::cerr << "Center sticks before arming/starting an episode\n";
-                    start = false;
-                }
-                if (start) {
-                    arm = true;
+                if (start)
                     pending_start = true;
-                }
                 if (toggle)
                     pump = !pump;
-                if (arm && imu_ready)
-                    control.send(Operation::Drive, action,
+                // Until armed, send the centered hold the controller needs instead of the sticks.
+                if (imu_ready)
+                    control.send(Operation::Drive, was_armed ? action : Commands{},
                                  deadman_flag | arm_flag | (pump ? pump_flag : 0));
                 auto raw = control.status();
                 auto status = YAML::Load(raw);
                 if (status["state"].as<std::string>() == "fault") {
                     const auto reason = status["reason"].as<std::string>();
-                    if (writer || auto_seconds > 0)
+                    if (writer)
+                        abandon("controller fault: " + reason);
+                    else if (auto_seconds > 0)
                         throw std::runtime_error("controller fault: " + reason);
-                    arm = false;
-                    pump = false;
-                    pending_start = false;
                     if (reason != last_fault)
-                        std::cerr << "Controller fault: " << reason
-                                  << "; Y recovers after correction\n";
+                        std::cerr << "Controller fault: " << reason << "; re-arming automatically\n";
                     last_fault = reason;
+                    // Clear the latched fault at most once per second; arming resumes after it.
+                    if (ns() - last_recovery >= 1000000000) {
+                        control.send(Operation::Disarm);
+                        last_recovery = ns();
+                    }
                 } else
                     last_fault.clear();
                 imu_ready = status["imu_healthy"].as<bool>();
                 bool healthy = status["fk_valid"].as<bool>();
                 bool armed = status["state"].as<std::string>() == "armed";
+                if (armed && !was_armed)
+                    std::cout << "Armed\n" << std::flush;
                 was_armed = armed;
                 if (pending_start && armed && healthy) {
                     writer = std::make_unique<Writer>(root, queue);
@@ -618,9 +551,9 @@ int main(int argc, char **argv) {
                     pending_start = false;
                     std::cout << "Recording\n" << std::flush;
                 }
+                if (writer && (!healthy || !armed))
+                    abandon("recording lost healthy armed controller");
                 if (writer) {
-                    if (!healthy || !armed)
-                        throw std::runtime_error("recording lost healthy armed controller");
                     Record record;
                     bool fresh = cam1.read() && cam2.read();
                     uint64_t capture = ns();
@@ -674,7 +607,6 @@ int main(int argc, char **argv) {
                     if (duration >= max_episode || (auto_seconds > 0 && duration >= auto_seconds)) {
                         finish(true, "duration");
                         if (auto_seconds > 0 && ++auto_done < auto_episodes) {
-                            arm = true;
                             pending_start = true;
                             session_start = ns();
                         } else if (auto_seconds > 0)

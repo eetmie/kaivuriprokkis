@@ -50,6 +50,7 @@ struct Config {
     double max_packet_age = 0.1, max_observation_age = 1.5, max_horizon = 5;
     bool enable_slew = false, enable_tracks = false;
 };
+Config load_hardware_config(const std::string &profile_dir);
 Config load_config(const std::string &profile_dir, const std::string &safety_file);
 struct Pose {
     Vec3 position{};
@@ -75,15 +76,23 @@ uint16_t pulse_count(double pulse_us, int frequency);
 struct ImuSample {
     std::array<Quat, 4> quats{};
     std::array<std::array<float, 6>, 4> motion{}; // gyro dps, accel g
-    uint64_t device_us = 0, sequence = 0;
+    uint64_t device_us = 0, sequence = 0, epoch = 0;
+    uint32_t raw_device_us = 0;
+    uint8_t packet_type = 0;
     double received = 0;
     bool valid = false;
 };
 class ImuParser {
   public:
+    using SampleSink = void (*)(void *, const ImuSample &);
     explicit ImuParser(int expected) : expected_(expected) {}
     void feed(const uint8_t *bytes, size_t count, double now);
     const ImuSample &sample() const { return sample_; }
+    void set_sample_sink(SampleSink sink, void *context) {
+        sink_ = sink;
+        sink_context_ = context;
+    }
+    double gyro_range_dps = 0, accel_range_g = 0;
     uint64_t checksum_errors = 0, invalid_frames = 0, resets = 0;
     int control_message = 0;
     bool firmware_blocked = false;
@@ -93,6 +102,8 @@ class ImuParser {
     size_t size_ = 0;
     int expected_;
     ImuSample sample_{};
+    SampleSink sink_ = nullptr;
+    void *sink_context_ = nullptr;
     uint32_t previous_ts_ = 0;
     uint64_t extended_ts_ = 0;
     bool have_ts_ = false;

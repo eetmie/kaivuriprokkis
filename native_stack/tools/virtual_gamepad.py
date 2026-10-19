@@ -82,8 +82,8 @@ def main():
     pad.sticks()
     time.sleep(args.startup_s)
     for episode in range(args.episodes):
-        pad.press(BTN_SOUTH)            # A: arm and start
-        time.sleep(0.6)                 # centered arming hold is 250 ms
+        pad.press(BTN_SOUTH)            # A: start (the recorder arms itself)
+        time.sleep(0.6)
         pad.press(BTN_NORTH)            # X: pump permission (Linux BTN_NORTH is the X label)
         drive(pad, args.seconds, args.rate_hz, rng)
         discard = args.discard_every and (episode + 1) % args.discard_every == 0

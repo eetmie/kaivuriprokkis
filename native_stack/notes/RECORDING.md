@@ -42,10 +42,10 @@ python3 tools/record_native.py \
   --session results/new-synthetic-session --task "recorder verification" \
   --synthetic --bench-seconds 3
 
-# Real IR1 + IR2 and real IMUs; zero commands, dry PWM.
+# Real IR1 + IR2 and real IMUs; zero commands, no I2C.
 python3 tools/record_native.py \
   --session results/new-real-session --task "dual IR verification" \
-  --bench-seconds 30
+  --bench-seconds 30 --dry
 python3 tools/export_episodes.py results/new-real-session --validate-only
 ```
 
@@ -58,8 +58,8 @@ including startup and shutdown. It is not needed in the timed recording loop.
 
 Connect the Xbox gamepad and identify its evdev event path (`/dev/input/by-id/...
 -event-joystick`, or the corresponding `/dev/input/eventN`). No gamepad was plugged
-in during the initial hardware capture validation; verify physical joystick
-mapping on dry PWM before enabling output. Signs, 25% deadzone, trigger range
+in during the initial hardware capture validation; check the joystick mapping
+with servo power off first. Signs, 25% deadzone, trigger range
 probing and bumper track reversal match the existing Linux Python recorder.
 
 ```bash
@@ -70,48 +70,51 @@ python3 tools/record_native.py \
   --enable-slew
 ```
 
-That command is dry. For physical output, explicitly add `--live-pwm`, after the
-existing controller hardware acceptance checks. Tracks require `--enable-tracks`
+PWM output is live by default; the servo/pump power switch is the cut-off. Add
+`--dry` to run without opening I2C (`--synthetic` is always dry). The old
+`--live-pwm` flag is still accepted and does nothing. Tracks require `--enable-tracks`
 on the launcher; they are disabled and exported actions stay four-dimensional by
 default. The launcher forwards the same slew/track flags to both controller and
 recorder; direct IPC use refuses mismatched flags.
 
+The recorder arms the controller by itself as soon as the IMUs are healthy. It
+sends the controller's 250 ms centered hold for you, whatever the sticks are doing,
+and then the sticks drive at all times, inside or outside a take. After a
+controller fault (IMU glitch, deadline miss, E-stop) it clears the fault and
+re-arms automatically, at most once per second. A take that was running during the
+fault is stopped and kept as `.partial`, which export skips; the session carries on.
+
 | Input | Behavior |
 | --- | --- |
-| A | Center sticks, arm after healthy IMUs, start episode; while recording, save and disarm |
-| B | Discard current episode, disarm and turn pump off |
-| X | Toggle operator pump permission; pump remains off until armed |
-| Y | Centered arming/recovery for teleoperation outside an episode |
-| Ctrl+C | Save a valid active episode, disarm, shut down all services |
+| A | Start a take (once armed); while recording, save |
+| B | Discard the current take |
+| X | Toggle the pump |
+| Y | Re-arm now (normally not needed) |
+| Ctrl+C | Save a valid active take, disarm, shut down all services |
 
-Saving/discarding turns the pump off and disarms **before** waiting for disk flush.
-The pump is not automatically restarted after save; use A/Y and X deliberately.
-Y is arming/recovery, replacing the old recorder's reload button. Configuration
-reload is not implemented by the native controller: stop and restart after edits.
-Default maximum take length is 180 s, with automatic save and disarm.
-
-The recorder requests no physical permissions itself. Live PWM cannot be combined
-with scripted/automatic capture or simulated IMUs. All automated tests are dry.
+Saving or discarding a take leaves the controller armed and the pump as it was.
+Configuration reload is not implemented by the native controller: stop and restart
+after edits. Default maximum take length is 180 s, with automatic save.
 
 ## Test sessions without an operator
 
-`--bench-seconds S` records automatically with zero commands (dry only). `--bench-episodes N`
+`--bench-seconds S` records automatically with zero commands. `--bench-episodes N`
 records N takes in one session and `--bench-sine A` replaces the zero commands with a per-joint
-sine of amplitude A, so a test dataset has non-constant actions.
+sine of amplitude A, so a test dataset has non-constant actions. With real IMUs this
+writes live PWM unless `--dry` is given. In automatic mode a controller fault still
+ends the run with an error, so failures are visible in tests.
 
 For the full teleop path, `tools/virtual_gamepad.py` plays an operator through a FIFO given to
 `--gamepad`. This L4T kernel has no uinput, so `kaivuri-record` reads raw `input_event` structs
-from a FIFO with xpad Xbox ranges; deadzone, signs, buttons, arming, pump permission and
-`--live-pwm` all run unchanged. `session.json` records `"virtual_gamepad": true`.
+from a FIFO with xpad Xbox ranges; deadzone, signs, buttons, arming and pump all run
+unchanged. `session.json` records `"virtual_gamepad": true`.
 
 ```bash
 F=/tmp/kvr-pad.fifo
 python3 tools/record_native.py --session results/vpad-test --task "scoop sand" \
-  --gamepad $F --enable-slew [--live-pwm] &
+  --gamepad $F --enable-slew [--dry] &
 python3 tools/virtual_gamepad.py $F --episodes 5 --seconds 20 --discard-every 4 --stop-pid $!
 ```
-
-Use `--live-pwm` only with servo and pump power physically disconnected.
 
 ## Native spool and additional data
 

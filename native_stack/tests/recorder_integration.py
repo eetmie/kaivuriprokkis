@@ -105,11 +105,34 @@ with tempfile.TemporaryDirectory(prefix='rec-test-') as temp:
         with Client(root/'control.sock') as client:
             state = wait_until(lambda: (s if (s := client.status())['state'] == 'disarmed' else None))
             assert not state['pump_on']
-        recorder = launch('live-refused', '--allow-live', '--auto-record-s', '.5', '--enable-tracks')
+        recorder = launch('flags-differ', '--auto-record-s', '.5', '--enable-tracks')
         out, err = recorder.communicate(timeout=5)
         assert recorder.returncode == 1 and 'flags differ' in err
+        # A controller fault mid-take keeps that take as .partial, re-arms without operator
+        # input and the session continues.
+        camera = subprocess.Popen([str(build/'kaivuri-camera'), '--synthetic', '--camera', 'first:1', '--camera', 'second:2',
+                                   '--width', '64', '--height', '48', '--output-dir', str(root/'cameras2')])
+        wait_until(lambda: (root/'cameras2/second-ir2.frame').exists())
+        recorder = subprocess.Popen([str(build/'kaivuri-record'), '--socket', str(root/'control.sock'), '--task', 'test',
+            '--scripted', '--root', str(root/'recover'), '--camera-file', str(root/'cameras2/first-ir1.frame'),
+            '--camera-file', str(root/'cameras2/second-ir2.frame')],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with Client(root/'control.sock') as client:
+            from client import ESTOP
+            wait_until(lambda: client.status()['state'] == 'armed')
+            command('start')
+            wait_until(lambda: list((root/'recover').glob('*.partial')))
+            time.sleep(.3)
+            client.send(ESTOP)
+            wait_until(lambda: client.status()['state'] == 'fault', timeout=1)
+            wait_until(lambda: client.status()['state'] == 'armed', timeout=4)
+        command('start'); time.sleep(.4); command('save'); command('quit')
+        out, err = recorder.communicate(timeout=5)
+        assert recorder.returncode == 0, (out, err)
+        assert 'kept incomplete' in err and 're-arming automatically' in err, err
+        assert len(list((root/'recover').glob('*.partial'))) == 1 and len(list((root/'recover').glob('*.ready'))) == 1
     finally:
         for proc in (recorder, camera, control):
             if proc is not None and proc.poll() is None:
                 proc.terminate(); proc.wait(timeout=5)
-print('Recorder lifecycle, camera failure, action attribution and export validation passed')
+print('Recorder lifecycle, camera failure, fault recovery, action attribution and export validation passed')

@@ -88,7 +88,7 @@ static Vec3 vec3(const YAML::Node &n) {
     }
     return v;
 }
-Config load_config(const std::string &profile_dir, const std::string &safety_file) {
+Config load_hardware_config(const std::string &profile_dir) {
     const auto dir = std::filesystem::path(profile_dir);
     const auto profile = YAML::LoadFile((dir / "profile.yaml").string());
     if (profile["board"].as<std::string>() != "jetson")
@@ -97,7 +97,6 @@ Config load_config(const std::string &profile_dir, const std::string &safety_fil
         YAML::LoadFile((dir / profile["servo_config_file"].as<std::string>()).string());
     const auto control =
         YAML::LoadFile((dir / profile["control_config_file"].as<std::string>()).string());
-    const auto safety = YAML::LoadFile(safety_file);
     Config c;
     c.frequency = servo["pwm_frequency"].as<int>();
     if (c.frequency < 24 || c.frequency > 1526)
@@ -203,6 +202,11 @@ Config load_config(const std::string &profile_dir, const std::string &safety_fil
         }
     }
     c.tip = vec3(control["robot"]["tool"]["parent_to_tip_xyz"]);
+    return c;
+}
+Config load_config(const std::string &profile_dir, const std::string &safety_file) {
+    Config c = load_hardware_config(profile_dir);
+    const auto safety = YAML::LoadFile(safety_file);
     c.control_hz = number(safety, "control_hz");
     c.imu_timeout = number(safety, "imu_timeout_s");
     c.command_lease = number(safety, "command_lease_s");
@@ -392,6 +396,14 @@ void ImuParser::parse(double now) {
             sample_.valid = false;
             ++resets;
         } else if (type == 3 || type == 6) {
+            if (type == 6) {
+                const double gyro = read_le<float>(&buffer_[6]);
+                const double accel = read_le<float>(&buffer_[10]);
+                if (std::isfinite(gyro) && gyro > 0)
+                    gyro_range_dps = gyro;
+                if (std::isfinite(accel) && accel > 0)
+                    accel_range_g = accel;
+            }
             sample_.valid = false;
             have_ts_ = false;
             ++resets;
@@ -431,12 +443,17 @@ void ImuParser::parse(double now) {
             }
             previous_ts_ = ts;
             next.device_us = extended_ts_;
+            next.raw_device_us = ts;
+            next.packet_type = static_cast<uint8_t>(type);
+            next.epoch = resets;
             next.sequence = sample_.sequence + 1;
             next.received = now;
             next.valid = valid;
             sample_ = next;
             if (!valid)
                 ++invalid_frames;
+            else if (sink_)
+                sink_(sink_context_, sample_);
         }
         consume(len);
     }

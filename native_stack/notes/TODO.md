@@ -1,5 +1,22 @@
 # Work items
 
+## MLP data collection
+
+Implementation order and acceptance criteria are in the
+[native MLP logging plan](MLP_LOGGING_PLAN.md). One 100 Hz process writes the
+PCA9685 directly, without arming or other software gates, and is kept separate
+from the VLA recorder.
+
+- [x] Per-packet `ImuParser` emission, shared `Pwm`/gamepad modules and an IMU byte-replay input.
+- [x] `kaivuri-mlp-collect`: manual driving, pump toggle, `drive_log`/`imu_raw`/`excitation` output.
+- [x] Port sine/chirp/stroke excitation with cross-language fixtures.
+- [x] `pump_on` handling in `training/drive_logs.py`; validate q/v/u on a replayed strip.
+- [x] 30-minute real-IMU/live-neutral-PWM Jetson run with servo/pump power off; zero missed periods/drops, flat 12.52 MiB RSS and neutral register readback. See [MLP validation](MLP_VALIDATION.md).
+- [ ] Operator: physical gamepad mapping and a short powered collection before full dataset collection.
+
+IK/PID and old MLP driving, circle tests and model training are deferred from this
+logging milestone.
+
 ## Completed on Spark
 
 - [x] Separate C++ safety/IMU/valve/FK process; retain existing profiles and calibration math.

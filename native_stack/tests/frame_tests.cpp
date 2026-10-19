@@ -70,7 +70,40 @@ int main() {
             throw std::runtime_error("undersized destination accepted");
         if (kaivuri_frame_read(reader, &m, nullptr, 0) != 1)
             throw std::runtime_error("metadata-only read failed");
-        std::printf("Concurrent frame snapshot checks passed (%llu snapshots)\n",
+        {
+            // Z16 depth store: two bytes per pixel, packed rows.
+            const std::string depth_path = path + "-depth";
+            Cleanup depth_cleanup{depth_path};
+            FrameWriter depth(depth_path, 64, 48, 0, 2);
+            void *depth_reader = kaivuri_frame_open(depth_path.c_str());
+            if (!depth_reader)
+                throw std::runtime_error("open depth reader");
+            Close depth_close{depth_reader};
+            std::vector<uint16_t> z(64 * 48);
+            for (size_t i = 0; i < z.size(); ++i)
+                z[i] = uint16_t(i * 7);
+            FrameMetadata d{};
+            d.sequence = 1;
+            d.width = 64;
+            d.height = 48;
+            d.stride = 64;
+            d.pixel_bytes = 64 * 48;
+            bool y8_rejected = false;
+            try {
+                depth.publish(d, z.data());
+            } catch (...) {
+                y8_rejected = true;
+            }
+            d.stride = 128;
+            d.pixel_bytes = 128 * 48;
+            if (!y8_rejected || !depth.publish(d, z.data()))
+                throw std::runtime_error("Z16 geometry not enforced");
+            std::vector<uint16_t> back(z.size());
+            if (kaivuri_frame_read(depth_reader, &m, back.data(), back.size() * 2) != 1 ||
+                back != z || m.pixel_bytes != 128 * 48)
+                throw std::runtime_error("Z16 round trip failed");
+        }
+        std::printf("Concurrent frame snapshot and Z16 checks passed (%llu snapshots)\n",
                     (unsigned long long)snapshots);
         return 0;
     } catch (const std::exception &e) {

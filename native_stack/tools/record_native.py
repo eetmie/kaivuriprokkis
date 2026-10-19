@@ -4,6 +4,8 @@ A=start/save, B=discard, X=pump, Y=re-arm. The recorder arms itself and re-arms
 after controller faults; sticks drive at all times. PWM is live by default (the
 servo/pump power switch is the cut-off); --dry and --synthetic never open I2C.
 Export is a separate post-session step, after controller shutdown.
+Depth (Z16 from the cameras' stereo ASIC, same resolution as IR) is recorded for both
+cameras by default as lossless zstd; --depth none restores IR-only capture.
 """
 import argparse
 import hashlib
@@ -59,6 +61,8 @@ def main():
     p.add_argument('--live-pwm', action='store_true', help=argparse.SUPPRESS)  # old flag; live is the default
     p.add_argument('--enable-slew', action='store_true')
     p.add_argument('--enable-tracks', action='store_true')
+    p.add_argument('--depth', choices=('both', 'cam1', 'cam2', 'none'), default='both',
+                   help='record same-sensor depth for these cameras (camN.depth.zst, ~11%% of one core)')
     p.add_argument('--exposure-us', type=float)
     p.add_argument('--gain', type=float)
     p.add_argument('--synthetic', action='store_true', help='simulated cameras and IMUs, dry only')
@@ -130,6 +134,9 @@ def main():
                            '--output-dir', str(runtime / 'cameras'), '--fps', str(args.fps)]
             if args.rotate_camera1:
                 camera_args += ['--rotate-180', parsed[0][0]]
+            depth_cams = {'both': (0, 1), 'cam1': (0,), 'cam2': (1,), 'none': ()}[args.depth]
+            for k in depth_cams:
+                camera_args += ['--depth', parsed[k][0]]
             if args.synthetic:
                 camera_args.append('--synthetic')
             if args.exposure_us is not None:
@@ -139,7 +146,8 @@ def main():
             cameras = subprocess.Popen(camera_args, start_new_session=True)
             processes.append(cameras)
             files = [runtime / 'cameras' / f'{serial}-ir{index}.frame' for serial, index in parsed]
-            for path in files:
+            depth_files = {k: runtime / 'cameras' / f'{parsed[k][0]}-depth.frame' for k in depth_cams}
+            for path in [*files, *depth_files.values()]:
                 wait_for(path, cameras)
             recorder_args = [str(args.build / 'kaivuri-record'), '--socket', str(runtime / 'control.sock'),
                              '--root', str(args.session), '--task', args.task, '--revision', revision,
@@ -147,6 +155,8 @@ def main():
                              '--max-pair-skew-ms', str(args.max_pair_skew_ms), *flags]
             for file in files:
                 recorder_args += ['--camera-file', str(file)]
+            for k, file in depth_files.items():
+                recorder_args += [f'--cam{k + 1}-depth-file', str(file)]
             if args.bench_seconds is not None:
                 recorder_args += ['--scripted', '--auto-record-s', str(args.bench_seconds),
                                   '--auto-episodes', str(args.bench_episodes)]
@@ -215,7 +225,7 @@ def main():
                 'files': {name: hashlib.sha256(data).hexdigest() for name, data in snapshots.items()},
                 'executables': executable_hashes, 'camera_order': specs, 'controller_arguments': control_args,
                 'camera_arguments': camera_args, 'camera_rotations_deg': [180 if args.rotate_camera1 else 0, 0],
-                'live_pwm': live_pwm, 'live_view': args.live_view, 'view_fps': args.view_fps if args.live_view else None,
+                'live_pwm': live_pwm, 'depth': args.depth, 'live_view': args.live_view, 'view_fps': args.view_fps if args.live_view else None,
                 'view_camera1_rotation_deg': 180 if args.view_rotate_camera1 else 0}, indent=2) + '\n')
     if rc == 0:
         print(f'Native recording complete: {args.session}\nExport with export_episodes.py after recording.')

@@ -9,11 +9,20 @@ Only `observation.state` and `observation.images.*` are policy inputs. FK and IM
 under `feedback.*`, like the Python recorder's `feedback.imu_quaternion`: LeRobot types
 every other `observation.*` key as a STATE input feature too, so a policy would silently
 pick them up. Build a state from them on purpose instead.
+
+Optional depth (`session.json` "depth": ["cam1", ...]) is not a LeRobot feature: H.264
+would quantize Z16. Each take's `camN.depth.zst` (one zstd frame of packed little-endian
+uint16 per recorded frame, paired to that frame's IR exposure by sensor timestamp) is
+validated and copied losslessly to `native/episode-*/`, with the session's
+`camN.depth.json` calibration in `native/session-*/`. Read it with `depth_frames()`.
 """
 import argparse
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import math
+import mmap
 from pathlib import Path
 import shutil
 
@@ -37,6 +46,48 @@ STATUS_INT_FIELDS = ('imu_sequence', 'imu_device_us', 'imu_host_monotonic_ns',
 JOINTS = {'slew': 0, 'lift': 1, 'tilt': 2, 'scoop': 3}
 
 
+_ZSTD = None
+
+
+def _zstd():
+    global _ZSTD
+    if _ZSTD is None:
+        lib = ctypes.CDLL(ctypes.util.find_library('zstd') or 'libzstd.so.1')
+        size, ptr = ctypes.c_size_t, ctypes.c_void_p
+        for name, res, args in (('ZSTD_findFrameCompressedSize', size, [ptr, size]),
+                                ('ZSTD_getFrameContentSize', ctypes.c_ulonglong, [ptr, size]),
+                                ('ZSTD_decompress', size, [ptr, size, ptr, size]),
+                                ('ZSTD_isError', ctypes.c_uint, [size])):
+            getattr(lib, name).restype, getattr(lib, name).argtypes = res, args
+        _ZSTD = lib
+    return _ZSTD
+
+
+def depth_frames(path):
+    """Yield each recorded depth frame of a camN.depth.zst as bytes (packed uint16 LE, mm * depth_scale)."""
+    lib = _zstd()
+    with open(path, 'rb') as stream:
+        if not Path(path).stat().st_size:
+            return
+        with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_COPY) as view:
+            buffer = (ctypes.c_char * len(view)).from_buffer(view)
+            base, offset, total = ctypes.addressof(buffer), 0, len(view)
+            try:
+                while offset < total:
+                    frame = lib.ZSTD_findFrameCompressedSize(base + offset, total - offset)
+                    content = lib.ZSTD_getFrameContentSize(base + offset, total - offset)
+                    if lib.ZSTD_isError(frame) or content >= 2**63 or content > 64 * 2**20:
+                        raise ValueError(f'{path}: corrupt zstd depth frame at byte {offset}')
+                    out = ctypes.create_string_buffer(content)
+                    got = lib.ZSTD_decompress(out, content, base + offset, frame)
+                    if lib.ZSTD_isError(got) or got != content:
+                        raise ValueError(f'{path}: corrupt zstd depth frame at byte {offset}')
+                    yield out.raw
+                    offset += frame
+            finally:
+                del buffer
+
+
 def feedback_key(field):
     return f"feedback.{'imu' if field.startswith('imu_') else 'fk'}.{field}"
 
@@ -51,6 +102,9 @@ def frame_rows(episode):
 
 def validate_episode(episode, session, rate_tolerance=.03):
     summary = json.loads((episode / 'episode.json').read_text())
+    depth_keys = session.get('depth', [])
+    if summary.get('depth', []) != depth_keys or any(k not in ('cam1', 'cam2') for k in depth_keys):
+        raise ValueError(f'{episode}: depth cameras differ from session')
     count, first, last, previous = 0, None, None, None
     shape = None
     gaps = []
@@ -70,6 +124,14 @@ def validate_episode(episode, session, rate_tolerance=.03):
             shapes.append((m['height'], m['width']))
             if previous and (m['sequence'] <= previous[key]['sequence'] or m['host_monotonic_ns'] <= previous[key]['host_monotonic_ns']):
                 raise ValueError(f'{episode}: duplicate/restarted camera stream')
+        for key in depth_keys:
+            d, m = row[f'{key}_depth'], row[key]
+            if (d['width'], d['height']) != (m['width'], m['height']) or d['stride'] != 2 * d['width'] or d['pixel_bytes'] != d['stride'] * d['height'] or d['ir_index'] != 0:
+                raise ValueError(f'{episode}: invalid packed Z16 depth geometry')
+            if not (d['valid_metadata'] & m['valid_metadata'] & 1) or d['sensor_timestamp_us'] != m['sensor_timestamp_us']:
+                raise ValueError(f'{episode}: depth not paired with its IR exposure')
+            if previous and d['sequence'] <= previous[f'{key}_depth']['sequence']:
+                raise ValueError(f'{episode}: duplicate/restarted depth stream')
         if shape is None:
             shape = shapes
         if shape != shapes:
@@ -86,6 +148,14 @@ def validate_episode(episode, session, rate_tolerance=.03):
     for key, (height, width) in zip(('cam1', 'cam2'), shape):
         if (episode / f'{key}.y8').stat().st_size != count * height * width:
             raise ValueError(f'{episode}: truncated/extra pixels in {key}')
+        if key in depth_keys:
+            frames = 0
+            for data in depth_frames(episode / f'{key}.depth.zst'):
+                if len(data) != 2 * height * width:
+                    raise ValueError(f'{episode}: wrong depth frame size in {key}')
+                frames += 1
+            if frames != count:
+                raise ValueError(f'{episode}: {frames} depth frames for {count} samples in {key}')
     if count < 2:
         raise ValueError(f'{episode}: at least two frames required for timing validation')
     elapsed = (last['cam1']['host_monotonic_ns'] - first['cam1']['host_monotonic_ns']) / 1e9
@@ -208,6 +278,8 @@ def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop'))
                 shutil.copytree(session_path / 'provenance', target_session / 'provenance')
             if (session_path / 'control-timing.csv').exists():
                 shutil.copy2(session_path / 'control-timing.csv', target_session / 'control-timing.csv')
+            for key in session.get('depth', []):
+                shutil.copy2(session_path / f'{key}.depth.json', target_session / f'{key}.depth.json')
             for episode, (_, count, hz) in zip(episodes, group):
                 with (episode / 'cam1.y8').open('rb') as c1, (episode / 'cam2.y8').open('rb') as c2:
                     for row in frame_rows(episode):
@@ -216,7 +288,7 @@ def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop'))
                 dataset.save_episode()
                 target = native / f'episode-{index:06d}'
                 target.mkdir()
-                for name in ('samples.jsonl', 'episode.json'):
+                for name in ('samples.jsonl', 'episode.json', *(f'{k}.depth.zst' for k in session.get('depth', []))):
                     shutil.copy2(episode / name, target / name)
                 (target / 'source.json').write_text(json.dumps({'source': str(episode.resolve()), 'session': number,
                     'task': session['task'], 'frames': count, 'achieved_hz': hz,
@@ -245,7 +317,7 @@ def main():
             session, episodes = load_session(path)
             for ep in episodes:
                 shape, count, hz = validate_episode(ep, session)
-                print(f'{ep.name}: {count} frames, {hz:.3f} Hz, shapes={shape}')
+                print(f'{ep.name}: {count} frames, {hz:.3f} Hz, shapes={shape}, depth={session.get("depth", [])}')
     else:
         if not args.root or not args.repo_id:
             p.error('--root and --repo-id required for export')

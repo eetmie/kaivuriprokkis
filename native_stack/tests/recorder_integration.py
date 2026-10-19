@@ -66,6 +66,43 @@ with tempfile.TemporaryDirectory(prefix='rec-test-') as temp:
         assert rows[0]['cam1']['ir_index'] == 1 and rows[0]['cam2']['ir_index'] == 2
         assert len(rows[0]['status']['fk_joint_xyz_m']) == 4
         assert rows[0]['status']['simulated_imu'] and not rows[0]['status']['live_pwm']
+        # Depth: same-exposure pairing by sensor timestamp, lossless zstd spool, export checks.
+        depth_camera = subprocess.Popen([str(build/'kaivuri-camera'), '--synthetic', '--camera', 'dfirst:1', '--camera', 'dsecond:2',
+            '--depth', 'dfirst', '--depth', 'dsecond', '--rotate-180', 'dfirst', '--width', '64', '--height', '48',
+            '--output-dir', str(root/'dcameras')])
+        try:
+            wait_until(lambda: (root/'dcameras/dsecond-depth.frame').exists())
+            recorder = subprocess.Popen([str(build/'kaivuri-record'), '--socket', str(root/'control.sock'), '--task', 'test',
+                '--scripted', '--root', str(root/'depth'), '--auto-record-s', '1',
+                '--camera-file', str(root/'dcameras/dfirst-ir1.frame'), '--camera-file', str(root/'dcameras/dsecond-ir2.frame'),
+                '--cam1-depth-file', str(root/'dcameras/dfirst-depth.frame'), '--cam2-depth-file', str(root/'dcameras/dsecond-depth.frame')],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out, err = recorder.communicate(timeout=6)
+            assert recorder.returncode == 0, (out, err)
+        finally:
+            depth_camera.terminate(); depth_camera.wait(timeout=5)
+        from export_episodes import depth_frames
+        episode = next((root/'depth').glob('*.ready'))
+        session = json.loads((root/'depth/session.json').read_text())
+        assert session['depth'] == ['cam1', 'cam2'] and json.loads((root/'depth/cam1.depth.json').read_text())['synthetic']
+        shape, count, hz = validate_episode(episode, session)
+        assert 28 <= count <= 32
+        rows = list(frame_rows(episode))
+        for key in ('cam1', 'cam2'):
+            frames = list(depth_frames(episode/f'{key}.depth.zst'))
+            assert len(frames) == count
+            for row, data in zip(rows, frames):
+                d = row[f'{key}_depth']
+                assert d['sensor_timestamp_us'] == row[key]['sensor_timestamp_us'] and d['ir_index'] == 0
+                z, level = memoryview(data).cast('H'), 400 + row[key]['sequence'] % 600
+                ramp = [level + x for x in range(64)]  # synthetic row; camera 1 is rotated 180 degrees
+                assert list(z[:64]) == (ramp[::-1] if key == 'cam1' else ramp), list(z[:4])
+        raw = episode/'cam2.depth.zst'
+        data = raw.read_bytes(); raw.write_bytes(data[:-3])
+        try: validate_episode(episode, session)
+        except ValueError as e: assert 'depth' in str(e), e
+        else: raise AssertionError('truncated depth accepted')
+        raw.write_bytes(data)
         # Export must reject truncated pixels and inaccurate timebases before creating a dataset.
         raw = episode/'cam1.y8'
         data = raw.read_bytes(); raw.write_bytes(data[:-1])

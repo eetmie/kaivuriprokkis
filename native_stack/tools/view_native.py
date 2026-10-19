@@ -2,6 +2,10 @@
 
 Live preview is capped at --max-fps (10 by default); full recording stays intact.
 Uses only NumPy + rerun-sdk 0.26.2, never LeRobot/Torch or controller IPC.
+
+Committed takes with depth also show each camera's colormapped depth and a 3D point
+cloud colored by its IR image (camera 1's IR2 via the recorded depth-to-IR extrinsics).
+Live tails (--live, direct preview) show IR only.
 """
 import argparse
 import json
@@ -22,7 +26,7 @@ def wait_episode(session, index, live):
         time.sleep(.1)
 
 
-def rows(episode, live, max_fps=10):
+def rows(episode, live, max_fps=10, depth_keys=()):
     # Open handles survive the writer's .partial -> .ready rename.
     while True:
         try:
@@ -38,6 +42,8 @@ def rows(episode, live, max_fps=10):
                 episode = episode.with_suffix('.ready')
             time.sleep(.05)
     next_preview = -math.inf
+    from export_episodes import depth_frames
+    depth = {key: [depth_frames(episode / f'{key}.depth.zst'), 0] for key in depth_keys}
     try:
         while True:
             offset = samples.tell()
@@ -75,7 +81,12 @@ def rows(episode, live, max_fps=10):
                 pixels.append(data)
             if len(pixels) == 2:
                 next_preview = elapsed + 1 / max_fps
-                yield row, pixels
+                frames = {}
+                for key, state in depth.items():  # sequential zstd frames; skip unsampled ones
+                    while state[1] < row['frame_index']:
+                        next(state[0]); state[1] += 1
+                    frames[key] = next(state[0]); state[1] += 1
+                yield row, pixels, frames
     finally:
         samples.close()
         for stream in streams:
@@ -101,7 +112,7 @@ def camera_rows(paths, socket_path, library, max_fps):
                     meta, data = snapshot
                     row[key] = {name: getattr(meta, name) for name, _ in Metadata._fields_}
                     pixels.append(bytes(data))
-                yield row, pixels
+                yield row, pixels, {}
             time.sleep(max(0, 1 / max_fps - (time.monotonic() - start)))
 
 
@@ -119,6 +130,9 @@ def main():
     p.add_argument('--grpc-port', type=int, default=9876)
     p.add_argument('--web-port', type=int, default=9090)
     p.add_argument('--save', type=Path, help='write an .rrd instead of serving a viewer')
+    p.add_argument('--no-depth', action='store_true', help='skip recorded depth')
+    p.add_argument('--cloud-stride', type=int, default=2, help='depth pixel step for the 3D point cloud')
+    p.add_argument('--depth-range-mm', type=float, nargs=2, default=(150, 1500), help='depth colormap range')
     args = p.parse_args()
     if args.episode_index < 0 or not math.isfinite(args.max_fps) or not 0 < args.max_fps <= 90 or not 1 <= args.jpeg_quality <= 100:
         p.error('invalid preview limits')
@@ -130,14 +144,31 @@ def main():
     import numpy as np
     import rerun as rr
     import rerun.blueprint as rrb
+    depth_keys, calibration = [], {}
+    if args.session is not None and not args.live and not args.no_depth:
+        depth_keys = json.loads((args.session / 'session.json').read_text()).get('depth', [])
+        calibration = {key: json.loads((args.session / f'{key}.depth.json').read_text()) for key in depth_keys}
     rr.init('kaivuri-native-episode', spawn=False)
-    blueprint = rrb.Blueprint(rrb.Vertical(
-        rrb.Horizontal(rrb.Spatial2DView(origin='cameras/cam1', name='Camera 1'),
-                       rrb.Spatial2DView(origin='cameras/cam2', name='Camera 2'),
-                       rrb.Spatial3DView(origin='robot/base', name='Full FK (meters)')),
-        rrb.Horizontal(rrb.TimeSeriesView(origin='actions', name='Actions'),
-                       rrb.TimeSeriesView(origin='joints', name='Joint angles (rad)'),
-                       rrb.TimeSeriesView(origin='timing', name='Timing (ms)'))))
+    series = rrb.Horizontal(rrb.TimeSeriesView(origin='actions', name='Actions'),
+                            rrb.TimeSeriesView(origin='joints', name='Joint angles (rad)'),
+                            rrb.TimeSeriesView(origin='timing', name='Timing (ms)'))
+    if depth_keys:
+        images, clouds = [], []
+        for key in ('cam1', 'cam2'):
+            images.append(rrb.Spatial2DView(origin=f'cameras/{key}', name=f'Camera {key[-1]} IR'))
+            if key in depth_keys:
+                images.append(rrb.Spatial2DView(origin=f'scene/{key}/camera', name=f'Camera {key[-1]} depth'))
+                clouds.append(rrb.Spatial3DView(origin=f'scene/{key}', name=f'Camera {key[-1]} point cloud (m)',
+                                                contents=['+ $origin/**', '- $origin/camera/depth'], line_grid=False))
+        blueprint = rrb.Blueprint(rrb.Vertical(rrb.Horizontal(*images),
+            rrb.Horizontal(*clouds, rrb.Spatial3DView(origin='robot/base', name='Full FK (meters)')),
+            series, row_shares=[2, 3, 1]))
+    else:
+        blueprint = rrb.Blueprint(rrb.Vertical(
+            rrb.Horizontal(rrb.Spatial2DView(origin='cameras/cam1', name='Camera 1'),
+                           rrb.Spatial2DView(origin='cameras/cam2', name='Camera 2'),
+                           rrb.Spatial3DView(origin='robot/base', name='Full FK (meters)')),
+            series))
     if args.save:
         rr.save(args.save, default_blueprint=blueprint)
     else:
@@ -150,9 +181,29 @@ def main():
     else:
         print(f'Waiting for episode {args.episode_index}: {args.session}', flush=True)
         episode = wait_episode(args.session, args.episode_index, args.live)
-        source = rows(episode, args.live, args.max_fps)
+        source = rows(episode, args.live, args.max_fps, depth_keys)
+    # Depth intrinsics/extrinsics are SDK values for unrotated sensor pixels. Unrotate stored
+    # pixels for geometry; a 180 degree image turn equals flipping camera x and y.
+    geometry = {}
+    for key in depth_keys:
+        c = calibration[key]
+        turned = (c.get('rotation_deg', 0) + (180 if key == 'cam1' and args.rotate_camera1 else 0)) % 360 == 180
+        if c.get('synthetic'):
+            geometry[key] = None
+            continue
+        di, ii, e = c['depth_intrinsics'], c['ir_intrinsics'], c['depth_to_ir_extrinsics']
+        w, h, step = di['width'], di['height'], args.cloud_stride
+        v, u = np.mgrid[0:h:step, 0:w:step]
+        rays = np.stack([(u - di['ppx']) / di['fx'], (v - di['ppy']) / di['fy']], -1).astype(np.float32)
+        geometry[key] = dict(rays=rays, step=step, ii=ii, turned=turned, scale=c['depth_scale_m'],
+                             R=np.asarray(e['rotation_column_major'], np.float32).reshape(3, 3).T,
+                             t=np.asarray(e['translation_m'], np.float32))
+        ppx, ppy = (w - 1 - di['ppx'], h - 1 - di['ppy']) if turned else (di['ppx'], di['ppy'])
+        rr.log(f'scene/{key}', rr.ViewCoordinates.RDF, static=True)
+        rr.log(f'scene/{key}/camera', rr.Pinhole(focal_length=[di['fx'], di['fy']], principal_point=[ppx, ppy],
+               width=w, height=h, camera_xyz=rr.ViewCoordinates.RDF, image_plane_distance=.05), static=True)
     count = 0
-    for row, pixels in source:
+    for row, pixels, depth in source:
         elapsed = row['episode_ns'] / 1e9
         rr.set_time('elapsed', duration=elapsed)
         rr.set_time('frame_index', sequence=row['frame_index'])
@@ -162,6 +213,38 @@ def main():
             if key == 'cam1' and args.rotate_camera1:
                 image = np.rot90(image, 2).copy()
             rr.log(f'cameras/{key}', rr.Image(image).compress(jpeg_quality=args.jpeg_quality))
+            if key in depth:
+                z = np.frombuffer(depth[key], dtype='<u2').reshape(m['height'], m['width'])
+                if key == 'cam1' and args.rotate_camera1:
+                    z = np.rot90(z, 2).copy()
+                rr.log(f'scene/{key}/camera/depth', rr.DepthImage(z, meter=1000.0, colormap='turbo',
+                       depth_range=args.depth_range_mm))
+                g = geometry.get(key)
+                if g:
+                    raw_z, raw_ir = (np.rot90(z, 2), np.rot90(image, 2)) if g['turned'] else (z, image)
+                    zm = raw_z[::g['step'], ::g['step']].astype(np.float32) * g['scale']
+                    # The colormap range also bounds the cloud: sparse far matches would otherwise
+                    # dominate the 3D view's automatic framing.
+                    lo, hi = (r / 1000 for r in args.depth_range_mm)
+                    ok = (zm >= lo) & (zm <= hi)
+                    # Drop speckle: keep points with at least 4 of 8 neighbours within 3% depth.
+                    padded = np.pad(np.where(ok, zm, np.nan), 1, constant_values=np.nan)
+                    agree = sum(np.abs(padded[1 + dy:padded.shape[0] - 1 + dy, 1 + dx:padded.shape[1] - 1 + dx] - zm) < .03 * zm
+                                for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
+                    ok &= agree >= 4
+                    pts = np.concatenate([g['rays'][ok] * zm[ok, None], zm[ok, None]], 1)
+                    # Color from this camera's recorded IR imager (IR2 is 50 mm from depth's IR1).
+                    q = pts @ g['R'].T + g['t']
+                    ii = g['ii']
+                    pu = np.round(q[:, 0] / q[:, 2] * ii['fx'] + ii['ppx']).astype(int)
+                    pv = np.round(q[:, 1] / q[:, 2] * ii['fy'] + ii['ppy']).astype(int)
+                    inside = (pu >= 0) & (pu < ii['width']) & (pv >= 0) & (pv < ii['height'])
+                    gray = np.zeros(len(pts), np.uint8)
+                    gray[inside] = raw_ir[pv[inside], pu[inside]]
+                    if g['turned']:
+                        pts[:, :2] *= -1
+                    rr.log(f'scene/{key}/points', rr.Points3D(pts, colors=np.repeat(gray[:, None], 3, 1),
+                                                              radii=rr.Radius.ui_points(1.5)))
             age = (row['sample_ns'] - m['host_monotonic_ns']) / 1e6
             rr.log(f'timing/{key}_arrival_age', rr.Scalars(age))
         status = row['status']

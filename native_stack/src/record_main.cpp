@@ -27,6 +27,7 @@
 #include <thread>
 #include <unistd.h>
 #include <yaml-cpp/yaml.h>
+#include <zstd.h>
 using namespace kaivuri;
 namespace fs = std::filesystem;
 static volatile sig_atomic_t stopped = 0;
@@ -166,10 +167,31 @@ static std::string metadata(const FrameMetadata &m) {
 struct Record {
     std::string json;
     std::array<std::vector<uint8_t>, 2> images;
+    std::array<std::vector<uint8_t>, 2> depth; // packed Z16, compressed on the writer thread
 };
 class Writer {
     fs::path path_;
     std::ofstream rows_, cam1_, cam2_;
+    // camN.depth.zst: one independent zstd frame per recorded frame (self-delimiting).
+    std::array<bool, 2> depth_enabled_;
+    std::array<std::ofstream, 2> depth_;
+    std::array<uint64_t, 2> depth_written_{};
+    std::vector<uint8_t> packed_;
+    ZSTD_CCtx *zstd_ = nullptr;
+    bool depth_ok() const {
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled_[k] && !depth_[k])
+                return false;
+        return true;
+    }
+    void close_files() {
+        rows_.close();
+        cam1_.close();
+        cam2_.close();
+        for (auto &d : depth_)
+            if (d.is_open())
+                d.close();
+    }
     std::deque<Record> queue_;
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -196,15 +218,30 @@ class Writer {
                     cam2_.write(reinterpret_cast<const char *>(r.images[1].data()),
                                 r.images[1].size());
                     ++written_;
+                    for (int k = 0; k < 2; ++k) {
+                        if (!depth_enabled_[k])
+                            continue;
+                        const auto &z = r.depth[k];
+                        packed_.resize(ZSTD_compressBound(z.size()));
+                        const size_t bytes = ZSTD_compressCCtx(zstd_, packed_.data(),
+                                                               packed_.size(), z.data(), z.size(), 1);
+                        if (z.empty() || ZSTD_isError(bytes))
+                            throw std::runtime_error("depth compression failed");
+                        depth_[k].write(reinterpret_cast<const char *>(packed_.data()), bytes);
+                        ++depth_written_[k];
+                    }
                 }
                 rows_ << r.json << '\n';
-                if (!rows_ || !cam1_ || !cam2_)
+                if (!rows_ || !cam1_ || !cam2_ || !depth_ok())
                     throw std::runtime_error("episode disk write failed");
             }
             rows_.flush();
             cam1_.flush();
             cam2_.flush();
-            if (!rows_ || !cam1_ || !cam2_)
+            for (auto &d : depth_)
+                if (d.is_open())
+                    d.flush();
+            if (!rows_ || !cam1_ || !cam2_ || !depth_ok())
                 throw std::runtime_error("episode flush failed");
         } catch (...) {
             failed_ = true;
@@ -212,23 +249,31 @@ class Writer {
     }
 
   public:
-    Writer(const fs::path &root, size_t limit) : limit_(limit) {
+    Writer(const fs::path &root, size_t limit, std::array<bool, 2> depth)
+        : depth_enabled_(depth), limit_(limit) {
         path_ = root / ("episode-" + std::to_string(ns()) + ".partial");
         if (!fs::create_directory(path_))
             throw std::runtime_error("episode directory exists");
         rows_.open(path_ / "samples.jsonl");
         cam1_.open(path_ / "cam1.y8", std::ios::binary);
         cam2_.open(path_ / "cam2.y8", std::ios::binary);
-        if (!rows_ || !cam1_ || !cam2_)
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled_[k])
+                depth_[k].open(path_ / ("cam" + std::to_string(k + 1) + ".depth.zst"),
+                               std::ios::binary);
+        if (!rows_ || !cam1_ || !cam2_ || !depth_ok())
             throw std::runtime_error("cannot create episode files");
+        if (depth_enabled_[0] || depth_enabled_[1]) {
+            zstd_ = ZSTD_createCCtx();
+            if (!zstd_)
+                throw std::runtime_error("zstd context allocation failed");
+        }
         thread_ = std::thread([this] { run(); });
     }
     // Stop writing without committing: the take stays as .partial, which export skips.
     void abandon(const std::string &reason) {
         join();
-        rows_.close();
-        cam1_.close();
-        cam2_.close();
+        close_files();
         std::cerr << "Take stopped (" << reason << "); kept incomplete at " << path_ << std::endl;
     }
     bool push(Record r) {
@@ -248,13 +293,17 @@ class Writer {
         if (thread_.joinable())
             thread_.join();
     }
-    ~Writer() { join(); }
+    ~Writer() {
+        join();
+        ZSTD_freeCCtx(zstd_);
+    }
     void finish(bool save, uint64_t frames, uint64_t start, uint64_t end,
                 const std::string &reason) {
         join();
-        rows_.close();
-        cam1_.close();
-        cam2_.close();
+        close_files();
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled_[k] && depth_written_[k] != frames)
+                throw std::runtime_error("incomplete depth retained at " + path_.string());
         if (failed_ || written_ != frames)
             throw std::runtime_error("incomplete episode retained at " + path_.string());
         if (!save || !frames) {
@@ -264,11 +313,19 @@ class Writer {
         }
         std::ofstream summary(path_ / "episode.json");
         summary << "{\"frames\":" << frames << ",\"start_ns\":" << start << ",\"end_ns\":" << end
-                << ",\"reason\":" << quote(reason) << "}\n";
+                << ",\"reason\":" << quote(reason) << ",\"depth\":[";
+        for (int k = 0, n = 0; k < 2; ++k)
+            if (depth_enabled_[k])
+                summary << (n++ ? "," : "") << "\"cam" << k + 1 << "\"";
+        summary << "]}\n";
         summary.close();
         if (!summary)
             throw std::runtime_error("episode summary write failed");
-        for (const char *file : {"samples.jsonl", "cam1.y8", "cam2.y8", "episode.json"}) {
+        std::vector<std::string> files{"samples.jsonl", "cam1.y8", "cam2.y8", "episode.json"};
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled_[k])
+                files.push_back("cam" + std::to_string(k + 1) + ".depth.zst");
+        for (const auto &file : files) {
             int fd = open((path_ / file).c_str(), O_RDONLY | O_CLOEXEC);
             if (fd < 0)
                 throw std::runtime_error("episode sync open failed");
@@ -302,6 +359,7 @@ int main(int argc, char **argv) {
         std::string runtime = "/tmp/kaivuri-native-" + std::to_string(geteuid());
         std::string socket = runtime + "/control.sock", gamepad, task, root, revision;
         std::vector<std::string> camera_paths;
+        std::array<std::string, 2> depth_paths;
         int fps = 30, queue = 64;
         double max_episode = 180, auto_seconds = 0, max_skew_ms = 40, max_age_ms = 200;
         double auto_sine = 0;
@@ -324,6 +382,10 @@ int main(int argc, char **argv) {
                 gamepad = val();
             else if (a == "--camera-file")
                 camera_paths.push_back(val());
+            else if (a == "--cam1-depth-file")
+                depth_paths[0] = val();
+            else if (a == "--cam2-depth-file")
+                depth_paths[1] = val();
             else if (a == "--fps")
                 fps = std::stoi(val());
             else if (a == "--queue-frames")
@@ -352,6 +414,8 @@ int main(int argc, char **argv) {
                 std::cout
                     << "kaivuri-record --root NEW_SESSION --task TEXT --gamepad /dev/input/eventN\n"
                        "  --camera-file .../SERIAL1-ir1.frame --camera-file .../SERIAL2-ir2.frame\n"
+                       "  [--cam1-depth-file .../SERIAL1-depth.frame] [--cam2-depth-file ...]\n"
+                       "  (depth is paired to its IR frame by sensor timestamp; camN.depth.zst)\n"
                        "  [--socket PATH --fps 30 --enable-slew --enable-tracks]\n"
                        "  [--max-episode-s 180 --queue-frames 64 --max-pair-skew-ms 40 "
                        "--max-age-ms 200]\n"
@@ -388,6 +452,11 @@ int main(int argc, char **argv) {
         if (!scripted)
             pad = std::make_unique<Pad>(gamepad);
         Image cam1(camera_paths[0]), cam2(camera_paths[1]);
+        std::array<std::unique_ptr<Image>, 2> depth;
+        const std::array<bool, 2> depth_enabled{!depth_paths[0].empty(), !depth_paths[1].empty()};
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled[k])
+                depth[k] = std::make_unique<Image>(depth_paths[k]);
         if (!fs::create_directory(root))
             throw std::runtime_error("session root must be new");
         fs::permissions(root, fs::perms::owner_all, fs::perm_options::replace);
@@ -400,15 +469,26 @@ int main(int argc, char **argv) {
                  << ",\"simulated_imu\":" << initial["simulated_imu"].as<bool>()
                  << ",\"virtual_gamepad\":" << (pad && pad->virtual_pad ? "true" : "false")
                  << ",\"camera_files\":[" << quote(camera_paths[0]) << "," << quote(camera_paths[1])
+                 << "],\"depth\":[";
+        for (int k = 0, n = 0; k < 2; ++k)
+            if (depth_enabled[k])
+                manifest << (n++ ? "," : "") << "\"cam" << k + 1 << "\"";
+        manifest << "],\"depth_files\":[" << quote(depth_paths[0]) << "," << quote(depth_paths[1])
                  << "],\"initial_status\":" << control.status() << "}\n";
         manifest.close();
         if (!manifest)
             throw std::runtime_error("manifest write failed");
+        // Calibration written by kaivuri-camera next to its depth store (SERIAL-depth.json).
+        for (int k = 0; k < 2; ++k)
+            if (depth_enabled[k])
+                fs::copy_file(fs::path(depth_paths[k]).replace_extension(".json"),
+                              fs::path(root) / ("cam" + std::to_string(k + 1) + ".depth.json"));
         control.send(Operation::Disarm);
         signal(SIGINT, stop_signal);
         signal(SIGTERM, stop_signal);
         std::unique_ptr<Writer> writer;
         uint64_t begin = 0, frames = 0, last1 = 0, last2 = 0, last_frame = 0, last_master_ns = 0;
+        std::array<uint64_t, 2> last_depth{};
         // No operator arming: the controller's centered arming hold is sent automatically
         // (zero commands with the arm flag) whenever it is not armed, then sticks take over.
         bool pump = false, pending_start = auto_seconds > 0;
@@ -543,11 +623,12 @@ int main(int argc, char **argv) {
                     std::cout << "Armed\n" << std::flush;
                 was_armed = armed;
                 if (pending_start && armed && healthy) {
-                    writer = std::make_unique<Writer>(root, queue);
+                    writer = std::make_unique<Writer>(root, queue, depth_enabled);
                     frames = 0;
                     begin = ns();
                     last_frame = begin;
                     last1 = last2 = 0;
+                    last_depth = {};
                     pending_start = false;
                     std::cout << "Recording\n" << std::flush;
                 }
@@ -566,6 +647,15 @@ int main(int argc, char **argv) {
                                   1e6;
                     fresh = fresh && valid(cam1.m) && valid(cam2.m) && cam1.m.sequence != last1 &&
                             cam2.m.sequence != last2 && skew <= max_skew_ms;
+                    // Depth arrives within about a millisecond of its IR frame, either side: hold
+                    // the sample for a later tick until the same exposure's depth is present.
+                    const Image *ir[2]{&cam1, &cam2};
+                    for (int k = 0; k < 2 && fresh; ++k)
+                        if (depth[k])
+                            fresh = depth[k]->read() && depth[k]->m.sequence != last_depth[k] &&
+                                    (ir[k]->m.valid_metadata & 1) &&
+                                    (depth[k]->m.valid_metadata & 1) &&
+                                    depth[k]->m.sensor_timestamp_us == ir[k]->m.sensor_timestamp_us;
                     // FPS is an upper bound; sample each new master frame without a second capture
                     // clock.
                     if (fresh && (frames == 0 || cam1.m.host_monotonic_ns - last_master_ns >=
@@ -578,14 +668,25 @@ int main(int argc, char **argv) {
                                                 cam1.pixels.begin() + cam1.m.pixel_bytes);
                         record.images[1].assign(cam2.pixels.begin(),
                                                 cam2.pixels.begin() + cam2.m.pixel_bytes);
+                        for (int k = 0; k < 2; ++k)
+                            if (depth[k]) {
+                                const auto &d = depth[k]->m;
+                                if (d.width != ir[k]->m.width || d.height != ir[k]->m.height ||
+                                    d.stride != d.width * 2 ||
+                                    d.pixel_bytes != uint64_t(d.stride) * d.height)
+                                    throw std::runtime_error("depth must be packed Z16 of IR size");
+                                record.depth[k].assign(depth[k]->pixels.begin(),
+                                                       depth[k]->pixels.begin() + d.pixel_bytes);
+                                last_depth[k] = d.sequence;
+                            }
                         last1 = cam1.m.sequence;
                         last2 = cam2.m.sequence;
                         last_frame = capture;
                         last_master_ns = cam1.m.host_monotonic_ns;
                     }
                     if (capture - last_frame > uint64_t(max_age_ms * 1e6))
-                        throw std::runtime_error(
-                            "camera stalled, stale, duplicated or pair skew exceeds limit");
+                        throw std::runtime_error("camera stalled, stale, duplicated, pair skew "
+                                                 "exceeds limit or depth unpaired");
                     std::ostringstream row;
                     row << std::setprecision(17) << "{\"sample_ns\":" << capture
                         << ",\"episode_ns\":" << capture - begin
@@ -597,6 +698,9 @@ int main(int argc, char **argv) {
                     if (!record.images[0].empty()) {
                         row << ",\"frame_index\":" << frames++ << ",\"cam1\":" << metadata(cam1.m)
                             << ",\"cam2\":" << metadata(cam2.m);
+                        for (int k = 0; k < 2; ++k)
+                            if (depth[k])
+                                row << ",\"cam" << k + 1 << "_depth\":" << metadata(depth[k]->m);
                     }
                     row << "}";
                     record.json = row.str();

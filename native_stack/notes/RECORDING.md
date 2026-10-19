@@ -3,8 +3,9 @@
 `kaivuri-record` is a C++17 teleoperation and episode capture process. The existing
 C++ controller runs at 200 Hz by default through the launcher. The recorder polls
 the local Xbox evdev device and full controller status at 100 Hz; the independent
-camera service captures packed Y8 IR at 30 FPS. A bounded writer queue streams
-pixels and JSONL snapshots to disk. Disk writes, video encoding, LeRobot, Torch and
+camera service captures packed Y8 IR at 30 FPS, plus same-sensor Z16 depth unless
+`--depth none`. A bounded writer queue streams pixels, zstd-compressed depth and JSONL
+snapshots to disk. Disk writes, video encoding, LeRobot, Torch and
 Python callbacks do not run on the controller thread.
 
 The Python launcher only starts/stops processes and saves provenance. It neither
@@ -21,12 +22,36 @@ are immediately saved to the native spool; LeRobot video encoding is offline.
 | `observation.images.cam2` | `141722076647` | IR1, away from the USB connector |
 
 This order is explicit and saved with the session. The emitter is disabled; no
-RGB or depth stream is opened. Export repeats gray into three identical channels
+RGB stream is opened. Export repeats gray into three identical channels
 for the existing LeRobot image convention, then encodes H.264. Raw Y8 is retained
 unchanged. Physical cameras are USB-only/free-running: timestamp domain, validity
 bits, hardware sensor/readout timestamps, host arrivals, exposure/gain, counters,
 and signed pair skew are logged. Host arrival pairing is **not** synchronized
 exposure. Default maximum arrival skew is 40 ms and maximum frame age is 200 ms.
+
+### Depth
+
+`--depth both` (default; or `cam1`, `cam2`, `none`) adds Z16 depth from each
+camera's stereo ASIC. It costs the host no depth computation and no GPU. IR and depth
+come from one sensor, so they share resolution and FPS; the D435i silently stops
+IR when they differ. Depth uses the same auto exposure with the emitter off, so
+the recorded IR is unchanged. Passive stereo filled about 52–58% of all pixels on
+the bench scene, and the textured sand nearly completely.
+With the emitter at its default 150 mW at these ranges, IR saturated and fill dropped.
+
+Every depth frame is paired with the IR frame of **the same exposure** by
+`sensor_timestamp_us`: the two streams share it exactly. Frame counters do not pair
+them on firmware 5.17.3.10: depth reads +1 against IR1 and −1 against IR2 for the
+same exposure. Depth arrives within about 1 ms of its IR frame. The recorder holds
+a sample for a later 100 Hz tick until its depth is present. An unpaired depth stream
+fails the take like a stalled camera.
+
+Depth is always in the **IR1 (left imager) frame**. `cam2` records IR1, so they
+overlay. `cam1` records IR2, so its depth is offset by the 50 mm stereo baseline.
+`camN.depth.json` holds depth and IR intrinsics, `depth_to_ir_extrinsics`
+(translation `[-0.0499, 0, 0]` m for cam1) and `depth_scale_m` (0.001). These are SDK values for
+unrotated pixels, and `rotation_deg` says when stored pixels (IR and depth alike)
+are rotated 180°.
 
 ## Build and dry validation on the Jetson
 
@@ -125,6 +150,10 @@ within one session. A new invocation requires a new session directory.
 Each take starts as `episode-<monotonic_ns>.partial`. Its bounded writer streams:
 
 - `cam1.y8` and `cam2.y8`: one packed grayscale frame per committed frame pair;
+- `cam1.depth.zst` / `cam2.depth.zst` (depth cameras only): one independent zstd
+  level-1 frame of packed little-endian uint16 per committed frame. They are
+  self-delimiting, so no index is needed. `camN_depth` metadata sits on the same
+  `samples.jsonl` row (`ir_index` 0);
 - `samples.jsonl`: full 100 Hz controller snapshots, requested action and command
   sequence, sampler lateness, and camera metadata/frame indices on image rows;
 - `episode.json`: number of pairs, real start/end times and stop reason.
@@ -137,7 +166,11 @@ pad disconnect stops publication and disarms. An interrupted/failed take remains
 power failure can still interrupt a session; preserve raw files for recovery.
 
 Default 640x480 dual Y8 storage is approximately **18.4 MB/s**, or **1.1 GB/min**, plus
-100 Hz JSONL. Space does not grow in RAM with episode length: default queue depth
+100 Hz JSONL. Depth adds about **4 MB/s** for both cameras on the bench scene: per frame
+cam2 compresses 6.2x to 100 kB and cam1 16.9x to 36 kB, which is about 119 MB per
+30 s take. Moving sand will likely compress less. Raw Z16 would add 36.9 MB/s.
+Compression runs on the writer thread: the recorder used 25.8% of one core instead of
+14.3%, and the camera 7.4% instead of 3.5%. RSS grew by about 5 MB and 19 MB. Space does not grow in RAM with episode length: default queue depth
 is 64 samples. A slow/full disk fails the take instead of silently dropping rows.
 The shared-frame service remains latest-value; counters and timestamps reveal
 camera skips before the recorder samples them.
@@ -186,6 +219,30 @@ feature, so policies would pick them up silently. Derive a policy state from the
 deliberately.
 Camera/IMU host/device times remain separate `clock.*` columns. Do not mix them as
 a common exposure clock without calibration.
+
+Depth is validated (geometry, same-exposure pairing, every zstd frame decodes to
+the IR size, one per sample) but **is not a LeRobot feature**: H.264 would quantize
+it. `camN.depth.zst` files are copied unchanged to `native/episode-NNNNNN/`, with
+`camN.depth.json` in `native/session-NNN/`. Read them with
+`export_episodes.depth_frames(path)`. It uses libzstd via ctypes, so Python needs no
+extra package:
+
+```python
+import numpy as np
+from export_episodes import depth_frames
+for z in depth_frames('native/episode-000000/cam2.depth.zst'):
+    depth_m = np.frombuffer(z, '<u2').reshape(480, 640) * 0.001  # 0 = no depth
+```
+
+To view a raw session with depth, use Rerun (`.venv-rerun`, rerun-sdk 0.26.2). It shows each
+camera's IR, colormapped depth and a 3D point cloud coloured by that camera's IR
+image; cam1 uses the depth-to-IR2 extrinsics. In the 3D view, double-click the
+cloud to frame it.
+
+```bash
+.venv-rerun/bin/python native_stack/tools/view_native.py SESSION --save take.rrd [--max-fps 30]
+.venv-rerun/bin/rerun take.rrd
+```
 
 The output is LeRobot v3 Parquet + two H.264 videos, plus the complete 100 Hz JSONL
 and provenance under `native/` (`session-NNN/` per source session, `episode-NNNNNN/` per

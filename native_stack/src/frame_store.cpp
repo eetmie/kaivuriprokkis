@@ -40,8 +40,10 @@ void verify(bool ok, const char *what) {
 }
 } // namespace
 kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint32_t height,
-                                  uint32_t ir_index) {
-    if (width < 1 || height < 1 || uint64_t(width) * height > 16 * 1024 * 1024)
+                                  uint32_t ir_index, uint32_t bytes_per_pixel)
+    : bytes_per_pixel_(bytes_per_pixel) {
+    if (width < 1 || height < 1 || (bytes_per_pixel != 1 && bytes_per_pixel != 2) ||
+        uint64_t(width) * height * bytes_per_pixel > 16 * 1024 * 1024)
         throw std::runtime_error("invalid frame dimensions");
     // Atomic rename preserves the previous mapping for already connected readers on restart.
     std::string temporary = path + ".new." + std::to_string(getpid());
@@ -52,7 +54,7 @@ kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint3
                "camera already has a writer");
         fd_ = ::open(temporary.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
         verify(fd_ >= 0, "create frame store");
-        size_ = header_bytes + size_t(width) * height;
+        size_ = header_bytes + size_t(width) * height * bytes_per_pixel;
         verify(ftruncate(fd_, size_) == 0, "size frame store");
         mapping_ = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (mapping_ == MAP_FAILED) {
@@ -62,7 +64,7 @@ kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint3
         auto *h = new (mapping_) Header{};
         h->magic_value = magic;
         h->version = 1;
-        h->capacity = width * height;
+        h->capacity = width * height * bytes_per_pixel;
         pthread_mutexattr_t attr;
         verify(pthread_mutexattr_init(&attr) == 0, "mutex attributes");
         int result = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
@@ -74,7 +76,7 @@ kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint3
         verify(result == 0, "shared robust mutex");
         h->metadata.width = width;
         h->metadata.height = height;
-        h->metadata.stride = width;
+        h->metadata.stride = width * bytes_per_pixel;
         h->metadata.ir_index = ir_index;
         verify(rename(temporary.c_str(), path.c_str()) == 0, "publish frame store");
     } catch (...) {
@@ -98,9 +100,9 @@ kaivuri::FrameWriter::~FrameWriter() {
 }
 bool kaivuri::FrameWriter::publish(const FrameMetadata &m, const void *pixels) {
     auto *h = static_cast<Header *>(mapping_);
-    if (!pixels || m.pixel_bytes > h->capacity || m.pixel_bytes != uint64_t(m.width) * m.height ||
-        m.stride != m.width)
-        throw std::runtime_error("invalid packed Y8 frame");
+    if (!pixels || m.pixel_bytes > h->capacity || m.stride != m.width * bytes_per_pixel_ ||
+        m.pixel_bytes != uint64_t(m.stride) * m.height)
+        throw std::runtime_error("invalid packed frame");
     if (!acquire(&h->mutex))
         return false;
     // Copy pixels first: a recovered owner-dead lock must not expose partially copied pixels.

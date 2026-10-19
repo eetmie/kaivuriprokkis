@@ -11,6 +11,7 @@ struct FrameMetadata {
 };
 static_assert(sizeof(FrameMetadata) == 96, "Frame metadata ABI v1 requires 96 bytes");
 // Metadata bits: 0 sensor timestamp, 1 frame timestamp, 2 counter, 3 exposure, 4 gain.
+// Packed rows: stride = width * bytes per pixel (1 for Y8 IR, 2 for Z16 depth with ir_index 0).
 extern "C" {
 void *kaivuri_frame_open(const char *path);
 // 1=snapshot, 0=no frame/busy, -1=bad arguments/capacity. Null pixels reads metadata only.
@@ -22,9 +23,11 @@ class FrameWriter {
     void *mapping_ = nullptr;
     size_t size_ = 0;
     int fd_ = -1, lock_fd_ = -1;
+    uint32_t bytes_per_pixel_ = 1;
 
   public:
-    FrameWriter(const std::string &path, uint32_t width, uint32_t height, uint32_t ir_index);
+    FrameWriter(const std::string &path, uint32_t width, uint32_t height, uint32_t ir_index,
+                uint32_t bytes_per_pixel = 1);
     ~FrameWriter();
     FrameWriter(const FrameWriter &) = delete;
     FrameWriter &operator=(const FrameWriter &) = delete;

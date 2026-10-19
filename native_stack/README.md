@@ -2,12 +2,12 @@
 
 Built on Spark on 2026-10-11 for the next hardware session. Everything new lives in this folder. The existing Python stack and Pico firmware remain the reference and are unchanged.
 
-This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR-only RealSense service. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
+This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR RealSense service with optional same-sensor depth. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
 
 | Component | Current behavior |
 | --- | --- |
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
-| `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory |
+| `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory; optional `--depth SERIAL` Z16 from the camera ASIC (`SERIAL-depth.frame` + calibration JSON) and `--depth-log DIR` zstd snapshots |
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
@@ -126,6 +126,15 @@ python3 -B tools/frame_reader.py \
 Simulated IMUs emit identity raw quaternions. Existing mounting offsets still apply, so simulated reported joint angles need not all be zero.
 
 ## Results and next steps
+
+**Depth (2026-10-19, pikkumasi2tb).** `kaivuri-camera --depth SERIAL` adds Z16 depth from the same stereo sensor. The camera computes it, so the host does no depth work and needs no GPU. In a 180 s paced 2 Hz pi0.5 run against a same-day baseline, `--depth` on both cameras plus the 2 Hz `--depth-log` gave:
+- inference p50/p99/max 426.98/428.76/429.16 ms (baseline 426.89/435.71/440.72) and zero overruns;
+- control lateness p99 0.077 ms and work p99 1.27 ms;
+- both cameras at ~29.97 fps with zero unexplained counter gaps and zero depth gaps; latest-frame writer-busy skips were 5+1 (baseline 1+0);
+- camera process 9.6% of one core (baseline 4.1%), RSS 49 MB (baseline 24 MB);
+- 832 zstd snapshots (57 MB).
+
+The emitter stays off: passive stereo fills the textured sand, and the 150 mW emitter saturates IR at these ranges. Depth pairs with IR by sensor timestamp; frame counters differ by ±1. Changing stream configuration takes 0.4–1.6 s, so streams stay open and a snapshot is just the latest frame. Emitter switching and alternation measurements, and the probe tools, are in `~/kaivuriprokkis/depth_snapshot_tests/` on the board. Recording and export: [notes/RECORDING.md](notes/RECORDING.md#depth).
 
 FK/output extension session spanning 2026-10-12/13: local and Jetson CTest pass, and all 12,192 original-code parity cases pass across three profiles (maximum FK component difference `1.12e-7`). The **10-minute 200 Hz live-neutral full-stack run** validated 125,452 complete FK/IMU snapshots against independent Python FK, including all pivots and quaternions in both frames. No whole-tick work or wake-up lateness exceeded the 5 ms budget, including startup. During steady inference, FK preparation p50/p99 was 2.37/5.86 microseconds and control work p99/max was 1.25/2.47 ms. Control wake-up lateness p99/max was 0.071/0.300 ms. Full-status logging achieved 199.99 Hz; Pico decoding and control ticks both averaged 200 Hz. All sampled IMUs/FK stayed healthy. Both cameras remained near 30 fps with zero capture-counter gaps/resets and five combined latest-frame writer-busy skips. Minimum available system RAM was 1.056 GiB, median 1.074 GiB; control, camera and inference had no process swap. Inference p50/p99 was 427.32/429.97 ms over 1,390 runs. Artifacts: `results/pi05-fk200-full-stack-600s-20261012/`. The monitoring script hit `/proc` process-exit `ProcessLookupError` after inference completed normally; summaries were recovered from complete logs, the original monitor session retained, and that race fixed.
 

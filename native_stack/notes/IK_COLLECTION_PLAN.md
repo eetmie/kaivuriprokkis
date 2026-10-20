@@ -111,12 +111,12 @@ Torch, camera services or a second controller into the collection loop.
 
 | Component | Reuse and gap |
 | --- | --- |
-| [Pose coverage](../../data_collection/plot_coverage.py) | Reuse FK, bins, log selection and interval accounting. Current output is PNGs plus a summary, with no reusable 3D occupancy payload or collision-checked routes. |
+| [Pose coverage](../../reference/data_collection/plot_coverage.py) | Reuse FK, bins, log selection and interval accounting. Current output is PNGs plus a summary, with no reusable 3D occupancy payload or collision-checked routes. |
 | [Native FK](../src/core.cpp) | Reuse profile-driven joints and carriage-relative link poses. Add a collection task-pose adapter for the cutting-lip pitch offset. |
-| [PID engine](../../modules/pid.py) | Port explicit-dt scalar math and test parity, including derivative handling, integral limits and anti-windup. Load boom/arm/bucket gains from the selected profile. |
-| [Python IK/reachability](../../modules/reachability.py) | Reference DLS, warm starts and bounded rollouts. Its success check currently tests position and conditioning, not final pitch or collision: it is not the complete automatic-motion validator. |
-| [Relative-command prototype](../../control_prototype/relative_command_processor.py) | Reuse measured-state synchronization and bounded reference lead. Avoid allowing an integrated virtual target to run ahead of the machine. |
-| [Bundle kinematics](../../learned_control/kinematics.py) | Reference weighted planar IK, polygon collision pairs and edge backtracking. Port the needed geometry math, not the Torch runtime or a learned policy. |
+| [PID engine](../../reference/modules/pid.py) | Port explicit-dt scalar math and test parity, including derivative handling, integral limits and anti-windup. Load boom/arm/bucket gains from the selected profile. |
+| [Python IK/reachability](https://github.com/eetmie/kaivuriprokkis/blob/python/modules/reachability.py) | Reference DLS, warm starts and bounded rollouts. Its success check currently tests position and conditioning, not final pitch or collision: it is not the complete automatic-motion validator. |
+| [Relative-command prototype](https://github.com/eetmie/kaivuriprokkis/blob/python/control_prototype/relative_command_processor.py) | Reuse measured-state synchronization and bounded reference lead. Avoid allowing an integrated virtual target to run ahead of the machine. |
+| [Bundle kinematics](https://github.com/eetmie/kaivuriprokkis/blob/python/learned_control/kinematics.py) | Reference weighted planar IK, polygon collision pairs and edge backtracking. Port the needed geometry math, not the Torch runtime or a learned policy. |
 | [Native excitation](../src/mlp_excitation.cpp) | Reuse generator version 4: sine carriers 0.2–10 Hz, instantaneous limit 12 Hz; chirp 0.05–12 Hz; existing stroke mode remains separate. |
 | [Native recorder](../src/mlp_record.cpp) | Extend fixed records with controller contributions, targets and plan labels. Preserve requested and final command meanings. |
 

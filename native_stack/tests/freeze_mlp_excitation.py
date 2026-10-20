@@ -14,7 +14,7 @@ import numpy as np
 
 
 def main():
-    reference = Path(__file__).resolve().parents[2]/'simple_drive.py'
+    reference = Path(__file__).resolve().parents[2]/'reference'/'simple_drive.py'
     names = {'SineExcitationGenerator', 'ChirpExcitationGenerator', 'StrokeExcitationGenerator',
              'sine_target_modes'}
     constants = {'SINE_TARGET_MODES', 'SINE_SLEW_MODE'}

@@ -20,8 +20,8 @@ def module(name, path):
 
 def main():
     probe, *profiles = sys.argv[1:]
-    pid_module = module("reference_pid", ROOT / "modules/pid.py")
-    coverage = module("reference_coverage", ROOT / "data_collection/plot_coverage.py")
+    pid_module = module("reference_pid", ROOT / "reference/modules/pid.py")
+    coverage = module("reference_coverage", ROOT / "reference/data_collection/plot_coverage.py")
     maxima = {"fk_m": 0.0, "pitch_rad": 0.0, "pid_output": 0.0, "pid_integral": 0.0, "pid_derivative": 0.0}
     counts = {"fk": 0, "pid": 0}
     for profile in profiles:

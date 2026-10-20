@@ -1,6 +1,6 @@
 # Native control + IR camera bench stack
 
-Built on Spark on 2026-10-11 for the next hardware session. Everything new lives in this folder. The existing Python stack and Pico firmware remain the reference and are unchanged.
+Built on Spark from 2026-10-11 on. The Python stack it replaced is frozen on branch [`python`](https://github.com/eetmie/kaivuriprokkis/tree/python); the few Python files the parity tests still load are in [`../reference/`](../reference/).
 
 This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR RealSense service with optional same-sensor depth. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. A separate hardware-free IK/PID preview exercises randomized data-collection commands. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
 

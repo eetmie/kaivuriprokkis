@@ -228,7 +228,7 @@ controller can run as another command source inside this same loop, so it
 drives through the same calibration, PWM writes and logging.
 
 Relevant references: [control protocol](PROTOCOL.md),
-[Python excitation reference](../../data_collection/EXCITATION.md),
-[shared legacy log schema](../../modules/drive_log.py),
-[legacy collector](../../simple_drive.py), and
+[Python excitation reference](../../reference/data_collection/EXCITATION.md),
+[shared legacy log schema](../../reference/modules/drive_log.py),
+[legacy collector](../../reference/simple_drive.py), and
 [current actuator importer](../../../Isaac-hydraulic-actuator/training/drive_logs.py).

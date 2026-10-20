@@ -9,13 +9,13 @@ import numpy as np
 import yaml
 
 binary, repo = Path(sys.argv[1]), Path(sys.argv[2])
-sys.path.insert(0, str(repo))
+sys.path.insert(0, str(repo / "reference"))
 from modules.pwm.config import ChannelConfig
 from modules.pwm.controller import PWMController
 # Execute the original function bodies without their JIT decorators/import chain.
 # This needs NumPy and PyYAML on Spark, but never Numba or the full controller.
 names = {"_rot_axis_angle_quat", "_quat_mul", "_quat_rotate_vec", "_fk_core"}
-tree = ast.parse((repo / "modules/ik/kinematics.py").read_text())
+tree = ast.parse((repo / "reference/modules/ik/kinematics.py").read_text())
 functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
 assert len(functions) == len(names)
 for function in functions:

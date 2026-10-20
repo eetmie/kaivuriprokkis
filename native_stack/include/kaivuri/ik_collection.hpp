@@ -38,7 +38,7 @@ class Kinematics {
     const Robot &robot() const { return robot_; }
 };
 
-// Same explicit-dt arithmetic as modules/pid.py; optional combined-command
+// Same explicit-dt arithmetic as reference/modules/pid.py; optional combined-command
 // saturation also prevents windup when an excitation overlay consumes headroom.
 class Pid {
     Gains gains_{};

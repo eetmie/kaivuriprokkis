@@ -122,7 +122,7 @@ struct Control {
         }
     }
 };
-// Linux evdev uses X/Y labels BTN_NORTH/BTN_WEST, matching modules/gamepad.py.
+// Linux evdev uses X/Y labels BTN_NORTH/BTN_WEST, matching reference/modules/gamepad.py.
 struct Image {
     void *handle = nullptr;
     FrameMetadata m{};

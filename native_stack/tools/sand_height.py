@@ -21,7 +21,8 @@ Calibration needs SciPy; viewing needs only NumPy and rerun-sdk 0.26.2. Camera m
 fixed per machine, so one calibration serves later sessions (pass --calibration).
 Slew angle comes from a gyro-only IMU and can drift: the viewer re-registers the cabin camera
 against the calibration's reference map every frame and applies that turn to both cameras.
-Chassis tilt (digging forces tip the machine) comes from the base IMU and levels all FK poses.
+Chassis tilt (digging forces tip the machine) comes from the base IMU and levels all FK poses;
+recordings from a controller with robot.level_frame.cabin_tilt already carry it in their FK.
 """
 import argparse
 import json
@@ -75,8 +76,9 @@ def base_gravity(status):
 
 
 def tilt_correction(status, yaw=None, pivot=None):
-    """(T, u): level a base-frame point p as T p + u."""
-    if GRAVITY_REFERENCE is None or not status.get('imu_corrected_quat_wxyz'):
+    """(T, u): level a base-frame point p as T p + u. Recordings whose controller already
+    levels its base frame (fk_cabin_tilt) need nothing here."""
+    if GRAVITY_REFERENCE is None or status.get('fk_cabin_tilt') or not status.get('imu_corrected_quat_wxyz'):
         return np.eye(3), np.zeros(3)
     yaw = TILT_YAW if yaw is None else yaw; pivot = TILT_PIVOT if pivot is None else pivot
     g = base_gravity(status); v = np.cross(g, GRAVITY_REFERENCE); s = np.linalg.norm(v)
@@ -469,8 +471,10 @@ def calibrate(args):
         r.key = k
     flat = episode_path(session, args.flat)
     global GRAVITY_REFERENCE
-    g = np.median([base_gravity(r['status']) for r in frame_rows(flat) if r['status'].get('fk_valid')], 0)
-    GRAVITY_REFERENCE = None if args.no_tilt else g / np.linalg.norm(g)
+    flat_rows = [r['status'] for r in frame_rows(flat) if r['status'].get('fk_valid')]
+    g = np.median([base_gravity(st) for st in flat_rows], 0)
+    levelled = all(st.get('fk_cabin_tilt') for st in flat_rows)  # the controller's FK is already level
+    GRAVITY_REFERENCE = None if args.no_tilt or levelled else g / np.linalg.norm(g)
     report, mounts = {}, {}
     for key, links in (('cam2', (0,)), ('cam1', (1, 2, 3))):
         samples = flat_samples(flat, rays[key])

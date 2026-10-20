@@ -61,10 +61,11 @@ def rz(a):
 
 # Chassis tilt: the FK assumes a level base, but digging forces tip the machine about a track
 # edge (2 degrees and a 16 mm cabin lift seen when the bucket hit the container bottom). The
-# base IMU's AHRS gives gravity in its axes; the turn back onto the reference (median over the
-# flat take), about the calibrated tilt pivot, levels every FK pose. Heading is unused.
+# 'base' IMU rides the cabin (its yaw is the slew angle), so its AHRS gravity is in cabin axes;
+# the turn back onto the reference (median over the flat take), turned by the slew into base
+# axes and applied about the calibrated pivot (a chassis point), levels every FK pose.
 GRAVITY_REFERENCE = None
-TILT_YAW = 0.          # base IMU axes relative to FK base axes, about vertical (rad)
+TILT_YAW = 0.          # cabin IMU axes relative to the upper-carriage axes, about vertical (rad)
 TILT_PIVOT = np.zeros(3)  # a point on the tipping axis, base frame
 TILT_DEADBAND = math.radians(.75)  # slewing rocks the base IMU by about 0.5 degrees; only real tipping counts
 
@@ -81,7 +82,8 @@ def tilt_correction(status, yaw=None, pivot=None):
     g = base_gravity(status); v = np.cross(g, GRAVITY_REFERENCE); s = np.linalg.norm(v)
     angle = math.asin(min(s, 1.)) - TILT_DEADBAND
     T = np.eye(3) if angle <= 0 else rotvec_matrix(v / s * angle)
-    T = rz(yaw) @ T @ rz(-yaw)
+    a = yaw + status['angles_rad'][0]  # cabin IMU axes -> base axes
+    T = rz(a) @ T @ rz(-a)
     return T, pivot - T @ pivot
 
 
@@ -510,7 +512,9 @@ def calibrate(args):
         cab, wr = mounts['cam2'], mounts['cam1']
         Rz = rz(-psi)  # bring the cabin camera into the wrist camera's (FK-consistent) base frame
         mounts['cam2'] = Mount(cab.link, Rz @ cab.R, Rz @ cab.t, Rz @ cab.n, cab.d)
-        TILT_YAW, TILT_PIVOT = TILT_YAW - psi, Rz @ TILT_PIVOT  # the tilt fit was in the cabin camera's frame
+        TILT_PIVOT = Rz @ TILT_PIVOT  # the pivot was fitted in the cabin camera's base frame
+        # IMU axes vs the upper carriage: the gauge turn also turns that frame's carriage axes
+        TILT_YAW = TILT_YAW - psi
         if 'tilt' in report:
             report['tilt'].update(imu_yaw_deg=round(math.degrees(TILT_YAW) % 360, 1), pivot_base_xy_m=TILT_PIVOT[:2].round(3).tolist())
         mounts['cam1'] = Mount(wr.link, wr.R, wr.t, wr.n, wr.d, shift)

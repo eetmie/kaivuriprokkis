@@ -304,6 +304,7 @@ int main(int argc, char **argv) {
             // One coherent observation per tick, reused by every status client on this tick.
             std::array<double, 4> angles{};
             KinematicState fk;
+            Attitude att;
             std::array<Quat, 4> imu_raw{}, imu_corrected{};
             std::array<Vec3, 4> imu_gyro{}, imu_accel{};
             double fk_work_us = 0;
@@ -314,7 +315,10 @@ int main(int argc, char **argv) {
                     for (auto &q : raw)
                         q = {1, 0, 0, 0};
                 angles = joint_angles(cfg, raw);
-                fk = forward_kinematic_state(cfg, angles);
+                att = attitude(cfg, raw);
+                fk = forward_kinematic_state(cfg, angles, att.tilt,
+                                             cfg.level.link_roll ? att.link_roll
+                                                                 : std::array<double, 4>{});
                 const auto corrected = corrected_imu_quaternions(cfg, raw);
                 for (int i = 0; i < 4; ++i) {
                     const int sensor = cfg.joints[i].sensor;
@@ -442,6 +446,16 @@ int main(int argc, char **argv) {
                             reply.matrix("fk_link_quat_wxyz", fk.link_orientations_base, healthy);
                             reply.matrix("fk_link_quat_upper_wxyz", fk.link_orientations_upper,
                                          healthy);
+                            reply.append(",\"fk_cabin_tilt\":%s,\"fk_link_roll\":%s",
+                                         cfg.level.cabin_tilt ? "true" : "false",
+                                         cfg.level.link_roll ? "true" : "false");
+                            if (healthy)
+                                reply.append(",\"cabin_roll_rad\":%.9f,\"cabin_pitch_rad\":%.9f",
+                                             att.cabin_roll, att.cabin_pitch);
+                            else
+                                reply.append(",\"cabin_roll_rad\":null,\"cabin_pitch_rad\":null");
+                            reply.vector("cabin_tilt_quat_wxyz", att.tilt, healthy);
+                            reply.vector("link_roll_rad", att.link_roll, healthy);
                             reply.matrix("imu_quat_wxyz", imu_raw, healthy);
                             reply.matrix("imu_corrected_quat_wxyz", imu_corrected, healthy);
                             reply.matrix("imu_gyro_dps", imu_gyro, healthy);

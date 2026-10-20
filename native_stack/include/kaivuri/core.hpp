@@ -19,6 +19,7 @@ Vec3 rotate(const Quat &q, const Vec3 &v);
 Quat axis_angle(Vec3 axis, double angle);
 double wrap(double angle);
 double gravity_pitch(const Quat &q);
+double gravity_roll(const Quat &q); // about sensor +X, from gravity alone; valid at any pitch
 double twist(const Quat &q, Vec3 axis);
 double monotonic_seconds();
 
@@ -37,7 +38,14 @@ struct Joint {
     bool pitch_delta = false;
     Vec3 extraction_axis{};
 };
+// Level frame options (control_config robot.level_frame). The cabin carries the 'base' IMU,
+// so its roll/pitch is the whole upper body's tilt; link_roll adds each link's measured roll
+// about its own X relative to its parent IMU (hinge play/flex; mounting error looks the same).
+struct LevelOptions {
+    bool cabin_tilt = true, link_roll = false;
+};
 struct Config {
+    LevelOptions level;
     std::array<Valve, 8> valves{};
     std::array<Joint, 4> joints{};
     std::array<Quat, 4> offsets_inv{};
@@ -57,14 +65,26 @@ struct Pose {
     Quat orientation{1, 0, 0, 0};
 };
 struct KinematicState {
-    Pose base, upper; // Upper frame: slew pivot origin, axes rotate with the carriage.
+    // Base frame: gravity level, origin at the ground reference, heading at slew zero. Upper
+    // frame: slew pivot origin, axes rotate (and tilt) with the carriage.
+    Pose base, upper;
     std::array<Vec3, 4> joint_positions_base{}, joint_positions_upper{};
     std::array<Quat, 4> joint_rotations{}, link_orientations_base{}, link_orientations_upper{};
     double slew_yaw = 0, bucket_pitch = 0; // radians; pitch is positive about upper +Y.
 };
+// Cabin attitude from the cabin ('base' role) IMU, and per-link roll relative to the parent IMU.
+struct Attitude {
+    Quat tilt{1, 0, 0, 0}; // level <- slewed carriage axes (no heading); identity when disabled
+    double cabin_roll = 0, cabin_pitch = 0; // carriage axes, from gravity
+    std::array<double, 4> link_roll{};      // about each link's X vs its parent; 0 for slew/near-vertical links
+};
 std::array<Quat, 4> corrected_imu_quaternions(const Config &cfg, const std::array<Quat, 4> &raw);
 std::array<double, 4> joint_angles(const Config &cfg, const std::array<Quat, 4> &raw);
-KinematicState forward_kinematic_state(const Config &cfg, const std::array<double, 4> &angles);
+Attitude attitude(const Config &cfg, const std::array<Quat, 4> &raw);
+// Without tilt/roll: the nominal level-machine chain (used for planning in the upper frame).
+KinematicState forward_kinematic_state(const Config &cfg, const std::array<double, 4> &angles,
+                                       const Quat &tilt = {1, 0, 0, 0},
+                                       const std::array<double, 4> &link_roll = {});
 Pose forward_kinematics(const Config &cfg, const std::array<double, 4> &angles);
 struct RampState {
     double pulse = 0, time = 0;

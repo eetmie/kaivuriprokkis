@@ -122,6 +122,85 @@ int main(int argc, char **argv) {
             multiply(axis_angle({0, 1, 0}, .3), conjugate(c.offsets_inv[c.joints[1].sensor]));
         angles = joint_angles(c, mounted);
         expect(close(angles[1], .3) && close(angles[2], -.3), "pitch relative to parent");
+        {
+            // Level frame: the cabin IMU (slew role) carries the upper body's tilt.
+            expect(c.level.cabin_tilt && !c.level.link_roll, "profile level_frame options");
+            const Quat tilt = axis_angle({.6, -.8, 0}, .035); // 2 deg about a horizontal axis
+            const std::array<double, 4> q{.7, -.4, 1.3, -.9};
+            std::array<Quat, 4> world{};
+            world[c.joints[0].sensor] = multiply(tilt, axis_angle({0, 0, 1}, q[0]));
+            Quat link = world[c.joints[0].sensor];
+            for (int i = 1; i < 4; ++i) {
+                link = multiply(link, axis_angle({0, 1, 0}, q[i]));
+                world[c.joints[i].sensor] = link;
+            }
+            std::array<Quat, 4> raw{};
+            for (int i = 0; i < 4; ++i)
+                raw[i] = multiply(world[i], conjugate(c.offsets_inv[i]));
+            const auto a = attitude(c, raw);
+            const auto up = rotate(a.tilt, {0, 0, 1}), want = rotate(tilt, {0, 0, 1});
+            expect(close(up[0], want[0], 1e-12) && close(up[1], want[1], 1e-12) &&
+                       close(up[2], want[2], 1e-12),
+                   "swing-twist recovers the cabin tilt");
+            expect(close(joint_angles(c, raw)[0], q[0], 1e-12), "slew is the remaining twist");
+            const auto g = rotate(conjugate(world[c.joints[0].sensor]), {0, 0, 1});
+            expect(close(a.cabin_roll, std::asin(g[1])) &&
+                       close(a.cabin_pitch, std::atan2(-g[0], g[2])),
+                   "cabin roll/pitch are gravity angles in carriage axes");
+            for (int i = 1; i < 4; ++i)
+                expect(close(a.link_roll[i], 0, 1e-12),
+                       "parallel hinges have no relative roll at any tilt");
+            const auto flat = forward_kinematic_state(c, q);
+            const auto level = forward_kinematic_state(c, q, a.tilt);
+            for (int i = 0; i < 4; ++i) {
+                const auto p = rotate(a.tilt, flat.joint_positions_base[i]);
+                for (int j = 0; j < 3; ++j)
+                    expect(close(level.joint_positions_base[i][j], p[j]) &&
+                               close(level.joint_positions_upper[i][j],
+                                     flat.joint_positions_upper[i][j]),
+                           "tilt turns base pivots about the ground origin; upper frame unchanged");
+            }
+            const auto tip = rotate(a.tilt, flat.base.position);
+            const auto qt = multiply(a.tilt, flat.base.orientation);
+            for (int j = 0; j < 4; ++j)
+                expect((j == 3 || close(level.base.position[j], tip[j])) &&
+                           close(level.base.orientation[j], qt[j]),
+                       "tool pose follows the tilt");
+            const double moved = std::hypot(level.base.position[0] - flat.base.position[0],
+                                            level.base.position[1] - flat.base.position[1],
+                                            level.base.position[2] - flat.base.position[2]);
+            expect(moved > .005 && moved < .04, "2 deg of tilt moves the tool by centimetres");
+            // Link roll addon: bucket IMU rolled 1 deg about its own X relative to the arm IMU.
+            const double roll = .0175;
+            const int s3 = c.joints[3].sensor;
+            raw[s3] = multiply(multiply(world[s3], axis_angle({1, 0, 0}, roll)),
+                               conjugate(c.offsets_inv[s3]));
+            const auto rolled = attitude(c, raw);
+            expect(close(rolled.link_roll[3], roll, 1e-9) && close(rolled.link_roll[2], 0, 1e-12),
+                   "link roll is relative to the parent IMU");
+            const auto with = forward_kinematic_state(c, q, rolled.tilt, rolled.link_roll);
+            const auto expected =
+                multiply(level.link_orientations_upper[3], axis_angle({1, 0, 0}, roll));
+            for (int j = 0; j < 4; ++j)
+                expect(close(with.link_orientations_upper[3][j], expected[j], 1e-9),
+                       "link roll turns the link about its own X after the hinge");
+            for (int j = 0; j < 3; ++j)
+                expect(close(with.joint_positions_upper[3][j], level.joint_positions_upper[3][j]),
+                       "link roll leaves the bucket pivot in place");
+            // The same on the arm, pitched 52 deg below horizontal; the bucket follows its roll.
+            const int s2 = c.joints[2].sensor;
+            const Quat arm_rolled = multiply(world[s2], axis_angle({1, 0, 0}, roll));
+            raw[s2] = multiply(arm_rolled, conjugate(c.offsets_inv[s2]));
+            raw[s3] = multiply(multiply(arm_rolled, axis_angle({0, 1, 0}, q[3])),
+                               conjugate(c.offsets_inv[s3]));
+            const auto pitched = attitude(c, raw);
+            expect(close(pitched.link_roll[2], roll, 2e-4) && close(pitched.link_roll[3], 0, 2e-4),
+                   "link roll is exact on a steeply pitched link, and does not leak downstream");
+            Config off = c;
+            off.level.cabin_tilt = false;
+            expect(attitude(off, raw).tilt == Quat{1, 0, 0, 0},
+                   "cabin_tilt false keeps the nominal level chain");
+        }
         ImuParser parser(4);
         auto b = imu_packet(0xfffffff0U);
         for (auto byte : b)

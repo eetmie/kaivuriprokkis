@@ -59,6 +59,12 @@ imu:
     - 0.0
     - 0.0
 robot:
+  # Level frame: base-frame FK (fk_xyz_m, fk_joint_xyz_m, ...) includes the cabin IMU's
+  # roll/pitch, so it stays gravity level when the machine tilts. link_roll also adds each
+  # link's gravity roll relative to its parent IMU (hinge play; set mounting offsets first).
+  level_frame:
+    cabin_tilt: true
+    link_roll: false
   joints:
   - name: slew
     axis:

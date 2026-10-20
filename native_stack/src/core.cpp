@@ -60,6 +60,10 @@ double wrap(double a) {
 double gravity_pitch(const Quat &q) {
     return std::atan2(-2 * (q[1] * q[3] - q[0] * q[2]), 1 - 2 * (q[1] * q[1] + q[2] * q[2]));
 }
+double gravity_roll(const Quat &q) {
+    // Gravity's sensor-Y component is sin(roll) whatever the pitch (unlike atan2(y, z)).
+    return std::asin(std::clamp(2 * (q[2] * q[3] + q[0] * q[1]), -1., 1.));
+}
 double twist(const Quat &q, Vec3 axis) {
     const double n = std::sqrt(dot(axis, axis));
     if (n < 1e-12)
@@ -166,6 +170,10 @@ Config load_hardware_config(const std::string &profile_dir) {
     }
     if (sensors.size() != 4)
         throw std::runtime_error("native v1 requires four mapped IMUs");
+    if (const auto level = control["robot"]["level_frame"]) {
+        c.level.cabin_tilt = level["cabin_tilt"].as<bool>(c.level.cabin_tilt);
+        c.level.link_roll = level["link_roll"].as<bool>(c.level.link_roll);
+    }
     const auto joints = control["robot"]["joints"], chain = control["imu"]["chain"];
     if (joints.size() != 4 || chain.size() != 4)
         throw std::runtime_error("native v1 requires four joints and extraction rules");
@@ -246,7 +254,36 @@ std::array<double, 4> joint_angles(const Config &c, const std::array<Quat, 4> &r
     }
     return out;
 }
-KinematicState forward_kinematic_state(const Config &c, const std::array<double, 4> &angles) {
+Attitude attitude(const Config &c, const std::array<Quat, 4> &raw) {
+    const auto q = corrected_imu_quaternions(c, raw);
+    const auto &slew = c.joints[0];
+    const Quat cabin = q[slew.sensor];
+    Attitude a;
+    // Swing-twist about the slew axis: the twist is the slew angle, the swing is the tilt.
+    if (c.level.cabin_tilt)
+        a.tilt = normalized(multiply(
+            cabin, conjugate(axis_angle(slew.extraction_axis, twist(cabin, slew.extraction_axis)))));
+    a.cabin_roll = gravity_roll(cabin);
+    a.cabin_pitch = gravity_pitch(cabin);
+    // Link roll: the turn about the child's X between the gravity it measures and the gravity the
+    // parent IMU plus the hinge angle predict. Only the Y-Z part of gravity sees it, so a link
+    // within about 11 degrees of vertical reports 0 (unobservable).
+    const auto angles = joint_angles(c, raw);
+    for (int i = 1; i < 4; ++i) {
+        const auto &j = c.joints[i];
+        if (!j.pitch_delta || j.parent_sensor < 0)
+            continue;
+        const auto expected = rotate(conjugate(multiply(q[j.parent_sensor], axis_angle(j.axis, angles[i]))), {0, 0, 1});
+        const auto measured = rotate(conjugate(q[j.sensor]), {0, 0, 1});
+        const double norm = expected[1] * expected[1] + expected[2] * expected[2];
+        if (norm > .04)
+            a.link_roll[i] = std::atan2(measured[1] * expected[2] - measured[2] * expected[1],
+                                        measured[1] * expected[1] + measured[2] * expected[2]);
+    }
+    return a;
+}
+KinematicState forward_kinematic_state(const Config &c, const std::array<double, 4> &angles,
+                                       const Quat &tilt, const std::array<double, 4> &link_roll) {
     KinematicState state;
     // Evaluate the arm in the carriage frame directly: slew drift never enters this chain.
     const Quat slew = axis_angle(c.joints[0].axis, angles[0]);
@@ -258,6 +295,9 @@ KinematicState forward_kinematic_state(const Config &c, const std::array<double,
             state.upper.position[j] += d[j];
         state.joint_positions_upper[i] = state.upper.position;
         state.joint_rotations[i] = axis_angle(c.joints[i].axis, angles[i]);
+        if (link_roll[i] != 0) // measured roll about the link's own X, after the hinge
+            state.joint_rotations[i] =
+                multiply(state.joint_rotations[i], axis_angle({1, 0, 0}, link_roll[i]));
         state.upper.orientation =
             normalized(multiply(state.upper.orientation, state.joint_rotations[i]));
         state.link_orientations_upper[i] = state.upper.orientation;
@@ -265,16 +305,21 @@ KinematicState forward_kinematic_state(const Config &c, const std::array<double,
     const auto tip = rotate(state.upper.orientation, c.tip);
     for (int j = 0; j < 3; ++j)
         state.upper.position[j] += tip[j];
-    state.base.orientation = normalized(multiply(slew, state.upper.orientation));
-    const auto base_tip = rotate(slew, state.upper.position);
-    for (int j = 0; j < 3; ++j)
-        state.base.position[j] = c.joints[0].offset[j] + base_tip[j];
-    for (int i = 0; i < 4; ++i) {
-        const auto base_origin = rotate(slew, state.joint_positions_upper[i]);
+    // Carriage to level base: slew, then the measured tilt about the ground reference origin.
+    const Quat carriage = normalized(multiply(tilt, slew));
+    state.base.orientation = normalized(multiply(carriage, state.upper.orientation));
+    const auto to_base = [&](const Vec3 &upper) {
+        Vec3 p = rotate(carriage, upper);
+        const auto pivot = rotate(tilt, c.joints[0].offset);
         for (int j = 0; j < 3; ++j)
-            state.joint_positions_base[i][j] = c.joints[0].offset[j] + base_origin[j];
+            p[j] += pivot[j];
+        return p;
+    };
+    state.base.position = to_base(state.upper.position);
+    for (int i = 0; i < 4; ++i) {
+        state.joint_positions_base[i] = to_base(state.joint_positions_upper[i]);
         state.link_orientations_base[i] =
-            normalized(multiply(slew, state.link_orientations_upper[i]));
+            normalized(multiply(carriage, state.link_orientations_upper[i]));
     }
     state.slew_yaw = angles[0];
     // Signed planar tool-axis angle, including angles beyond Euler pitch's +/-90 deg range.

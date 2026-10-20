@@ -49,6 +49,13 @@ def finish(process):
     assert process.returncode == 0, (process.returncode, stdout, stderr)
 
 
+def rotate(q, v):
+    w, x, y, z = q
+    c = [y * v[2] - z * v[1], z * v[0] - x * v[2], x * v[1] - y * v[0]]
+    cc = [y * c[2] - z * c[1], z * c[0] - x * c[2], x * c[1] - y * c[0]]
+    return [v[i] + 2 * w * c[i] + 2 * cc[i] for i in range(3)]
+
+
 def check_kinematic_status(status):
     assert status["fk_valid"] and status["imu_healthy"]
     assert status["fk_frame"] == "base" and status["fk_upper_frame"] == "upper_carriage"
@@ -61,10 +68,18 @@ def check_kinematic_status(status):
         assert len(status[key]) == 4
         for row in status[key]:
             assert len(row) == width and all(math.isfinite(value) for value in row)
-            if "quat" in key:
-                assert math.isclose(sum(value * value for value in row), 1, abs_tol=1e-8)
+            if "quat" in key:  # raw firmware quaternions are float32, unit only to ~1e-7
+                tolerance = 1e-6 if key == "imu_quat_wxyz" else 1e-8
+                assert math.isclose(sum(value * value for value in row), 1, abs_tol=tolerance), (key, row)
     assert status["fk_upper_xz_m"] == [status["fk_upper_xyz_m"][0], status["fk_upper_xyz_m"][2]]
-    assert math.isclose(status["fk_xyz_m"][2], status["fk_upper_xyz_m"][2] + .07, abs_tol=2e-9)
+    # Level base = cabin tilt applied about the ground origin to the slewed carriage chain.
+    assert status["fk_cabin_tilt"] is True and status["fk_link_roll"] is False
+    assert len(status["link_roll_rad"]) == 4 and status["link_roll_rad"][0] == 0
+    tilt, yaw = status["cabin_tilt_quat_wxyz"], status["slew_yaw_rad"]
+    x, y, z = status["fk_upper_xyz_m"]
+    slewed = [x * math.cos(yaw) - y * math.sin(yaw), x * math.sin(yaw) + y * math.cos(yaw), z + .07]
+    expected = rotate(tilt, slewed)
+    assert all(math.isclose(a, b, abs_tol=2e-9) for a, b in zip(status["fk_xyz_m"], expected)), (status["fk_xyz_m"], expected)
     assert status["slew_yaw_rad"] == status["angles_rad"][0]
     assert math.isclose(status["bucket_pitch_rad"], sum(status["angles_rad"][1:]), abs_tol=2e-9)
     assert status["fk_link_quat_wxyz"][-1] == status["fk_quat_wxyz"]
@@ -128,8 +143,8 @@ def serial_test(temp):
         timestamp = 1000
         while not stop.wait(.01):
             payload = bytearray(b"\xaa\x55\x04\x04") + struct.pack("<I", timestamp)
-            for _ in range(4):
-                payload += struct.pack("<10f", 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+            for _ in range(4):  # the whole upper body rolled 2 degrees (cabin, boom, arm, bucket)
+                payload += struct.pack("<10f", math.cos(math.radians(1)), math.sin(math.radians(1)), 0, 0, 0, 0, 0, 0, 0, 1)
             payload += struct.pack("<H", sum(payload[2:]) & 65535)
             os.write(master, payload)
             timestamp += 10000
@@ -141,7 +156,12 @@ def serial_test(temp):
         process, path = launch(temp, "--serial", os.ttyname(slave))
         with Client(path) as client:
             wait_until(lambda: client.status()["imu_healthy"])
-            check_kinematic_status(client.status())
+            status = client.status()
+            check_kinematic_status(status)
+            assert math.isclose(status["cabin_roll_rad"], math.radians(2), abs_tol=1e-6), status["cabin_roll_rad"]
+            assert abs(status["cabin_pitch_rad"]) < 1e-6 and all(abs(r) < 1e-6 for r in status["link_roll_rad"])
+            # Rolled about +X: the tool (forward along +X at slew 0) keeps its X; Y/Z turn by 2 deg.
+            assert abs(status["fk_xyz_m"][1]) > 1e-3 and status["fk_upper_xyz_m"][1] == 0
             client.arm()
             stop.set()
             thread.join()
@@ -154,7 +174,8 @@ def serial_test(temp):
                         "slew_yaw_rad", "bucket_pitch_rad", "fk_joint_xyz_m",
                         "fk_joint_xyz_upper_m", "fk_joint_quat_wxyz", "fk_link_quat_wxyz",
                         "fk_link_quat_upper_wxyz", "imu_quat_wxyz", "imu_corrected_quat_wxyz",
-                        "imu_gyro_dps", "imu_accel_g"):
+                        "imu_gyro_dps", "imu_accel_g", "cabin_roll_rad", "cabin_pitch_rad",
+                        "cabin_tilt_quat_wxyz", "link_roll_rad"):
                 assert status[key] is None, key
     finally:
         stop.set()

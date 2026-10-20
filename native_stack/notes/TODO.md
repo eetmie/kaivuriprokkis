@@ -10,12 +10,30 @@ from the VLA recorder.
 - [x] Per-packet `ImuParser` emission, shared `Pwm`/gamepad modules and an IMU byte-replay input.
 - [x] `kaivuri-mlp-collect`: manual driving, pump toggle, `drive_log`/`imu_raw`/`excitation` output.
 - [x] Port sine/chirp/stroke excitation with cross-language fixtures.
+- [x] Broaden default frequency coverage and deploy generator version 4 to the isolated 2026-10-20 Jetson tree; local 89 Python/7 native checks, Jetson 7 native checks and a fresh real-Pico dry run pass.
 - [x] `pump_on` handling in `training/drive_logs.py`; validate q/v/u on a replayed strip.
 - [x] 30-minute real-IMU/live-neutral-PWM Jetson run with servo/pump power off; zero missed periods/drops, flat 12.52 MiB RSS and neutral register readback. See [MLP validation](MLP_VALIDATION.md).
 - [ ] Operator: physical gamepad mapping and a short powered collection before full dataset collection.
 
-IK/PID and old MLP driving, circle tests and model training are deferred from this
-logging milestone.
+The randomized IK/PID core now has its own initial collector described in
+[separate PID collection](PID_COLLECTION.md), alongside the offline preview in
+[IK-assisted collection](IK_COLLECTION_PLAN.md). Its control flow remains separate
+from the manual MLP collector. Old MLP driving, circle tests and model training
+remain outside this logging milestone.
+
+## IK-assisted collection
+
+- [x] Audit coverage reports, coordinate/calibration contracts, IK/PID references and native integration points; write the design and example settings.
+- [ ] Export machine-readable full joint-space coverage with native gyro/quality handling and an offline route preview.
+- [x] Implement native task-pose/Jacobian/IK and explicit-dt PID with Python parity.
+- [x] Build the separate PID collector, post-combination joint guard, recorded manual takeover, PID telemetry/protocol attachments and common atomic commit support.
+- [x] Extend training import compatibility for PID sidecars/source labels and exclude dry rows.
+- [ ] Operator: powered command-direction, stopping-margin and tracking acceptance for the initial PID collector.
+- [x] Add a hardware-free randomized pitch/velocity preview: 0.1–3 s commands, independently varied PID gains and 25/50/100 Hz updates, separate 100 Hz excitation clock, measured coverage and replay provenance. All 10 local native tests pass.
+- [x] Allow inward PID recovery from outside the working range (fixed gains, 100 Hz, 0.25 output cap, no overlay); print incremental measured working-grid coverage every 30 seconds and at exit.
+- [ ] Add single-waypoint assistance, manual takeover and command decomposition to the recorder; validate by replay before powered acceptance.
+- [ ] Add coverage-guided continuation over checked, connected transitions.
+- [ ] Validate fast-excitation preservation, regional coverage, physical envelope and loaded Jetson timing.
 
 ## Completed on Spark
 

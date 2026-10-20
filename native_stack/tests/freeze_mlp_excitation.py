@@ -2,7 +2,7 @@
 
 Run manually from any directory. Native CTest only reads the frozen JSON and
 does not need NumPy or the legacy collector. Parameters/directions are explicit:
-NumPy and the native version 3 generator intentionally use different RNGs.
+NumPy and the native version 4 generator intentionally use different RNGs.
 """
 
 import ast
@@ -25,17 +25,20 @@ def main():
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(reference), 'exec'), namespace)
     limits = {'boom': [-50,30], 'arm': [28,144], 'bucket': [-120,20]}
     cases = []
-    for mode in ('sine', 'chirp', 'constant_chirp', 'stroke'):
+    for name in ('sine', 'fast_sine', 'chirp', 'fast_chirp', 'constant_chirp', 'stroke'):
+        mode = {'fast_sine': 'sine', 'fast_chirp': 'chirp'}.get(name, name)
         amplitude = .65 if mode == 'sine' else .4 if mode == 'stroke' else .35
         cls = namespace[{'sine':'SineExcitationGenerator', 'stroke':'StrokeExcitationGenerator'}.get(mode, 'ChirpExcitationGenerator')]
         options = {'enabled': True, 'seed': 42, 'amplitude': amplitude}
         start, end, sweep = (.5,12,20) if mode == 'stroke' else (.05,.9,60)
+        if name == 'fast_chirp': end = 12
         if mode == 'constant_chirp': start = end = .3
         if mode != 'sine': options.update(start_hz=start, end_hz=end, sweep_s=sweep)
         if mode == 'stroke': options['joint_limits_deg'] = limits
         generator = cls(**options)
         parameters = dict(f_env=.025, f_car=.4, f_rate=.04, depth=.8, f_noise=.25,
                           noise=0., amp=amplitude, phi1=.2, phi2=.3)
+        if name == 'fast_sine': parameters['f_car'] = 8.
         generator._params = {name: dict(parameters) for name in namespace['JOINT_NAMES']}
         directions = [1,-1,-1,-1]  # Explicit native seed 42 / block 2 inputs.
         if mode == 'stroke':
@@ -52,7 +55,7 @@ def main():
                 generator.observe(q if fresh else None)
             u = generator.get_all(float(t))
             samples.append([float(t), fresh, q, [u[name] for name in namespace['JOINT_NAMES']], generator.enabled])
-        cases.append(dict(mode=mode, amplitude=amplitude, start_hz=start, end_hz=end,
+        cases.append(dict(name=name, mode=mode, amplitude=amplitude, start_hz=start, end_hz=end,
                           sweep_s=sweep, directions=directions, parameters=parameters, samples=samples))
     fixture = dict(reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(),
                    reference='simple_drive.py waveform classes', numpy_version=np.__version__, cases=cases)

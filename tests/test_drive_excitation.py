@@ -72,6 +72,28 @@ def test_chirp_phase_matches_frequency_integral():
     assert gen.chirp_phase(60 - 1e-7) == pytest.approx(gen.chirp_phase(60 + 1e-7))
 
 
+def test_default_sine_covers_slow_and_fast_motion_without_exceeding_limit():
+    parameters = [p for seed in range(64)
+                  for p in drive.SineExcitationGenerator(seed=seed)._params.values()]
+    carriers = np.array([p['f_car'] for p in parameters])
+    assert np.all((carriers >= .2) & (carriers <= 10.0))
+    assert (carriers < 1.0).mean() > .15
+    assert (carriers >= 5.0).mean() > .10
+    assert carriers.max() > 8.0
+    for p in parameters:
+        assert p['f_car'] * (1 + 2 * np.pi * p['f_rate'] * p['depth']) <= 12.0 + 1e-9
+
+
+def test_default_chirp_reaches_fast_response_band():
+    gen = drive.ChirpExcitationGenerator(seed=1)
+    assert (gen.start_hz, gen.end_hz, gen.sweep_s) == (.05, 12.0, 60.0)
+    h = 1e-4
+    for t in (1.0, 30.0, 59.0, 61.0, 90.0, 119.0):
+        frequency = (gen.chirp_phase(t + h) - gen.chirp_phase(t - h)) / (4 * np.pi * h)
+        expected = .05 * 240 ** (t / 60) if t < 60 else 12 * (1 / 240) ** ((t - 60) / 60)
+        assert frequency == pytest.approx(expected, rel=1e-7)
+
+
 def test_chirp_limits_rest_interval_and_slew_isolation():
     gen = drive.ChirpExcitationGenerator(enabled=True, seed=3, amplitude=.25)
     gen.start_time = 0.0
@@ -146,6 +168,7 @@ def test_cli_builds_chirp_with_requested_target_and_seed():
     assert gen.target_joints == ('bucket',)
     assert gen.seed == 42
     assert gen.amplitude == .35
+    assert (gen.start_hz, gen.end_hz, gen.sweep_s) == (.05, 12.0, 60.0)
     assert not gen.enabled
 
 

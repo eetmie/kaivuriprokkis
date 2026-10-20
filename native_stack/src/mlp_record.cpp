@@ -15,6 +15,14 @@
 
 namespace kaivuri::mlp {
 namespace fs = std::filesystem;
+const char *drive_source_name(DriveSource source) {
+    switch (source) {
+    case DriveSource::Manual: return "manual";
+    case DriveSource::Controller: return "controller";
+    case DriveSource::Idle: return "idle";
+    }
+    throw std::invalid_argument("invalid drive source");
+}
 namespace {
 constexpr const char *roles[]{"base", "boom", "arm", "bucket"};
 constexpr const char *channels[]{"rotate", "lift", "tilt", "scoop"};
@@ -93,6 +101,8 @@ std::string json_quote(const std::string &s) {
 struct MlpWriter::Impl {
     fs::path out;
     RecordingMetadata metadata;
+    std::shared_ptr<RecordingAttachment> attachment;
+    std::vector<fs::path> attachment_paths;
     const size_t capacity;
     std::vector<Record> queue;
     alignas(64) std::atomic<uint64_t> head{0};
@@ -111,8 +121,8 @@ struct MlpWriter::Impl {
     uint64_t drops_at_start = 0;
     bool have_tick = false, open = false;
     DriveSample final{};
-    Impl(fs::path destination, RecordingMetadata m, size_t n)
-        : out(std::move(destination)), metadata(std::move(m)), capacity(n), queue(n) {
+    Impl(fs::path destination, RecordingMetadata m, size_t n, std::shared_ptr<RecordingAttachment> a)
+        : out(std::move(destination)), metadata(std::move(m)), attachment(std::move(a)), capacity(n), queue(n) {
         if (n < 16 || n > 65536 || (n & (n - 1)))
             throw std::invalid_argument("queue capacity must be a power of two in 16..65536");
         fs::create_directories(out);
@@ -146,6 +156,15 @@ struct MlpWriter::Impl {
         if (!metadata.suffix.empty())
             id << '_' << metadata.suffix;
         const auto name = id.str();
+        attachment_paths.clear();
+        if (attachment) {
+            attachment->begin(out, name);
+            attachment_paths = attachment->paths();
+            for (const auto &path : attachment_paths)
+                if (fs::absolute(path).lexically_normal().parent_path() != fs::absolute(out).lexically_normal() ||
+                    path.extension() != ".partial")
+                    throw std::runtime_error("invalid recording attachment path");
+        }
         drive_path = out / ("drive_log_" + name + ".csv.partial");
         raw_path = out / ("imu_raw_" + name + ".csv.partial");
         excitation_path = out / ("excitation_" + name + ".json.partial");
@@ -169,7 +188,8 @@ struct MlpWriter::Impl {
         last_block = 0;
         first_block = true;
         excitation << std::setprecision(17)
-                   << "{\"version\":3,\"rng\":\"splitmix64-box-muller-v1\",\"blocks\":[";
+                   << "{\"version\":" << excitation_version
+                   << ",\"rng\":\"splitmix64-box-muller-v1\",\"blocks\":[";
         drive << std::setprecision(17);
         raw << std::setprecision(17);
         drive << "timestamp,sample_idx,scheduled_ns,start_ns,post_write_ns,lateness_ms,work_ms,cmd_"
@@ -197,7 +217,13 @@ struct MlpWriter::Impl {
             drive << ",pwm_count_" << i;
         drive << ",sine_enabled,sine_target,sine_seed,excitation_mode,excitation_version,"
                  "excitation_block,excitation_elapsed_s,excitation_noise_tick,excitation_stage,"
-                 "missed_periods,checksum_errors,invalid_imu_frames,imu_resets\n";
+                 "missed_periods,checksum_errors,invalid_imu_frames,imu_resets";
+        if (attachment) {
+            drive << ",control_source,control_source_code,controller_valid";
+            for (auto prefix : {"assist_cmd_", "constraint_cmd_"})
+                for (auto channel : channels) drive << ',' << prefix << channel;
+        }
+        drive << '\n';
         raw << "device_ts_us,raw_device_ts_us,host_read_ns,sequence,epoch,packet_type";
         for (auto role : roles)
             for (auto field :
@@ -237,7 +263,7 @@ struct MlpWriter::Impl {
             have_tick = true;
         }
         final = s;
-        const bool stale = !s.write_ok || !s.input_valid || !s.imu_valid;
+        const bool stale = !s.write_ok || !s.input_valid || !s.imu_valid || !s.controller_valid;
         drive << double(s.post_write_ns) / 1e9 << ',' << s.tick - first_tick << ','
               << s.scheduled_ns << ',' << s.start_ns << ',' << s.post_write_ns << ','
               << double(int64_t(s.start_ns) - int64_t(s.scheduled_ns)) / 1e6 << ','
@@ -258,9 +284,9 @@ struct MlpWriter::Impl {
             for (unsigned i = 0; i < 4; ++i)
                 drive << ',' << (*values)[i];
         for (unsigned i = 0; i < 4; ++i)
-            drive << ',' << (std::abs(s.manual[i] + s.excitation[i]) > 1 + 1e-9);
+            drive << ',' << (std::abs(s.manual[i] + s.assist[i] + s.excitation[i]) > 1 + 1e-9);
         for (unsigned i = 0; i < 4; ++i)
-            drive << ',' << s.command[i] - s.manual[i];
+            drive << ',' << s.command[i] - s.manual[i] - s.assist[i] - s.constraint[i];
         for (double x : s.command)
             drive << ',' << x;
         for (double x : s.angles)
@@ -287,10 +313,18 @@ struct MlpWriter::Impl {
         for (double x : s.pulses)
             drive << ',' << pulse_count(x, metadata.config.frequency);
         drive << ',' << s.enabled << ',' << target_name(s.target) << ',' << s.seed << ','
-              << waveform_name(s.waveform) << ",3," << s.block_id << ',' << s.excitation_elapsed_s
+              << waveform_name(s.waveform) << ',' << excitation_version << ',' << s.block_id << ','
+              << s.excitation_elapsed_s
               << ',' << s.noise_tick << ',' << stage_name(s.stage) << ',' << s.missed_periods << ','
-              << s.checksum_errors << ',' << s.invalid_frames << ',' << s.resets << '\n';
+              << s.checksum_errors << ',' << s.invalid_frames << ',' << s.resets;
+        if (attachment) {
+            drive << ',' << drive_source_name(s.source) << ',' << static_cast<unsigned>(s.source) << ',' << s.controller_valid;
+            for (const auto *values : {&s.assist, &s.constraint})
+                for (unsigned i = 0; i < 4; ++i) drive << ',' << (*values)[i];
+        }
+        drive << '\n';
         ++rows;
+        if (attachment) attachment->drive(s);
     }
     void write_manifest(bool complete) {
         std::ofstream manifest(session_path);
@@ -299,6 +333,7 @@ struct MlpWriter::Impl {
                  << (complete ? "true" : "false")
                  << ",\"control_hz\":100,\"dry_pwm\":" << (metadata.dry ? "true" : "false")
                  << ",\"collection_id\":" << json_quote(metadata.collection_id)
+                 << ",\"collector\":" << json_quote(metadata.collector)
                  << ",\"enable_slew\":" << (metadata.slew ? "true" : "false")
                  << ",\"enable_tracks\":" << (metadata.tracks ? "true" : "false")
                  << ",\"rows\":" << rows << ",\"raw_packets\":" << packets
@@ -358,6 +393,15 @@ struct MlpWriter::Impl {
                 name.resize(name.size() - 8);
                 manifest << json_quote(name) << ':' << json_quote(sha256_file(p));
             }
+        manifest << "},\"attachments\":{";
+        first = true;
+        if (complete)
+            for (const auto &path : attachment_paths) {
+                if (!first) manifest << ',';
+                first = false;
+                auto name = path.filename().string(); name.resize(name.size() - 8);
+                manifest << json_quote(name) << ':' << json_quote(sha256_file(path));
+            }
         manifest << "}}\n";
     }
     void write_block(const ExcitationBlock &b) {
@@ -413,14 +457,19 @@ struct MlpWriter::Impl {
         drive.close();
         raw.close();
         excitation.close();
+        if (attachment) attachment->close();
         complete = complete && dropped.load(std::memory_order_acquire) == drops_at_start &&
                    rows > 0 && packets > 0;
         write_manifest(complete);
         for (const auto &p : {drive_path, raw_path, excitation_path, session_path})
             sync_file(p);
+        for (const auto &p : attachment_paths) sync_file(p);
         if (complete) {
             // The manifest is the final commit marker for the entire trio.
-            for (const auto &p : {raw_path, excitation_path, drive_path, session_path}) {
+            std::vector<fs::path> paths{raw_path, excitation_path, drive_path};
+            paths.insert(paths.end(), attachment_paths.begin(), attachment_paths.end());
+            paths.push_back(session_path);
+            for (const auto &p : paths) {
                 std::string final_name = p.string();
                 final_name.resize(final_name.size() - 8);
                 if (fs::exists(final_name))
@@ -462,6 +511,7 @@ struct MlpWriter::Impl {
                         write_block(r.block);
                 }
             } catch (const std::exception &e) {
+                if (attachment) attachment->abort();
                 try {
                     if (drive.is_open())
                         drive.close();
@@ -491,14 +541,17 @@ struct MlpWriter::Impl {
         }
     }
 };
-MlpWriter::MlpWriter(const fs::path &out, RecordingMetadata metadata, size_t capacity)
-    : impl_(std::make_unique<Impl>(out, std::move(metadata), capacity)) {}
+MlpWriter::MlpWriter(const fs::path &out, RecordingMetadata metadata, size_t capacity,
+                     std::shared_ptr<RecordingAttachment> attachment)
+    : impl_(std::make_unique<Impl>(out, std::move(metadata), capacity, std::move(attachment))) {}
 MlpWriter::~MlpWriter() {
     shutdown();
 }
 bool MlpWriter::start() {
     auto old = impl_->state.load(std::memory_order_acquire);
-    if (old != WriterState::Idle && old != WriterState::Failed)
+    // A new take may be queued behind an in-flight Finish. Transition IDs keep
+    // that Finish from overwriting Opening with Idle when its fsync completes.
+    if (old != WriterState::Idle && old != WriterState::Failed && old != WriterState::Closing)
         return false;
     impl_->state.store(WriterState::Opening, std::memory_order_release);
     Record r;
@@ -564,5 +617,20 @@ uint64_t MlpWriter::dropped() const {
 }
 size_t MlpWriter::high_water() const {
     return impl_->high_water.load();
+}
+void RawCapture::packet(const ImuSample &sample) {
+    if (!recording) return;
+    if (sample.epoch != epoch) {
+        if (!writer->rotate()) { failed = true; recording = false; return; }
+        epoch = sample.epoch; last_raw = 0; reset = true;
+    }
+    if (sample.sequence == last_raw) return;
+    Record record;
+    record.kind = RecordKind::Raw; record.sample.imu = sample;
+    record.sample.gyro_range_dps = parser->gyro_range_dps;
+    record.sample.accel_range_g = parser->accel_range_g;
+    if (!writer->push(record)) {
+        failed = true; recording = false; writer->finish(false);
+    } else last_raw = sample.sequence;
 }
 } // namespace kaivuri::mlp

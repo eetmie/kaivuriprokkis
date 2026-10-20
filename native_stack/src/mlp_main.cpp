@@ -35,42 +35,6 @@ struct Fd {
             ::close(value);
     }
 };
-struct Capture {
-    MlpWriter *writer;
-    ImuParser *parser;
-    bool recording = false, reset = false, failed = false;
-    uint64_t epoch = 0, last_raw = 0;
-    void packet(const ImuSample &sample) {
-        if (!recording)
-            return;
-        if (sample.epoch != epoch) {
-            if (!writer->rotate()) {
-                failed = true;
-                recording = false;
-                return;
-            }
-            epoch = sample.epoch;
-            last_raw = 0;
-            reset = true;
-        }
-        if (sample.sequence == last_raw)
-            return;
-        Record r;
-        r.kind = RecordKind::Raw;
-        r.sample.imu = sample;
-        r.sample.gyro_range_dps = parser->gyro_range_dps;
-        r.sample.accel_range_g = parser->accel_range_g;
-        if (!writer->push(r)) {
-            failed = true;
-            recording = false;
-            writer->finish(false);
-        } else
-            last_raw = sample.sequence;
-    }
-    static void sink(void *self, const ImuSample &sample) {
-        static_cast<Capture *>(self)->packet(sample);
-    }
-};
 } // namespace
 int main(int argc, char **argv) {
     try {
@@ -96,8 +60,8 @@ int main(int argc, char **argv) {
             pad = std::make_unique<Pad>(o.gamepad);
         auto writer = std::make_unique<MlpWriter>(o.out, runtime.metadata, o.queue);
         ImuParser parser(4);
-        Capture capture{writer.get(), &parser};
-        parser.set_sample_sink(Capture::sink, &capture);
+        RawCapture capture{writer.get(), &parser};
+        parser.set_sample_sink(RawCapture::sink, &capture);
         signal(SIGINT, stop_signal);
         signal(SIGTERM, stop_signal);
         if (o.scripted)

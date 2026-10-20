@@ -11,7 +11,7 @@ python simple_drive.py --excitation chirp --excitation-target scoop --excitation
 
 This starts with excitation **off**. The chirp amplitude defaults to 0.35 of
 the normalized valve command range. It sweeps logarithmically from 0.05 to
-0.9 Hz over 60 seconds, back down over 60 seconds, then supplies zero
+12 Hz over 60 seconds, back down over 60 seconds, then supplies zero
 excitation for 10 seconds. The cycle repeats. These are collection settings,
 not a measurement of the machine's bandwidth.
 
@@ -38,13 +38,13 @@ Excitation is open-loop and does not impose angle or workspace limits.
 
 | Option | Default / behavior |
 | --- | --- |
-| `--excitation sine` | Existing randomized modulated sine with filtered noise |
+| `--excitation sine` | Randomized modulated sine: log-uniform 0.2–10 Hz carriers, 12 Hz instantaneous carrier limit, filtered noise |
 | `--excitation chirp` | Clean up/down logarithmic chirp, no added noise |
 | `--excitation-target` | `all`; also `lift`, `tilt`, `scoop`, the three pairs, or `slew` |
 | `--excitation-seed 42` | Reuse a session seed each recording; omitted draws a new seed |
 | `--excitation-amplitude 0.35` | Fixed excitation amplitude/cap in `(0, 1]`; default sine draws 0.35–1.0 per joint, chirp uses 0.35 |
 | `--chirp-start-hz 0.05` | Positive lower frequency |
-| `--chirp-end-hz 0.9` | Upper frequency, at least the lower one and at most 0.9 Hz |
+| `--chirp-end-hz 12` | Upper frequency, at least the lower one and at most 15 Hz |
 | `--chirp-seconds 60` | Time per direction; minimum 2 seconds |
 | `--suffix bucket_chirp` | Label for all companion files |
 
@@ -64,9 +64,22 @@ Keep some complete recordings without excitation. Include individual-axis
 steps, reversals and 5–10 second neutral holds, plus a stationary 30–60 second
 recording after startup calibration.
 
+## Default frequency coverage — 2026-10-20
+
+Both the Python and native collectors now cover fast valve corrections by
+default. Plain chirp sweeps 0.05–12 Hz. Randomized sine draws each joint's
+carrier independently from a log-uniform 0.2–10 Hz range each block, with FM
+depth limited so instantaneous carrier frequency stays at or below 12 Hz.
+Log-uniform sampling keeps slow strokes represented alongside the 6–7 Hz
+corrections missing from the older data. A single sine block uses one carrier
+per joint; use several seeds/blocks or chirp for broad frequency coverage.
+Amplitude, envelope/noise settings and stroke behavior remain as above.
+`--chirp-*` controls chirp and stroke, not the sine carrier distribution.
+To repeat the old slow chirp, pass `--chirp-end-hz 0.9` explicitly.
+
 ## Stroke excitation (fast valve dynamics)
 
-The 0.05–0.9 Hz chirps never move the valves faster than about 1 Hz, so the
+The previous 0.05–0.9 Hz chirps never moved the valves faster than about 1 Hz, so the
 actuator models cannot predict a closed-loop controller's fast corrections. The
 first MLP circle runs (2026-10-07) chattered at 6–7 Hz, and in that band the real
 joints moved 2–3x more than the model predicted. `stroke` records that band:
@@ -106,8 +119,10 @@ The new fields include `excitation_version`, `excitation_block`,
 (`off`, `run`, `up`, `down`, `rest`, `stroke`, `stroke+chirp`). The JSON records the target for each
 block. Reseeding, enabling or changing targets starts a new parameter block.
 
-Sine version 2 uses separate parameter/noise streams and a fixed 100 Hz noise
-grid. The waveform at the same elapsed time is independent of polling jitter.
+Python sine/chirp version 3 widens the default frequency range; version 2
+recordings used the earlier slow defaults. Separate parameter/noise streams
+and the fixed 100 Hz noise grid are retained. The waveform at the same elapsed
+time is independent of polling jitter.
 The JSON includes NumPy/RNG versions and all drawn parameters. A seed plus the
 same sequence of block changes reproduces the session, but manually pressing
 buttons at different times does not produce identical wall-clock commands.

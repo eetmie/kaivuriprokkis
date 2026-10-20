@@ -28,9 +28,10 @@ Button Controls:
         reverse that track; the trigger on the same side still sets speed.
         Released = forward, held = reverse.
 
-The default sine mode randomizes amplitude, frequencies and phases per joint
-and adds filtered noise. --excitation chirp selects clean logarithmic up/down
-sweeps: 0.05–0.9 Hz by default (up to 15 Hz), 60 seconds each way, then 10
+The default sine mode draws carriers logarithmically across 0.2–10 Hz, limits
+instantaneous carrier frequency to 12 Hz, and adds filtered noise.
+--excitation chirp selects clean logarithmic up/down
+sweeps: 0.05–12 Hz by default (up to 15 Hz), 60 seconds each way, then 10
 seconds of zero excitation. --excitation stroke reads the joint angles and
 sweeps each targeted joint across its range (ramps under P feedback), with a
 0.5–12 Hz chirp on every other stroke; see data_collection/EXCITATION.md.
@@ -232,20 +233,20 @@ class SineExcitationGenerator:
     """
 
     WAVEFORM = "sine"
-    VERSION = 2
+    VERSION = 3
     RAMP_S = 1.0
     NOISE_HZ = 100.0
     ENV_FREQ_HZ = 0.03
-    CARRIER_FREQ_HZ = 0.35
+    CARRIER_FREQ_RANGE_HZ = (0.2, 10.0)
     FM_DEPTH = 0.99
     FM_RATE_HZ = 0.04
-    MAX_INSTANT_FREQ_HZ = 0.9
+    MAX_INSTANT_FREQ_HZ = 12.0
     NOISE_CUTOFF_HZ = 0.25
     NOISE_FRACTION = 0.10
     NOISE_CLIP_SIGMA = 3.0
     AMPLITUDE_RANGE = (0.35, 1.0)
     _JITTER = {
-        'f_env': (0.60, 1.50), 'f_car': (0.60, 1.60),
+        'f_env': (0.60, 1.50),
         'f_rate': (0.70, 1.10), 'depth': (0.70, 1.20),
         'f_noise': (0.70, 1.30), 'noise': (0.70, 1.30),
     }
@@ -264,7 +265,8 @@ class SineExcitationGenerator:
     def _draw_params(self) -> dict[str, float]:
         j, rng = self._JITTER, self._parameter_rng
         f_env = self.ENV_FREQ_HZ * rng.uniform(*j['f_env'])
-        f_car = self.CARRIER_FREQ_HZ * rng.uniform(*j['f_car'])
+        # Equal weight per frequency ratio retains slow strokes and fast corrections.
+        f_car = float(np.exp(rng.uniform(*np.log(self.CARRIER_FREQ_RANGE_HZ))))
         f_rate = self.FM_RATE_HZ * rng.uniform(*j['f_rate'])
         depth = self.FM_DEPTH * rng.uniform(*j['depth'])
         f_noise = self.NOISE_CUTOFF_HZ * rng.uniform(*j['f_noise'])
@@ -409,7 +411,7 @@ class ChirpExcitationGenerator(SineExcitationGenerator):
     CHIRP_MAX_HZ = 15.0
 
     def __init__(self, enabled=False, seed=None, enable_slew=False, amplitude=.35,
-                 start_hz=.05, end_hz=.9, sweep_s=60.0):
+                 start_hz=.05, end_hz=12.0, sweep_s=60.0):
         if not (0 < start_hz <= end_hz <= self.CHIRP_MAX_HZ):
             raise ValueError(f"chirp frequencies must satisfy 0 < start <= end <= {self.CHIRP_MAX_HZ:g} Hz")
         if not np.isfinite(sweep_s) or sweep_s < 2:
@@ -932,7 +934,7 @@ def _parse_args():
     p.add_argument("--chirp-start-hz", type=float, default=None,
                    help="Default 0.05 (chirp), 0.5 (stroke overlay)")
     p.add_argument("--chirp-end-hz", type=float, default=None,
-                   help=f"Default 0.9 (chirp), 12 (stroke overlay); at most "
+                   help=f"Default 12 (chirp and stroke overlay); at most "
                         f"{ChirpExcitationGenerator.CHIRP_MAX_HZ:g}")
     p.add_argument("--chirp-seconds", type=float, default=None,
                    help="Seconds per sweep direction. Default 60 (chirp, then 10 s neutral), "
@@ -946,7 +948,7 @@ def _parse_args():
         p.error('--excitation-amplitude must be finite and in (0, 1]')
     if args.excitation_seed is not None and not (0 <= args.excitation_seed < 2**32):
         p.error('--excitation-seed must be an unsigned 32-bit integer')
-    defaults = {'stroke': (.5, 12.0, 20.0)}.get(args.excitation, (.05, .9, 60.0))
+    defaults = {'stroke': (.5, 12.0, 20.0)}.get(args.excitation, (.05, 12.0, 60.0))
     for name, default in zip(('chirp_start_hz', 'chirp_end_hz', 'chirp_seconds'), defaults):
         if getattr(args, name) is None:
             setattr(args, name, default)

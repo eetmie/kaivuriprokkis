@@ -208,6 +208,16 @@ instead of silently compressing motion into `frame_index/fps`. The real timing
 columns are retained alongside LeRobot's nominal timestamps. Failed export leaves
 raw data intact; choose a new destination when retrying an incomplete export.
 
+**Open issue (2026-10-20): startup frames can fail export timing validation.**
+In `sand-depth-001`, `episode-332085182766231.ready` skipped one cam1 frame
+between its first two saved frame pairs, creating a 66.7 ms interval at 30 FPS
+(the export limit is 50 ms). Its saved IR/depth files are intact, but the current
+validator rejects the take. `episode-332144087887833.ready` passes validation.
+Check frame pairing at the start of each take and whether a short pairing warmup
+is needed, using more recordings. This remains unresolved; no warmup fix has
+been validated. Run `tools/export_episodes.py SESSION --validate-only` from
+`native_stack` before export, and preserve the raw recordings while investigating.
+
 State defaults to `[lift,tilt,scoop]` in degrees, preserving the legacy convention
 and avoiding unanchored slew yaw. Use `--state-joints slew,lift,tilt,scoop` to include
 it. FK stays in meters/radians and `[w,x,y,z]`; IMU gyro stays degrees/s and

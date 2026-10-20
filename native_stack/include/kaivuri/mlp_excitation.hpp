@@ -4,6 +4,9 @@
 #include <limits>
 
 namespace kaivuri::mlp {
+inline constexpr unsigned excitation_version = 4;
+inline constexpr double sine_carrier_min_hz = .2, sine_carrier_max_hz = 10,
+                        sine_max_instant_hz = 12;
 enum class Waveform { Sine, Chirp, Stroke };
 enum class Stage { Off, Run, Up, Down, Rest, Stroke, StrokeChirp };
 const char *waveform_name(Waveform);
@@ -15,7 +18,7 @@ struct ExcitationOptions {
     uint32_t seed = 42;
     unsigned target = 14;
     double amplitude = std::numeric_limits<double>::quiet_NaN();
-    double start_hz = .05, end_hz = .9, sweep_s = 60;
+    double start_hz = .05, end_hz = 12, sweep_s = 60;
     double stroke_s = 8, margin_deg = 10, gain_per_deg = .05, valve_limit = .5;
 };
 struct WaveParameters {

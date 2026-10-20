@@ -2,6 +2,7 @@
 #include "kaivuri/mlp_excitation.hpp"
 #include "kaivuri/mlp_record.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -80,6 +81,34 @@ void reference_fixtures(const char *path) {
         }
     }
 }
+void default_frequency_coverage() {
+    const std::array<std::array<double, 2>, 4> limits{
+        {{-180, 180}, {-50, 30}, {28, 144}, {-120, 20}}};
+    unsigned slow = 0, fast = 0;
+    double maximum = 0;
+    for (uint32_t seed = 0; seed < 64; ++seed) {
+        ExcitationOptions options;
+        options.seed = seed;
+        Excitation generator(options, limits);
+        for (const auto &p : generator.block().parameters) {
+            check(p.carrier >= .2 && p.carrier <= 10, "sine carrier range");
+            check(p.carrier * (1 + 2 * pi * p.rate * p.depth) <= 12 + 1e-9,
+                  "sine instantaneous frequency limit");
+            slow += p.carrier < 1;
+            fast += p.carrier >= 5;
+            maximum = std::max(maximum, p.carrier);
+        }
+    }
+    check(slow > 38 && fast > 25 && maximum > 8, "default sine misses slow or fast motion");
+    ExcitationOptions options;
+    options.waveform = Waveform::Chirp;
+    Excitation chirp(options, limits);
+    const double h = 1e-4;
+    for (double t : {59., 61.}) {
+        const double frequency = (chirp.phase(t + h) - chirp.phase(t - h)) / (4 * pi * h);
+        check(frequency > 10 && frequency < 12, "default chirp misses fast motion");
+    }
+}
 void queue_overflow() {
     namespace fs = std::filesystem;
     const auto root = fs::temp_directory_path() / ("mlp-queue-" + std::to_string(getpid()));
@@ -124,11 +153,68 @@ void queue_overflow() {
     check(partial, "overflow left no incomplete manifest");
     fs::remove_all(root);
 }
+void queued_restart() {
+    namespace fs = std::filesystem;
+    struct ClosingBarrier : RecordingAttachment {
+        std::atomic<bool> entered{false}, release{false};
+        void begin(const fs::path &, const std::string &) override {}
+        void drive(const DriveSample &) override {}
+        void close() override {
+            entered.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        }
+        void abort() noexcept override { release.store(true, std::memory_order_release); }
+        std::vector<fs::path> paths() const override { return {}; }
+    };
+    const auto root = fs::temp_directory_path() / ("mlp-restart-" + std::to_string(getpid()));
+    fs::remove_all(root);
+    RecordingMetadata metadata;
+    metadata.dry = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        metadata.config.joints[i].sensor = i;
+        metadata.config.joints[i].parent_sensor = int(i) - 1;
+        metadata.config.joints[i].pitch_delta = true;
+        metadata.config.offsets_inv[i] = {1, 0, 0, 0};
+    }
+    auto barrier = std::make_shared<ClosingBarrier>();
+    MlpWriter writer(root, metadata, 16, barrier);
+    auto samples = [&](uint64_t tick) {
+        Record raw; raw.kind = RecordKind::Raw; raw.sample.imu.valid = true;
+        raw.sample.imu.sequence = tick + 1; raw.sample.imu.device_us = (tick + 1) * 10000;
+        check(writer.push(raw), "restart raw queue failed");
+        Record drive; drive.kind = RecordKind::Drive; drive.sample = raw.sample;
+        drive.sample.tick = tick; drive.sample.start_ns = drive.sample.post_write_ns = 1000000000 + tick * 10000000;
+        check(writer.push(drive), "restart drive queue failed");
+    };
+    check(writer.start(), "first restart take failed"); samples(0); writer.finish();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!barrier->entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool entered = barrier->entered.load(std::memory_order_acquire);
+    const bool accepted = entered && writer.start();
+    // Release even when start was rejected, so a regression reports failure
+    // instead of hanging in the writer destructor.
+    barrier->release.store(true, std::memory_order_release);
+    check(entered && accepted, "start during previous close was lost");
+    samples(1); writer.finish(); writer.shutdown();
+    unsigned sessions = 0;
+    for (const auto &entry : fs::directory_iterator(root))
+        if (entry.path().filename().string().find("session_") == 0) {
+            check(entry.path().extension() == ".json", "queued restart left an incomplete take");
+            const auto m = YAML::LoadFile(entry.path().string());
+            check(m["complete"].as<bool>() && m["rows"].as<unsigned>() == 1, "queued take lost rows or completion");
+            ++sessions;
+        }
+    check(sessions == 2 && writer.state() == WriterState::Idle, "queued restart did not commit both takes");
+    fs::remove_all(root);
+}
 int main(int argc, char **argv) {
     try {
         check(argc == 2, "missing waveform reference fixture");
         reference_fixtures(argv[1]);
+        default_frequency_coverage();
         queue_overflow();
+        queued_restart();
         ImuParser parser(4);
         std::vector<ImuSample> samples;
         parser.set_sample_sink(

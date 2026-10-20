@@ -1,0 +1,26 @@
+# Loaded by kaivuri-pid-collect. Prototype starting values; powered tuning and
+# obstacle/self-collision routing are separate acceptance work.
+version: 1
+command:
+  duration_s: [0.1, 3.0]
+  tip_speed_m_s: [0.005, 0.020]
+  pitch_change_max_deg: 45.0
+  pitch_rate_rad_s: 0.4
+  reference_lead_m: 0.030
+pid:
+  update_hz: [25, 50, 100]
+  gain_multiplier: [0.5, 1.5]
+  base_output_limit: 0.5
+limits:
+  joint_margin_deg: 10.0
+  taper_deg: 5.0
+  velocity_lookahead_s: 0.1
+  # Fixed profile gains at 100 Hz; no overlay while returning inside the range.
+  recovery_output_limit: 0.25
+  recovery_inset_deg: 1.0
+  # Positive normalized command increases the measured joint angle. These are
+  # NOT the electrical PWM directions in servo_config.yaml.
+  command_sign: [1, 1, 1]
+coverage:
+  joint_bin_deg: 10.0
+  goal_lifetime_s: 30.0

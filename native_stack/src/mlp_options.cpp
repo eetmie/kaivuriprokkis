@@ -110,6 +110,8 @@ Options parse_options(int argc, char **argv) {
                    "  [--stroke-seconds 8 --stroke-margin-deg 10 --record-seconds 600]\n"
                    "  [--scripted --record-on-start --duration-s S --queue-records 4096 "
                    "--read-chunk-bytes 512]\n"
+                   "Defaults: sine carriers 0.2-10 Hz (log-uniform), 12 Hz instantaneous limit;\n"
+                   "  chirp 0.05-12 Hz, 60 s each way, amplitude 0.35; stroke 0.5-12 Hz.\n"
                    "PWM is LIVE by default. --dry skips I2C. No arming/lease state.\n"
                    "A=record/save B=excitation X=pump Y=reload between strips D-pad=target.\n"
                    "Scripted stdin: start, save, pump, excitation, target NAME, command "

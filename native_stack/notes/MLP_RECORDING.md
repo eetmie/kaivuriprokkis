@@ -23,11 +23,13 @@ cmake --build native_stack/build/mlp -j4
 ctest --test-dir native_stack/build/mlp --output-on-failure
 ```
 
-The tested Jetson copy is already built at
-`/home/joel/kaivuriprokkis-mlp-20261019-final/native_stack/build/kaivuri-mlp-collect`.
-Its source/profile tree is the parent repository directory. The commands below
-use the fresh-build layout above; substitute `native_stack/build/` when using
-that existing Jetson copy.
+The updated Jetson copy is built and tested at
+`/home/joel/kaivuriprokkis-mlp-20261020/native_stack/build/kaivuri-mlp-collect`.
+It uses the wider frequency defaults below. Its source/profile tree is the
+parent repository directory. The commands below use the fresh-build layout
+above; substitute `native_stack/build/` when using that existing Jetson tree.
+The 2026-10-19 final tree retains the earlier defaults and original 30-minute
+neutral hardware-bench executable.
 
 On `pikkumasi2tb`, use the stable Pico path: its current tty is `ttyACM1`, which
 can change after reconnecting. Set `--gamepad` to the controller's evdev event
@@ -39,7 +41,7 @@ native_stack/build/mlp/kaivuri-mlp-collect \
   --profile configuration_files/profiles/jetson \
   --serial /dev/serial/by-id/usb-RPi_IMU_Reader_4250305031363910-if00 \
   --gamepad /dev/input/eventN \
-  --out /path/to/actuator-data/2026-10-19 \
+  --out /path/to/actuator-data/2026-10-20 \
   --suffix chirp_lift --excitation chirp --excitation-target lift
 ```
 
@@ -79,8 +81,12 @@ Restart the process to reconnect a pad.
 
 ## Excitation and timing
 
-`--excitation sine|chirp|stroke` selects the waveform, initially off. Chirp
-defaults to 0.05–0.9 Hz, 60 seconds up / 60 down / 10 neutral, amplitude 0.35.
+`--excitation sine|chirp|stroke` selects the waveform, initially off. Sine draws
+independent log-uniform 0.2–10 Hz carriers per joint/block, with FM limited to
+12 Hz instantaneous carrier frequency. This retains slow motion while adding
+the fast valve corrections missing from the earlier data. Sine amplitude
+still draws 0.35–1.0 per joint, with the existing envelope and filtered noise.
+Chirp defaults to 0.05–12 Hz, 60 seconds up / 60 down / 10 neutral, amplitude 0.35.
 Stroke defaults to an eight-second reference sweep within the profile's joint
 limits minus a ten-degree margin, with a 0.5–12 Hz chirp (20 seconds each way,
 amplitude 0.4) on alternate strokes. Stale feedback makes the stroke
@@ -90,8 +96,12 @@ still add to the signal before clipping to [-1, 1].
 `--excitation-amplitude`, `--chirp-start-hz`, `--chirp-end-hz`,
 `--chirp-seconds`, `--stroke-seconds` and `--stroke-margin-deg` override those
 settings. `--excitation-seed N` repeats a strip's parameter sequence; omitted
-seeds are regenerated for each strip. Native generator version 3 uses
-SplitMix64 / Box–Muller, with separate parameter/noise state. Its seed is not a
+seeds are regenerated for each strip. `--chirp-*` does not change sine's carrier
+range. Use several sine seeds/blocks, or chirp, to cover the full frequency band.
+`--chirp-end-hz 0.9` restores the earlier slow chirp explicitly.
+Native generator version 4 records the wider default frequency distribution;
+version 3 recordings used the earlier defaults. It retains SplitMix64 /
+Box–Muller, with separate parameter/noise state. Its seed is not a
 claim of NumPy sample identity. The companion JSON stores every block's drawn
 parameters, initial noise state/directions, limits and algorithm version.
 Noise advances on a fixed 100 Hz grid independent of polling jitter. Frozen
@@ -188,4 +198,8 @@ The bench keeps manual commands zero, excitation off and pump at minimum. It
 writes `bench_summary.json`, a one-second resource trace and collector output.
 The data is deliberately unsuitable for training. See
 [MLP_VALIDATION.md](MLP_VALIDATION.md) for measured results and remaining physical
-checks. IK/PID, old model driving, circles and model training are deferred.
+checks. PID/IK control has its own executable and sidecars, described in
+[separate PID collection](PID_COLLECTION.md); it is not added to this manual
+collector's control flow. The offline prototype and full-reach design remain in
+[IK-assisted collection](IK_COLLECTION_PLAN.md). Old model driving, circles and
+model training remain deferred.

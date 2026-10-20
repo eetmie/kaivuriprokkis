@@ -1,0 +1,91 @@
+# Design/example only: neither executable loads this YAML yet.
+# kaivuri-pid-collect loads pid_collection.yaml instead; this file describes
+# the broader future full-reach system. Powered tuning acceptance is pending.
+version: 2
+status: separate_initial_collector_full_reach_pending
+
+profile: configuration_files/profiles/jetson_bucket
+frame:
+  origin: slew_bearing
+  task: [x_m, z_m, cutting_lip_pitch_rad]
+  joints: [boom, arm, bucket]
+  slew_automatic: false
+  tracks_automatic: false
+  require_geometry_and_runtime_calibration_match: true
+
+coverage:
+  joint_bin_deg: 10.0
+  spatial_bin_mm: 20.0
+  pitch_bin_deg: 15.0
+  frequency_bands_hz: [[0.0, 1.0], [1.0, 3.0], [3.0, 6.0], [6.0, 9.0], [9.0, 12.0]]
+  credit: measured_eligible_intervals
+  training_window_credit: importer_confirmed_only
+  include_dry_or_bench: false
+
+planning:
+  initial_joint_margin_deg: 10.0
+  selection: coverage_deficit_and_dynamic_value_minus_graph_travel_cost
+  component: measured_start_connected_component
+  validate_edge_interiors: true
+  # Must be supplied and validated before execution support can be accepted.
+  motion_envelope: null
+  floor_and_exclusion_regions: null
+  missing_envelope_behavior: preview_only
+
+tracking:
+  control_hz: 100
+  proposed_tip_speed_m_s: 0.020
+  proposed_max_reference_lead_m: 0.030
+  pid_gains: selected_profile_joint1_joint2_joint3
+  pid_angle_units: radians
+  proposed_base_valve_limit: 0.5
+  anti_windup: final_combined_saturation
+  tracking_filter_hz: null # Decide from measured feedback cancellation; never filter raw logs.
+
+random_commands:
+  task: cutting_lip_pitch_and_tip_velocity_xz
+  duration_seconds: [0.1, 3.0]
+  duration_sampling: log_uniform_10ms_ticks
+  coverage_duration: upper_third_of_range
+  segment_probabilities: {coverage: 0.40, free: 0.35, reverse: 0.10, pitch: 0.10, hold: 0.05}
+  speed_m_s: [0.005, 0.020]
+  pitch_change_max_deg: 45.0
+  pitch_rate_max_rad_s: 0.4
+  pitch_reference_lead_max_rad: 0.25
+  pid_update_hz_choices: [25, 50, 100]
+  pid_gain_multipliers: [0.5, 1.5]
+  pid_sampling: independent_per_joint_and_gain_term_each_segment
+  zero_base_gain_behavior: stays_zero
+  pid_hold: hold_base_output_between_updates_add_excitation_every_100Hz_tick
+  gain_change: preserve_integral_contribution_and_derivative_history
+  record_actual_update_times_and_applied_gains: true
+  coverage_goal_lifetime_seconds: 30.0
+  preview_coverage_seed: fresh_measured_dwell_grid
+
+preview_excitation:
+  independent_from_command_segment_clock: true
+  block_seconds: 20.0
+  alternate_clean_and_excited: true
+  excited_modes: [sine, chirp]
+  targets: [boom, arm, bucket, boom_arm, boom_bucket, arm_bucket, all]
+  amplitude: [0.2, 0.4]
+  chirp_hz: [0.05, 12.0]
+  sweep_seconds_each_direction: 5.0
+  rest_seconds: 10.0
+
+excitation:
+  clean_and_excited_traversals: true
+  initial_protocol: chirp
+  start_hz: 0.05
+  end_hz: 12.0
+  sweep_seconds_each_direction: 60.0
+  neutral_seconds: 10.0
+  proposed_assisted_amplitude: 0.35
+  injection: after_pid_before_final_clamp
+
+operator:
+  proposed_assist_toggle: start_button
+  manual_stick_takeover: cancel_assistance_and_excitation
+  resume: explicit_measured_state_sync
+  excitation_enable: existing_b_button
+  strip_timeout_seconds: 600

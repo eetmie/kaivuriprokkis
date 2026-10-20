@@ -2,7 +2,7 @@
 
 Built on Spark on 2026-10-11 for the next hardware session. Everything new lives in this folder. The existing Python stack and Pico firmware remain the reference and are unchanged.
 
-This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR RealSense service with optional same-sensor depth. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
+This is a working C++17 bench implementation: independent safety/valve service, Pico IMU parser, forward kinematics, and an IR RealSense service with optional same-sensor depth. The control and camera services have no inference runtime, ROS, IK/PID, Jacobian/SVD, video encoder, or GPU context. A separate hardware-free IK/PID preview exercises randomized data-collection commands. An optional separate C++ TensorRT process runs the validated OpenPI pi0.5 LIBERO policy for bench measurements. Python monitoring tools use the standard library.
 
 | Component | Current behavior |
 | --- | --- |
@@ -11,6 +11,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
+| `kaivuri-pid-collect` | Independent 100 Hz randomized IK/PID collector, guarded arm commands, manual takeover and committed PID sidecars; initial powered acceptance pending |
 | `tools/client.py` | Status, disarm, emergency stop, bounded bench exercise; reusable IPC client for later TRT integration |
 | `tools/frame_reader.py` | Coherent Y8 snapshot through the native C ABI; rejects stale frames |
 | `tools/measure.py` | Per-process RSS, PSS, swap, CPU; no model or hardware imports |
@@ -34,7 +35,12 @@ The native recorder pairs camera `233522073919:2` (rotated 180°) with `14172207
 live-by-default PWM and asynchronous `drive_log`/`imu_raw`/excitation output.
 It is a separate tool from the VLA recorder. See the
 [MLP runbook](notes/MLP_RECORDING.md) for build, controls, schema and training
-preparation. IK/MLP driving, circle tests and training remain deferred.
+preparation. Old-model MLP driving, circle tests and training remain deferred.
+The independent `kaivuri-pid-collect` implements randomized 0.1–3 s pitch/velocity
+commands, varied PID frequencies/gains, joint guards and controller sidecars;
+see [PID collection](notes/PID_COLLECTION.md). `kaivuri-ik-preview` retains the
+hardware-free synthetic preview. Full-reach routing and powered PID acceptance
+are pending; see [IK-assisted collection](notes/IK_COLLECTION_PLAN.md).
 
 ## Build
 

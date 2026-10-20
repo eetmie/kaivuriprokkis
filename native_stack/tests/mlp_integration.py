@@ -53,11 +53,14 @@ def verify(root):
         m = json.loads(path.read_text())
         assert m['format'] == 'kaivuri-native-mlp-v1' and m['complete'] and m['dry_pwm']
         assert m['dropped'] == 0 and m['queue_high_water'] < m['queue_capacity']
+        excitation = next(name for name in m['outputs'] if name.startswith('excitation_'))
+        assert json.loads((root/excitation).read_text())['version'] == 4
         for name, expected in m['outputs'].items():
             assert hashlib.sha256((root/name).read_bytes()).hexdigest() == expected
         stem = path.name.removeprefix('session_').removesuffix('.json')
         d, r = read_csv(root/f'drive_log_{stem}.csv'), read_csv(root/f'imu_raw_{stem}.csv')
         assert len(d) == m['rows'] and len(r) == m['raw_packets']
+        assert all(row['excitation_version'] == '4' for row in d)
         assert all(int(b['sample_idx']) - int(a['sample_idx']) ==
                    1 + int(b['missed_periods']) - int(a['missed_periods']) for a,b in zip(d,d[1:]))
         assert all(int(b['device_ts_us']) > int(a['device_ts_us']) for a,b in zip(r,r[1:]))

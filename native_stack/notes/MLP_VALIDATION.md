@@ -123,3 +123,34 @@ no pad was attached during this session. PWM pulse-edge timing and hydraulic
 motion were not measured. Host write-completion timing does not establish the
 PCA carrier phase or physical actuator response. Keep bench/replay outputs
 outside training datasets.
+
+## Wider frequency defaults — local and Jetson validation, 2026-10-20
+
+Native generator version 4 and Python sine/chirp version 3 broaden the default
+collection frequencies: chirp is 0.05–12 Hz and sine carriers are log-uniform
+0.2–10 Hz with a 12 Hz instantaneous carrier limit. Amplitudes, stroke behavior,
+manual controls and PWM shaping are unchanged.
+
+The local Release build passes all 7 CTest checks. Python excitation, input and
+profile checks pass 89/89, including actual slow/fast signal spectra. Frozen
+cross-language fixtures include an 8 Hz sine carrier and a 0.05–12 Hz chirp,
+alongside the earlier slow fixtures. The native recorder to real actuator
+importer replay retains 579 samples at 100 Hz, with maximum errors of
+1.01e-7 rad in position, 4.00e-9 rad/s in velocity and 1.48e-8 in valve command.
+
+The updated source is deployed and built in
+`/home/joel/kaivuriprokkis-mlp-20261020`. All 7 CTest checks pass on Jetson too.
+Executable SHA-256:
+`4e44b045e749be449361874f7da7b863257bafece0f741d67787621e31adffe0`.
+A fresh 15-second real-Pico dry run captured 1500 control rows and 2998 raw
+packets, with zero missed ticks, dropped records, checksum errors, invalid
+frames or raw sequence gaps. Wake lateness p99/max was 0.0611/0.1133 ms; dry
+tick work p99/max was 0.0226/0.0530 ms. These exclude I2C and are not a replacement
+for the earlier live-neutral hardware timing measurement.
+
+These checks use dry PWM or intercepted I2C. The changed defaults have not been
+run on powered hydraulics. The isolated 2026-10-19 final tree retains its earlier
+defaults and original 30-minute hardware-bench executable. Local artifacts are
+under `native_stack/results/excitation-defaults-20261020/`; the fresh Jetson
+capture is under `bench/current-pico-dry/` in the new tree. No collector is left
+running. IK-assisted collection is a separate design, not enabled by this update.

@@ -89,10 +89,12 @@ void Excitation::begin(double now) {
     for (auto &p : block_.parameters) {
         auto draw = [&](double low, double high) { return low + (high - low) * uniform(rng); };
         p.env = .03 * draw(.60, 1.50);
-        p.carrier = .35 * draw(.60, 1.60);
+        // Equal weight per frequency ratio retains slow strokes and fast corrections.
+        p.carrier = std::exp(draw(std::log(sine_carrier_min_hz), std::log(sine_carrier_max_hz)));
         p.rate = .04 * draw(.70, 1.10);
         p.depth =
-            std::min(.99 * draw(.70, 1.20), std::max(0., (.9 / p.carrier - 1) / (2 * pi * p.rate)));
+            std::min(.99 * draw(.70, 1.20),
+                     std::max(0., (sine_max_instant_hz / p.carrier - 1) / (2 * pi * p.rate)));
         p.cutoff = .25 * draw(.70, 1.30);
         p.noise = block_.options.waveform == Waveform::Sine ? .10 * draw(.70, 1.30) : 0;
         p.amplitude = std::isnan(block_.options.amplitude)

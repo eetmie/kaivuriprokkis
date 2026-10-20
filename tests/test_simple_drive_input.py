@@ -236,21 +236,19 @@ class SineTargetTests(unittest.TestCase):
                 self.assertGreaterEqual(value, -1.0)
                 self.assertLessEqual(value, 1.0)
 
-    def test_excitation_stays_within_valve_bandwidth(self):
-        """The whole point of the retune: no energy the hydraulics cannot track."""
-        gen = SineExcitationGenerator(enabled=True, seed=7)
-        gen.start_time = 0.0
-        fs = simple_drive.SAMPLING_FREQUENCY
-        signal = []
-        t = 0.0
-        for _ in range(fs * 200):
-            t += 1.0 / fs
-            signal.append(gen.get_all(t)['boom'])
+    def test_default_excitation_contains_slow_strokes_and_fast_corrections(self):
+        """Check actual signal energy for repeatable slow and 6–7 Hz carrier draws."""
         import numpy as np
-        power = np.abs(np.fft.rfft(signal)) ** 2
-        freqs = np.fft.rfftfreq(len(signal), 1.0 / fs)
-        above_1hz = power[1:][freqs[1:] > 1.0].sum() / power[1:].sum()
-        self.assertLess(above_1hz, 0.005)
+        fs = simple_drive.SAMPLING_FREQUENCY
+        for seed, lo, hi in ((6, 0.0, 1.0), (3, 5.0, 12.0)):
+            with self.subTest(seed=seed):
+                gen = SineExcitationGenerator(enabled=True, seed=seed)
+                gen.start_time = 0.0
+                signal = [gen.get_all((i + 1) / fs)['boom'] for i in range(fs * 200)]
+                power = np.abs(np.fft.rfft(signal)) ** 2
+                freqs = np.fft.rfftfreq(len(signal), 1.0 / fs)
+                in_band = power[(freqs > lo) & (freqs <= hi)].sum() / power[1:].sum()
+                self.assertGreater(in_band, 0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -292,11 +290,7 @@ class SineRandomizationTests(unittest.TestCase):
         self.assertNotEqual(gen._params, before)
 
     def test_peak_frequency_never_exceeds_the_ceiling(self):
-        """The FM depth clamp is what enforces this; without it draws exceed 2 Hz.
-
-        Above the ceiling the valves stop tracking the excitation, so the
-        recording captures noise instead of actuator response.
-        """
+        """The FM depth clamp keeps fast carrier draws within the 12 Hz contract."""
         ceiling = SineExcitationGenerator.MAX_INSTANT_FREQ_HZ
         worst = 0.0
         for seed in range(400):

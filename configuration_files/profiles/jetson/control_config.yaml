@@ -97,7 +97,7 @@ robot:
       parent_to_joint_xyz: [0.468, 0.0, 0.0]     # boom -> arm pivot
     - name: bucket
       axis: [0.0, 1.0, 0.0]
-      parent_to_joint_xyz: [0.250, 0.0, 0.0]     # arm  -> bucket pivot
+      parent_to_joint_xyz: [0.240, 0.0, 0.0]     # arm  -> bucket pivot (hand 240 mm, side camera 237 mm; was 0.250 until 2026-10-21)
   tool:
     # Bucket pivot -> tool tip. Combines coupler length (0.031 along bucket x)
     # with bucket tip drop (-0.142 along bucket z).

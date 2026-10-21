@@ -56,27 +56,27 @@ int main(int argc, char **argv) {
         }
         expect(pulse_count(1500, 100) == 614, "matches existing truncation and 4095 multiplier");
         Pose p = forward_kinematics(c, {0, 0, 0, 0});
-        expect(close(p.position[0], .7655) && close(p.position[2], -.0075),
+        expect(close(p.position[0], .7555) && close(p.position[2], -.0075),
                "zero FK analytical geometry");
         p = forward_kinematics(c, {pi / 2, 0, 0, 0});
-        expect(close(p.position[0], 0) && close(p.position[1], .7655),
+        expect(close(p.position[0], 0) && close(p.position[1], .7555),
                "slew rotates child offsets");
         const auto zero = forward_kinematic_state(c, {0, 0, 0, 0});
-        expect(close(zero.upper.position[0], .7655) && close(zero.upper.position[1], 0) &&
+        expect(close(zero.upper.position[0], .7555) && close(zero.upper.position[1], 0) &&
                    close(zero.upper.position[2], -.0775),
                "upper frame origin is the slew pivot, not the ground origin");
         expect(close(zero.joint_positions_base[0][2], .07) &&
                    close(zero.joint_positions_base[1][0], .0165) &&
                    close(zero.joint_positions_base[1][2], .1345) &&
                    close(zero.joint_positions_upper[2][0], .4845) &&
-                   close(zero.joint_positions_upper[3][0], .7345),
+                   close(zero.joint_positions_upper[3][0], .7245),
                "FK reports joint pivots, before the tool-tip offset");
         for (const auto &arm :
              std::vector<std::array<double, 3>>{{0, 0, 0}, {.3, -.8, 2.4}, {-.7, .2, -2.0}}) {
             const double b = arm[0], a = b + arm[1], tip_angle = a + arm[2];
-            const double x = .0165 + .468 * std::cos(b) + .250 * std::cos(a) +
+            const double x = .0165 + .468 * std::cos(b) + .240 * std::cos(a) +
                              .031 * std::cos(tip_angle) - .142 * std::sin(tip_angle);
-            const double z = .0645 - .468 * std::sin(b) - .250 * std::sin(a) -
+            const double z = .0645 - .468 * std::sin(b) - .240 * std::sin(a) -
                              .031 * std::sin(tip_angle) - .142 * std::cos(tip_angle);
             for (double yaw : {0., pi / 2, pi, 3 * pi / 2, -2 * pi, 2 * pi + .37}) {
                 const auto fk = forward_kinematic_state(c, {yaw, arm[0], arm[1], arm[2]});

@@ -97,7 +97,9 @@ def camera_rows(paths, socket_path, library, max_fps):
     """Sample native frame stores/status without driving or writing an episode."""
     from frame_reader import FrameReader, Metadata
     from client import Client
-    with FrameReader(paths[0], library) as cam1, FrameReader(paths[1], library) as cam2, Client(socket_path) as control:
+    capacity = 1280 * 800  # largest D435 IR mode; record_native --resolution goes up to 1280x720
+    with FrameReader(paths[0], library, capacity) as cam1, FrameReader(paths[1], library, capacity) as cam2, \
+            Client(socket_path) as control:
         begin = time.monotonic_ns()
         while True:
             start = time.monotonic()

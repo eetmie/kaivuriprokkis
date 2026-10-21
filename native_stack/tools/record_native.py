@@ -46,6 +46,8 @@ def main():
     p.add_argument('--camera1', default='233522073919:2')
     p.add_argument('--camera2', default='141722076647:1')
     p.add_argument('--fps', type=int, default=30)
+    p.add_argument('--resolution', choices=('640x480', '848x480', '1280x720'), default='640x480',
+                   help='IR and depth size for both cameras; VLA training and inference use 640x480')
     p.add_argument('--control-hz', type=int, default=200)
     p.add_argument('--max-episode-s', type=float, default=180)
     p.add_argument('--max-pair-skew-ms', type=float, default=40)
@@ -82,6 +84,8 @@ def main():
         p.error('--bench-episodes/--bench-sine require --bench-seconds')
     if args.bench_episodes < 1 or not 0 <= args.bench_sine <= 1:
         p.error('--bench-episodes must be >= 1 and --bench-sine in [0, 1]')
+    if args.resolution == '1280x720' and args.depth == 'both' and not args.synthetic:
+        p.error('1280x720 depth on both cameras stalls camera 1 on the shared USB root; use --depth cam2 (or cam1/none)')
     if args.synthetic and not args.bench_seconds:
         p.error('--synthetic requires --bench-seconds')
     specs = [args.camera1, args.camera2]
@@ -131,7 +135,8 @@ def main():
             processes.append(controller)
             wait_for(runtime / 'control.sock', controller)
             camera_args = [str(args.build / 'kaivuri-camera'), '--camera', specs[0], '--camera', specs[1],
-                           '--output-dir', str(runtime / 'cameras'), '--fps', str(args.fps)]
+                           '--output-dir', str(runtime / 'cameras'), '--fps', str(args.fps),
+                           '--width', args.resolution.split('x')[0], '--height', args.resolution.split('x')[1]]
             if args.rotate_camera1:
                 camera_args += ['--rotate-180', parsed[0][0]]
             depth_cams = {'both': (0, 1), 'cam1': (0,), 'cam2': (1,), 'none': ()}[args.depth]

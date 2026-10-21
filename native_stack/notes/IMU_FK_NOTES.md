@@ -110,6 +110,10 @@ joint zero/link-length calibration (side camera).
   the gyro is cleaner.
 - **Frames.** Joint angles are relative and unaffected by the level frame. Use level-frame
   positions only for ground-referenced targets (dig depth).
+- **Rocking penalty.** Bang-bang boom pulses near 4.5 Hz pump the large-amplitude cabin mode (small
+  amplitude rings at 7.5–14 Hz). For a learned actuator or policy, penalise cabin gyro pitch/roll rate
+  (`imu_gyro_dps` row 0) or \|accel\| − 1 g, plus command rate/jerk. A simulator needs that mode (a
+  spring-damper under the carriage, about 4.5 Hz at large amplitude, about 2 s decay) for a policy to learn it.
 - **Load.** Digging into the bottom tips the machine about 2°. Under contact the joint
   pressure/force picture changes, so mark or exclude contact phases in free-air actuator
   datasets.
@@ -125,7 +129,7 @@ edge, base height, arm IMU remount, cabin rock under aggressive driving, ground 
   give an independent slew angle (about ±30° while the tags stay in view), the slew gyro gain and
   drift, and separate whole-machine yaw from slew.
 - Boom-only sweeps, slow and fast: the boom hinge axis is still *low data* (95% interval 0.3–1.3°).
-- Optional: reflash the Pico with acceleration rejection 5° (`settings.c`) and repeat one
-  aggressive take; the offline replay predicts boom errors under shaking drop by 3–5×.
+- Done: Pico reflashed with acceleration rejection 5° (`imu_new` A/B: equal when calm, lower under
+  shaking). Rollback images on the board in `~/pico-build` (`backup-20261021-pre-rej5.uf2`).
 - Re-run `tools/imu_audit.py SESSION ...` on everything together. It flags what is still
   *low data*.

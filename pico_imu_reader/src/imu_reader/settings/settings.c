@@ -33,7 +33,11 @@
 //                        0.11 deg and the attitude lag from 25 ms to 2.5 ms.
 //                        Use 1.0f instead if stationary drift matters more
 //                        than lag; do not exceed 2.0f on this machine.
-//  ahrsAccelRejection 10 Tighter than 20 deg, more conservative than 5 deg.
+//  ahrsAccelRejection 5  Was 10 (tighter than the old 20). 2026-10-21 side-camera A/B on the
+//                        machine: same error when calm; under shaking the boom/bucket p99 fell
+//                        from 0.74/0.86 to 0.63/0.68 deg, and offline replay of a harder shake
+//                        cut the boom error 0.84 -> 0.25 deg rms. 3 deg over-rejects: recovery
+//                        keeps triggering and errors grow.
 //  ahrsRecoveryPeriodS 2 Now counted in AHRS updates at ahrsRateHz. The old
 //                        0.5 s was multiplied by sampleRate (200) and applied
 //                        at 416 Hz, so it was really 0.24 s.
@@ -44,6 +48,6 @@ imu_reader_settings_t imu_reader_settings = {
     .accelRangeG         = 4.0f,
     .gyroSaturationDps   = 0.0f,    // resolved by initialize_sensors()
     .ahrsGain            = 0.5f,
-    .ahrsAccelRejection  = 10.0f,
+    .ahrsAccelRejection  = 5.0f,   // 10 until 2026-10-21; side-camera A/B: equal when calm, lower error under shaking
     .ahrsRecoveryPeriodS = 2.0f,
 };

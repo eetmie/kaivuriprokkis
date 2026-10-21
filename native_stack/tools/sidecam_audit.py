@@ -47,7 +47,7 @@ def load(episode, tags=None):
         a = np.polyfit(sens, host, 1)[0]; b = np.min(host - a * sens)
         d['frames'], d['T'] = frames, a * (sens + expo / 2) + b
     if tags is not None or ft:
-        path = Path(tags) if tags else episode.parent.with_name(episode.parent.name + '.sidecam') / (episode.name.removesuffix('.ready') + '.tags.npy')
+        path = Path(tags) if tags else episode.parent.parent.parent / 'sidecam' / episode.parent.name / (episode.name.removesuffix('.ready') + '.tags.npy')
         if path.exists():
             d['tags'] = np.load(path)
     return d
@@ -207,7 +207,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('command', choices=('joints', 'pivots', 'slew', 'touches'))
     p.add_argument('episodes', type=Path, nargs='+')
-    p.add_argument('--tags', type=Path, help='detections from sidecam_tags.py (default: SESSION.sidecam/EPISODE.tags.npy)')
+    p.add_argument('--tags', type=Path, help='detections from sidecam_tags.py (default: ../sidecam/SESSION/EPISODE.tags.npy beside the sessions)')
     p.add_argument('--axis-from', type=Path, help='episode whose boom sweep defines the hinge axis')
     a = p.parse_args()
     axis = None

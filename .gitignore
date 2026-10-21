@@ -246,3 +246,4 @@ lerobot_vla/model/
 data_collection/coverage_plots/
 .venv-lerobot061/
 .venv-rerun/
+.venv-tags/

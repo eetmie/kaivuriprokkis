@@ -3,8 +3,9 @@
     sidecam_tags.py SESSION/episode-N.ready [--out FILE] [--workers 8]
 
 Writes one row per detection: frame, id, hamming, decision_margin, centre x/y, then the four
-corners (x, y) in pupil-apriltags order. The default output is SESSION.sidecam/episode-N.tags.npy,
-next to (not inside) the raw session. Needs pupil-apriltags (on the board: ~/kaivuriprokkis/.venv-tags).
+corners (x, y) in pupil-apriltags order. The default output is ../sidecam/SESSION/episode-N.tags.npy
+beside the sessions directory, so the raw session and the session list stay untouched.
+Needs pupil-apriltags (on the board: ~/kaivuriprokkis/.venv-tags).
 """
 import argparse
 from concurrent.futures import ProcessPoolExecutor
@@ -15,6 +16,11 @@ import time
 import numpy as np
 
 FAMILY = 'tagStandard41h12'
+
+
+def default_tags(episode):
+    session = episode.parent
+    return session.parent.parent / 'sidecam' / session.name / (episode.name.removesuffix('.ready') + '.tags.npy')
 
 
 def frame_shape(episode):
@@ -46,7 +52,7 @@ def main():
     a = p.parse_args()
     episode = a.episode.resolve(); shape = frame_shape(episode); video = episode / 'cam2.y8'
     n = video.stat().st_size // (shape[0] * shape[1])
-    out = a.out or episode.parent.with_name(episode.parent.name + '.sidecam') / (episode.name.removesuffix('.ready') + '.tags.npy')
+    out = a.out or default_tags(episode)
     out.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
     chunks = [(str(video), shape, range(i, min(n, i + 100))) for i in range(0, n, 100)]

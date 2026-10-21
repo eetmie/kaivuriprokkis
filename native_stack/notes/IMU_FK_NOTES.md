@@ -73,6 +73,17 @@ noise per frame on side-panel tags, 0.5–0.6° on the slanted arm and bucket ta
 | Rocking | large-amplitude cabin mode at **4.4–4.5 Hz** (small-amplitude peaks 7.5–14 Hz): the mode softens with amplitude. Bang-bang boom pulses near 4.5 Hz pump it; the machine walked 1–2 cm on the table |
 | Timing | IMU 10–20 ms behind camera timestamps (includes unmeasured camera transfer latency) |
 
+Run 3 (`imu-align-00` before and `imu-align-005` after an arm IMU remount): 40 mm tags 14 (boom) and 12 (arm)
+give two-tag link baselines, and tag 17 on a wall decoupled from the table reveals camera motion.
+
+| | Result |
+| --- | --- |
+| Joint angles | two-tag baselines: boom 0.08–0.24°, arm 0.12–0.31°, bucket 0.36–0.87° rms against the IMU |
+| Lengths | boom 467.6 / 468.6 mm (config 468 kept); arm 244.8 mm over a 134° bucket sweep (hand 240, config now 0.240) |
+| Arm remount | hinge-axis misalignment 1.06–1.12° → **0.68°**; roll against the cabin about 0 → +0.43°; pitch zero unchanged (under 0.3°) |
+| Arm zero | pin line vs IMU arm angle +2.3° (run 1: +2.5°): the arm offset would be about −1.8° about Y instead of +0.612°, ±1° (bucket-pin fit); pending a CAD check |
+| Bucket tip | tip 135 mm straight below the pin at −8.5° bucket level pitch (side camera agrees): `parent_to_tip_xyz` [−0.020, 0, −0.1335] |
+
 Pitfalls: the tripod stood on the machine's table and moved with the shaking, so the camera is only a fixed
 reference in calm takes. Joint angles are tag to tag and still valid. A whole-machine yaw (camera bump at 23 s in
 the second aggressive episode) moved the gyro-only slew reading by 3° with the slew disabled.

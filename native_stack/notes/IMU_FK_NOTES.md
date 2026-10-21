@@ -116,11 +116,16 @@ joint zero/link-length calibration (side camera).
 
 ## Data still needed
 
-- Free-air back-and-forth of one joint at a time: 3–4 cycles, slow and fast, with still pauses.
-  Plus a slew back-and-forth. Gives the hinge axes (boom especially), gain/lag and ringing
-  decay.
-- Side camera (the cabin D435i on a tripod, recorded as cam2) with AprilTag 36h11 tags, 50–60 mm:
-  two per link near the pivots, plus the cabin, the lower carriage and the box. Gives joint zero
-  offsets, link lengths, deflection under load, the real cabin rock, and IMU latency.
+Done 2026-10-21: side camera with tagStandard41h12 tags, joint zeros, link lengths, tool contact
+edge, base height, arm IMU remount, cabin rock under aggressive driving, ground touches.
+
+- Validation touch take with the new profile: about 8 soft touches over the full reach and bucket
+  angles. The tip should read about 0 mm and stay flat to about 1 mm without refitting.
+- Slew back-and-forth with `--enable-slew` and the side camera: cabin tags 16/20 against track tag 21
+  give an independent slew angle (about ±30° while the tags stay in view), the slew gyro gain and
+  drift, and separate whole-machine yaw from slew.
+- Boom-only sweeps, slow and fast: the boom hinge axis is still *low data* (95% interval 0.3–1.3°).
+- Optional: reflash the Pico with acceleration rejection 5° (`settings.c`) and repeat one
+  aggressive take; the offline replay predicts boom errors under shaking drop by 3–5×.
 - Re-run `tools/imu_audit.py SESSION ...` on everything together. It flags what is still
   *low data*.

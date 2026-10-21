@@ -68,10 +68,11 @@ imu:
     # Production CAD (2026-10-07): liftboom IMU mounting magnitude 13.832 deg;
     # sign not yet confirmed. Keep active quaternion until sign is verified.
     boom: [0.9927048, 0.0, 0.12057, 0.0]
-    # Active correction: +0.612 deg about Y (hardware removes this rotation).
-    # Production CAD (2026-10-07): tiltboom IMU mounting magnitude 0.612 deg;
-    # Updated magnitude to CAD; retained existing positive sign (not independently verified).
-    arm: [0.999985738456, 0.0, 0.005340682122, 0.0]
+    # Active correction: -0.612 deg about Y (hardware removes this rotation).
+    # Production CAD (2026-10-07): tiltboom IMU mounting magnitude 0.612 deg.
+    # Sign verified 2026-10-21 against a plumb line: with +0.612 the arm read 88.3 deg
+    # level pitch where the side camera put its pin line at 89.2-89.5 deg; -0.612 reads 89.5.
+    arm: [0.999985738456, 0.0, -0.005340682122, 0.0]
     bucket: [1.0, 0.0, 0.0, 0.0]
 
 robot:

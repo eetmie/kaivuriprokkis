@@ -81,7 +81,7 @@ give two-tag link baselines, and tag 17 on a wall decoupled from the table revea
 | Joint angles | two-tag baselines: boom 0.08–0.24°, arm 0.12–0.31°, bucket 0.36–0.87° rms against the IMU |
 | Lengths | boom 467.6 / 468.6 mm (config 468 kept); arm 244.8 mm over a 134° bucket sweep (hand 240, config now 0.240) |
 | Arm remount | hinge-axis misalignment 1.06–1.12° → **0.68°**; roll against the cabin about 0 → +0.43°; pitch zero unchanged (under 0.3°) |
-| Arm zero | pin line vs IMU arm angle +2.3° (run 1: +2.5°): the arm offset would be about −1.8° about Y instead of +0.612°, ±1° (bucket-pin fit); pending a CAD check |
+| Arm zero | plumb line (`arm-align`): with +0.612° the arm read 88.3° level pitch where the camera put its pin line at 89.2–89.5°, so the CAD sign was flipped: **−0.612°** (reads 89.5°). The boom read 33.2° against the camera's 32.8–33.6°, so the boom offset stays. The boom-to-arm pin-line comparison drifts from +1.2° to +2.35° across the arm sweep (camera geometry), so the plumb line is the reference for absolute zeros |
 | Bucket tip | tip 135 mm straight below the pin at −8.5° bucket level pitch (side camera agrees): `parent_to_tip_xyz` [−0.020, 0, −0.1335] |
 
 Pitfalls: the tripod stood on the machine's table and moved with the shaking, so the camera is only a fixed

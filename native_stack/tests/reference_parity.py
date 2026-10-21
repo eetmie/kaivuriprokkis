@@ -24,7 +24,7 @@ reference_math = {"np": np}
 exec(compile(ast.Module(body=functions, type_ignores=[]), "original_fk", "exec"), reference_math)
 
 checks, max_pulse_error, max_fk_error = 0, 0., 0.
-for profile_name in ("jetson", "jetson_bucket", "jetson_bucket_dz0"):
+for profile_name in ("jetson",):
     profile = repo / "configuration_files/profiles" / profile_name
     servo = yaml.safe_load((profile / "servo_config.yaml").read_text())
     control = yaml.safe_load((profile / "control_config.yaml").read_text())

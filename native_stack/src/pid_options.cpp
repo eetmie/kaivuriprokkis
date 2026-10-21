@@ -48,7 +48,7 @@ void settings(AppOptions &o) {
 } // namespace
 AppOptions parse_options(int argc, char **argv) {
     AppOptions o;
-    o.profile = fs::path(NATIVE_SOURCE).parent_path() / "configuration_files/profiles/jetson_bucket";
+    o.profile = fs::path(NATIVE_SOURCE).parent_path() / "configuration_files/profiles/jetson";
     o.settings = fs::path(NATIVE_SOURCE) / "config/pid_collection.yaml";
     o.excitation.waveform = mlp::Waveform::Chirp;
     o.excitation.amplitude = .35;

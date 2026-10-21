@@ -4,7 +4,7 @@
 version: 2
 status: separate_initial_collector_full_reach_pending
 
-profile: configuration_files/profiles/jetson_bucket
+profile: configuration_files/profiles/jetson
 frame:
   origin: slew_bearing
   task: [x_m, z_m, cutting_lip_pitch_rad]

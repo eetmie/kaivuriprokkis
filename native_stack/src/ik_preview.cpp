@@ -121,7 +121,7 @@ YAML::Node block_record(uint64_t index, const mlp::Excitation *e) {
 int main(int argc, char **argv) {
     try {
         Options o;
-        fs::path out, profile = fs::path(NATIVE_SOURCE) / "../configuration_files/profiles/jetson_bucket";
+        fs::path out, profile = fs::path(NATIVE_SOURCE) / "../configuration_files/profiles/jetson";
         double seconds = 120;
         bool excite = true;
         for (int i = 1; i < argc; ++i) {

@@ -25,7 +25,7 @@ command guard and records its intervention as described in `PID_COLLECTION.md`.
 ```sh
 native_stack/build/mlp/kaivuri-ik-preview \
   --out native_stack/results/ik-preview-new \
-  --profile configuration_files/profiles/jetson_bucket \
+  --profile configuration_files/profiles/jetson \
   --seconds 600 --seed 42
 python3 native_stack/tools/ik_preview_report.py native_stack/results/ik-preview-new
 ```
@@ -122,9 +122,9 @@ Torch, camera services or a second controller into the collection loop.
 
 The existing September 11 reports in `/home/masi-pgx/robot-data-coverage/` cover
 3496.78 seconds across seven recordings, including 2816.56 seconds classified
-as moving. Their frozen bucket profile exactly matches the current
-`jetson_bucket/control_config.yaml` (SHA-256
-`5b7042d6eafac5cfb05625ddf2533aaa0889843e4da27cf2d1f92b038daf6039`).
+as moving. Their frozen bucket profile matched an earlier `jetson_bucket/control_config.yaml`
+(SHA-256 `5b7042d6eafac5cfb05625ddf2533aaa0889843e4da27cf2d1f92b038daf6039`); that profile was
+dropped on 2026-10-21 and is in git history.
 They explicitly say `workspace_collision_checked: false`. Their summaries and
 images cannot reconstruct a full joint-space occupancy table; rebuild that
 table from the source logs. Those seven CSVs are not in this checkout's
@@ -132,11 +132,11 @@ table from the source logs. Those seven CSVs are not in this checkout's
 
 ## Coordinate and calibration contract first
 
-Use the selected profile for both map generation and control. Start with
-`jetson_bucket`, which describes the cutting tip, slew-bearing origin and
-cutting-lip orientation used by the existing coverage reports. Do not silently
-switch the current collector's profile or mix its default `jetson` geometry
-with a bucket-profile map.
+Use the selected profile for both map generation and control. Since 2026-10-21 that is `jetson`,
+calibrated against a side camera and ground touches ([IMU and FK notes](IMU_FK_NOTES.md)); it also
+carries the CAD cutting-lip orientation (`robot.tool.pitch_offset_rad`). The dropped `jetson_bucket`
+put its carriage origin 14 mm lower (boom pin 78.5 mm above it, against 64.5 mm here), used CAD link
+lengths (arm 250 mm) and read the arm 1.2° lower (old arm IMU offset), so do not mix maps built with it.
 
 | Quantity | Order / convention |
 | --- | --- |

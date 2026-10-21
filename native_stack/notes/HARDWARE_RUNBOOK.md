@@ -25,7 +25,7 @@ python3 -B tools/client.py status
 python3 -B tools/client.py exercise --values 0,0,0,0,0,0 --seconds 2
 ```
 
-Use `jetson_bucket` or `jetson_bucket_dz0` instead if that is the intended profile. Wait for Pico calibration; firmware CAL_WAIT/rejected calibration prevents arming. Check `imu_healthy`, `firmware_blocked`, increasing device time/sequence, joint sign and mounting-offset behavior, and plausible FK against a known physical pose. Compare with existing logs or a separate reference run; do not run both serial/control owners simultaneously.
+Wait for Pico calibration; firmware CAL_WAIT/rejected calibration prevents arming. Check `imu_healthy`, `firmware_blocked`, increasing device time/sequence, joint sign and mounting-offset behavior, and plausible FK against a known physical pose. Compare with existing logs or a separate reference run; do not run both serial/control owners simultaneously.
 
 Unplug the Pico during a dry exercise: expect fault and neutral preview within roughly 100 ms plus a tick. Stop feeding while keeping the producer connection open: expect pump-off preview at 500 ms and valve decay completed by about 750 ms. Closing an armed producer faults immediately. Reconnect/restart and explicitly rearm; there is no automatic serial reconnection in v1.
 

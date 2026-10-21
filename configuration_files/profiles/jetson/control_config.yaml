@@ -104,6 +104,11 @@ robot:
     # fitted to 14 soft table touches at bucket pitch -36..+12 deg (flat to 0.63 mm rms); the
     # plumb-line pose gave [-0.020, 0, -0.1335] to the top edge. Was [0.031, 0.0, -0.142].
     parent_to_tip_xyz: [-0.009, 0.0, -0.1335]
+    # Cutting-lip pitch relative to the bucket frame, for IK/PID task poses [x, z, lip pitch].
+    # From the CAD/USD bucket profile (dropped 2026-10-21); its tip vector agrees with the
+    # measured one above to 3 mm, so the bucket frame matches.
+    name: bucket
+    pitch_offset_rad: 2.806488513946533
 
 pid:
   # PID controller gains for each joint

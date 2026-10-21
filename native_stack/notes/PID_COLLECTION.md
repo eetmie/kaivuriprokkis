@@ -11,7 +11,7 @@ writer are separate libraries; the manual executable does not link them.
 
 ## Joint ranges and command guarding
 
-The current `jetson_bucket` profile has these relative joint limits:
+The `jetson` profile has these relative joint limits:
 
 | Joint | Profile limits | Initial IK target range, with 10° margin |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ cmake --build native_stack/build/mlp -j4
 ctest --test-dir native_stack/build/mlp --output-on-failure
 
 native_stack/build/mlp/kaivuri-pid-collect \
-  --profile configuration_files/profiles/jetson_bucket \
+  --profile configuration_files/profiles/jetson \
   --settings native_stack/config/pid_collection.yaml \
   --serial /dev/serial/by-id/usb-RPi_IMU_Reader_4250305031363910-if00 \
   --gamepad /dev/input/eventN --out /path/to/pid-desk-test --dry --seed 42

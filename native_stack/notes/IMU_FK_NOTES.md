@@ -56,6 +56,10 @@ side-camera sessions below before anything is calibrated from them.
 
 ### Side camera, 2026-10-21 (`imu-align-001` gentle, `imu-align-002` aggressive)
 
+Tools: `tools/sidecam_tags.py EPISODE` (needs pupil-apriltags; on the board `~/kaivuriprokkis/.venv-tags`),
+then `tools/sidecam_audit.py joints|pivots|slew EPISODE` and `touches EPISODE...`; `tools/fusion_replay.py
+EPISODE --rejection 5 --compare-camera` scores AHRS settings. The tags were for this calibration only.
+
 Setup: the former cabin D435i on a tripod about 0.8 m from the machine's side, recording at 1280x720 with depth
 on that camera only (`--resolution 1280x720 --depth cam2`). Tags are tagStandard41h12, printed 50 mm, so the
 detection border is 27.8 mm: 16 and 20 on the cabin, 21 on the track, 22 on the boom, 18 on the arm, 23 on the

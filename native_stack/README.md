@@ -15,6 +15,9 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `tools/client.py` | Status, disarm, emergency stop, bounded bench exercise; reusable IPC client for later TRT integration |
 | `tools/frame_reader.py` | Coherent Y8 snapshot through the native C ABI; rejects stale frames |
 | `tools/measure.py` | Per-process RSS, PSS, swap, CPU; no model or hardware imports |
+| `tools/imu_audit.py` | IMU chain audit from recorded sessions: hinge axes, relative roll, angle gain/lag, cabin rocking, with bootstrap intervals |
+| `tools/sidecam_tags.py`, `tools/sidecam_audit.py` | Calibration-only side camera with AprilTags: joint angles, pin-to-pin lengths, slew and ground-touch FK checks ([method and results](notes/IMU_FK_NOTES.md#side-camera-2026-10-21-imu-align-001-gentle-imu-align-002-aggressive)) |
+| `tools/fusion_replay.py` | Offline replay of the Pico's Fusion AHRS over recorded gyro/accel to compare settings before reflashing |
 
 The default `kaivuri-control` mode reads real IMUs but **does not open I2C**. `--simulate-imu` gives a completely hardware-free control run. `--live-pwm` enables physical output and refuses simulated IMUs. Slew and tracks also require their own daemon flags. The pump requires an explicit command flag and an armed state.
 

@@ -89,7 +89,7 @@ robot:
   joints:
     - name: slew
       axis: [0.0, 0.0, 1.0]
-      parent_to_joint_xyz: [0.0, 0.0, 0.07]      # ground -> slew origin
+      parent_to_joint_xyz: [0.0, 0.0, 0.1045]    # ground -> slew origin (ground touches: boom pin 169 mm above the table, hand ~170; was 0.07 until 2026-10-21)
     - name: boom
       axis: [0.0, 1.0, 0.0]
       parent_to_joint_xyz: [0.0165, 0.0, 0.0645] # slew -> boom pivot

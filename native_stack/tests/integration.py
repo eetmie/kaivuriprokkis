@@ -77,7 +77,7 @@ def check_kinematic_status(status):
     assert len(status["link_roll_rad"]) == 4 and status["link_roll_rad"][0] == 0
     tilt, yaw = status["cabin_tilt_quat_wxyz"], status["slew_yaw_rad"]
     x, y, z = status["fk_upper_xyz_m"]
-    slewed = [x * math.cos(yaw) - y * math.sin(yaw), x * math.sin(yaw) + y * math.cos(yaw), z + .07]
+    slewed = [x * math.cos(yaw) - y * math.sin(yaw), x * math.sin(yaw) + y * math.cos(yaw), z + .1045]
     expected = rotate(tilt, slewed)
     assert all(math.isclose(a, b, abs_tol=2e-9) for a, b in zip(status["fk_xyz_m"], expected)), (status["fk_xyz_m"], expected)
     assert status["slew_yaw_rad"] == status["angles_rad"][0]

@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
         }
         expect(pulse_count(1500, 100) == 614, "matches existing truncation and 4095 multiplier");
         Pose p = forward_kinematics(c, {0, 0, 0, 0});
-        expect(close(p.position[0], .7155) && close(p.position[2], .001),
+        expect(close(p.position[0], .7155) && close(p.position[2], .0355),
                "zero FK analytical geometry");
         p = forward_kinematics(c, {pi / 2, 0, 0, 0});
         expect(close(p.position[0], 0) && close(p.position[1], .7155),
@@ -65,9 +65,9 @@ int main(int argc, char **argv) {
         expect(close(zero.upper.position[0], .7155) && close(zero.upper.position[1], 0) &&
                    close(zero.upper.position[2], -.069),
                "upper frame origin is the slew pivot, not the ground origin");
-        expect(close(zero.joint_positions_base[0][2], .07) &&
+        expect(close(zero.joint_positions_base[0][2], .1045) &&
                    close(zero.joint_positions_base[1][0], .0165) &&
-                   close(zero.joint_positions_base[1][2], .1345) &&
+                   close(zero.joint_positions_base[1][2], .169) &&
                    close(zero.joint_positions_upper[2][0], .4845) &&
                    close(zero.joint_positions_upper[3][0], .7245),
                "FK reports joint pivots, before the tool-tip offset");
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
                        "upper tool position is independent of slew");
                 expect(close(fk.base.position[0], x * std::cos(yaw)) &&
                            close(fk.base.position[1], x * std::sin(yaw)) &&
-                           close(fk.base.position[2], z + .07),
+                           close(fk.base.position[2], z + .1045),
                        "base tool position follows the cylindrical path");
                 expect(close(fk.bucket_pitch, wrap(tip_angle)) && close(fk.slew_yaw, yaw),
                        "bucket pitch keeps its signed full range; slew is stored separately");
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
                     const auto &v = fk.joint_positions_base[i];
                     expect(close(v[0], u[0] * std::cos(yaw) - u[1] * std::sin(yaw)) &&
                                close(v[1], u[0] * std::sin(yaw) + u[1] * std::cos(yaw)) &&
-                               close(v[2], u[2] + .07),
+                               close(v[2], u[2] + .1045),
                            "all joint pivots share the documented carriage-to-base transform");
                     const auto expected =
                         multiply(axis_angle({0, 0, 1}, yaw), fk.link_orientations_upper[i]);

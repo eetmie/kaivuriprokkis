@@ -83,7 +83,7 @@ give two-tag link baselines, and tag 17 on a wall decoupled from the table revea
 | Arm remount | hinge-axis misalignment 1.06–1.12° → **0.68°**; roll against the cabin about 0 → +0.43°; pitch zero unchanged (under 0.3°) |
 | Arm zero | plumb line (`arm-align`): with +0.612° the arm read 88.3° level pitch where the camera put its pin line at 89.2–89.5°, so the CAD sign was flipped: **−0.612°** (reads 89.5°). The boom read 33.2° against the camera's 32.8–33.6°, so the boom offset stays. The boom-to-arm pin-line comparison drifts from +1.2° to +2.35° across the arm sweep (camera geometry), so the plumb line is the reference for absolute zeros |
 | Bucket tip | plumb pose: top edge [−0.020, 0, −0.1335]. Ground touches (`ee-plane`, 14 soft touches, bucket −36…+12°) fit the bottom (contact) edge at **[−0.009, 0, −0.1335]**: tip heights then flat to 0.63 mm rms (max 1.6 mm, was 9 mm spread) |
-| Base height | the table reads −34.5 mm in the level base frame: the boom pin is about 100 mm above the table vs 134.5 mm in the config (ground→slew 0.07 + slew→boom 0.0645). Not changed; hand-measure the pin height first |
+| Base height | the table read −34.5 mm in the level base frame, so the boom pin is 169 mm above the table (hand: about 170 mm; slew about 100 mm). Ground→slew 0.07 → **0.1045** m; slew→boom 0.0645 kept |
 | Hard pushes | level frame removes most of the tip error (cabin −3.3°: −76 → −47 mm; −14.6°: −180 → −77 mm, soft-touch plane about −40). The rest is tipping about the rear track edge, 110–150 mm behind the slew axis; not modelled |
 
 Pitfalls: the tripod stood on the machine's table and moved with the shaking, so the camera is only a fixed

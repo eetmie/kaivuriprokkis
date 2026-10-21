@@ -145,7 +145,11 @@ def audit(data):
         # Slew is the cabin IMU's own twist; each pitch joint is child pitch minus parent pitch.
         parent = 0. if k == 0 else G[:, k - 1] @ (axes.get(k - 1, y) if k > 1 else y)
         hinge = G[:, k] @ axes[k] - parent
-        moving = np.flatnonzero((np.abs(R[:, k]) > 15) & ~edge)
+        # Same +-3 sample window as rate(), so vibration above ~7 Hz is attenuated equally on both sides.
+        hinge = np.convolve(hinge, np.r_[.5, np.ones(5), .5] / 6, 'same')
+        # Select on the gyro side: selecting on the noisier angle rate biases the gain low
+        # (shaking spikes the angle rate without matching hinge motion).
+        moving = np.flatnonzero((np.abs(hinge) > 15) & ~edge)
         if len(moving) < 50:
             continue
         lags = np.arange(-20, 21); best = (-2, 0)

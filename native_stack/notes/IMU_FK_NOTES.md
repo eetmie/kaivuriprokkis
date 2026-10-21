@@ -54,6 +54,29 @@ side-camera sessions below before anything is calibrated from them.
 | Slew gyro | gain 1.00; drift under 1° per take against the sandbox seen by the cabin camera | one take |
 | Arm FK | wrist-camera heights 5–10 mm off at some poses: zero offsets or link lengths, not play | side camera will tell |
 
+### Side camera, 2026-10-21 (`imu-align-001` gentle, `imu-align-002` aggressive)
+
+Setup: the former cabin D435i on a tripod about 0.8 m from the machine's side, recording at 1280x720 with depth
+on that camera only (`--resolution 1280x720 --depth cam2`). Tags are tagStandard41h12, printed 50 mm, so the
+detection border is 27.8 mm: 16 and 20 on the cabin, 21 on the track, 22 on the boom, 18 on the arm, 23 on the
+bucket. Single-tag PnP orientation is ambiguous at this size, with up to 12° disagreement between two rigid
+cabin tags. So angles come from corner rays intersected with planes perpendicular to the hinge axis: 0.08–0.2°
+noise per frame on side-panel tags, 0.5–0.6° on the slanted arm and bucket tags.
+
+| | Result |
+| --- | --- |
+| Joint angles, gentle | camera minus IMU after a linear fit, 0.5 s average: boom 0.15°, arm 0.39°, bucket 0.64° rms (mostly camera noise); gains 0.99–1.03, not resolvable below ±2% (camera-axis uncertainty) |
+| Joint angles, aggressive | 0.24–0.84° rms, p99 up to ±1.9°; the boom angle trails the camera by about 1° during long pulse trains |
+| Link lengths (pin to pin, in plane) | boom 470.7 mm (config 468); **arm 237.4 mm (config 250)**: hand-measure to confirm |
+| Zeros | arm joint +2.5° (camera minus IMU); boom elevation +1.3° ±1° (gravity from the tripod accelerometer); boom mounting sign (13.85°) is right |
+| Cabin tilt | gentle: camera vs `cabin_pitch_rad` correlation 0.97, lag 6 ms; aggressive (cabin \|a\| 0.6–1.5 g): firmware tilt overshoots by up to about 0.4° (0.5 s average) against the integrated gyro, recovers in about 2 s |
+| Rocking | large-amplitude cabin mode at **4.4–4.5 Hz** (small-amplitude peaks 7.5–14 Hz): the mode softens with amplitude. Bang-bang boom pulses near 4.5 Hz pump it; the machine walked 1–2 cm on the table |
+| Timing | IMU 10–20 ms behind camera timestamps (includes unmeasured camera transfer latency) |
+
+Pitfalls: the tripod stood on the machine's table and moved with the shaking, so the camera is only a fixed
+reference in calm takes. Joint angles are tag to tag and still valid. A whole-machine yaw (camera bump at 23 s in
+the second aggressive episode) moved the gyro-only slew reading by 3° with the slew disabled.
+
 Full chain with yaw/roll per joint: not worth it yet. Off-axis motion is small; link roll is
 already an option; per-joint yaw cannot be seen by gravity and drifts in the AHRS, so it needs
 the side camera or a magnetometer. The bigger error terms were cabin tilt (now in the FK) and

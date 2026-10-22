@@ -103,6 +103,29 @@ This is an **unfinetuned LIBERO performance demo**. IR gray is replicated into t
 
 After the register-level hardware checks, `bench_pi05.py --live-pwm` also completed a 60-second inference run with real 100 Hz neutral I2C writes. It stays disarmed and refuses simulated IMUs. Inference p50/p99 was 425.50/426.98 ms; control wake-up lateness p99/max was 0.070/0.242 ms, and per-tick control work p99 was 1.108 ms. Both camera callback counters had zero gaps/resets. One camera skipped two shared-frame publications (latest-frame writer busy) across capture including model load; the other skipped none. Evidence is in `results/pi05-dual-ir-live-pwm-60s-20261012/`.
 
+### Live sand height beside pi0.5
+
+`tools/sand_height_live.py live` reads the cabin camera's shared depth frame and control status (read-only) and keeps `sand_height.py`'s level height map, litres moved and slew correction while inference runs. `replay SESSION` times the same work on a recording. `tools/bench_fullstack.py` runs dry/disarmed control, both IR cameras with depth, pi0.5 without `--drive`, and the sand process:
+
+```bash
+python3 -B tools/bench_fullstack.py --out results/fullstack-new \
+  --bundle ~/bundles/pi05-excavator-smoke9 --cache ~/bundles/pi05-excavator-smoke9.cache \
+  --fixtures PREPARED_FIXTURES --calibration SESSION/sand-calibration.json --duration-s 120 \
+  --sand-hz 5 --sand-args "--reference live --field none --track-every 5"
+```
+
+The slew gyro is zeroed at power-on, so park the machine in its zero pose before boot. A stored calibration's reference map and sand outline are only valid for that zero (`--reference live --field none` builds the tracking map at start, with the machine still, and keeps it for the run only). Between tracker fixes the heading is the gyro plus the last correction.
+
+Measured on `pikkumasi2tb` on 2026-10-22, smoke9 at 2 Hz, 120 s runs:
+
+| Sand process | pi0.5 p50/p99 ms | Overruns | Sand CPU (one core) | Sand RSS |
+|---|---|---|---|---|
+| none (depth on) | 437.1/438.4 | 0 | – | – |
+| map 5 Hz, tracker 1 Hz | 441.2/445.9 | 0 | 35 % | 91 MB |
+| unpaced, tracker every update (7.4 Hz) | 445.7/447.7 | 0 | 100 % | 91 MB |
+
+System memory peaked at 6.5 of 7.5 GB. A map update takes about 39 ms and a tracker update about 80 ms; when the tracker loses its match it runs a ±40° search (about 210 ms). A manual ±70° yaw stayed matched while the view was in the map, and matched again after fast turns into unmapped sand. Gyro drift over 2.5 minutes was under 0.2°. In a replay of a recorded dig with an injected 15° gyro bias, the stored-reference tracker corrected it to within 0.1–0.7°. On flat sand, which has nothing to match, the residual was about 2°.
+
 ## Hardware-free use
 
 In one terminal:

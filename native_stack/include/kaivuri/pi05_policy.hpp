@@ -3,6 +3,7 @@
 // per-step state prompt, OpenPI quantile normalization, controller state, and the
 // policy -> controller drive-plan producer. See notes/PI05_FINETUNE.md.
 #include "kaivuri/core.hpp"
+#include "kaivuri/util.hpp"
 #include <array>
 #include <condition_variable>
 #include <cstdint>
@@ -15,7 +16,6 @@
 #include <yaml-cpp/yaml.h>
 
 namespace kaivuri::pi05 {
-uint64_t now_ns();
 
 struct Quantiles {
     std::vector<double> q01, q99;

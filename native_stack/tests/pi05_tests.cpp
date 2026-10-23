@@ -461,7 +461,7 @@ static void producer_tests(const std::string &binary) {
     {
         Daemon daemon(binary, dir, false);
         ControlLink watch(daemon.socket);
-        auto robot = robot_state(watch.status(), {1, 2, 3}, now_ns(), 50000000);
+        auto robot = robot_state(watch.status(), {1, 2, 3}, monotonic_ns(), 50000000);
         expect(robot.degrees.size() == 3 && robot.imu_ns > 0, "simulated status gives state");
         ProducerOptions options;
         options.socket = daemon.socket;
@@ -476,7 +476,7 @@ static void producer_tests(const std::string &binary) {
             expect(status(watch)["state"].as<std::string>() == "armed", "armed by producer");
             sleep_ms(650); // centered hold renewed past the 500 ms lease
             expect(status(watch)["state"].as<std::string>() == "armed", "hold renewed");
-            const uint64_t observed = now_ns();
+            const uint64_t observed = monotonic_ns();
             expect(producer.post(chunk(observed, 50, 0.2), reason), "chunk posted: " + reason);
             sleep_ms(60);
             auto s = status(watch);
@@ -503,7 +503,7 @@ static void producer_tests(const std::string &binary) {
         {
             Producer producer(options);
             producer.arm();
-            expect(producer.post(chunk(now_ns(), 10, 0.1), reason), "short chunk posted");
+            expect(producer.post(chunk(monotonic_ns(), 10, 0.1), reason), "short chunk posted");
             sleep_ms(400);
             expect(!producer.running() &&
                        producer.stop_reason().find("exhausted") != std::string::npos,
@@ -513,13 +513,13 @@ static void producer_tests(const std::string &binary) {
         {
             Producer producer(options);
             producer.arm();
-            expect(producer.post(chunk(now_ns(), 50, 0.1), reason), "chunk posted");
+            expect(producer.post(chunk(monotonic_ns(), 50, 0.1), reason), "chunk posted");
             watch.send(Operation::Estop);
             sleep_ms(100);
             expect(!producer.running() &&
                        producer.stop_reason().find("emergency_stop") != std::string::npos,
                    "stops on controller fault: " + producer.stop_reason());
-            expect(!producer.post(chunk(now_ns(), 50, 0.1), reason), "no posts after stop");
+            expect(!producer.post(chunk(monotonic_ns(), 50, 0.1), reason), "no posts after stop");
         }
         expect(status(watch)["state"].as<std::string>() == "disarmed",
                "fault cleared only by the producer's own disarm");
@@ -546,7 +546,7 @@ static void producer_tests(const std::string &binary) {
         Producer producer(options);
         producer.arm();
         std::string reason;
-        expect(producer.post(chunk(now_ns(), 50, 0), reason), "slew chunk posted");
+        expect(producer.post(chunk(monotonic_ns(), 50, 0), reason), "slew chunk posted");
         sleep_ms(60);
         ControlLink watch(daemon.socket);
         expect(std::abs(status(watch)["applied_action"][0].as<double>() - 0.4) < 1e-6,

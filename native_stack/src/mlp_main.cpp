@@ -27,14 +27,6 @@ uint64_t ns() {
     clock_gettime(CLOCK_MONOTONIC, &t);
     return uint64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
 }
-struct Fd {
-    int value;
-    explicit Fd(int v) : value(v) {}
-    ~Fd() {
-        if (value >= 0)
-            ::close(value);
-    }
-};
 } // namespace
 int main(int argc, char **argv) {
     try {
@@ -44,15 +36,15 @@ int main(int argc, char **argv) {
         ControlLock lock("/tmp/kaivuri-native-" + std::to_string(geteuid()));
         auto pwm = std::make_unique<Pwm>(runtime.config, !o.dry);
         Fd serial(::open(o.serial.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
-        if (serial.value < 0)
+        if (serial.get() < 0)
             throw std::runtime_error("cannot open serial: " + o.serial.string());
-        if (isatty(serial.value)) {
+        if (isatty(serial.get())) {
             termios t{};
-            if (tcgetattr(serial.value, &t) != 0)
+            if (tcgetattr(serial.get(), &t) != 0)
                 throw std::runtime_error("serial termios read failed");
             cfmakeraw(&t);
             t.c_cflag |= CLOCAL | CREAD;
-            if (tcsetattr(serial.value, TCSANOW, &t) != 0 || ioctl(serial.value, TIOCEXCL) != 0)
+            if (tcsetattr(serial.get(), TCSANOW, &t) != 0 || ioctl(serial.get(), TIOCEXCL) != 0)
                 throw std::runtime_error("serial setup/exclusive lock failed");
         }
         std::unique_ptr<Pad> pad;
@@ -109,7 +101,7 @@ int main(int argc, char **argv) {
                     break;
                 size_t read_total = 0;
                 while (read_total < bytes.size()) {
-                    const auto n = ::read(serial.value, bytes.data(),
+                    const auto n = ::read(serial.get(), bytes.data(),
                                           std::min(o.read_chunk, bytes.size() - read_total));
                     if (n > 0) {
                         parser.feed(bytes.data(), size_t(n), double(ns()) / 1e9);

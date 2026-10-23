@@ -70,7 +70,7 @@ struct PidAttachment::Impl {
         protocol << "{\"id\":" << s.id << ",\"begin_ns\":" << s.begin_ns
                  << ",\"end_ns_requested\":" << s.end_ns
                  << ",\"duration_requested_s\":" << s.duration
-                 << ",\"kind\":" << mlp::json_quote(collection::kind_name(s.kind))
+                 << ",\"kind\":" << json_quote(collection::kind_name(s.kind))
                  << ",\"goal_cell\":" << s.goal_cell << ",\"goal_q_rad\":";
         json_values(protocol, s.goal_q);
         protocol << ",\"velocity_xz_m_s\":";

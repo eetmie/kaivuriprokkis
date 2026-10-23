@@ -181,22 +181,22 @@ Runtime load_runtime(const AppOptions &o) {
     m.suffix = o.suffix;
     m.collector = "kaivuri-pid-collect";
     m.source_revision = NATIVE_GIT_REVISION;
-    m.executable_sha256 = mlp::sha256_file("/proc/self/exe");
+    m.executable_sha256 = sha256_file("/proc/self/exe");
     m.collection_id = std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count()) +
                       "-pid-" + std::to_string(getpid());
     std::ostringstream options;
     options << std::setprecision(17)
-            << "{\"profile\":" << mlp::json_quote(fs::absolute(o.profile).string())
-            << ",\"settings\":" << mlp::json_quote(fs::absolute(o.settings).string())
-            << ",\"serial\":" << mlp::json_quote(o.serial.string())
-            << ",\"gamepad\":" << mlp::json_quote(o.gamepad)
+            << "{\"profile\":" << json_quote(fs::absolute(o.profile).string())
+            << ",\"settings\":" << json_quote(fs::absolute(o.settings).string())
+            << ",\"serial\":" << json_quote(o.serial.string())
+            << ",\"gamepad\":" << json_quote(o.gamepad)
             << ",\"scripted\":" << (o.scripted ? "true" : "false")
             << ",\"seed\":" << o.planning.seed << ",\"duration_s\":" << o.duration
             << ",\"record_seconds\":" << o.record_seconds
             << ",\"read_chunk_bytes\":" << o.read_chunk
-            << ",\"settings_yaml\":" << mlp::json_quote(read(o.settings)) << '}';
+            << ",\"settings_yaml\":" << json_quote(read(o.settings)) << '}';
     m.options_json = options.str();
     std::ostringstream protocol;
     protocol << "{\"version\":1,\"controller\":\"random-pitch-velocity-ik-pid-v1\",\"seed\":"
@@ -205,7 +205,7 @@ Runtime load_runtime(const AppOptions &o) {
                 "draws\",\"output_hz\":100,"
                 "\"joint_order\":[\"boom\",\"arm\",\"bucket\"],\"collision_checked\":false,"
                 "\"settings_yaml\":"
-             << mlp::json_quote(read(o.settings)) << ",\"segments\":[";
+             << json_quote(read(o.settings)) << ",\"segments\":[";
     r.protocol_json = protocol.str();
     const auto profile = YAML::LoadFile((o.profile / "profile.yaml").string());
     for (const auto &name :

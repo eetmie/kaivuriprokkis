@@ -11,15 +11,6 @@
 #include <unistd.h>
 
 namespace kaivuri::pi05 {
-static void require(bool condition, const std::string &message) {
-    if (!condition)
-        throw std::runtime_error(message);
-}
-uint64_t now_ns() {
-    timespec t{};
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return uint64_t(t.tv_sec) * 1000000000ULL + t.tv_nsec;
-}
 std::vector<double> normalize(const std::vector<float> &x, const Quantiles &q) {
     require(q.q01.size() >= x.size() && q.q99.size() >= x.size(), "state quantiles too short");
     std::vector<double> out(x.size());
@@ -373,7 +364,7 @@ ControlLink::~ControlLink() {
         close(fd_);
 }
 void ControlLink::send(Operation op, uint32_t flags, const Plan *plan) {
-    auto data = encode(op, flags, ++sequence_, now_ns(), plan);
+    auto data = encode(op, flags, ++sequence_, monotonic_ns(), plan);
     require(::send(fd_, data.data(), data.size(), MSG_DONTWAIT | MSG_NOSIGNAL) ==
                 ssize_t(data.size()),
             "control send failed");
@@ -417,7 +408,7 @@ Producer::~Producer() {
 void Producer::arm(double timeout_s) {
     require(!thread_.joinable(), "producer already armed once; restart to re-arm");
     const uint32_t pump = options_.pump ? pump_flag : 0;
-    const uint64_t begin = now_ns();
+    const uint64_t begin = monotonic_ns();
     supervisor_.hold(begin);
     Plan centered{{Commands{}}, 30, 0, 0};
     for (;;) {
@@ -426,14 +417,14 @@ void Producer::arm(double timeout_s) {
         const auto state = s["state"].as<std::string>();
         if (state == "armed")
             break;
-        if (state == "fault" || now_ns() - begin > uint64_t(timeout_s * 1e9)) {
+        if (state == "fault" || monotonic_ns() - begin > uint64_t(timeout_s * 1e9)) {
             link_.send(Operation::Disarm);
             throw std::runtime_error("arming failed: " + state + " " +
                                      s["reason"].as<std::string>());
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-    supervisor_.sent(now_ns());
+    supervisor_.sent(monotonic_ns());
     running_ = true;
     thread_ = std::thread([this] { loop(); });
 }
@@ -443,13 +434,13 @@ bool Producer::post(Plan plan, std::string &reason) {
         reason = "producer stopped: " + reason_;
         return false;
     }
-    reason = supervisor_.offer(std::move(plan), now_ns());
+    reason = supervisor_.offer(std::move(plan), monotonic_ns());
     wake_.notify_all();
     return reason.empty();
 }
 void Producer::loop() {
     const uint32_t pump = options_.pump ? pump_flag : 0;
-    uint64_t last_status = 0, last_send = now_ns();
+    uint64_t last_status = 0, last_send = monotonic_ns();
     try {
         for (;;) {
             Plan send;
@@ -460,7 +451,7 @@ void Producer::loop() {
                 if (stopping_)
                     return;
                 std::string why;
-                const uint64_t now = now_ns();
+                const uint64_t now = monotonic_ns();
                 auto decision = supervisor_.next(now, why);
                 if (decision == PlanSupervisor::Decision::Stop) {
                     lock.unlock();
@@ -477,7 +468,7 @@ void Producer::loop() {
                 // Renewals resend the same rows, t0 and observation time; only the
                 // sequence and send time change.
                 link_.send(Operation::Drive, deadman_flag | pump, &send);
-                const uint64_t now = now_ns();
+                const uint64_t now = monotonic_ns();
                 std::lock_guard<std::mutex> lock(mutex_);
                 counters_.max_send_gap_ms =
                     std::max(counters_.max_send_gap_ms, (now - last_send) / 1e6);
@@ -489,7 +480,7 @@ void Producer::loop() {
                 else
                     ++counters_.renewals;
             }
-            const uint64_t now = now_ns();
+            const uint64_t now = monotonic_ns();
             if (now - last_status >= uint64_t(options_.status_s * 1e9)) {
                 last_status = now;
                 auto s = YAML::Load(link_.status());

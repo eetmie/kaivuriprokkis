@@ -38,16 +38,6 @@ void sync_file(const fs::path &p, bool directory = false) {
     if (result != 0)
         throw std::runtime_error("sync failed: " + p.string());
 }
-std::string hash_bytes(const char *bytes, size_t count) {
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned length = 0;
-    if (EVP_Digest(bytes, count, digest, &length, EVP_sha256(), nullptr) != 1)
-        throw std::runtime_error("SHA256 failed");
-    std::ostringstream out;
-    for (unsigned i = 0; i < length; ++i)
-        out << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[i]);
-    return out.str();
-}
 void scalar(std::ostream &out, double x) {
     if (std::isfinite(x))
         out << x;
@@ -55,52 +45,6 @@ void scalar(std::ostream &out, double x) {
         out << "null";
 }
 } // namespace
-std::string sha256_file(const fs::path &path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
-        throw std::runtime_error("cannot hash: " + path.string());
-    auto *ctx = EVP_MD_CTX_new();
-    if (!ctx)
-        throw std::runtime_error("SHA256 allocation failed");
-    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
-        EVP_MD_CTX_free(ctx);
-        throw std::runtime_error("SHA256 init failed");
-    }
-    char bytes[65536];
-    while (in.read(bytes, sizeof(bytes)) || in.gcount())
-        EVP_DigestUpdate(ctx, bytes, size_t(in.gcount()));
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned length = 0;
-    EVP_DigestFinal_ex(ctx, digest, &length);
-    EVP_MD_CTX_free(ctx);
-    if (!in.eof())
-        throw std::runtime_error("SHA256 read failed");
-    std::ostringstream out;
-    for (unsigned i = 0; i < length; ++i)
-        out << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[i]);
-    return out.str();
-}
-std::string json_quote(const std::string &s) {
-    std::ostringstream out;
-    out << '"';
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\')
-            out << '\\' << c;
-        else if (c == '\n')
-            out << "\\n";
-        else if (c == '\r')
-            out << "\\r";
-        else if (c == '\t')
-            out << "\\t";
-        else if (c < 32)
-            out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(c)
-                << std::dec;
-        else
-            out << c;
-    }
-    out << '"';
-    return out.str();
-}
 struct MlpWriter::Impl {
     fs::path out;
     RecordingMetadata metadata;
@@ -363,7 +307,7 @@ struct MlpWriter::Impl {
                 manifest << ',';
             first = false;
             manifest << json_quote(name)
-                     << ":{\"sha256\":" << json_quote(hash_bytes(bytes.data(), bytes.size()))
+                     << ":{\"sha256\":" << json_quote(sha256_hex(bytes.data(), bytes.size()))
                      << ",\"content\":" << json_quote(bytes) << '}';
         }
         manifest << "},\"sensor_contract\":{\"version\":1,\"roles\":[\"base\",\"boom\",\"arm\","

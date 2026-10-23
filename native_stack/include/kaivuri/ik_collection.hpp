@@ -73,6 +73,7 @@ struct GuardResult {
 class JointGuard {
     std::array<std::array<double, 2>, 3> limits_{};
     GuardOptions options_;
+
   public:
     JointGuard(const Robot &, GuardOptions = {});
     GuardResult apply(const Angles &q, const Angles &velocity, const Angles &command,
@@ -120,7 +121,8 @@ struct Output {
 class RandomCollection {
     Kinematics kin_;
     Options options_;
-    uint64_t rng_ = 0, previous_ns_ = 0, previous_schedule_ns_ = 0, goal_begin_ = 0, segment_id_ = 0;
+    uint64_t rng_ = 0, previous_ns_ = 0, previous_schedule_ns_ = 0, goal_begin_ = 0,
+             segment_id_ = 0;
     bool initialized_ = false, have_goal_ = false, recovering_ = false;
     Angles previous_q_{}, reference_{}, goal_q_{}, held_{};
     std::array<Pid, 3> pid_;
@@ -150,7 +152,9 @@ class RandomCollection {
     size_t visited_cells() const { return visited_cells_; }
     size_t working_cells() const { return working_cells_; }
     size_t visited_working_cells() const { return visited_working_cells_; }
-    double coverage_percent() const { return 100. * double(visited_working_cells_) / double(working_cells_); }
+    double coverage_percent() const {
+        return 100. * double(visited_working_cells_) / double(working_cells_);
+    }
     bool recovering() const { return recovering_; }
     const std::vector<double> &dwell() const { return dwell_; }
     const std::vector<double> &moving_dwell() const { return moving_; }

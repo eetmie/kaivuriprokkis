@@ -261,8 +261,9 @@ Attitude attitude(const Config &c, const std::array<Quat, 4> &raw) {
     Attitude a;
     // Swing-twist about the slew axis: the twist is the slew angle, the swing is the tilt.
     if (c.level.cabin_tilt)
-        a.tilt = normalized(multiply(
-            cabin, conjugate(axis_angle(slew.extraction_axis, twist(cabin, slew.extraction_axis)))));
+        a.tilt =
+            normalized(multiply(cabin, conjugate(axis_angle(slew.extraction_axis,
+                                                            twist(cabin, slew.extraction_axis)))));
     a.cabin_roll = gravity_roll(cabin);
     a.cabin_pitch = gravity_pitch(cabin);
     // Link roll: the turn about the child's X between the gravity it measures and the gravity the
@@ -273,7 +274,8 @@ Attitude attitude(const Config &c, const std::array<Quat, 4> &raw) {
         const auto &j = c.joints[i];
         if (!j.pitch_delta || j.parent_sensor < 0)
             continue;
-        const auto expected = rotate(conjugate(multiply(q[j.parent_sensor], axis_angle(j.axis, angles[i]))), {0, 0, 1});
+        const auto expected = rotate(
+            conjugate(multiply(q[j.parent_sensor], axis_angle(j.axis, angles[i]))), {0, 0, 1});
         const auto measured = rotate(conjugate(q[j.sensor]), {0, 0, 1});
         const double norm = expected[1] * expected[1] + expected[2] * expected[2];
         if (norm > .04)

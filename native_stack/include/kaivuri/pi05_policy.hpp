@@ -2,11 +2,11 @@
 // CUDA-free parts of the fine-tuned OpenPI pi0.5 runtime (bundle policy pi05_openpi_state):
 // per-step state prompt, OpenPI quantile normalization, controller state, and the
 // policy -> controller drive-plan producer. See notes/PI05_FINETUNE.md.
-#include <limits>
 #include "kaivuri/core.hpp"
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>

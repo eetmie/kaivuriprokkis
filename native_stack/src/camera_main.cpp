@@ -258,8 +258,8 @@ int main(int argc, char **argv) {
                 output + "/" + camera->serial + "-ir" + std::to_string(camera->index) + ".frame";
             camera->writer =
                 std::make_unique<FrameWriter>(camera->path, width, height, camera->index);
-            camera->depth = std::find(depth_serials.begin(), depth_serials.end(),
-                                      camera->serial) != depth_serials.end();
+            camera->depth = std::find(depth_serials.begin(), depth_serials.end(), camera->serial) !=
+                            depth_serials.end();
             std::string calibration;
             if (camera->depth) {
                 camera->depth_path = output + "/" + camera->serial + "-depth.frame";
@@ -323,9 +323,9 @@ int main(int argc, char **argv) {
                                   camera->sensor.as<rs2::depth_sensor>().get_depth_scale());
                     calibration =
                         std::string("{\"synthetic\":false,\"serial\":\"") + camera->serial +
-                        "\",\"depth_scale_m\":" + scale + ",\"ir_index\":" +
-                        std::to_string(camera->index) + ",\"rotation_deg\":" +
-                        (camera->rotate_180 ? "180" : "0") +
+                        "\",\"depth_scale_m\":" + scale +
+                        ",\"ir_index\":" + std::to_string(camera->index) +
+                        ",\"rotation_deg\":" + (camera->rotate_180 ? "180" : "0") +
                         ",\"note\":\"intrinsics/extrinsics are SDK values for unrotated pixels\""
                         ",\"depth_intrinsics\":" +
                         intrinsics_json(
@@ -370,8 +370,8 @@ int main(int argc, char **argv) {
                 // Calibration and the depth store exist before the first callback can publish.
                 if (camera->depth) {
                     write_json(output + "/" + camera->serial + "-depth.json", calibration);
-                    camera->depth_writer = std::make_unique<FrameWriter>(camera->depth_path, width,
-                                                                         height, 0, 2);
+                    camera->depth_writer =
+                        std::make_unique<FrameWriter>(camera->depth_path, width, height, 0, 2);
                 }
                 Camera *c = camera.get();
                 sensor.start([c, require_metadata](rs2::frame frame) {
@@ -616,9 +616,9 @@ int main(int argc, char **argv) {
                     size_t valid = 0;
                     for (size_t k = 0; k < n; ++k)
                         valid += z[k] != 0;
-                    const size_t bytes = ZSTD_compressCCtx(zstd.p, depth_packed.data(),
-                                                           depth_packed.size(), depth_pixels.data(),
-                                                           m.pixel_bytes, 1);
+                    const size_t bytes =
+                        ZSTD_compressCCtx(zstd.p, depth_packed.data(), depth_packed.size(),
+                                          depth_pixels.data(), m.pixel_bytes, 1);
                     if (ZSTD_isError(bytes))
                         throw std::runtime_error("depth zstd compression failed");
                     log->data.write(reinterpret_cast<const char *>(depth_packed.data()), bytes);
@@ -627,8 +627,8 @@ int main(int argc, char **argv) {
                     depth_csv << log->camera->serial << ',' << m.sequence << ','
                               << m.host_monotonic_ns << ',' << m.sdk_timestamp_ms << ','
                               << m.sensor_timestamp_us << ',' << m.frame_counter << ','
-                              << double(valid) / std::max<size_t>(1, n) << ',' << log->offset
-                              << ',' << bytes << '\n';
+                              << double(valid) / std::max<size_t>(1, n) << ',' << log->offset << ','
+                              << bytes << '\n';
                     depth_csv.flush();
                     log->offset += bytes;
                     if (!log->data || !depth_csv)

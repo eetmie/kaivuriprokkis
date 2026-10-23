@@ -76,7 +76,8 @@ struct KinematicState {
 struct Attitude {
     Quat tilt{1, 0, 0, 0}; // level <- slewed carriage axes (no heading); identity when disabled
     double cabin_roll = 0, cabin_pitch = 0; // carriage axes, from gravity
-    std::array<double, 4> link_roll{};      // about each link's X vs its parent; 0 for slew/near-vertical links
+    std::array<double, 4>
+        link_roll{}; // about each link's X vs its parent; 0 for slew/near-vertical links
 };
 std::array<Quat, 4> corrected_imu_quaternions(const Config &cfg, const std::array<Quat, 4> &raw);
 std::array<double, 4> joint_angles(const Config &cfg, const std::array<Quat, 4> &raw);

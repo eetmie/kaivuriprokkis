@@ -1330,8 +1330,7 @@ int main(int argc, char **argv) {
                         std::cerr << "[drive] warning: sample " << count << " clamped " << clamped
                                   << " actions to [-1,1] (max |v| " << worst << ")\n";
                     }
-                }
-                else
+                } else
                     try { // Record-only: report an out-of-range chunk as -1 instead of stopping.
                         plan = kp::make_plan(last_robot, h, r, fps, t0, oldest,
                                              producer_options.gate, clamped);

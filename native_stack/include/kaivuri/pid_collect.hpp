@@ -36,6 +36,7 @@ struct Frame {
 class PidAttachment final : public mlp::RecordingAttachment {
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
   public:
     PidAttachment(std::string protocol_json, size_t capacity = 4096);
     ~PidAttachment() override;

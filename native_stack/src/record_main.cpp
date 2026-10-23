@@ -1,7 +1,7 @@
 // Native teleoperation and bounded, lossless episode spool. No encoder or Python in this process.
 #include "kaivuri/core.hpp"
-#include "kaivuri/gamepad.hpp"
 #include "kaivuri/frame_store.hpp"
+#include "kaivuri/gamepad.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -223,8 +223,8 @@ class Writer {
                             continue;
                         const auto &z = r.depth[k];
                         packed_.resize(ZSTD_compressBound(z.size()));
-                        const size_t bytes = ZSTD_compressCCtx(zstd_, packed_.data(),
-                                                               packed_.size(), z.data(), z.size(), 1);
+                        const size_t bytes = ZSTD_compressCCtx(
+                            zstd_, packed_.data(), packed_.size(), z.data(), z.size(), 1);
                         if (z.empty() || ZSTD_isError(bytes))
                             throw std::runtime_error("depth compression failed");
                         depth_[k].write(reinterpret_cast<const char *>(packed_.data()), bytes);
@@ -607,7 +607,8 @@ int main(int argc, char **argv) {
                     else if (auto_seconds > 0)
                         throw std::runtime_error("controller fault: " + reason);
                     if (reason != last_fault)
-                        std::cerr << "Controller fault: " << reason << "; re-arming automatically\n";
+                        std::cerr << "Controller fault: " << reason
+                                  << "; re-arming automatically\n";
                     last_fault = reason;
                     // Clear the latched fault at most once per second; arming resumes after it.
                     if (ns() - last_recovery >= 1000000000) {

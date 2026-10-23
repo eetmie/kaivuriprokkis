@@ -20,6 +20,9 @@ from pathlib import Path
 
 import numpy as np
 
+from export_episodes import samples
+from sidecam_tags import default_tags
+
 # Tag layout on the machine. Each link direction is the baseline between two tags on that link
 # (first -> second); the bucket uses tag 23's edge direction.
 TAGS = {'cabin': (16, 20), 'boom': (14, 22), 'arm': (18, 12), 'bucket': (23,), 'wall': (17, 19), 'track': (21,)}
@@ -30,7 +33,7 @@ CAMERA_LAG_S = .012            # IMU sample time relative to mid-exposure (fitte
 def load(episode, tags=None):
     episode = Path(episode).resolve()
     k = json.loads((episode.parent / 'cam2.depth.json').read_text())['ir_intrinsics']
-    rows = [json.loads(l) for l in open(episode / 'samples.jsonl')]
+    rows = list(samples(episode))
     st = [r['status'] for r in rows]
     d = dict(name=f'{episode.parent.name}/{episode.name}',
              K=np.array([[k['fx'], 0, k['ppx']], [0, k['fy'], k['ppy']], [0, 0, 1]]),
@@ -47,20 +50,23 @@ def load(episode, tags=None):
         a = np.polyfit(sens, host, 1)[0]; b = np.min(host - a * sens)
         d['frames'], d['T'] = frames, a * (sens + expo / 2) + b
     if tags is not None or ft:
-        path = Path(tags) if tags else episode.parent.parent.parent / 'sidecam' / episode.parent.name / (episode.name.removesuffix('.ready') + '.tags.npy')
+        path = Path(tags) if tags else default_tags(episode)
         if path.exists():
             d['tags'] = np.load(path)
     return d
 
 
+def tag_centre(tag_id, corners, K):
+    """Camera-frame tag centre from its four image corners (single-tag PnP; orientation is unreliable)."""
+    import cv2
+    obj = np.array([[-1, 1, 0], [1, 1, 0], [1, -1, 0], [-1, -1, 0]], float) * SIZE.get(tag_id, .0278) / 2
+    return cv2.solvePnP(obj, corners, K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)[2].ravel()
+
+
 def geometry(d, axis=None):
     """Rectified tag centres C[id] (n_frames, 2) and edge angles A[id] in the plane perpendicular to the hinge axis."""
-    import cv2
     tags = d['tags']; ids = tags[:, 1].astype(int); px = tags[:, 6:14].reshape(-1, 4, 2); K = d['K']
-    cen = np.zeros((len(tags), 3))
-    for j in range(len(tags)):
-        s = SIZE.get(ids[j], .0278); obj = np.array([[-1, 1, 0], [1, 1, 0], [1, -1, 0], [-1, -1, 0]], float) * s / 2
-        cen[j] = cv2.solvePnP(obj, px[j], K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)[2].ravel()
+    cen = np.array([tag_centre(i, c, K) for i, c in zip(ids, px)]).reshape(-1, 3)
     sweep = np.concatenate([cen[ids == i] - cen[ids == i].mean(0) for i in TAGS['boom'] if (ids == i).any()])
     w, V = np.linalg.eigh(np.cov(sweep.T)); n = V[:, 0] * np.sign(V[2, 0])
     if axis is not None:
@@ -152,14 +158,10 @@ def pivots(d):
 
 def slew(d):
     """Rigid rotation of all upper-structure tag centres (camera as reference) vs the IMU slew."""
-    import cv2
     from scipy.spatial.transform import Rotation
-    upper = TAGS['cabin'] + TAGS['boom'] + TAGS['arm'] + TAGS['bucket']; tags = d['tags']; K = d['K']; cen = {}
-    for row in tags:
-        f, i = int(row[0]), int(row[1])
-        if i in upper:
-            s = SIZE.get(i, .0278); obj = np.array([[-1, 1, 0], [1, 1, 0], [1, -1, 0], [-1, -1, 0]], float) * s / 2
-            cen[f, i] = cv2.solvePnP(obj, row[6:14].reshape(4, 2), K, None, flags=cv2.SOLVEPNP_IPPE_SQUARE)[2].ravel()
+    upper = TAGS['cabin'] + TAGS['boom'] + TAGS['arm'] + TAGS['bucket']
+    cen = {(int(row[0]), int(row[1])): tag_centre(int(row[1]), row[6:14].reshape(4, 2), d['K'])
+           for row in d['tags'] if int(row[1]) in upper}
     frames = sorted({f for f, _ in cen}); seen = {f: [i for i in upper if (f, i) in cen] for f in frames}
     ref = max(frames, key=lambda f: (len(seen[f]), -f)); fr, rv = [], []
     for f in frames:

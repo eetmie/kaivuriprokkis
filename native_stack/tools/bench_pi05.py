@@ -10,7 +10,6 @@ import csv
 import datetime
 import json
 import math
-import os
 import re
 from pathlib import Path
 import shutil
@@ -18,46 +17,19 @@ import subprocess
 import threading
 import time
 
-from client import Client
+from client import RUNTIME_DIR, Client, stop
+from measure import percentile, process_snapshot, system_snapshot
 
 
 def distribution(values):
     values = sorted(values)
     if not values:
         return None
-    def percentile(p):
-        pos = p * (len(values) - 1)
-        lo = int(pos)
-        hi = min(lo + 1, len(values) - 1)
-        return values[lo] + (values[hi] - values[lo]) * (pos - lo)
     mean = sum(values) / len(values)
-    return {"count": len(values), "min": values[0], "p50": percentile(.5),
-            "p95": percentile(.95), "p99": percentile(.99), "max": values[-1],
+    return {"count": len(values), "min": values[0], "p50": percentile(values, .5),
+            "p95": percentile(values, .95), "p99": percentile(values, .99), "max": values[-1],
             "mean": mean,
             "stddev": math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))}
-
-
-def process_snapshot(pid):
-    root = Path("/proc") / str(pid)
-    result = {}
-    for line in (root / "smaps_rollup").read_text().splitlines():
-        parts = line.split()
-        if parts[0] in ("Rss:", "Pss:", "Swap:"):
-            result[parts[0][:-1].lower() + "_mib"] = int(parts[1]) / 1024
-    fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
-    result["cpu_seconds"] = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-    result["threads"] = int(fields[17])
-    return result
-
-
-def system_snapshot():
-    info = {}
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        parts = line.split()
-        info[parts[0][:-1]] = int(parts[1])
-    return {"used_mib": (info["MemTotal"] - info["MemAvailable"]) / 1024,
-            "available_mib": info["MemAvailable"] / 1024,
-            "swap_used_mib": (info["SwapTotal"] - info["SwapFree"]) / 1024}
 
 
 def summarize_camera(path, window):
@@ -100,9 +72,8 @@ def summarize(output, samples):
         "state_age_ms", "prompt_ms") if key in timings[0]}
     starts = [int(row["start_ns"]) for row in timings]
     metrics["inference_start_interval_ms"] = distribution([(b - a) / 1e6 for a, b in zip(starts, starts[1:])])
-    for key in ("rate_wait_ms", "rate_lateness_ms"):
-        if key in timings[0]:
-            metrics[key] = distribution([float(row[key]) for row in timings])
+    metrics.update({key: distribution([float(row[key]) for row in timings])
+                    for key in ("rate_wait_ms", "rate_lateness_ms") if key in timings[0]})
     with (output / "control-timing.csv").open() as handle:
         control = [row for row in csv.DictReader(handle) if window[0] <= int(row["start_ns"]) <= window[1]]
     metrics["control_lateness_ms"] = distribution([float(r["lateness_ms"]) for r in control])
@@ -118,9 +89,7 @@ def summarize(output, samples):
         if records:
             elapsed = (records[-1][0] - records[0][0]) / 1e9
             values = [r[1] for r in records]
-            memory[name] = {"rss_mib": distribution([r["rss_mib"] for r in values]),
-                            "pss_mib": distribution([r["pss_mib"] for r in values]),
-                            "swap_mib": distribution([r["swap_mib"] for r in values]),
+            memory[name] = {**{k: distribution([r[k] for r in values]) for k in ("rss_mib", "pss_mib", "swap_mib")},
                             "rss_start_mib": values[0]["rss_mib"], "rss_end_mib": values[-1]["rss_mib"],
                             "cpu_percent_one_core": 100 * (values[-1]["cpu_seconds"] - values[0]["cpu_seconds"]) / elapsed if elapsed else 0}
     statuses = [s["control_status"] for s in steady if "control_status" in s]
@@ -131,9 +100,8 @@ def summarize(output, samples):
                 "received": int(match[2]), "writer_busy_drops": int(match[3]),
                 "device_counter_gaps": int(match[4]), "device_counter_resets": int(match[5])}
     report = {"inference": inference, "metrics": metrics, "processes": memory,
-              "system_used_mib": distribution([s["system"]["used_mib"] for s in steady]),
-              "system_available_mib": distribution([s["system"]["available_mib"] for s in steady]),
-              "system_swap_used_mib": distribution([s["system"]["swap_used_mib"] for s in steady]),
+              **{f"system_{k}": distribution([s["system"][k] for s in steady])
+                 for k in ("used_mib", "available_mib", "swap_used_mib")},
               "cameras": camera_report,
               "control": {"states": sorted({s["state"] for s in statuses}),
                           "imu_healthy_samples": sum(s["imu_healthy"] for s in statuses),
@@ -175,14 +143,14 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     build = args.build.resolve()
     children, handles = {}, []
+
     def start(name, command):
         log = (output / (name + ".log")).open("w")
         handles.append(log)
-        child = subprocess.Popen([str(v) for v in command], cwd=stack, stdout=log, stderr=subprocess.STDOUT)
-        children[name] = child
-        return child
+        children[name] = subprocess.Popen([str(v) for v in command], cwd=stack, stdout=log, stderr=subprocess.STDOUT)
+        return children[name]
     camera_dir = output / "frames"
-    socket_path = f"/tmp/kaivuri-native-{os.geteuid()}/pi05-bench.sock"
+    socket_path = f"{RUNTIME_DIR}/pi05-bench.sock"
     control = [build / "kaivuri-control", "--socket", socket_path,
                "--control-hz", str(args.control_hz),
                "--duration-s", str(args.duration_s + 600),
@@ -194,10 +162,8 @@ def run(args):
         control += ["--rt-priority", str(args.rt_priority)]
     camera = [build / "kaivuri-camera", "--output-dir", camera_dir,
               "--metadata-csv", output / "camera-timestamps.csv"]
-    for spec in args.camera:
-        camera += ["--camera", spec]
-    for serial in args.rotate_180:
-        camera += ["--rotate-180", serial]
+    camera += [v for spec in args.camera for v in ("--camera", spec)]
+    camera += [v for serial in args.rotate_180 for v in ("--rotate-180", serial)]
     command = [build / "kaivuri-inference", "--bundle", args.bundle.resolve(),
                "--control-socket", socket_path,
                "--cache", args.cache.resolve(), "--fixtures", args.fixtures.resolve(),
@@ -207,20 +173,14 @@ def run(args):
         command += ["--rate-hz", str(args.rate_hz)]
     if args.parity_cosine is not None:
         command += ["--parity-cosine", str(args.parity_cosine), "--parity-max-abs", str(args.parity_max_abs)]
-    frame_files = []
-    for spec in args.camera:
-        serial, index = spec.split(":")
-        path = camera_dir / f"{serial}-ir{index}.frame"
-        frame_files.append(path)
-        command += ["--camera-frame", path]
+    frame_files = [camera_dir / "{}-ir{}.frame".format(*spec.split(":")) for spec in args.camera]
+    command += [v for path in frame_files for v in ("--camera-frame", path)]
     started = time.monotonic()
-    client = None
-    samples = []
+    client = status_thread = None
+    samples, status_errors = [], []
     successful = False
     initial_memory = system_snapshot()
     status_stop = threading.Event()
-    status_errors = []
-    status_thread = None
 
     def record_status():
         try:
@@ -309,15 +269,7 @@ def run(args):
             status_thread.join(timeout=3)
         if client:
             client.close()
-        for child in children.values():
-            if child.poll() is None:
-                child.terminate()
-        for child in children.values():
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+        stop(list(children.values()))
         for handle in handles:
             handle.close()
         (output / "session.json").write_text(json.dumps({

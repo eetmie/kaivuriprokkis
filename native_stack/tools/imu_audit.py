@@ -28,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 
+from export_episodes import committed_episodes, samples
+
 NAMES = ('cabin', 'boom', 'arm', 'bucket')  # IMU rows and joints share this order (slew = cabin IMU)
 JOINTS = ('slew', 'boom', 'arm', 'bucket')
 MIN_MOVING, MIN_STILL = 1000, 2000  # samples (10 s / 20 s at 100 Hz)
@@ -39,7 +41,7 @@ def episodes(paths):
         if (p / 'samples.jsonl').exists():
             yield p
         else:
-            found = sorted(p.glob('episode-*.ready'))
+            found = committed_episodes(p)
             if not found:
                 raise SystemExit(f'{p}: no saved episodes')
             yield from found
@@ -50,8 +52,8 @@ def load(paths):
     out = []
     for ep in episodes(paths):
         t, g, a, q = [], [], [], []
-        for line in open(ep / 'samples.jsonl'):
-            row = json.loads(line); st = row['status']
+        for row in samples(ep):
+            st = row['status']
             if not st.get('fk_valid') or st.get('simulated_imu') or st.get('imu_gyro_dps') is None:
                 continue
             t.append(row['sample_ns'] / 1e9); g.append(st['imu_gyro_dps']); a.append(st['imu_accel_g']); q.append(st['angles_rad'])

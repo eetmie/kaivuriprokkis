@@ -118,6 +118,34 @@ def camera_rows(paths, socket_path, library, max_fps):
             time.sleep(max(0, 1 / max_fps - (time.monotonic() - start)))
 
 
+def point_cloud(g, z, image, depth_range_mm):
+    """Depth points (m, displayed camera frame) and their gray from the IR image; g from main()'s geometry."""
+    import numpy as np
+    raw_z, raw_ir = (np.rot90(z, 2), np.rot90(image, 2)) if g['turned'] else (z, image)
+    zm = raw_z[::g['step'], ::g['step']].astype(np.float32) * g['scale']
+    # The colormap range also bounds the cloud: sparse far matches would otherwise
+    # dominate the 3D view's automatic framing.
+    lo, hi = (r / 1000 for r in depth_range_mm)
+    ok = (zm >= lo) & (zm <= hi)
+    # Drop speckle: keep points with at least 4 of 8 neighbours within 3% depth.
+    padded = np.pad(np.where(ok, zm, np.nan), 1, constant_values=np.nan)
+    agree = sum(np.abs(padded[1 + dy:padded.shape[0] - 1 + dy, 1 + dx:padded.shape[1] - 1 + dx] - zm) < .03 * zm
+                for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
+    ok &= agree >= 4
+    pts = np.concatenate([g['rays'][ok] * zm[ok, None], zm[ok, None]], 1)
+    # Color from this camera's recorded IR imager (IR2 is 50 mm from depth's IR1).
+    q = pts @ g['R'].T + g['t']
+    ii = g['ii']
+    pu = np.round(q[:, 0] / q[:, 2] * ii['fx'] + ii['ppx']).astype(int)
+    pv = np.round(q[:, 1] / q[:, 2] * ii['fy'] + ii['ppy']).astype(int)
+    inside = (pu >= 0) & (pu < ii['width']) & (pv >= 0) & (pv < ii['height'])
+    gray = np.zeros(len(pts), np.uint8)
+    gray[inside] = raw_ir[pv[inside], pu[inside]]
+    if g['turned']:
+        pts[:, :2] *= -1
+    return pts, gray
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('session', type=Path, nargs='?')
@@ -211,40 +239,19 @@ def main():
         rr.set_time('frame_index', sequence=row['frame_index'])
         for key, data in zip(('cam1', 'cam2'), pixels):
             m = row[key]
+            rotate = key == 'cam1' and args.rotate_camera1
             image = np.frombuffer(data, dtype=np.uint8).reshape(m['height'], m['width'])
-            if key == 'cam1' and args.rotate_camera1:
+            if rotate:
                 image = np.rot90(image, 2).copy()
             rr.log(f'cameras/{key}', rr.Image(image).compress(jpeg_quality=args.jpeg_quality))
             if key in depth:
                 z = np.frombuffer(depth[key], dtype='<u2').reshape(m['height'], m['width'])
-                if key == 'cam1' and args.rotate_camera1:
+                if rotate:
                     z = np.rot90(z, 2).copy()
                 rr.log(f'scene/{key}/camera/depth', rr.DepthImage(z, meter=1000.0, colormap='turbo',
                        depth_range=args.depth_range_mm))
-                g = geometry.get(key)
-                if g:
-                    raw_z, raw_ir = (np.rot90(z, 2), np.rot90(image, 2)) if g['turned'] else (z, image)
-                    zm = raw_z[::g['step'], ::g['step']].astype(np.float32) * g['scale']
-                    # The colormap range also bounds the cloud: sparse far matches would otherwise
-                    # dominate the 3D view's automatic framing.
-                    lo, hi = (r / 1000 for r in args.depth_range_mm)
-                    ok = (zm >= lo) & (zm <= hi)
-                    # Drop speckle: keep points with at least 4 of 8 neighbours within 3% depth.
-                    padded = np.pad(np.where(ok, zm, np.nan), 1, constant_values=np.nan)
-                    agree = sum(np.abs(padded[1 + dy:padded.shape[0] - 1 + dy, 1 + dx:padded.shape[1] - 1 + dx] - zm) < .03 * zm
-                                for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
-                    ok &= agree >= 4
-                    pts = np.concatenate([g['rays'][ok] * zm[ok, None], zm[ok, None]], 1)
-                    # Color from this camera's recorded IR imager (IR2 is 50 mm from depth's IR1).
-                    q = pts @ g['R'].T + g['t']
-                    ii = g['ii']
-                    pu = np.round(q[:, 0] / q[:, 2] * ii['fx'] + ii['ppx']).astype(int)
-                    pv = np.round(q[:, 1] / q[:, 2] * ii['fy'] + ii['ppy']).astype(int)
-                    inside = (pu >= 0) & (pu < ii['width']) & (pv >= 0) & (pv < ii['height'])
-                    gray = np.zeros(len(pts), np.uint8)
-                    gray[inside] = raw_ir[pv[inside], pu[inside]]
-                    if g['turned']:
-                        pts[:, :2] *= -1
+                if geometry.get(key):
+                    pts, gray = point_cloud(geometry[key], z, image, args.depth_range_mm)
                     rr.log(f'scene/{key}/points', rr.Points3D(pts, colors=np.repeat(gray[:, None], 3, 1),
                                                               radii=rr.Radius.ui_points(1.5)))
             age = (row['sample_ns'] - m['host_monotonic_ns']) / 1e6

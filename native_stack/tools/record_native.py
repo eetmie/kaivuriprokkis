@@ -10,15 +10,17 @@ cameras by default as lossless zstd; --depth none restores IR-only capture.
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import signal
 import subprocess
 import tempfile
 import time
 
+from client import stop
+
 SOURCE = Path(__file__).resolve().parents[1]
 PROJECT = SOURCE.parent
+CAM1, CAM2 = '233522073919', '141722076647'  # camera 1: wrist (mounted upside down), camera 2: cabin
 
 
 def wait_for(path, process, timeout=15):
@@ -43,8 +45,8 @@ def main():
     p.add_argument('--profile', type=Path, default=PROJECT / 'configuration_files/profiles/jetson')
     p.add_argument('--safety', type=Path, default=SOURCE / 'config/safety.yaml')
     p.add_argument('--gamepad', help='Xbox evdev path, e.g. /dev/input/by-id/...-event-joystick')
-    p.add_argument('--camera1', default='233522073919:2')
-    p.add_argument('--camera2', default='141722076647:1')
+    p.add_argument('--camera1', default=f'{CAM1}:2')
+    p.add_argument('--camera2', default=f'{CAM2}:1')
     p.add_argument('--fps', type=int, default=30)
     p.add_argument('--resolution', choices=('640x480', '848x480', '1280x720'), default='640x480',
                    help='IR and depth size for both cameras; VLA training and inference use 640x480')
@@ -89,13 +91,9 @@ def main():
     if args.synthetic and not args.bench_seconds:
         p.error('--synthetic requires --bench-seconds')
     specs = [args.camera1, args.camera2]
-    try:
-        parsed = [spec.split(':') for spec in specs]
-        if any(len(s) != 2 or not s[0].replace('-', '').replace('_', '').isalnum() or s[1] not in ('1', '2') for s in parsed):
-            raise ValueError()
-        if parsed[0][0] == parsed[1][0]:
-            raise ValueError()
-    except ValueError:
+    parsed = [spec.split(':') for spec in specs]
+    if (any(len(s) != 2 or not s[0].replace('-', '').replace('_', '').isalnum() or s[1] not in ('1', '2') for s in parsed)
+            or parsed[0][0] == parsed[1][0]):
         p.error('select two different physical cameras as SERIAL:IR_INDEX')
     args.session = args.session.resolve()
     args.session.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +116,11 @@ def main():
     processes = []
     viewer = None
     rc = 1
+
+    def view(*argv):
+        return subprocess.Popen([str(args.view_python), str(SOURCE / 'tools/view_native.py'), *argv,
+                                 '--max-fps', str(args.view_fps), *(['--rotate-camera1'] if args.view_rotate_camera1 else [])],
+                                start_new_session=True)
     try:
         with tempfile.TemporaryDirectory(prefix='kvr-') as tmp:
             runtime = Path(tmp)
@@ -172,11 +175,8 @@ def main():
             recorder = subprocess.Popen(recorder_args, stdin=subprocess.DEVNULL, start_new_session=True)
             processes.append(recorder)
             if args.live_view:
-                viewer = subprocess.Popen([str(args.view_python), str(SOURCE / 'tools/view_native.py'),
-                    '--camera-file', str(files[0]), '--camera-file', str(files[1]),
-                    '--socket', str(runtime / 'control.sock'), '--library', str(args.build / 'libkaivuri_frames.so'),
-                    '--max-fps', str(args.view_fps),
-                    *(['--rotate-camera1'] if args.view_rotate_camera1 else [])], start_new_session=True)
+                viewer = view('--camera-file', str(files[0]), '--camera-file', str(files[1]),
+                              '--socket', str(runtime / 'control.sock'), '--library', str(args.build / 'libkaivuri_frames.so'))
             try:
                 rc = recorder.wait()
             except KeyboardInterrupt:
@@ -185,40 +185,23 @@ def main():
             finally:
                 # Stop recorder before controller and cameras, including startup failures.
                 for proc in reversed(processes):
-                    if proc.poll() is None:
-                        proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
+                    stop([proc])
                 if args.session.exists() and (runtime / 'control-timing.csv').exists():
                     (args.session / 'control-timing.csv').write_bytes((runtime / 'control-timing.csv').read_bytes())
                 if viewer is not None and args.bench_seconds is not None and rc == 0:
                     if viewer.poll() is None:
                         viewer.terminate(); viewer.wait(timeout=10)
-                    viewer = subprocess.Popen([str(args.view_python), str(SOURCE / 'tools/view_native.py'),
-                        str(args.session), '--max-fps', str(args.view_fps),
-                        *(['--rotate-camera1'] if args.view_rotate_camera1 else [])], start_new_session=True)
+                    viewer = view(str(args.session))
                     print('Capture and hardware processes stopped. Rerun remains available; Ctrl+C closes it.', flush=True)
                     try:
                         viewer.wait()
                     except KeyboardInterrupt:
                         pass
     finally:
-        if viewer is not None and viewer.poll() is None:
-            viewer.terminate()
-            try:
-                viewer.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                viewer.kill(); viewer.wait()
+        if viewer is not None:
+            stop([viewer])
         for proc in reversed(processes):
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill(); proc.wait()
+            stop([proc])
         if args.session.exists():
             provenance = args.session / 'provenance'
             provenance.mkdir(exist_ok=True)

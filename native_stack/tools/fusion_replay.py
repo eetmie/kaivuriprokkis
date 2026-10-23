@@ -17,9 +17,10 @@ import os
 from pathlib import Path
 import struct
 import subprocess
-import sys
 
 import numpy as np
+
+from export_episodes import samples
 
 SOURCE = Path(__file__).resolve().parents[1]
 FUSION = SOURCE.parent / 'pico_imu_reader/src/imu_reader/Fusion/Fusion'
@@ -70,7 +71,7 @@ def session_offsets(episode):
 
 
 def load(episode):
-    st = [json.loads(l)['status'] for l in open(episode / 'samples.jsonl')]
+    st = [row['status'] for row in samples(episode)]
     return dict(dev=np.array([s['imu_device_us'] for s in st]) * 1e-6, q=np.array([s['imu_quat_wxyz'] for s in st]),
                 g=np.array([s['imu_gyro_dps'] for s in st]), a=np.array([s['imu_accel_g'] for s in st]),
                 ang=np.array([s['angles_rad'] for s in st]))
@@ -102,7 +103,7 @@ def main():
     print(f'replay gain {a.gain} / rejection {a.rejection} deg / recovery {a.recovery_s} s vs firmware joint angles, p99 deg: '
           f'boom {diff[0]:.3f}, arm {diff[1]:.3f}, bucket {diff[2]:.3f}')
     if a.compare_camera:
-        sys.path.insert(0, str(Path(__file__).parent)); import sidecam_audit as sc
+        import sidecam_audit as sc
         cam = sc.load(episode); sc.geometry(cam)
         for label, ang in (('firmware', d['ang']), ('replay', np.c_[d['ang'][:, :1], replayed])):
             r = sc.compare(cam, ang)

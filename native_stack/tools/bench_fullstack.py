@@ -17,9 +17,9 @@ import time
 SOURCE = Path(__file__).resolve().parents[1]
 PROJECT = SOURCE.parent
 import bench_pi05 as bench  # noqa: E402
-from client import Client  # noqa: E402
-
-CAM1, CAM2 = '233522073919', '141722076647'  # record_native.py defaults: cam1 (wrist, upside down), cam2 (cabin)
+from client import RUNTIME_DIR, Client, stop  # noqa: E402
+from measure import process_snapshot, system_snapshot  # noqa: E402
+from record_native import CAM1, CAM2  # noqa: E402
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
         p.error('--sand-hz needs --calibration')
     out = a.out.resolve(); out.mkdir(parents=True, exist_ok=False)
     build = a.build.resolve()
-    sock = f'/tmp/kaivuri-native-{os.geteuid()}/fullstack.sock'
+    sock = f'{RUNTIME_DIR}/fullstack.sock'
     frames = out / 'frames'
     children, logs = {}, []
 
@@ -93,11 +93,11 @@ def main():
                                '--out', out / 'sand', '--hz', a.sand_hz, '--duration-s', a.duration_s + 30,
                                *a.sand_args.split()], env=env)
                 sand_started = True
-            rec = {'monotonic_ns': time.monotonic_ns(), 'system': bench.system_snapshot(), 'processes': {}}
+            rec = {'monotonic_ns': time.monotonic_ns(), 'system': system_snapshot(), 'processes': {}}
             for n in ('control', 'camera', 'inference', 'sand'):
                 if n in children and children[n].poll() is None:
                     try:
-                        rec['processes'][n] = bench.process_snapshot(children[n].pid)
+                        rec['processes'][n] = process_snapshot(children[n].pid)
                     except (FileNotFoundError, ProcessLookupError):
                         pass
                 elif n in ('control', 'camera'):
@@ -113,14 +113,7 @@ def main():
     finally:
         if client:
             client.close()
-        for c in children.values():
-            if c.poll() is None:
-                c.terminate()
-        for c in children.values():
-            try:
-                c.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                c.kill(); c.wait()
+        stop(list(children.values()), timeout=15)
         for f in logs:
             f.close()
         (out / 'session.json').write_text(json.dumps({'args': {k: str(v) for k, v in vars(a).items()},

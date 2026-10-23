@@ -9,11 +9,12 @@ Needs pupil-apriltags (on the board: ~/kaivuriprokkis/.venv-tags).
 """
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-import json
 from pathlib import Path
 import time
 
 import numpy as np
+
+from export_episodes import samples
 
 FAMILY = 'tagStandard41h12'
 
@@ -24,11 +25,9 @@ def default_tags(episode):
 
 
 def frame_shape(episode):
-    with open(episode / 'samples.jsonl') as f:
-        for line in f:
-            c = json.loads(line).get('cam2')
-            if c:
-                return c['height'], c['width']
+    for row in samples(episode):
+        if row.get('cam2'):
+            return row['cam2']['height'], row['cam2']['width']
     raise SystemExit('no cam2 metadata in samples.jsonl')
 
 

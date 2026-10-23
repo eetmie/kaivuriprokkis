@@ -12,6 +12,7 @@ import argparse
 import collections
 import json
 import math
+import signal
 from pathlib import Path
 import sys
 import threading
@@ -22,20 +23,10 @@ import numpy as np
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 import sand_height as sh  # noqa: E402
+from client import Client  # noqa: E402
 from export_episodes import depth_frames, frame_rows  # noqa: E402
-
-
-def load_rays(path):
-    """sand_height.Rays from a camera depth JSON (live SERIAL-depth.json or recorded camN.depth.json)."""
-    r = sh.Rays.__new__(sh.Rays)
-    c = json.loads(Path(path).read_text()); i = c['depth_intrinsics']
-    r.h, r.w, r.scale = i['height'], i['width'], c['depth_scale_m']
-    v, u = np.mgrid[0:r.h, 0:r.w].astype(float)
-    if c.get('rotation_deg', 0) == 180:
-        u, v = r.w - 1 - u, r.h - 1 - v
-    r.x, r.y = (u - i['ppx']) / i['fx'], (v - i['ppy']) / i['fy']
-    r.serial = c.get('serial')
-    return r
+from frame_reader import FrameReader  # noqa: E402
+from record_native import CAM1, CAM2  # noqa: E402
 
 
 class LiveTracker(sh.SlewTracker):
@@ -52,7 +43,7 @@ class LiveTracker(sh.SlewTracker):
 
     def add(self, data, status, delta, only_new):
         P, _ = self.rays.points(data, 4, .9); Pb = self.mount.base(P, status)
-        W = self.mount.world(Pb[~sh.near_arm(Pb, status, .1)] @ sh.rz(delta).T); W = W[np.abs(W[:, 2]) < .08]
+        W = sh.near_flat(self.mount.world(Pb[~sh.near_arm(Pb, status, .1)] @ sh.rz(delta).T))
         mean, count = sh.raster(W[:, :2], W[:, 2], self.lo, self.shape)
         new = (count > 0) & ((self.count == 0) if only_new else True)
         self.sum[new] += np.nan_to_num(mean[new]) * count[new]; self.count[new] += count[new]
@@ -72,11 +63,8 @@ class LiveTracker(sh.SlewTracker):
 class Engine:
     def __init__(self, cal_path, rays, args):
         cal = json.loads(Path(cal_path).read_text())
-        if cal.get('base_gravity_reference') and not args.no_tilt:
-            sh.GRAVITY_REFERENCE = np.asarray(cal['base_gravity_reference'])
-            sh.TILT_YAW = math.radians(cal.get('tilt_imu_yaw_deg', 0.))
-            sh.TILT_PIVOT = np.asarray(cal.get('tilt_pivot_base_m', [0, 0, 0.]))
-            sh.TILT_DEADBAND = math.radians(cal.get('tilt_deadband_deg', math.degrees(sh.TILT_DEADBAND)))
+        if not args.no_tilt:
+            sh.load_tilt(cal)
         self.args = args
         self.keys = ['cam2'] + (['cam1'] if args.fusion != 'cabin' else [])
         self.mounts = {k: sh.Mount.from_json(cal['cameras'][k]) for k in self.keys}
@@ -88,19 +76,11 @@ class Engine:
             ref = np.load(Path(cal_path).parent / cal['reference_map'])
             self.tracker = sh.SlewTracker(ref['height'], ref['lo'], self.mounts['cam2'], rays['cam2'])
         self.fresh = []  # frames collected for a fresh reference
-        self.poly = np.asarray(cal['sand_polygon_level_xy_m'])
+        self.n = -1  # index of the current map update
+        poly = np.asarray(cal['sand_polygon_level_xy_m'])
         if args.field == 'none':  # the calibration's field outline needs the calibration day's slew zero
-            h = 1.2; self.poly = np.array([[-h, -h], [h, -h], [h, h], [-h, h]])
-        self.lo = self.poly.min(0) - .02
-        self.shape = tuple(np.ceil((self.poly.max(0) + .02 - self.lo) / sh.CELL).astype(int))
-        cells = np.stack(np.meshgrid(np.arange(self.shape[0]), np.arange(self.shape[1]), indexing='ij'), -1)
-        centres = self.lo + (cells.reshape(-1, 2) + .5) * sh.CELL
-        self.in_field = sh.inside(self.poly, centres).reshape(self.shape)
-        middle = self.poly.mean(0)
-        inner = self.poly + (middle - self.poly) * (.03 * math.sqrt(2) / np.linalg.norm(middle - self.poly, axis=1))[:, None]
-        self.in_metric = sh.inside(inner, centres).reshape(self.shape)
-        self.fused = np.full(self.shape, np.nan); self.start = np.full(self.shape, np.nan)
-        self.change = self.fused
+            h = 1.2; poly = np.array([[-h, -h], [h, -h], [h, h], [-h, h]])
+        self.field = sh.FieldMap(poly)
 
     def _refresh_reference(self, data, status, delta):
         """Collect cabin frames at the corrected slew, then swap them in as the tracker reference
@@ -110,18 +90,15 @@ class Engine:
         self.fresh.append(w[(np.abs(w[:, 2]) < .08) & ~sh.near_arm(Pb, status, .1)])
         if len(self.fresh) < self.args.fresh_frames:
             return False
-        W = np.concatenate(self.fresh); self.fresh = None
-        lo = np.floor(W[:, :2].min(0) / sh.CELL) * sh.CELL - .05
-        shape = tuple(np.ceil((W[:, :2].max(0) + .05 - lo) / sh.CELL).astype(int))
-        self.tracker.G = sh.raster(W[:, :2], W[:, 2], lo, shape)[0].astype(np.float32)
-        self.tracker.lo = lo
+        self.tracker.G, self.tracker.lo = sh.height_map(np.concatenate(self.fresh))
+        self.fresh = None
         return True
 
     def update(self, data, status):
         a, t, out = self.args, {}, {}
         c0 = time.perf_counter(); p0 = time.process_time()
         turn = np.eye(3)
-        self.n = getattr(self, 'n', -1) + 1
+        self.n += 1
         if self.tracker is not None and self.n % a.track_every:
             # Between camera fixes: heading = gyro + last correction.
             turn = sh.rz(self.tracker.delta)
@@ -137,31 +114,17 @@ class Engine:
                 c1 = time.perf_counter()
                 out['reference_refreshed'] = self._refresh_reference(data['cam2'], status, delta)
                 t['refresh_ms'] = (time.perf_counter() - c1) * 1e3
-        update = np.zeros(self.shape); weight = np.zeros(self.shape)
+        field = self.field
+        field.begin()
         for k in self.keys:
             c1 = time.perf_counter()
-            m, r = self.mounts[k], self.rays[k]
-            P, _ = r.points(data[k], a.stride, a.max_range_m)
-            Pb = m.base(P, status); arm = sh.near_arm(Pb, status, a.arm_radius_m)
-            W = m.world(Pb @ turn.T)
-            good = (W[:, 2] > -a.below_m) & (W[:, 2] < a.above_m) & sh.inside(self.poly, W[:, :2]) & ~arm
-            mean, count = sh.raster(W[good, :2], W[good, 2], self.lo, self.shape)
-            seen = count > 0
-            if k == 'cam1' and a.fusion == 'fill':
-                seen &= weight == 0
-            update[seen] += mean[seen] * count[seen]; weight[seen] += count[seen]
+            W, good, _ = field.points(self.mounts[k], self.rays[k], data[k], status, turn, a)
+            field.add(k, W[good], a.fusion)
             t[f'{k}_ms'] = (time.perf_counter() - c1) * 1e3
             out[f'{k}_points'] = int(good.sum())
         c1 = time.perf_counter()
-        seen = weight > 0; self.fused[seen] = update[seen] / weight[seen]
-        new = seen & np.isnan(self.start); self.start[new] = self.fused[new]
-        self.change = self.fused - self.start
-        known = np.isfinite(self.change) & self.in_metric; c, h = self.change[known], self.fused[known]
-        area = sh.CELL * sh.CELL * 1000; dead = a.deadband_mm / 1000
-        dug = h[c < -dead]
-        out.update(dug_l=float(-c[c < -dead].sum() * area), piled_l=float(c[c > dead].sum() * area),
-                   hole_bottom_mm=float(-np.percentile(dug, 1) * 1000) if len(dug) > 50 else 0.,
-                   field_seen=float(np.isfinite(self.fused)[self.in_field].mean()))
+        field.commit()
+        out.update(**field.metrics(a.deadband_mm), field_seen=float(np.isfinite(field.fused)[field.in_field].mean()))
         t['metrics_ms'] = (time.perf_counter() - c1) * 1e3
         t['total_ms'] = (time.perf_counter() - c0) * 1e3
         t['cpu_ms'] = (time.process_time() - p0) * 1e3
@@ -169,13 +132,13 @@ class Engine:
         return out
 
     def snapshot(self, path):
-        np.savez_compressed(path.with_suffix('.npz'), fused=self.fused, change=self.change, lo=self.lo,
-                            in_field=self.in_field, poly=self.poly)
+        field = self.field
+        np.savez_compressed(path.with_suffix('.npz'), fused=field.fused, change=field.change, lo=field.lo,
+                            in_field=field.in_field, poly=field.poly)
         try:
             from PIL import Image
             lim = self.args.color_mm / 1000
-            a = sh.diverging(np.where(self.in_field, self.fused, np.nan).T[::-1], lim)
-            b = sh.diverging(np.where(self.in_field, self.change, np.nan).T[::-1], lim)
+            a, b = field.image(field.fused, lim), field.image(field.change, lim)
             gap = np.zeros((a.shape[0], 8, 3), np.uint8)
             parts = [a, gap, b]
             if isinstance(self.tracker, LiveTracker):  # reference map, same cells as the field when --field none
@@ -215,13 +178,9 @@ def common(p):
     p.add_argument('--snapshot-s', type=float, default=5, help='map PNG/NPZ every N seconds (0: end only)')
 
 
-def slim(status):
-    return {k: status.get(k) for k in ('angles_rad', 'slew_yaw_rad', 'imu_host_monotonic_ns', 'host_monotonic_ns', 'state')}
-
-
 def replay(args):
     session = args.session
-    rays = {k: load_rays(session / f'{k}.depth.json') for k in ('cam1', 'cam2')}
+    rays = {k: sh.Rays(session, k) for k in ('cam1', 'cam2')}
     engine = Engine(args.calibration, rays, args)
     episode = sh.episode_path(session, args.episode)
     rows = list(frame_rows(episode))
@@ -243,7 +202,6 @@ class StatusRing(threading.Thread):
     """Poll control status at a fixed rate; keep the recent ones for time pairing with depth."""
     def __init__(self, socket_path, hz):
         super().__init__(daemon=True, name='status')
-        from client import Client
         self.client, self.period = Client(socket_path), 1 / hz
         self.ring, self.lock, self.stop, self.error = collections.deque(maxlen=int(hz * 2)), threading.Lock(), threading.Event(), None
 
@@ -270,7 +228,6 @@ class StatusRing(threading.Thread):
 
 
 def live(args):
-    from frame_reader import FrameReader
     frames = args.frames
     serial = {'cam1': args.cam1, 'cam2': args.cam2}
     deadline = time.monotonic() + 20
@@ -278,7 +235,7 @@ def live(args):
         if time.monotonic() > deadline:
             raise SystemExit('depth JSON not found in ' + str(frames))
         time.sleep(.1)
-    rays = {k: load_rays(frames / f'{serial[k]}-depth.json') for k in ('cam1', 'cam2')}
+    rays = {k: sh.Rays(frames / f'{serial[k]}-depth.json') for k in ('cam1', 'cam2')}
     engine = Engine(args.calibration, rays, args)
     lib = args.library
     readers = {k: FrameReader(frames / f'{serial[k]}-depth.frame', lib, capacity=640 * 480 * 2, max_age_s=.5)
@@ -289,7 +246,6 @@ def live(args):
     end = time.monotonic() + args.duration_s
     nxt = time.monotonic(); last_snap = time.monotonic(); n = 0; skipped = collections.Counter()
     stop = threading.Event(); dumps = {}
-    import signal
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     with (args.out / 'updates.jsonl').open('w') as log:
         while time.monotonic() < end and not stop.is_set():
@@ -374,7 +330,7 @@ def main():
     v = sub.add_parser('live'); common(v)
     v.add_argument('--frames', type=Path, required=True); v.add_argument('--socket', required=True)
     v.add_argument('--library', default=None)
-    v.add_argument('--cam1', default='233522073919'); v.add_argument('--cam2', default='141722076647')
+    v.add_argument('--cam1', default=CAM1); v.add_argument('--cam2', default=CAM2)
     v.add_argument('--hz', type=float, default=2, help='update rate cap (0: as fast as possible)')
     v.add_argument('--status-hz', type=float, default=50)
     v.add_argument('--depth-latency-ms', type=float, default=0, help='pair status this long before depth arrival')

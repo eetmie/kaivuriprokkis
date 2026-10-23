@@ -28,35 +28,6 @@ constexpr const char *usage =
     "Joint PID rates vary independently. Output samples stay at 100 Hz.\n"
     "This is a synthetic plant, with no collision or physical tracking acceptance.\n";
 
-// Args::number() accepts nan/inf and Args::integer() is an int; these options need a finite
-// double and an unsigned 64-bit value.
-double finite(const std::string &flag, const std::string &text) {
-    size_t used = 0;
-    double v = 0;
-    try {
-        v = std::stod(text, &used);
-    } catch (const std::exception &) {
-    }
-    require(used > 0 && used == text.size() && std::isfinite(v),
-            "invalid value for " + flag + ": " + text);
-    return v;
-}
-double finite(Args &args) {
-    const auto text = args.value();
-    return finite(args.flag(), text);
-}
-uint64_t natural(Args &args) {
-    const auto text = args.value();
-    size_t used = 0;
-    uint64_t v = 0;
-    try {
-        if (text[0] != '-')
-            v = std::stoull(text, &used);
-    } catch (const std::exception &) {
-    }
-    require(used > 0 && used == text.size(), "invalid value for " + args.flag() + ": " + text);
-    return v;
-}
 template <class T> YAML::Node sequence(const T &values) {
     YAML::Node n(YAML::NodeType::Sequence);
     for (const auto &value : values)
@@ -202,27 +173,27 @@ int main(int argc, char **argv) {
             else if (args.is("--profile"))
                 profile = args.value();
             else if (args.is("--seed"))
-                o.seed = natural(args);
+                o.seed = args.natural();
             else if (args.is("--seconds"))
-                seconds = finite(args);
+                seconds = args.finite();
             else if (args.is("--min-seconds"))
-                o.min_seconds = finite(args);
+                o.min_seconds = args.finite();
             else if (args.is("--max-seconds"))
-                o.max_seconds = finite(args);
+                o.max_seconds = args.finite();
             else if (args.is("--gain-min"))
-                o.gain_min = finite(args);
+                o.gain_min = args.finite();
             else if (args.is("--gain-max"))
-                o.gain_max = finite(args);
+                o.gain_max = args.finite();
             else if (args.is("--min-speed-mm-s"))
-                o.min_speed = finite(args) / 1000;
+                o.min_speed = args.finite() / 1000;
             else if (args.is("--max-speed-mm-s"))
-                o.max_speed = finite(args) / 1000;
+                o.max_speed = args.finite() / 1000;
             else if (args.is("--pid-rates")) {
                 const auto value = args.value();
                 o.pid_rates.clear();
                 std::istringstream rates(value);
                 for (std::string rate; std::getline(rates, rate, ',');)
-                    o.pid_rates.push_back(finite(args.flag(), rate));
+                    o.pid_rates.push_back(Args::finite(args.flag(), rate));
                 require(!value.empty() && value.back() != ',', "empty PID rate");
             } else
                 args.unknown();

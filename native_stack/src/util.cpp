@@ -1,5 +1,6 @@
 #include "kaivuri/util.hpp"
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -85,6 +86,32 @@ double Args::number() {
     require(used == text.size() && used > 0, "invalid value for " + flag_ + ": " + text);
     return v;
 }
+double Args::finite() {
+    return finite(flag_, value());
+}
+double Args::finite(const std::string &flag, const std::string &text) {
+    size_t used = 0;
+    double v = 0;
+    try {
+        v = std::stod(text, &used);
+    } catch (const std::exception &) {
+    }
+    require(used > 0 && used == text.size() && std::isfinite(v),
+            "invalid value for " + flag + ": " + text);
+    return v;
+}
+uint64_t Args::natural() {
+    auto text = value();
+    size_t used = 0;
+    uint64_t v = 0;
+    try {
+        if (text[0] != '-')
+            v = std::stoull(text, &used);
+    } catch (const std::exception &) {
+    }
+    require(used > 0 && used == text.size(), "invalid value for " + flag_ + ": " + text);
+    return v;
+}
 int Args::integer() {
     auto text = value();
     size_t used = 0;
@@ -117,8 +144,7 @@ std::string sha256_hex(const void *data, size_t bytes) {
 std::string sha256_file(const std::filesystem::path &path) {
     std::ifstream in(path, std::ios::binary);
     require(bool(in), "cannot hash: " + path.string());
-    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),
-                                                                 EVP_MD_CTX_free);
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
     require(ctx && EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) == 1, "SHA256 init failed");
     char bytes[65536];
     while (in.read(bytes, sizeof(bytes)) || in.gcount())

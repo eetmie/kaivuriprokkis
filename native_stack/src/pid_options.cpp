@@ -25,25 +25,6 @@ constexpr const char *usage =
     "Scripted input: start, save, pump, assist, excitation, manual BOOM ARM BUCKET, quit.\n"
     "Joint targets/commands are bounded; obstacle/full-reach routing is not implemented.\n";
 
-// Args::number() accepts nan/inf and Args::integer() is an int; these options need a finite
-// double and an unsigned 64-bit value.
-double finite(Args &args) {
-    const double v = args.number();
-    require(std::isfinite(v), "invalid value for " + args.flag() + ": " + std::to_string(v));
-    return v;
-}
-uint64_t natural(Args &args) {
-    const auto text = args.value();
-    size_t used = 0;
-    uint64_t v = 0;
-    try {
-        if (text[0] != '-')
-            v = std::stoull(text, &used);
-    } catch (const std::exception &) {
-    }
-    require(used > 0 && used == text.size(), "invalid value for " + args.flag() + ": " + text);
-    return v;
-}
 std::string read(const fs::path &path) {
     std::ifstream input(path, std::ios::binary);
     require(bool(input), "cannot read " + path.string());
@@ -104,7 +85,7 @@ AppOptions parse_options(int argc, char **argv) {
         else if (args.is("--suffix"))
             o.suffix = args.value();
         else if (args.is("--seed")) {
-            o.planning.seed = natural(args);
+            o.planning.seed = args.natural();
             o.fixed_seed = true;
         } else if (args.is("--dry"))
             o.dry = true;
@@ -113,17 +94,17 @@ AppOptions parse_options(int argc, char **argv) {
         else if (args.is("--record-on-start"))
             o.record_on_start = true;
         else if (args.is("--duration-s"))
-            o.duration = finite(args);
+            o.duration = args.finite();
         else if (args.is("--record-seconds"))
-            o.record_seconds = finite(args);
+            o.record_seconds = args.finite();
         else if (args.is("--queue-records"))
-            o.queue = natural(args);
+            o.queue = args.natural();
         else if (args.is("--read-chunk-bytes"))
-            o.read_chunk = natural(args);
+            o.read_chunk = args.natural();
         else if (args.is("--excitation-amplitude"))
-            o.excitation.amplitude = finite(args);
+            o.excitation.amplitude = args.finite();
         else if (args.is("--chirp-seconds"))
-            o.excitation.sweep_s = finite(args);
+            o.excitation.sweep_s = args.finite();
         else if (args.is("--excitation")) {
             const auto v = args.value();
             require(v == "sine" || v == "chirp", "PID overlay supports sine or chirp");

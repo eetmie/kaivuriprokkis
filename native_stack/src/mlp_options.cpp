@@ -33,25 +33,6 @@ constexpr const char *usage =
     "Scripted stdin: start, save, pump, excitation, target NAME, command "
     "SIX_VALUES, quit.\n";
 
-double finite(Args &args) {
-    const double v = args.number();
-    require(std::isfinite(v), "invalid value for " + args.flag() + ": " + std::to_string(v));
-    return v;
-}
-// Args::integer() is a signed int; queue sizes and uint32 seeds need the full unsigned range,
-// and a leading '-' must not wrap around.
-uint64_t natural(Args &args) {
-    const auto text = args.value();
-    size_t used = 0;
-    uint64_t v = 0;
-    try {
-        v = std::stoull(text, &used);
-    } catch (const std::exception &) {
-    }
-    require(used > 0 && used == text.size() && text[0] != '-',
-            "invalid value for " + args.flag() + ": " + text);
-    return v;
-}
 Waveform waveform(const std::string &name) {
     for (auto w : {Waveform::Sine, Waveform::Chirp, Waveform::Stroke})
         if (name == waveform_name(w))
@@ -93,34 +74,34 @@ Options parse_options(int argc, char **argv) {
         else if (args.is("--record-on-start"))
             o.record_on_start = true;
         else if (args.is("--duration-s"))
-            o.duration = finite(args);
+            o.duration = args.finite();
         else if (args.is("--record-seconds"))
-            o.record_seconds = finite(args);
+            o.record_seconds = args.finite();
         else if (args.is("--queue-records"))
-            o.queue = natural(args);
+            o.queue = args.natural();
         else if (args.is("--read-chunk-bytes"))
-            o.read_chunk = natural(args);
+            o.read_chunk = args.natural();
         else if (args.is("--excitation"))
             e.waveform = waveform(args.value());
         else if (args.is("--excitation-target"))
             e.target = target_mask(args.value());
         else if (args.is("--excitation-seed")) {
-            const auto seed = natural(args);
+            const auto seed = args.natural();
             require(seed <= UINT32_MAX, "seed must be uint32");
             e.seed = uint32_t(seed);
             o.fixed_seed = true;
         } else if (args.is("--excitation-amplitude"))
-            e.amplitude = finite(args);
+            e.amplitude = args.finite();
         else if (args.is("--chirp-start-hz"))
-            start_hz = finite(args);
+            start_hz = args.finite();
         else if (args.is("--chirp-end-hz"))
-            e.end_hz = finite(args);
+            e.end_hz = args.finite();
         else if (args.is("--chirp-seconds"))
-            sweep_s = finite(args);
+            sweep_s = args.finite();
         else if (args.is("--stroke-seconds"))
-            e.stroke_s = finite(args);
+            e.stroke_s = args.finite();
         else if (args.is("--stroke-margin-deg"))
-            e.margin_deg = finite(args);
+            e.margin_deg = args.finite();
         else if (args.is("--help")) {
             std::cout << usage;
             std::exit(0);

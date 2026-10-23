@@ -57,6 +57,7 @@ std::filesystem::path runtime_dir();
 
 // Command-line walker: while (args.next()) { if (args.is("--x")) x = args.number(); ... }
 // Errors read "missing argument: --x", "invalid value for --x: abc", "unknown option: --y".
+// Numbers must use the whole argument ("1junk" is rejected).
 class Args {
   public:
     Args(int argc, char **argv) : argc_(argc), argv_(argv) {}
@@ -64,8 +65,12 @@ class Args {
     bool is(const char *flag) const { return flag_ == flag; }
     const std::string &flag() const { return flag_; }
     std::string value();
-    double number();
+    double number(); // accepts inf/nan (e.g. --action-tolerance inf)
+    double finite();
     int integer();
+    uint64_t natural(); // non-negative, full 64-bit range; a leading '-' is rejected
+    // finite() for a value that is not the next argument (e.g. one item of a list).
+    static double finite(const std::string &flag, const std::string &text);
     [[noreturn]] void unknown() const;
 
   private:

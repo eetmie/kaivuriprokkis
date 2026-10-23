@@ -1,21 +1,29 @@
 #pragma once
 #include "kaivuri/core.hpp"
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace kaivuri::collection {
 using Angles = std::array<double, 3>;
 using Matrix = std::array<Angles, 3>;
+using Limits = std::array<std::array<double, 2>, 3>;
+inline constexpr std::array<const char *, 3> joint_names{"boom", "arm", "bucket"};
+inline constexpr uint64_t output_period_ns = 10000000; // fixed 100 Hz output clock
 struct Gains {
     double kp = 0, ki = 0, kd = 0, tau = .1;
 };
 struct Robot {
     Config hardware;
-    std::array<std::array<double, 2>, 3> limits{};
+    Limits limits{};
     std::array<Gains, 3> gains{};
     double pitch_offset = 0;
 };
 Robot load_robot(const std::filesystem::path &profile);
+// profile.yaml followed by the control and servo files it names.
+std::vector<std::string> profile_files(const std::filesystem::path &profile);
+// Excitation limits in degrees: slew is unbounded, then boom/arm/bucket from the robot.
+std::array<std::array<double, 2>, 4> excitation_limits_deg(const Robot &);
 
 struct TaskState {
     Angles pose{}; // carriage-relative x [m], z [m], cutting-lip pitch [rad]
@@ -71,7 +79,7 @@ struct GuardResult {
 // A command-direction guard, not a braking model or collision certificate.
 // Outside either limit, only the direction back into the working range passes.
 class JointGuard {
-    std::array<std::array<double, 2>, 3> limits_{};
+    Limits limits_{};
     GuardOptions options_;
 
   public:
@@ -139,6 +147,9 @@ class RandomCollection {
     void choose_segment(uint64_t now, const Angles &q);
     void reset_pids(double limit);
     void begin_recovery(uint64_t now, const Angles &q);
+    // Row-major grid index with each joint's bin clamped to [first, end).
+    size_t grid_index(const Angles &q, const std::array<size_t, 3> &first,
+                      const std::array<size_t, 3> &end) const;
 
   public:
     RandomCollection(Robot, Options = {});

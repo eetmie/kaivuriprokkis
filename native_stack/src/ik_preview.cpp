@@ -1,5 +1,6 @@
 #include "kaivuri/ik_collection.hpp"
 #include "kaivuri/mlp_excitation.hpp"
+#include "kaivuri/util.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -17,23 +18,44 @@ using namespace kaivuri;
 using namespace kaivuri::collection;
 namespace fs = std::filesystem;
 namespace {
-constexpr std::array<const char *, 3> joints{"boom", "arm", "bucket"};
-constexpr uint64_t tick_ns = 10000000, block_ticks = 2000;
-double number(const std::string &text) {
-    size_t end = 0;
-    const double value = std::stod(text, &end);
-    if (end != text.size() || !std::isfinite(value))
-        throw std::invalid_argument("expected a finite number: " + text);
-    return value;
+constexpr uint64_t block_ticks = 2000;
+constexpr const char *usage =
+    "Hardware-free IK/PID synthetic preview; never connects to robot devices.\n"
+    "Usage: kaivuri-ik-preview --out NEW_DIR [--profile PROFILE_DIR] [--seconds 120] [--seed 42]\n"
+    "  --min-seconds 0.1 --max-seconds 3 --pid-rates 25,50,100\n"
+    "  --gain-min 0.5 --gain-max 1.5 --min-speed-mm-s 5 --max-speed-mm-s 20\n"
+    "  --no-excitation   Disable alternating clean/sine/chirp preview blocks.\n"
+    "Joint PID rates vary independently. Output samples stay at 100 Hz.\n"
+    "This is a synthetic plant, with no collision or physical tracking acceptance.\n";
+
+// Args::number() accepts nan/inf and Args::integer() is an int; these options need a finite
+// double and an unsigned 64-bit value.
+double finite(const std::string &flag, const std::string &text) {
+    size_t used = 0;
+    double v = 0;
+    try {
+        v = std::stod(text, &used);
+    } catch (const std::exception &) {
+    }
+    require(used > 0 && used == text.size() && std::isfinite(v),
+            "invalid value for " + flag + ": " + text);
+    return v;
 }
-uint64_t integer(const std::string &text) {
-    size_t end = 0;
-    if (text.empty() || text[0] == '-')
-        throw std::invalid_argument("expected a nonnegative integer");
-    const auto value = std::stoull(text, &end);
-    if (end != text.size())
-        throw std::invalid_argument("expected an integer: " + text);
-    return value;
+double finite(Args &args) {
+    const auto text = args.value();
+    return finite(args.flag(), text);
+}
+uint64_t natural(Args &args) {
+    const auto text = args.value();
+    size_t used = 0;
+    uint64_t v = 0;
+    try {
+        if (text[0] != '-')
+            v = std::stoull(text, &used);
+    } catch (const std::exception &) {
+    }
+    require(used > 0 && used == text.size(), "invalid value for " + args.flag() + ": " + text);
+    return v;
 }
 template <class T> YAML::Node sequence(const T &values) {
     YAML::Node n(YAML::NodeType::Sequence);
@@ -57,60 +79,54 @@ void write_yaml(const fs::path &file, const YAML::Node &node) {
     YAML::Emitter emitter;
     emitter.SetDoublePrecision(17);
     emitter << node;
-    if (!emitter.good())
-        throw std::runtime_error("cannot encode " + file.string());
+    require(emitter.good(), "cannot encode " + file.string());
     std::ofstream stream(file);
     stream << emitter.c_str() << '\n';
-    if (!stream)
-        throw std::runtime_error("cannot write " + file.string());
+    require(bool(stream), "cannot write " + file.string());
 }
+template <class Prefixes, class Names>
+void columns(std::ostream &stream, const Prefixes &prefixes, const Names &names) {
+    for (const auto *prefix : prefixes)
+        for (const auto *name : names)
+            stream << ',' << prefix << '_' << name;
+}
+constexpr std::array<const char *, 3> task_names{"x_m", "z_m", "pitch_rad"};
 struct Csv {
     std::ofstream stream;
     explicit Csv(const fs::path &file) : stream(file) {
-        if (!stream)
-            throw std::runtime_error("cannot open preview CSV");
-        stream << std::setprecision(17);
-        stream << "timestamp,tick,segment_id,segment_kind,excitation_block,excitation_mode,"
+        require(bool(stream), "cannot open preview CSV");
+        stream << std::setprecision(17)
+               << "timestamp,tick,segment_id,segment_kind,excitation_block,excitation_mode,"
                   "excitation_stage,valid,reason,coverage_cell";
-        for (const auto *prefix :
-             {"q_rad", "q_ref_rad", "task", "task_ref", "assist", "excitation_requested", "command",
-              "excitation_effective", "pid_rate_requested_hz", "pid_updated", "pid_dt_s",
-              "kp_applied", "ki_applied", "kd_applied", "clipped"})
-            if (std::string(prefix) == "task" || std::string(prefix) == "task_ref") {
-                for (const auto *name : {"x_m", "z_m", "pitch_rad"})
-                    stream << ',' << prefix << '_' << name;
-            } else {
-                for (const auto *name : joints)
-                    stream << ',' << prefix << '_' << name;
-            }
+        columns(stream, std::array{"q_rad", "q_ref_rad"}, joint_names);
+        columns(stream, std::array{"task", "task_ref"}, task_names);
+        columns(stream,
+                std::array{"assist", "excitation_requested", "command", "excitation_effective",
+                           "pid_rate_requested_hz", "pid_updated", "pid_dt_s", "kp_applied",
+                           "ki_applied", "kd_applied", "clipped"},
+                joint_names);
         stream << ",ik_position_error_m,ik_pitch_error_rad,ik_iterations,step_work_us\n";
     }
-    template <class T> void values(const T &a) {
-        for (const auto &v : a)
-            stream << ',' << v;
+    template <class... T> void values(const T &...arrays) {
+        auto one = [&](const auto &array) {
+            for (const auto &v : array)
+                stream << ',' << v;
+        };
+        (one(arrays), ...);
     }
     void row(uint64_t tick, const Angles &q, const Output &o, const Segment &s, uint64_t block,
              const char *mode, const char *stage, double work_us) {
         stream << double(tick) / 100 << ',' << tick << ',' << s.id << ',' << kind_name(s.kind)
                << ',' << block << ',' << mode << ',' << stage << ',' << o.valid << ',' << o.reason
                << ',' << o.cell;
-        values(q);
-        values(o.joint_reference);
-        values(o.measured.pose);
-        values(o.reference);
-        values(o.assist);
-        values(o.excitation);
-        values(o.command);
         Angles effective{};
         for (unsigned j = 0; j < 3; ++j)
             effective[j] = o.command[j] - o.assist[j];
-        values(effective);
-        values(s.pid_rates);
-        values(o.pid_updated);
-        values(o.pid_dt);
-        for (unsigned term = 0; term < 3; ++term)
+        values(q, o.joint_reference, o.measured.pose, o.reference, o.assist, o.excitation,
+               o.command, effective, s.pid_rates, o.pid_updated, o.pid_dt);
+        for (auto term : {&Gains::kp, &Gains::ki, &Gains::kd})
             for (const auto &g : o.applied_gains)
-                stream << ',' << (term == 0 ? g.kp : term == 1 ? g.ki : g.kd);
+                stream << ',' << g.*term;
         values(o.clipped);
         stream << ',' << o.ik.position_error << ',' << o.ik.pitch_error << ',' << o.ik.iterations
                << ',' << work_us << '\n';
@@ -134,8 +150,8 @@ YAML::Node segment_record(const Segment &s) {
 YAML::Node block_record(uint64_t index, const mlp::Excitation *e) {
     YAML::Node n;
     n["index"] = index;
-    n["begin_ns"] = index * block_ticks * tick_ns;
-    n["end_ns_requested"] = (index + 1) * block_ticks * tick_ns;
+    n["begin_ns"] = index * block_ticks * output_period_ns;
+    n["end_ns_requested"] = (index + 1) * block_ticks * output_period_ns;
     n["enabled"] = e != nullptr;
     if (!e) {
         n["mode"] = "clean";
@@ -150,9 +166,8 @@ YAML::Node block_record(uint64_t index, const mlp::Excitation *e) {
     n["start_hz"] = b.options.start_hz;
     n["end_hz"] = b.options.end_hz;
     n["sweep_s_each_direction"] = b.options.sweep_s;
-    for (unsigned j = 0; j < 4; ++j) {
+    for (const auto &v : b.parameters) {
         YAML::Node p;
-        const auto &v = b.parameters[j];
         p["env_hz"] = v.env;
         p["carrier_hz"] = v.carrier;
         p["fm_rate_hz"] = v.rate;
@@ -174,74 +189,53 @@ int main(int argc, char **argv) {
         fs::path out, profile = fs::path(NATIVE_SOURCE) / "../configuration_files/profiles/jetson";
         double seconds = 120;
         bool excite = true;
-        for (int i = 1; i < argc; ++i) {
-            const std::string arg = argv[i];
-            if (arg == "--help") {
-                std::cout
-                    << "Hardware-free IK/PID synthetic preview; never connects to robot devices.\n"
-                       "Usage: kaivuri-ik-preview --out NEW_DIR [--profile PROFILE_DIR] [--seconds "
-                       "120] [--seed 42]\n"
-                       "  --min-seconds 0.1 --max-seconds 3 --pid-rates 25,50,100\n"
-                       "  --gain-min 0.5 --gain-max 1.5 --min-speed-mm-s 5 --max-speed-mm-s 20\n"
-                       "  --no-excitation   Disable alternating clean/sine/chirp preview blocks.\n"
-                       "Joint PID rates vary independently. Output samples stay at 100 Hz.\n"
-                       "This is a synthetic plant, with no collision or physical tracking "
-                       "acceptance.\n";
+        Args args(argc, argv);
+        while (args.next()) {
+            if (args.is("--help")) {
+                std::cout << usage;
                 return 0;
             }
-            if (arg == "--no-excitation") {
+            if (args.is("--no-excitation"))
                 excite = false;
-                continue;
-            }
-            if (i + 1 == argc)
-                throw std::invalid_argument("missing value for " + arg);
-            const std::string value = argv[++i];
-            if (arg == "--out")
-                out = value;
-            else if (arg == "--profile")
-                profile = value;
-            else if (arg == "--seed")
-                o.seed = integer(value);
-            else if (arg == "--seconds")
-                seconds = number(value);
-            else if (arg == "--min-seconds")
-                o.min_seconds = number(value);
-            else if (arg == "--max-seconds")
-                o.max_seconds = number(value);
-            else if (arg == "--gain-min")
-                o.gain_min = number(value);
-            else if (arg == "--gain-max")
-                o.gain_max = number(value);
-            else if (arg == "--min-speed-mm-s")
-                o.min_speed = number(value) / 1000;
-            else if (arg == "--max-speed-mm-s")
-                o.max_speed = number(value) / 1000;
-            else if (arg == "--pid-rates") {
+            else if (args.is("--out"))
+                out = args.value();
+            else if (args.is("--profile"))
+                profile = args.value();
+            else if (args.is("--seed"))
+                o.seed = natural(args);
+            else if (args.is("--seconds"))
+                seconds = finite(args);
+            else if (args.is("--min-seconds"))
+                o.min_seconds = finite(args);
+            else if (args.is("--max-seconds"))
+                o.max_seconds = finite(args);
+            else if (args.is("--gain-min"))
+                o.gain_min = finite(args);
+            else if (args.is("--gain-max"))
+                o.gain_max = finite(args);
+            else if (args.is("--min-speed-mm-s"))
+                o.min_speed = finite(args) / 1000;
+            else if (args.is("--max-speed-mm-s"))
+                o.max_speed = finite(args) / 1000;
+            else if (args.is("--pid-rates")) {
+                const auto value = args.value();
                 o.pid_rates.clear();
                 std::istringstream rates(value);
-                std::string rate;
-                while (std::getline(rates, rate, ','))
-                    o.pid_rates.push_back(number(rate));
-                if (value.empty() || value.back() == ',')
-                    throw std::invalid_argument("empty PID rate");
+                for (std::string rate; std::getline(rates, rate, ',');)
+                    o.pid_rates.push_back(finite(args.flag(), rate));
+                require(!value.empty() && value.back() != ',', "empty PID rate");
             } else
-                throw std::invalid_argument("unknown option: " + arg);
+                args.unknown();
         }
-        if (out.empty())
-            throw std::invalid_argument("--out NEW_DIR is required");
-        if (seconds <= 0 || seconds > 86400)
-            throw std::invalid_argument("--seconds must be in (0, 86400]");
+        require(!out.empty(), "--out NEW_DIR is required");
+        require(seconds > 0 && seconds <= 86400, "--seconds must be in (0, 86400]");
         const auto robot = load_robot(profile);
         RandomCollection controller(robot, o);
         if (!out.parent_path().empty())
             fs::create_directories(out.parent_path());
-        if (!fs::create_directory(out))
-            throw std::invalid_argument("output directory already exists");
+        require(fs::create_directory(out), "output directory already exists");
         fs::create_directory(out / "profile");
-        const auto p = YAML::LoadFile((profile / "profile.yaml").string());
-        for (const std::string &file :
-             {std::string("profile.yaml"), p["control_config_file"].as<std::string>(),
-              p["servo_config_file"].as<std::string>()})
+        for (const auto &file : profile_files(profile))
             fs::copy_file(profile / file, out / "profile" / file);
 
         YAML::Node protocol, segments(YAML::NodeType::Sequence), blocks(YAML::NodeType::Sequence);
@@ -254,7 +248,7 @@ int main(int argc, char **argv) {
         protocol["profile"] = fs::canonical(profile).string();
         protocol["seed"] = o.seed;
         protocol["frame"] = "slew-pivot-relative x/z, cutting-lip pitch, radians";
-        protocol["joint_order"] = sequence(joints);
+        protocol["joint_order"] = sequence(joint_names);
         protocol["output_hz"] = 100;
         protocol["requested_seconds"] = seconds;
         protocol["segment_seconds_min_max"] =
@@ -296,11 +290,7 @@ int main(int argc, char **argv) {
         Angles q{}, velocity{};
         for (unsigned j = 0; j < 3; ++j)
             q[j] = (robot.limits[j][0] + robot.limits[j][1]) / 2;
-        std::array<std::array<double, 2>, 4> limits{};
-        limits[0] = {-180, 180};
-        for (unsigned j = 0; j < 3; ++j)
-            for (unsigned side = 0; side < 2; ++side)
-                limits[j + 1][side] = robot.limits[j][side] * 180 / pi;
+        const auto limits = excitation_limits_deg(robot);
         std::unique_ptr<mlp::Excitation> excitation;
         uint64_t block = 0, valid = 0, clipped = 0, boundaries = 0;
         std::array<uint64_t, 3> updates{};
@@ -333,7 +323,7 @@ int main(int argc, char **argv) {
                     overlay[j] = u[j + 1];
             }
             const auto begin = std::chrono::steady_clock::now();
-            const auto output = controller.step(tick * tick_ns, q, overlay);
+            const auto output = controller.step(tick * output_period_ns, q, overlay);
             const double work_us =
                 std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin)
                     .count();
@@ -366,8 +356,7 @@ int main(int argc, char **argv) {
             }
         }
         csv.stream.close();
-        if (!csv.stream)
-            throw std::runtime_error("preview CSV write failed");
+        require(bool(csv.stream), "preview CSV write failed");
         protocol["segments"] = segments;
         protocol["excitation_blocks"] = blocks;
         write_yaml(out / "protocol.yaml", protocol);
@@ -378,8 +367,7 @@ int main(int argc, char **argv) {
                 coverage << i << ',' << controller.dwell()[i] << ',' << controller.moving_dwell()[i]
                          << '\n';
         coverage.close();
-        if (!coverage)
-            throw std::runtime_error("coverage write failed");
+        require(bool(coverage), "coverage write failed");
         YAML::Node summary;
         summary["synthetic_only"] = true;
         summary["collision_checked"] = false;

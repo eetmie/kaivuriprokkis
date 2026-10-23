@@ -1,4 +1,5 @@
 #include "kaivuri/ik_collection.hpp"
+#include "kaivuri/util.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -7,6 +8,11 @@
 
 namespace kaivuri::collection {
 namespace {
+// Library errors stay std::invalid_argument: callers and tests rely on the type.
+void check(bool condition, const char *message) {
+    if (!condition)
+        throw std::invalid_argument(message);
+}
 bool finite(const Angles &a) {
     return std::all_of(a.begin(), a.end(), [](double v) { return std::isfinite(v); });
 }
@@ -16,8 +22,7 @@ Angles solve(Matrix a, Angles b) {
         for (unsigned j = i + 1; j < 3; ++j)
             if (std::abs(a[j][i]) > std::abs(a[pivot][i]))
                 pivot = j;
-        if (std::abs(a[pivot][i]) < 1e-15)
-            throw std::runtime_error("singular DLS solve");
+        require(std::abs(a[pivot][i]) >= 1e-15, "singular DLS solve");
         std::swap(a[i], a[pivot]);
         std::swap(b[i], b[pivot]);
         for (unsigned j = i + 1; j < 3; ++j) {
@@ -38,19 +43,30 @@ Angles solve(Matrix a, Angles b) {
 }
 void check_gains(const Gains &g) {
     for (double v : {g.kp, g.ki, g.kd, g.tau})
-        if (!std::isfinite(v) || v < 0)
-            throw std::invalid_argument("invalid PID gains");
+        check(std::isfinite(v) && v >= 0, "invalid PID gains");
 }
 } // namespace
 
+std::vector<std::string> profile_files(const std::filesystem::path &profile) {
+    const auto p = YAML::LoadFile((profile / "profile.yaml").string());
+    return {"profile.yaml", p["control_config_file"].as<std::string>(),
+            p["servo_config_file"].as<std::string>()};
+}
+std::array<std::array<double, 2>, 4> excitation_limits_deg(const Robot &robot) {
+    std::array<std::array<double, 2>, 4> limits{};
+    limits[0] = {-180, 180};
+    for (unsigned j = 0; j < 3; ++j)
+        for (unsigned side = 0; side < 2; ++side)
+            limits[j + 1][side] = robot.limits[j][side] * 180 / pi;
+    return limits;
+}
 Robot load_robot(const std::filesystem::path &profile) {
     Robot r;
     r.hardware = load_hardware_config(profile.string());
     const auto p = YAML::LoadFile((profile / "profile.yaml").string());
     const auto c = YAML::LoadFile((profile / p["control_config_file"].as<std::string>()).string());
-    r.pitch_offset = c["robot"]["tool"]["pitch_offset_rad"]
-                         ? c["robot"]["tool"]["pitch_offset_rad"].as<double>()
-                         : 0;
+    const auto pitch_offset = c["robot"]["tool"]["pitch_offset_rad"];
+    r.pitch_offset = pitch_offset ? pitch_offset.as<double>() : 0;
     for (unsigned i = 0; i < 3; ++i) {
         const auto l = c["ik"]["joint_limits_relative"][i + 1];
         r.limits[i] = {l[0].as<double>() * pi / 180, l[1].as<double>() * pi / 180};
@@ -61,20 +77,19 @@ Robot load_robot(const std::filesystem::path &profile) {
     return r;
 }
 Kinematics::Kinematics(Robot robot) : robot_(std::move(robot)) {
-    if (!std::isfinite(robot_.pitch_offset))
-        throw std::invalid_argument("invalid tool pitch");
+    check(std::isfinite(robot_.pitch_offset), "invalid tool pitch");
     for (unsigned i = 0; i < 3; ++i) {
         const auto &axis = robot_.hardware.joints[i + 1].axis;
-        if (std::abs(axis[0]) > 1e-10 || std::abs(axis[1] - 1) > 1e-10 || std::abs(axis[2]) > 1e-10)
-            throw std::invalid_argument("collection requires aligned positive-Y arm joints");
+        check(!(std::abs(axis[0]) > 1e-10 || std::abs(axis[1] - 1) > 1e-10 ||
+                std::abs(axis[2]) > 1e-10),
+              "collection requires aligned positive-Y arm joints");
         const auto &l = robot_.limits[i];
-        if (!std::isfinite(l[0]) || !std::isfinite(l[1]) || l[0] >= l[1])
-            throw std::invalid_argument("invalid collection joint limits");
+        check(std::isfinite(l[0]) && std::isfinite(l[1]) && l[0] < l[1],
+              "invalid collection joint limits");
     }
 }
 TaskState Kinematics::state(const Angles &q) const {
-    if (!finite(q))
-        throw std::invalid_argument("nonfinite joint angles");
+    check(finite(q), "nonfinite joint angles");
     const auto fk = forward_kinematic_state(robot_.hardware, {0, q[0], q[1], q[2]});
     TaskState result;
     result.pose = {fk.upper.position[0], fk.upper.position[2],
@@ -128,8 +143,7 @@ IkResult Kinematics::inverse(const Angles &target, const Angles &seed, double ma
 }
 
 Pid::Pid(Gains gains, double limit) : limit_(limit) {
-    if (!std::isfinite(limit) || limit <= 0 || limit > 1)
-        throw std::invalid_argument("invalid PID limit");
+    check(std::isfinite(limit) && limit > 0 && limit <= 1, "invalid PID limit");
     configure(gains, false);
 }
 void Pid::configure(Gains gains, bool preserve) {
@@ -150,10 +164,8 @@ void Pid::reset() {
 double Pid::compute(double setpoint, double measured, double dt, double excitation,
                     bool blocked_positive, bool blocked_negative) {
     for (double v : {setpoint, measured, dt, excitation})
-        if (!std::isfinite(v))
-            throw std::invalid_argument("nonfinite PID input");
-    if (dt < 0)
-        throw std::invalid_argument("negative PID dt");
+        check(std::isfinite(v), "nonfinite PID input");
+    check(dt >= 0, "negative PID dt");
     dt = std::max(dt, .001);
     const double error = setpoint - measured;
     const double raw_d = have_last_ ? -(measured - last_) / dt : 0;
@@ -176,16 +188,16 @@ double Pid::compute(double setpoint, double measured, double dt, double excitati
 
 JointGuard::JointGuard(const Robot &robot, GuardOptions options)
     : limits_(robot.limits), options_(options) {
-    if (!std::isfinite(options.margin) || options.margin < 0 || !std::isfinite(options.taper) ||
-        options.taper <= 0 || !std::isfinite(options.velocity_lookahead) ||
-        options.velocity_lookahead < 0)
-        throw std::invalid_argument("invalid joint guard parameters");
+    check(std::isfinite(options.margin) && options.margin >= 0 && std::isfinite(options.taper) &&
+              options.taper > 0 && std::isfinite(options.velocity_lookahead) &&
+              options.velocity_lookahead >= 0,
+          "invalid joint guard parameters");
     for (unsigned i = 0; i < 3; ++i) {
         const auto &l = limits_[i];
-        if (!std::isfinite(l[0]) || !std::isfinite(l[1]) ||
-            l[1] - l[0] <= 2 * (options.margin + options.taper) ||
-            (options.command_sign[i] != 1 && options.command_sign[i] != -1))
-            throw std::invalid_argument("invalid guard joint range or command sign");
+        check(std::isfinite(l[0]) && std::isfinite(l[1]) &&
+                  l[1] - l[0] > 2 * (options.margin + options.taper) &&
+                  (options.command_sign[i] == 1 || options.command_sign[i] == -1),
+              "invalid guard joint range or command sign");
     }
 }
 GuardResult JointGuard::apply(const Angles &q, const Angles &velocity, const Angles &command,
@@ -220,8 +232,7 @@ GuardResult JointGuard::apply(const Angles &q, const Angles &velocity, const Ang
 }
 double guarded_valve_pulse(const Valve &v, double command, bool limited, double now,
                            RampState &state) {
-    if (!std::isfinite(command) || !std::isfinite(now))
-        throw std::invalid_argument("nonfinite guarded PWM input");
+    check(std::isfinite(command) && std::isfinite(now), "nonfinite guarded PWM input");
     if (command == 0) {
         state = {v.center, now, true};
         return v.center;
@@ -252,42 +263,38 @@ RandomCollection::RandomCollection(Robot robot, Options options)
     for (double v : {o.min_seconds, o.max_seconds, o.min_speed, o.max_speed, o.max_pitch_change,
                      o.pitch_rate, o.gain_min, o.gain_max, o.joint_margin, o.max_lead,
                      o.coverage_bin, o.goal_seconds, o.max_gap, o.recovery_limit, o.recovery_inset})
-        if (!std::isfinite(v) || v <= 0)
-            throw std::invalid_argument("invalid random collection options");
-    if (o.min_seconds > o.max_seconds || o.min_speed > o.max_speed || o.gain_min > o.gain_max ||
-        o.max_seconds > 86400 || o.max_pitch_change > pi || o.max_gap < .01 ||
-        o.recovery_limit > o.valve_limit ||
-        std::ceil(o.min_seconds * 100) > std::floor(o.max_seconds * 100) || o.pid_rates.empty())
-        throw std::invalid_argument("invalid random collection ranges");
+        check(std::isfinite(v) && v > 0, "invalid random collection options");
+    check(!(o.min_seconds > o.max_seconds || o.min_speed > o.max_speed || o.gain_min > o.gain_max ||
+            o.max_seconds > 86400 || o.max_pitch_change > pi || o.max_gap < .01 ||
+            o.recovery_limit > o.valve_limit ||
+            std::ceil(o.min_seconds * 100) > std::floor(o.max_seconds * 100) ||
+            o.pid_rates.empty()),
+          "invalid random collection ranges");
     for (double hz : o.pid_rates)
-        if (!std::isfinite(hz) || hz <= 0 || hz > 100 || !std::isfinite(100 / hz) ||
-            1e9 / hz >= double(std::numeric_limits<int64_t>::max()) ||
-            std::abs(100 / hz - std::round(100 / hz)) > 1e-9)
-            throw std::invalid_argument("PID rates must divide the fixed 100 Hz output clock");
+        check(std::isfinite(hz) && hz > 0 && hz <= 100 && std::isfinite(100 / hz) &&
+                  1e9 / hz < double(std::numeric_limits<int64_t>::max()) &&
+                  std::abs(100 / hz - std::round(100 / hz)) <= 1e-9,
+              "PID rates must divide the fixed 100 Hz output clock");
     for (double sign : o.command_sign)
-        if (sign != 1 && sign != -1)
-            throw std::invalid_argument("invalid PID command growth sign");
+        check(sign == 1 || sign == -1, "invalid PID command growth sign");
     for (const auto &g : robot.gains)
         check_gains({g.kp * o.gain_max, g.ki * o.gain_max, g.kd * o.gain_max, g.tau});
     size_t size = 1;
     for (unsigned i = 0; i < 3; ++i) {
         const auto &l = robot.limits[i];
-        if (l[1] - l[0] <= 2 * (o.joint_margin + o.recovery_inset))
-            throw std::invalid_argument("joint margin and recovery inset consume range");
+        check(l[1] - l[0] > 2 * (o.joint_margin + o.recovery_inset),
+              "joint margin and recovery inset consume range");
         const double count = std::ceil((l[1] - l[0]) / o.coverage_bin);
-        if (!std::isfinite(count) || count > 1000000)
-            throw std::invalid_argument("coverage grid too large");
+        check(std::isfinite(count) && count <= 1000000, "coverage grid too large");
         bins_[i] = size_t(count);
-        if (bins_[i] > 1000000 / size)
-            throw std::invalid_argument("coverage grid too large");
+        check(bins_[i] <= 1000000 / size, "coverage grid too large");
         size *= bins_[i];
         // Count bins with nonzero overlap with the working interval. Exact
         // boundary points belong to its nearest interior bin for this statistic.
-        const auto first = size_t(std::floor(o.joint_margin / o.coverage_bin + 1e-10));
-        const auto end = size_t(std::ceil((l[1] - l[0] - o.joint_margin) / o.coverage_bin - 1e-10));
-        working_begin_[i] = first;
-        working_end_[i] = end;
-        working_cells_ *= end - first;
+        working_begin_[i] = size_t(std::floor(o.joint_margin / o.coverage_bin + 1e-10));
+        working_end_[i] =
+            size_t(std::ceil((l[1] - l[0] - o.joint_margin) / o.coverage_bin - 1e-10));
+        working_cells_ *= working_end_[i] - working_begin_[i];
     }
     dwell_.resize(size);
     moving_.resize(size);
@@ -316,24 +323,27 @@ void RandomCollection::reset_pids(double limit) {
         pid_[i] = Pid(kin_.robot().gains[i], limit);
 }
 void RandomCollection::feedback_limited(const Angles &requested, const Angles &actual) {
-    if (!finite(requested) || !finite(actual))
-        throw std::invalid_argument("nonfinite guard feedback");
+    check(finite(requested) && finite(actual), "nonfinite guard feedback");
     for (unsigned i = 0; i < 3; ++i) {
         const double lost = (requested[i] - actual[i]) * options_.command_sign[i];
         block_positive_[i] = block_positive_[i] || lost > 1e-12;
         block_negative_[i] = block_negative_[i] || lost < -1e-12;
     }
 }
-size_t RandomCollection::cell(const Angles &q) const {
-    if (!finite(q))
-        throw std::invalid_argument("nonfinite coverage pose");
+size_t RandomCollection::grid_index(const Angles &q, const std::array<size_t, 3> &first,
+                                    const std::array<size_t, 3> &end) const {
     size_t result = 0;
     for (unsigned i = 0; i < 3; ++i) {
         const double offset = (q[i] - kin_.robot().limits[i][0]) / options_.coverage_bin;
-        const size_t index = size_t(std::clamp(std::floor(offset), 0., double(bins_[i] - 1)));
-        result = result * bins_[i] + index;
+        const auto bin =
+            size_t(std::clamp(std::floor(offset), double(first[i]), double(end[i] - 1)));
+        result = result * bins_[i] + bin;
     }
     return result;
+}
+size_t RandomCollection::cell(const Angles &q) const {
+    check(finite(q), "nonfinite coverage pose");
+    return grid_index(q, {}, bins_);
 }
 void RandomCollection::choose_goal(uint64_t now, const Angles &q) {
     const auto pose = kin_.state(q).pose;
@@ -379,7 +389,7 @@ void RandomCollection::choose_segment(uint64_t now, const Angles &q) {
         uint64_t(std::clamp(std::ceil(seconds * 100), std::ceil(options_.min_seconds * 100),
                             std::floor(options_.max_seconds * 100)));
     segment_.duration = double(ticks) / 100;
-    segment_.end_ns = now + ticks * 10000000;
+    segment_.end_ns = now + ticks * output_period_ns;
     const double direction = uniform(-pi, pi),
                  speed = uniform(options_.min_speed, options_.max_speed);
     segment_.velocity = {speed * std::cos(direction), speed * std::sin(direction)};
@@ -468,17 +478,10 @@ Output RandomCollection::step(uint64_t now, const Angles &q, const Angles &excit
                 moving_[index] += dt;
             if (kin_.inside(previous_q_, options_.joint_margin) &&
                 kin_.inside(q, options_.joint_margin)) {
-                size_t working_index = 0;
-                for (unsigned i = 0; i < 3; ++i) {
-                    const double offset =
-                        (previous_q_[i] - kin_.robot().limits[i][0]) / options_.coverage_bin;
-                    const auto bin =
-                        size_t(std::clamp(std::floor(offset), double(working_begin_[i]),
-                                          double(working_end_[i] - 1)));
-                    working_index = working_index * bins_[i] + bin;
-                }
-                if (!working_visited_[working_index]) {
-                    working_visited_[working_index] = 1;
+                auto &visited =
+                    working_visited_[grid_index(previous_q_, working_begin_, working_end_)];
+                if (!visited) {
+                    visited = 1;
                     ++visited_working_cells_;
                 }
             }
@@ -534,7 +537,7 @@ Output RandomCollection::step(uint64_t now, const Angles &q, const Angles &excit
         if (!out.ik.reached) {
             reference_ = out.measured.pose;
             reset_pids(options_.valve_limit);
-            segment_.end_ns = now + 10000000;
+            segment_.end_ns = now + output_period_ns;
             out.reason = "ik_unreachable";
             return out;
         }

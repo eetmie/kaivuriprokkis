@@ -1,12 +1,11 @@
 // RealSense IR (and optional same-sensor Z16 depth) capture into the shared frame stores.
 #include "kaivuri/frame_store.hpp"
+#include "kaivuri/util.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <csignal>
 #include <cstdarg>
 #include <cstdio>
-#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <librealsense2/rs.hpp>
@@ -17,68 +16,10 @@
 #include <zstd.h>
 using namespace kaivuri;
 
-// kaivuri-camera links only kaivuri_frames and realsense, not kaivuri_core, so these mirror
-// kaivuri/util.hpp locally with the same names and behaviour.
 namespace {
-void require(bool condition, const std::string &message) {
-    if (!condition)
-        throw std::runtime_error(message);
-}
-uint64_t monotonic_ns() {
-    timespec t{};
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return uint64_t(t.tv_sec) * 1000000000ULL + uint64_t(t.tv_nsec);
-}
 double monotonic_seconds() {
     return monotonic_ns() * 1e-9;
 }
-volatile std::sig_atomic_t stop_requested = 0;
-void install_stop_handlers() {
-    std::signal(SIGINT, [](int) { stop_requested = 1; });
-    std::signal(SIGTERM, [](int) { stop_requested = 1; });
-}
-std::string runtime_dir() {
-    return "/tmp/kaivuri-native-" + std::to_string(geteuid());
-}
-class Args {
-  public:
-    Args(int argc, char **argv) : argc_(argc), argv_(argv) {}
-    bool next() {
-        if (++index_ >= argc_)
-            return false;
-        flag_ = argv_[index_];
-        return true;
-    }
-    bool is(const char *flag) const { return flag_ == flag; }
-    std::string value() {
-        require(++index_ < argc_, "missing argument: " + flag_);
-        return argv_[index_];
-    }
-    double number() {
-        return parse([](const std::string &s, size_t *n) { return std::stod(s, n); });
-    }
-    int integer() {
-        return parse([](const std::string &s, size_t *n) { return std::stoi(s, n); });
-    }
-    [[noreturn]] void unknown() const { throw std::runtime_error("unknown option: " + flag_); }
-
-  private:
-    template <class F> auto parse(F convert) -> decltype(convert(std::string(), nullptr)) {
-        const auto text = value();
-        size_t used = 0;
-        decltype(convert(text, nullptr)) v{};
-        try {
-            v = convert(text, &used);
-        } catch (const std::exception &) {
-        }
-        require(used == text.size() && used > 0, "invalid value for " + flag_ + ": " + text);
-        return v;
-    }
-    int argc_, index_ = 0;
-    char **argv_;
-    std::string flag_;
-};
-
 __attribute__((format(printf, 1, 2))) std::string format(const char *pattern, ...) {
     char text[512];
     va_list values;
@@ -237,7 +178,7 @@ int main(int argc, char **argv) {
         int width = 640, height = 480, fps = 30;
         double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2;
         bool list = false, synthetic = false, global_time = true, require_metadata = true;
-        std::string output = runtime_dir() + "/cameras", csv_path, depth_log;
+        std::string output = (runtime_dir() / "cameras").string(), csv_path, depth_log;
         std::vector<std::string> specs, rotate_serials, depth_serials;
         for (Args args(argc, argv); args.next();) {
             if (args.is("--camera"))

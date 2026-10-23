@@ -1,43 +1,121 @@
+// RealSense IR (and optional same-sensor Z16 depth) capture into the shared frame stores.
 #include "kaivuri/frame_store.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <csignal>
+#include <cstdarg>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <librealsense2/rs.hpp>
 #include <memory>
-#include <signal.h>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
 #include <zstd.h>
 using namespace kaivuri;
-static double monotonic_seconds() {
+
+// kaivuri-camera links only kaivuri_frames and realsense, not kaivuri_core, so these mirror
+// kaivuri/util.hpp locally with the same names and behaviour.
+namespace {
+void require(bool condition, const std::string &message) {
+    if (!condition)
+        throw std::runtime_error(message);
+}
+uint64_t monotonic_ns() {
     timespec t{};
     clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
+    return uint64_t(t.tv_sec) * 1000000000ULL + uint64_t(t.tv_nsec);
 }
-static volatile sig_atomic_t stopped = 0;
-static void stop_signal(int) {
-    stopped = 1;
+double monotonic_seconds() {
+    return monotonic_ns() * 1e-9;
 }
-struct Camera {
-    std::string serial, path;
-    int index = 1, sync = 0;
-    rs2::sensor sensor;
+volatile std::sig_atomic_t stop_requested = 0;
+void install_stop_handlers() {
+    std::signal(SIGINT, [](int) { stop_requested = 1; });
+    std::signal(SIGTERM, [](int) { stop_requested = 1; });
+}
+std::string runtime_dir() {
+    return "/tmp/kaivuri-native-" + std::to_string(geteuid());
+}
+class Args {
+  public:
+    Args(int argc, char **argv) : argc_(argc), argv_(argv) {}
+    bool next() {
+        if (++index_ >= argc_)
+            return false;
+        flag_ = argv_[index_];
+        return true;
+    }
+    bool is(const char *flag) const { return flag_ == flag; }
+    std::string value() {
+        require(++index_ < argc_, "missing argument: " + flag_);
+        return argv_[index_];
+    }
+    double number() {
+        return parse([](const std::string &s, size_t *n) { return std::stod(s, n); });
+    }
+    int integer() {
+        return parse([](const std::string &s, size_t *n) { return std::stoi(s, n); });
+    }
+    [[noreturn]] void unknown() const { throw std::runtime_error("unknown option: " + flag_); }
+
+  private:
+    template <class F> auto parse(F convert) -> decltype(convert(std::string(), nullptr)) {
+        const auto text = value();
+        size_t used = 0;
+        decltype(convert(text, nullptr)) v{};
+        try {
+            v = convert(text, &used);
+        } catch (const std::exception &) {
+        }
+        require(used == text.size() && used > 0, "invalid value for " + flag_ + ": " + text);
+        return v;
+    }
+    int argc_, index_ = 0;
+    char **argv_;
+    std::string flag_;
+};
+
+__attribute__((format(printf, 1, 2))) std::string format(const char *pattern, ...) {
+    char text[512];
+    va_list values;
+    va_start(values, pattern);
+    std::vsnprintf(text, sizeof text, pattern, values);
+    va_end(values);
+    return text;
+}
+
+// Read handle on a frame store; closes on destruction.
+using Reader = std::unique_ptr<void, void (*)(void *)>;
+Reader open_reader(const std::string &path, const char *what) {
+    Reader reader(kaivuri_frame_open(path.c_str()), kaivuri_frame_close);
+    require(bool(reader), what);
+    return reader;
+}
+
+// One published stream (IR Y8 or depth Z16) and its counters, shared with the SDK callback.
+struct Stream {
+    std::string path;
+    uint32_t bytes_per_pixel = 1;
     std::unique_ptr<FrameWriter> writer;
     std::atomic<uint64_t> received{0}, dropped{0}, last_ns{0};
-    std::atomic<uint64_t> last_device_counter{0}, counter_gaps{0}, counter_resets{0};
-    std::atomic<int> error{0};
-    bool started = false, opened = false, rotate_180 = false;
-    std::vector<uint8_t> rotated;
+    std::atomic<uint64_t> last_counter{0}, counter_gaps{0}, counter_resets{0};
+    std::vector<uint16_t> rotated; // width*height pixels when rotating 180 degrees, else empty
+};
+
+struct Camera {
+    std::string serial;
+    int index = 1, sync = 0;
+    rs2::sensor sensor;
+    Stream ir;
     // Optional Z16 depth from the same stereo sensor: computed on the camera, aligned to IR1.
-    bool depth = false;
-    std::string depth_path;
-    std::unique_ptr<FrameWriter> depth_writer;
-    std::atomic<uint64_t> depth_received{0}, depth_dropped{0}, depth_last_ns{0};
-    std::atomic<uint64_t> depth_last_counter{0}, depth_counter_gaps{0};
-    std::vector<uint16_t> depth_rotated;
+    bool with_depth = false;
+    Stream depth;
+    std::atomic<int> error{0}; // 1 = required timestamp metadata missing, 2 = callback failure
+    bool started = false, opened = false, rotate_180 = false;
     ~Camera() {
         try {
             if (started)
@@ -48,11 +126,30 @@ struct Camera {
         }
     }
 };
-static uint64_t mono_ns() {
-    return static_cast<uint64_t>(monotonic_seconds() * 1e9);
+
+// Publishes one packed frame, rotated 180 degrees when configured. False on a layout the
+// rotation cannot handle.
+bool publish(Stream &s, const FrameMetadata &m, const void *pixels) {
+    if (!s.rotated.empty()) {
+        const size_t n = size_t(m.width) * m.height;
+        if (m.stride != m.width * s.bytes_per_pixel || n != s.rotated.size())
+            return false;
+        if (s.bytes_per_pixel == 1) {
+            const auto *source = static_cast<const uint8_t *>(pixels);
+            std::reverse_copy(source, source + n, reinterpret_cast<uint8_t *>(s.rotated.data()));
+        } else {
+            const auto *source = static_cast<const uint16_t *>(pixels);
+            std::reverse_copy(source, source + n, s.rotated.data());
+        }
+        pixels = s.rotated.data();
+    }
+    if (!s.writer->publish(m, pixels))
+        ++s.dropped;
+    return true;
 }
-// Shared by IR and depth. Returns false when the SDK timestamp is invalid.
-static bool read_metadata(const rs2::frame &frame, const rs2::video_frame &v, FrameMetadata &m) {
+
+// Returns false when the SDK timestamp is invalid.
+bool read_metadata(const rs2::frame &frame, const rs2::video_frame &v, FrameMetadata &m) {
     m.sdk_timestamp_ms = frame.get_timestamp();
     if (!std::isfinite(m.sdk_timestamp_ms) || m.sdk_timestamp_ms < 0)
         return false;
@@ -74,111 +171,56 @@ static bool read_metadata(const rs2::frame &frame, const rs2::video_frame &v, Fr
         }
     return true;
 }
-// Pair depth with IR by sensor_timestamp_us: both streams of one exposure share it exactly,
-// while their frame counters differ by one (+1 against IR1, -1 against IR2, firmware 5.17).
-static void publish_depth(Camera *c, const rs2::frame &frame, const rs2::video_frame &v,
-                          bool require_metadata) {
+
+// SDK callback body for IR (ir_index 1/2) and depth (ir_index 0). Depth pairs with IR by
+// sensor_timestamp_us: both streams of one exposure share it exactly, while their frame
+// counters differ by one (+1 against IR1, -1 against IR2, firmware 5.17).
+void on_frame(Camera &c, Stream &s, const rs2::frame &frame, const rs2::video_frame &v,
+              uint32_t ir_index, bool require_metadata) {
     FrameMetadata m{};
-    m.host_monotonic_ns = mono_ns();
+    m.sequence = ++s.received;
+    m.host_monotonic_ns = monotonic_ns();
+    s.last_ns = m.host_monotonic_ns;
     if (!read_metadata(frame, v, m)) {
-        c->error = 2;
+        c.error = 2;
         return;
     }
-    m.sequence = ++c->depth_received;
-    c->depth_last_ns = m.host_monotonic_ns;
-    m.ir_index = 0;
+    m.ir_index = ir_index;
+    if (ir_index)
+        m.pixel_bytes = m.width * m.height; // IR is published packed
     if (m.valid_metadata & 4) {
-        const auto previous = c->depth_last_counter.exchange(m.frame_counter);
+        const auto previous = s.last_counter.exchange(m.frame_counter);
         if (previous && m.frame_counter > previous + 1)
-            c->depth_counter_gaps += m.frame_counter - previous - 1;
+            s.counter_gaps += m.frame_counter - previous - 1;
+        else if (previous && m.frame_counter <= previous)
+            ++s.counter_resets;
     }
-    if (require_metadata && (m.valid_metadata & 3) != 3) {
-        c->error = 1;
-        return;
-    }
-    const void *pixels = v.get_data();
-    if (c->rotate_180) {
-        const size_t n = size_t(m.width) * m.height;
-        if (m.stride != m.width * 2 || n != c->depth_rotated.size()) {
-            c->error = 2;
-            return;
-        }
-        const auto *source = static_cast<const uint16_t *>(pixels);
-        std::reverse_copy(source, source + n, c->depth_rotated.begin());
-        pixels = c->depth_rotated.data();
-    }
-    if (!c->depth_writer->publish(m, pixels))
-        ++c->depth_dropped;
+    if (require_metadata && (m.valid_metadata & 3) != 3)
+        c.error = 1;
+    else if (!publish(s, m, v.get_data()))
+        c.error = 2;
 }
-static void write_json(const std::string &path, const std::string &text) {
+
+void write_json(const std::string &path, const std::string &text) {
     std::ofstream f(path + ".new");
     f << text;
     f.close();
-    if (!f)
-        throw std::runtime_error("cannot write " + path);
+    require(bool(f), "cannot write " + path);
     std::filesystem::rename(path + ".new", path);
 }
-static std::string intrinsics_json(const rs2_intrinsics &i) {
-    char b[512];
-    std::snprintf(b, sizeof b,
-                  "{\"width\":%d,\"height\":%d,\"fx\":%.9g,\"fy\":%.9g,\"ppx\":%.9g,"
+
+std::string intrinsics_json(const rs2_intrinsics &i) {
+    return format("{\"width\":%d,\"height\":%d,\"fx\":%.9g,\"fy\":%.9g,\"ppx\":%.9g,"
                   "\"ppy\":%.9g,\"model\":\"%s\",\"coeffs\":[%.9g,%.9g,%.9g,%.9g,%.9g]}",
                   i.width, i.height, i.fx, i.fy, i.ppx, i.ppy, rs2_distortion_to_string(i.model),
                   i.coeffs[0], i.coeffs[1], i.coeffs[2], i.coeffs[3], i.coeffs[4]);
-    return b;
 }
-int main(int argc, char **argv) {
-    try {
-        int width = 640, height = 480, fps = 30;
-        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2;
-        bool list = false, synthetic = false, global_time = true, require_metadata = true;
-        std::string output = "/tmp/kaivuri-native-" + std::to_string(geteuid()) + "/cameras",
-                    csv_path, depth_log;
-        std::vector<std::string> specs, rotate_serials, depth_serials;
-        for (int i = 1; i < argc; ++i) {
-            std::string a = argv[i];
-            auto value = [&]() {
-                if (++i == argc)
-                    throw std::runtime_error("missing option argument");
-                return std::string(argv[i]);
-            };
-            if (a == "--camera")
-                specs.push_back(value());
-            else if (a == "--rotate-180")
-                rotate_serials.push_back(value());
-            else if (a == "--depth")
-                depth_serials.push_back(value());
-            else if (a == "--depth-log")
-                depth_log = value();
-            else if (a == "--depth-log-hz")
-                depth_log_hz = std::stod(value());
-            else if (a == "--width")
-                width = std::stoi(value());
-            else if (a == "--height")
-                height = std::stoi(value());
-            else if (a == "--fps")
-                fps = std::stoi(value());
-            else if (a == "--duration-s")
-                duration = std::stod(value());
-            else if (a == "--exposure-us")
-                exposure = std::stod(value());
-            else if (a == "--gain")
-                gain = std::stod(value());
-            else if (a == "--output-dir")
-                output = value();
-            else if (a == "--metadata-csv")
-                csv_path = value();
-            else if (a == "--list")
-                list = true;
-            else if (a == "--synthetic")
-                synthetic = true;
-            else if (a == "--hardware-clock")
-                global_time = false;
-            else if (a == "--allow-missing-metadata")
-                require_metadata = false;
-            else if (a == "--help") {
-                std::puts(
-                    "kaivuri-camera --list\nkaivuri-camera --camera SERIAL:IR_INDEX[:SYNC_MODE] "
+
+bool contains(const std::vector<std::string> &list, const std::string &item) {
+    return std::find(list.begin(), list.end(), item) != list.end();
+}
+
+const char *usage = "kaivuri-camera --list\nkaivuri-camera --camera SERIAL:IR_INDEX[:SYNC_MODE] "
                     "[--camera SECOND:1]\n  [--width 640 --height 480 --fps 30] [--duration-s SEC] "
                     "[--exposure-us US --gain N]\n  [--hardware-clock] [--allow-missing-metadata] "
                     "[--output-dir DIR] [--metadata-csv FILE]\n  [--rotate-180 SERIAL] [--depth "
@@ -187,143 +229,162 @@ int main(int argc, char **argv) {
                     "standalone, 1 master, 2 slave; requires a sync cable.\n--depth adds same-size "
                     "Z16 from the camera's stereo ASIC to SERIAL-depth.frame (+ SERIAL-depth.json\n"
                     "calibration); --depth-log appends zstd snapshots at the given rate. Emitter "
-                    "disabled;\nno RGB, host conversion, encoding, or CUDA context.");
+                    "disabled;\nno RGB, host conversion, encoding, or CUDA context.";
+} // namespace
+
+int main(int argc, char **argv) {
+    try {
+        int width = 640, height = 480, fps = 30;
+        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2;
+        bool list = false, synthetic = false, global_time = true, require_metadata = true;
+        std::string output = runtime_dir() + "/cameras", csv_path, depth_log;
+        std::vector<std::string> specs, rotate_serials, depth_serials;
+        for (Args args(argc, argv); args.next();) {
+            if (args.is("--camera"))
+                specs.push_back(args.value());
+            else if (args.is("--rotate-180"))
+                rotate_serials.push_back(args.value());
+            else if (args.is("--depth"))
+                depth_serials.push_back(args.value());
+            else if (args.is("--depth-log"))
+                depth_log = args.value();
+            else if (args.is("--depth-log-hz"))
+                depth_log_hz = args.number();
+            else if (args.is("--width"))
+                width = args.integer();
+            else if (args.is("--height"))
+                height = args.integer();
+            else if (args.is("--fps"))
+                fps = args.integer();
+            else if (args.is("--duration-s"))
+                duration = args.number();
+            else if (args.is("--exposure-us"))
+                exposure = args.number();
+            else if (args.is("--gain"))
+                gain = args.number();
+            else if (args.is("--output-dir"))
+                output = args.value();
+            else if (args.is("--metadata-csv"))
+                csv_path = args.value();
+            else if (args.is("--list"))
+                list = true;
+            else if (args.is("--synthetic"))
+                synthetic = true;
+            else if (args.is("--hardware-clock"))
+                global_time = false;
+            else if (args.is("--allow-missing-metadata"))
+                require_metadata = false;
+            else if (args.is("--help")) {
+                std::puts(usage);
                 return 0;
             } else
-                throw std::runtime_error("unknown camera option: " + a);
+                args.unknown();
         }
-        if (width < 1 || height < 1 || uint64_t(width) * height > 16 * 1024 * 1024 || fps < 1 ||
-            fps > 90 || duration < 0 || !std::isfinite(duration) || !std::isfinite(exposure) ||
-            !std::isfinite(gain) || !std::isfinite(depth_log_hz) || depth_log_hz <= 0 ||
-            (!depth_log.empty() && depth_serials.empty()))
-            throw std::runtime_error("invalid camera options");
-        // Context is not constructed in synthetic mode, avoiding USB enumeration and SDK worker
-        // threads.
+        require(width >= 1 && height >= 1 && uint64_t(width) * height <= 16 * 1024 * 1024 &&
+                    fps >= 1 && fps <= 90 && duration >= 0 && std::isfinite(duration) &&
+                    std::isfinite(exposure) && std::isfinite(gain) && std::isfinite(depth_log_hz) &&
+                    depth_log_hz > 0 && (depth_log.empty() || !depth_serials.empty()),
+                "invalid camera options");
+        // Synthetic mode constructs no context: no USB enumeration or SDK worker threads.
+        // Otherwise keep one enumeration alive for both cameras: re-enumerating after starting
+        // the first RSUSB stream can reopen its claimed USB interfaces.
         std::unique_ptr<rs2::context> context;
         std::vector<rs2::device> devices;
-        if (!synthetic)
+        if (!synthetic) {
             context = std::make_unique<rs2::context>();
-        // Keep one enumeration alive for both cameras. Re-enumerating after
-        // starting the first RSUSB stream can reopen its claimed USB interfaces.
-        if (context)
             for (auto device : context->query_devices())
                 devices.push_back(device);
+        }
         if (list) {
-            if (synthetic)
-                throw std::runtime_error("--list requires real devices");
-            for (auto d : devices)
+            require(!synthetic, "--list requires real devices");
+            auto info = [](const rs2::device &d, rs2_camera_info key) {
+                return d.supports(key) ? d.get_info(key) : "unknown";
+            };
+            for (const auto &d : devices)
                 std::printf("%s  %s  firmware=%s usb=%s port=%s\n",
                             d.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER),
                             d.get_info(RS2_CAMERA_INFO_NAME),
                             d.get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION),
-                            d.supports(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR)
-                                ? d.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR)
-                                : "unknown",
-                            d.supports(RS2_CAMERA_INFO_PHYSICAL_PORT)
-                                ? d.get_info(RS2_CAMERA_INFO_PHYSICAL_PORT)
-                                : "unknown");
+                            info(d, RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR),
+                            info(d, RS2_CAMERA_INFO_PHYSICAL_PORT));
             return 0;
         }
-        if (specs.empty() || specs.size() > 2)
-            throw std::runtime_error(
+        require(!specs.empty() && specs.size() <= 2,
                 "select one or two cameras explicitly with --camera SERIAL:IR_INDEX");
         std::filesystem::create_directories(output);
         std::filesystem::permissions(output, std::filesystem::perms::owner_all,
                                      std::filesystem::perm_options::replace);
+        const size_t frame_pixels = size_t(width) * height;
+        // First matching video profile of a sensor at the requested size and rate (index -1: any).
+        auto find_profile = [&](const rs2::sensor &sensor, rs2_stream type, int index,
+                                rs2_format pixel_format) {
+            for (auto p : sensor.get_stream_profiles()) {
+                auto video = p.as<rs2::video_stream_profile>();
+                if (video && p.stream_type() == type && (index < 0 || p.stream_index() == index) &&
+                    p.format() == pixel_format && video.width() == width &&
+                    video.height() == height && p.fps() == fps)
+                    return p;
+            }
+            return rs2::stream_profile();
+        };
         std::vector<std::unique_ptr<Camera>> cameras;
         for (const auto &spec : specs) {
             auto camera = std::make_unique<Camera>();
             auto first = spec.find(':');
-            if (first == std::string::npos)
-                throw std::runtime_error("camera syntax SERIAL:IR_INDEX[:SYNC_MODE]");
+            require(first != std::string::npos, "camera syntax SERIAL:IR_INDEX[:SYNC_MODE]");
             auto second = spec.find(':', first + 1);
             camera->serial = spec.substr(0, first);
             camera->index = std::stoi(spec.substr(first + 1, second - first - 1));
             if (second != std::string::npos)
                 camera->sync = std::stoi(spec.substr(second + 1));
-            if (camera->serial.empty() ||
-                camera->serial.find_first_not_of(
-                    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_") !=
-                    std::string::npos ||
-                camera->index < 1 || camera->index > 2 || camera->sync < 0 || camera->sync > 2)
-                throw std::runtime_error("invalid camera spec");
+            require(!camera->serial.empty() &&
+                        camera->serial.find_first_not_of("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                                         "abcdefghijklmnopqrstuvwxyz-_") ==
+                            std::string::npos &&
+                        camera->index >= 1 && camera->index <= 2 && camera->sync >= 0 &&
+                        camera->sync <= 2,
+                    "invalid camera spec");
             for (const auto &previous : cameras)
-                if (previous->serial == camera->serial)
-                    throw std::runtime_error("select one IR stream per physical camera");
-            camera->rotate_180 = std::find(rotate_serials.begin(), rotate_serials.end(),
-                                           camera->serial) != rotate_serials.end();
-            if (camera->rotate_180)
-                camera->rotated.resize(size_t(width) * height);
-            camera->path =
-                output + "/" + camera->serial + "-ir" + std::to_string(camera->index) + ".frame";
-            camera->writer =
-                std::make_unique<FrameWriter>(camera->path, width, height, camera->index);
-            camera->depth = std::find(depth_serials.begin(), depth_serials.end(), camera->serial) !=
-                            depth_serials.end();
-            std::string calibration;
-            if (camera->depth) {
-                camera->depth_path = output + "/" + camera->serial + "-depth.frame";
-                if (camera->rotate_180)
-                    camera->depth_rotated.resize(size_t(width) * height);
-                if (synthetic)
-                    calibration = "{\"synthetic\":true,\"depth_scale_m\":0.001}\n";
+                require(previous->serial != camera->serial,
+                        "select one IR stream per physical camera");
+            const std::string base = output + "/" + camera->serial;
+            camera->rotate_180 = contains(rotate_serials, camera->serial);
+            camera->with_depth = contains(depth_serials, camera->serial);
+            camera->ir.path = base + "-ir" + std::to_string(camera->index) + ".frame";
+            camera->ir.writer =
+                std::make_unique<FrameWriter>(camera->ir.path, width, height, camera->index);
+            camera->depth.path = base + "-depth.frame";
+            camera->depth.bytes_per_pixel = 2;
+            if (camera->rotate_180) {
+                camera->ir.rotated.resize(frame_pixels);
+                if (camera->with_depth)
+                    camera->depth.rotated.resize(frame_pixels);
             }
+            std::string calibration = "{\"synthetic\":true,\"depth_scale_m\":0.001}\n";
             if (!synthetic) {
-                rs2::device selected;
-                bool found = false;
-                for (auto device : devices)
-                    if (camera->serial == device.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER)) {
-                        selected = device;
-                        found = true;
-                        break;
+                auto selected = std::find_if(devices.begin(), devices.end(), [&](const auto &d) {
+                    return camera->serial == d.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+                });
+                require(selected != devices.end(), "camera serial not found: " + camera->serial);
+                // The last sensor offering the profile wins (in practice there is only one).
+                rs2::stream_profile profile, depth_profile;
+                for (auto sensor : selected->query_sensors())
+                    if (auto p = find_profile(sensor, RS2_STREAM_INFRARED, camera->index,
+                                              RS2_FORMAT_Y8)) {
+                        camera->sensor = sensor;
+                        profile = p;
                     }
-                if (!found)
-                    throw std::runtime_error("camera serial not found: " + camera->serial);
-                bool profile_found = false;
-                rs2::stream_profile profile;
-                for (auto sensor : selected.query_sensors())
-                    for (auto p : sensor.get_stream_profiles()) {
-                        auto video = p.as<rs2::video_stream_profile>();
-                        if (video && p.stream_type() == RS2_STREAM_INFRARED &&
-                            p.stream_index() == camera->index && p.format() == RS2_FORMAT_Y8 &&
-                            video.width() == width && video.height() == height && p.fps() == fps) {
-                            camera->sensor = sensor;
-                            profile = p;
-                            profile_found = true;
-                            break;
-                        }
-                    }
-                if (!profile_found)
-                    throw std::runtime_error("requested Y8 IR profile unavailable: " + spec);
-                rs2::stream_profile depth_profile;
-                if (camera->depth) {
-                    for (auto p : camera->sensor.get_stream_profiles()) {
-                        auto video = p.as<rs2::video_stream_profile>();
-                        if (video && p.stream_type() == RS2_STREAM_DEPTH &&
-                            p.format() == RS2_FORMAT_Z16 && video.width() == width &&
-                            video.height() == height && p.fps() == fps) {
-                            depth_profile = p;
-                            break;
-                        }
-                    }
+                require(bool(profile), "requested Y8 IR profile unavailable: " + spec);
+                auto &sensor = camera->sensor;
+                if (camera->with_depth) {
                     // IR and depth on one stereo sensor must share resolution and rate.
-                    if (!depth_profile)
-                        throw std::runtime_error("matching Z16 depth profile unavailable: " + spec);
+                    depth_profile = find_profile(sensor, RS2_STREAM_DEPTH, -1, RS2_FORMAT_Z16);
+                    require(bool(depth_profile), "matching Z16 depth profile unavailable: " + spec);
                     const auto e = depth_profile.get_extrinsics_to(profile);
-                    char extrinsics[512];
-                    std::snprintf(extrinsics, sizeof extrinsics,
-                                  "{\"rotation_column_major\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
-                                  "%.9g,%.9g],\"translation_m\":[%.9g,%.9g,%.9g]}",
-                                  e.rotation[0], e.rotation[1], e.rotation[2], e.rotation[3],
-                                  e.rotation[4], e.rotation[5], e.rotation[6], e.rotation[7],
-                                  e.rotation[8], e.translation[0], e.translation[1],
-                                  e.translation[2]);
-                    char scale[64];
-                    std::snprintf(scale, sizeof scale, "%.9g",
-                                  camera->sensor.as<rs2::depth_sensor>().get_depth_scale());
                     calibration =
-                        std::string("{\"synthetic\":false,\"serial\":\"") + camera->serial +
-                        "\",\"depth_scale_m\":" + scale +
+                        "{\"synthetic\":false,\"serial\":\"" + camera->serial +
+                        "\",\"depth_scale_m\":" +
+                        format("%.9g", sensor.as<rs2::depth_sensor>().get_depth_scale()) +
                         ",\"ir_index\":" + std::to_string(camera->index) +
                         ",\"rotation_deg\":" + (camera->rotate_180 ? "180" : "0") +
                         ",\"note\":\"intrinsics/extrinsics are SDK values for unrotated pixels\""
@@ -332,202 +393,149 @@ int main(int argc, char **argv) {
                             depth_profile.as<rs2::video_stream_profile>().get_intrinsics()) +
                         ",\"ir_intrinsics\":" +
                         intrinsics_json(profile.as<rs2::video_stream_profile>().get_intrinsics()) +
-                        ",\"depth_to_ir_extrinsics\":" + extrinsics + "}\n";
+                        ",\"depth_to_ir_extrinsics\":" +
+                        format("{\"rotation_column_major\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                               "%.9g,%.9g],\"translation_m\":[%.9g,%.9g,%.9g]}",
+                               e.rotation[0], e.rotation[1], e.rotation[2], e.rotation[3],
+                               e.rotation[4], e.rotation[5], e.rotation[6], e.rotation[7],
+                               e.rotation[8], e.translation[0], e.translation[1],
+                               e.translation[2]) +
+                        "}\n";
                 }
-                auto &sensor = camera->sensor;
                 if (sensor.supports(RS2_OPTION_EMITTER_ENABLED))
                     sensor.set_option(RS2_OPTION_EMITTER_ENABLED, 0);
                 if (sensor.supports(RS2_OPTION_FRAMES_QUEUE_SIZE))
                     sensor.set_option(RS2_OPTION_FRAMES_QUEUE_SIZE, 1);
                 if (sensor.supports(RS2_OPTION_GLOBAL_TIME_ENABLED))
                     sensor.set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, global_time ? 1 : 0);
-                else if (global_time)
-                    throw std::runtime_error(
-                        "global time option unavailable; use --hardware-clock");
-                if (camera->sync) {
-                    if (!sensor.supports(RS2_OPTION_INTER_CAM_SYNC_MODE))
-                        throw std::runtime_error("camera sync unsupported");
+                else
+                    require(!global_time, "global time option unavailable; use --hardware-clock");
+                if (sensor.supports(RS2_OPTION_INTER_CAM_SYNC_MODE))
                     sensor.set_option(RS2_OPTION_INTER_CAM_SYNC_MODE, camera->sync);
-                } else if (sensor.supports(RS2_OPTION_INTER_CAM_SYNC_MODE))
-                    sensor.set_option(RS2_OPTION_INTER_CAM_SYNC_MODE, 0);
+                else
+                    require(!camera->sync, "camera sync unsupported");
                 if (exposure >= 0) {
-                    if (!sensor.supports(RS2_OPTION_EXPOSURE) ||
-                        !sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE))
-                        throw std::runtime_error("manual exposure unsupported");
+                    require(sensor.supports(RS2_OPTION_EXPOSURE) &&
+                                sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE),
+                            "manual exposure unsupported");
                     sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
                     sensor.set_option(RS2_OPTION_EXPOSURE, exposure);
                 }
                 if (gain >= 0) {
-                    if (!sensor.supports(RS2_OPTION_GAIN))
-                        throw std::runtime_error("gain unsupported");
+                    require(sensor.supports(RS2_OPTION_GAIN), "gain unsupported");
                     sensor.set_option(RS2_OPTION_GAIN, gain);
                 }
-                if (camera->depth)
+                if (camera->with_depth)
                     sensor.open(std::vector<rs2::stream_profile>{profile, depth_profile});
                 else
                     sensor.open(profile);
                 camera->opened = true;
-                // Calibration and the depth store exist before the first callback can publish.
-                if (camera->depth) {
-                    write_json(output + "/" + camera->serial + "-depth.json", calibration);
-                    camera->depth_writer =
-                        std::make_unique<FrameWriter>(camera->depth_path, width, height, 0, 2);
-                }
+            }
+            // Calibration and the depth store exist before the first callback can publish.
+            if (camera->with_depth) {
+                write_json(base + "-depth.json", calibration);
+                camera->depth.writer =
+                    std::make_unique<FrameWriter>(camera->depth.path, width, height, 0, 2);
+            }
+            if (!synthetic) {
                 Camera *c = camera.get();
-                sensor.start([c, require_metadata](rs2::frame frame) {
+                c->sensor.start([c, require_metadata](rs2::frame frame) {
                     try {
                         auto v = frame.as<rs2::video_frame>();
                         if (!v)
                             return;
-                        if (c->depth && frame.get_profile().stream_type() == RS2_STREAM_DEPTH) {
-                            publish_depth(c, frame, v, require_metadata);
-                            return;
-                        }
-                        FrameMetadata m{};
-                        m.sequence = ++c->received;
-                        m.host_monotonic_ns = mono_ns();
-                        c->last_ns = m.host_monotonic_ns;
-                        if (!read_metadata(frame, v, m)) {
-                            c->error = 2;
-                            return;
-                        }
-                        m.ir_index = c->index;
-                        m.pixel_bytes = m.width * m.height;
-                        if (m.valid_metadata & 4) {
-                            const auto previous = c->last_device_counter.exchange(m.frame_counter);
-                            if (previous && m.frame_counter > previous + 1)
-                                c->counter_gaps += m.frame_counter - previous - 1;
-                            else if (previous && m.frame_counter <= previous)
-                                ++c->counter_resets;
-                        }
-                        if (require_metadata && (m.valid_metadata & 3) != 3) {
-                            c->error = 1;
-                            return;
-                        }
-                        const void *pixels = v.get_data();
-                        if (c->rotate_180) {
-                            if (m.stride != m.width || m.pixel_bytes != c->rotated.size()) {
-                                c->error = 2;
-                                return;
-                            }
-                            const auto *source = static_cast<const uint8_t *>(pixels);
-                            std::reverse_copy(source, source + m.pixel_bytes, c->rotated.begin());
-                            pixels = c->rotated.data();
-                        }
-                        if (!c->writer->publish(m, pixels))
-                            ++c->dropped;
+                        if (c->with_depth && frame.get_profile().stream_type() == RS2_STREAM_DEPTH)
+                            on_frame(*c, c->depth, frame, v, 0, require_metadata);
+                        else
+                            on_frame(*c, c->ir, frame, v, c->index, require_metadata);
                     } catch (...) {
                         c->error = 2;
                     }
                 });
                 camera->started = true;
-            } else if (camera->depth) {
-                write_json(output + "/" + camera->serial + "-depth.json", calibration);
-                camera->depth_writer =
-                    std::make_unique<FrameWriter>(camera->depth_path, width, height, 0, 2);
             }
+            const char *source = synthetic ? "SYNTHETIC " : "";
             std::fprintf(stderr, "%sIR%d serial=%s -> %s (Y8 %dx%d@%d, sync=%d, rotation=%d)\n",
-                         synthetic ? "SYNTHETIC " : "", camera->index, camera->serial.c_str(),
-                         camera->path.c_str(), width, height, fps, camera->sync,
-                         camera->rotate_180 ? 180 : 0);
-            if (camera->depth)
-                std::fprintf(stderr, "%sdepth serial=%s -> %s (Z16 %dx%d@%d)\n",
-                             synthetic ? "SYNTHETIC " : "", camera->serial.c_str(),
-                             camera->depth_path.c_str(), width, height, fps);
+                         source, camera->index, camera->serial.c_str(), camera->ir.path.c_str(),
+                         width, height, fps, camera->sync, camera->rotate_180 ? 180 : 0);
+            if (camera->with_depth)
+                std::fprintf(stderr, "%sdepth serial=%s -> %s (Z16 %dx%d@%d)\n", source,
+                             camera->serial.c_str(), camera->depth.path.c_str(), width, height,
+                             fps);
             cameras.push_back(std::move(camera));
         }
+        auto selected = [&](const std::string &serial) {
+            return std::any_of(cameras.begin(), cameras.end(),
+                               [&](const auto &c) { return c->serial == serial; });
+        };
         for (const auto &serial : rotate_serials)
-            if (std::none_of(cameras.begin(), cameras.end(),
-                             [&](const auto &c) { return c->serial == serial; }))
-                throw std::runtime_error("rotation serial is not a selected camera: " + serial);
+            require(selected(serial), "rotation serial is not a selected camera: " + serial);
         for (const auto &serial : depth_serials)
-            if (std::none_of(cameras.begin(), cameras.end(),
-                             [&](const auto &c) { return c->serial == serial; }))
-                throw std::runtime_error("depth serial is not a selected camera: " + serial);
-        signal(SIGINT, stop_signal);
-        signal(SIGTERM, stop_signal);
+            require(selected(serial), "depth serial is not a selected camera: " + serial);
+        install_stop_handlers();
         std::ofstream csv;
         if (!csv_path.empty()) {
             csv.open(csv_path);
-            if (!csv)
-                throw std::runtime_error("cannot open metadata CSV");
+            require(bool(csv), "cannot open metadata CSV");
+            csv.precision(17);
             csv << "serial,ir_index,sequence,host_monotonic_ns,sdk_timestamp_ms,domain,sensor_"
                    "timestamp_us,frame_timestamp_us,frame_counter,exposure_us,gain,valid_bits\n";
         }
-        std::vector<void *> readers;
-        for (auto &c : cameras) {
-            void *reader = kaivuri_frame_open(c->path.c_str());
-            if (!reader)
-                throw std::runtime_error("open frame store reader");
-            readers.push_back(reader);
-        }
-        struct Cleanup {
-            std::vector<void *> &handles;
-            ~Cleanup() {
-                for (void *h : handles)
-                    kaivuri_frame_close(h);
-            }
-        } cleanup{readers};
-        std::vector<uint8_t> pixels(size_t(width) * height, 0);
+        std::vector<Reader> readers;
+        readers.reserve(cameras.size());
+        for (auto &c : cameras)
+            readers.push_back(open_reader(c->ir.path, "open frame store reader"));
         std::vector<uint64_t> logged(cameras.size(), 0);
         // Low-rate depth snapshots (e.g. 2 Hz during policy runs), read back from the store.
         struct DepthLog {
             Camera *camera;
-            void *reader;
+            Reader reader;
             std::ofstream data;
             uint64_t offset = 0, last = 0;
         };
-        std::vector<std::unique_ptr<DepthLog>> depth_logs;
-        struct DepthLogCleanup {
-            std::vector<std::unique_ptr<DepthLog>> &logs;
-            ~DepthLogCleanup() {
-                for (auto &l : logs)
-                    kaivuri_frame_close(l->reader);
-            }
-        } depth_log_cleanup{depth_logs};
+        std::vector<DepthLog> depth_logs;
         std::ofstream depth_csv;
-        std::vector<uint8_t> depth_pixels(size_t(width) * height * 2), depth_packed;
-        struct Compressor {
-            ZSTD_CCtx *p = ZSTD_createCCtx();
-            ~Compressor() { ZSTD_freeCCtx(p); }
-        } zstd;
+        std::vector<uint8_t> depth_pixels(frame_pixels * 2), depth_packed;
+        std::unique_ptr<ZSTD_CCtx, size_t (*)(ZSTD_CCtx *)> zstd(nullptr, ZSTD_freeCCtx);
         double next_depth_log = monotonic_seconds();
         if (!depth_log.empty()) {
+            zstd.reset(ZSTD_createCCtx());
+            require(bool(zstd), "zstd context allocation failed");
             std::filesystem::create_directories(depth_log);
             depth_csv.open(depth_log + "/depth-log.csv");
+            depth_csv.precision(17);
             depth_csv << "serial,sequence,host_monotonic_ns,sdk_timestamp_ms,sensor_timestamp_us,"
                          "frame_counter,valid_fraction,zstd_offset,zstd_bytes\n";
             depth_packed.resize(ZSTD_compressBound(depth_pixels.size()));
             for (auto &c : cameras)
-                if (c->depth) {
-                    auto log = std::make_unique<DepthLog>();
-                    log->camera = c.get();
-                    log->reader = kaivuri_frame_open(c->depth_path.c_str());
-                    if (!log->reader)
-                        throw std::runtime_error("open depth store reader");
-                    depth_logs.push_back(std::move(log));
-                    auto &l = *depth_logs.back();
+                if (c->with_depth) {
+                    depth_logs.push_back(DepthLog{
+                        c.get(), open_reader(c->depth.path, "open depth store reader"), {}});
+                    auto &l = depth_logs.back();
                     l.data.open(depth_log + "/" + c->serial + "-depth.zst", std::ios::binary);
                     std::filesystem::copy_file(output + "/" + c->serial + "-depth.json",
                                                depth_log + "/" + c->serial + "-depth.json",
                                                std::filesystem::copy_options::overwrite_existing);
-                    if (!depth_csv || !l.data)
-                        throw std::runtime_error("cannot open depth log");
+                    require(depth_csv && l.data, "cannot open depth log");
                 }
         }
-        double begin = monotonic_seconds(), next = begin;
+        // Synthetic source buffers, reused every frame.
+        std::vector<uint8_t> pixels(synthetic ? frame_pixels : 0);
+        std::vector<uint16_t> ramp(synthetic ? frame_pixels : 0);
+        const double begin = monotonic_seconds();
+        double next = begin;
         bool failed = false;
-        while (!stopped) {
-            double now = monotonic_seconds();
+        while (!stop_requested) {
+            const double now = monotonic_seconds();
             if (duration > 0 && now - begin >= duration)
                 break;
             if (synthetic && now >= next) {
                 next += 1. / fps;
                 for (auto &c : cameras) {
                     FrameMetadata m{};
-                    m.sequence = ++c->received;
-                    m.host_monotonic_ns = mono_ns();
-                    c->last_ns = m.host_monotonic_ns;
+                    m.sequence = ++c->ir.received;
+                    m.host_monotonic_ns = monotonic_ns();
+                    c->ir.last_ns = m.host_monotonic_ns;
                     m.sensor_timestamp_us = static_cast<uint64_t>((now - begin) * 1e6);
                     m.frame_timestamp_us = m.sensor_timestamp_us + 500;
                     m.frame_counter = m.sequence;
@@ -541,64 +549,50 @@ int main(int argc, char **argv) {
                     m.ir_index = c->index;
                     m.pixel_bytes = pixels.size();
                     std::fill(pixels.begin(), pixels.end(), static_cast<uint8_t>(m.sequence % 256));
-                    const uint8_t *image = pixels.data();
-                    if (c->rotate_180) {
-                        std::reverse_copy(pixels.begin(), pixels.end(), c->rotated.begin());
-                        image = c->rotated.data();
-                    }
-                    if (!c->writer->publish(m, image))
-                        ++c->dropped;
-                    if (c->depth) {
+                    publish(c->ir, m, pixels.data());
+                    if (c->with_depth) {
                         // Same exposure as the IR frame: identical sensor timestamp. A horizontal
                         // ramp makes 180 degree rotation observable.
-                        std::vector<uint16_t> z(pixels.size());
-                        for (size_t k = 0; k < z.size(); ++k)
-                            z[k] = uint16_t(400 + m.sequence % 600 + k % width);
-                        if (c->rotate_180)
-                            std::reverse(z.begin(), z.end());
+                        for (size_t k = 0; k < ramp.size(); ++k)
+                            ramp[k] = uint16_t(400 + m.sequence % 600 + k % width);
                         FrameMetadata d = m;
-                        d.sequence = ++c->depth_received;
+                        d.sequence = ++c->depth.received;
                         d.ir_index = 0;
                         d.stride = width * 2;
-                        d.pixel_bytes = z.size() * 2;
-                        c->depth_last_ns = d.host_monotonic_ns;
-                        if (!c->depth_writer->publish(d, z.data()))
-                            ++c->depth_dropped;
+                        d.pixel_bytes = ramp.size() * 2;
+                        c->depth.last_ns = d.host_monotonic_ns;
+                        publish(c->depth, d, ramp.data());
                     }
                 }
             }
+            auto stale = [&](const Stream &s) {
+                return now - begin > 2 &&
+                       (!s.last_ns || monotonic_ns() - s.last_ns > 1000000000ULL);
+            };
             for (size_t i = 0; i < cameras.size(); ++i) {
-                auto &c = cameras[i];
-                const bool depth_stale =
-                    c->depth && now - begin > 2 &&
-                    (!c->depth_last_ns || mono_ns() - c->depth_last_ns > 1000000000ULL);
-                if (c->error || depth_stale ||
-                    (now - begin > 2 && (!c->last_ns || mono_ns() - c->last_ns > 1000000000ULL))) {
-                    std::fprintf(stderr, "Camera %s failed: %s\n", c->serial.c_str(),
-                                 c->error == 1   ? "required timestamp metadata missing"
-                                 : c->error == 2 ? "capture callback failure"
-                                 : depth_stale   ? "no fresh depth frame for one second"
-                                                 : "no fresh frame for one second");
+                auto &c = *cameras[i];
+                const bool depth_stale = c.with_depth && stale(c.depth);
+                if (c.error || depth_stale || stale(c.ir)) {
+                    std::fprintf(stderr, "Camera %s failed: %s\n", c.serial.c_str(),
+                                 c.error == 1   ? "required timestamp metadata missing"
+                                 : c.error == 2 ? "capture callback failure"
+                                 : depth_stale  ? "no fresh depth frame for one second"
+                                                : "no fresh frame for one second");
                     failed = true;
-                    stopped = 1;
+                    stop_requested = 1;
                     break;
                 }
-                if (csv.is_open()) {
-                    FrameMetadata m{};
-                    if (kaivuri_frame_read(readers[i], &m, nullptr, 0) == 1 &&
-                        m.sequence != logged[i]) {
-                        logged[i] = m.sequence;
-                        csv.precision(17);
-                        csv << c->serial << ',' << m.ir_index << ',' << m.sequence << ','
-                            << m.host_monotonic_ns << ',' << m.sdk_timestamp_ms << ','
-                            << m.timestamp_domain << ',' << m.sensor_timestamp_us << ','
-                            << m.frame_timestamp_us << ',' << m.frame_counter << ','
-                            << m.actual_exposure_us << ',' << m.gain_level << ','
-                            << m.valid_metadata << '\n';
-                        if (!csv)
-                            throw std::runtime_error("metadata CSV write failed");
-                    }
-                }
+                FrameMetadata m{};
+                if (!csv.is_open() || kaivuri_frame_read(readers[i].get(), &m, nullptr, 0) != 1 ||
+                    m.sequence == logged[i])
+                    continue;
+                logged[i] = m.sequence;
+                csv << c.serial << ',' << m.ir_index << ',' << m.sequence << ','
+                    << m.host_monotonic_ns << ',' << m.sdk_timestamp_ms << ',' << m.timestamp_domain
+                    << ',' << m.sensor_timestamp_us << ',' << m.frame_timestamp_us << ','
+                    << m.frame_counter << ',' << m.actual_exposure_us << ',' << m.gain_level << ','
+                    << m.valid_metadata << '\n';
+                require(bool(csv), "metadata CSV write failed");
             }
             if (!depth_logs.empty() && now >= next_depth_log) {
                 next_depth_log += 1. / depth_log_hz;
@@ -606,52 +600,46 @@ int main(int argc, char **argv) {
                     next_depth_log = now + 1. / depth_log_hz;
                 for (auto &log : depth_logs) {
                     FrameMetadata m{};
-                    if (kaivuri_frame_read(log->reader, &m, depth_pixels.data(),
+                    if (kaivuri_frame_read(log.reader.get(), &m, depth_pixels.data(),
                                            depth_pixels.size()) != 1 ||
-                        m.sequence == log->last)
+                        m.sequence == log.last)
                         continue;
-                    log->last = m.sequence;
+                    log.last = m.sequence;
                     const auto *z = reinterpret_cast<const uint16_t *>(depth_pixels.data());
                     const size_t n = m.pixel_bytes / 2;
-                    size_t valid = 0;
-                    for (size_t k = 0; k < n; ++k)
-                        valid += z[k] != 0;
+                    const size_t valid = n - std::count(z, z + n, uint16_t(0));
                     const size_t bytes =
-                        ZSTD_compressCCtx(zstd.p, depth_packed.data(), depth_packed.size(),
+                        ZSTD_compressCCtx(zstd.get(), depth_packed.data(), depth_packed.size(),
                                           depth_pixels.data(), m.pixel_bytes, 1);
-                    if (ZSTD_isError(bytes))
-                        throw std::runtime_error("depth zstd compression failed");
-                    log->data.write(reinterpret_cast<const char *>(depth_packed.data()), bytes);
-                    log->data.flush();
-                    depth_csv.precision(17);
-                    depth_csv << log->camera->serial << ',' << m.sequence << ','
+                    require(!ZSTD_isError(bytes), "depth zstd compression failed");
+                    log.data.write(reinterpret_cast<const char *>(depth_packed.data()), bytes);
+                    log.data.flush();
+                    depth_csv << log.camera->serial << ',' << m.sequence << ','
                               << m.host_monotonic_ns << ',' << m.sdk_timestamp_ms << ','
                               << m.sensor_timestamp_us << ',' << m.frame_counter << ','
-                              << double(valid) / std::max<size_t>(1, n) << ',' << log->offset << ','
+                              << double(valid) / std::max<size_t>(1, n) << ',' << log.offset << ','
                               << bytes << '\n';
                     depth_csv.flush();
-                    log->offset += bytes;
-                    if (!log->data || !depth_csv)
-                        throw std::runtime_error("depth log write failed");
+                    log.offset += bytes;
+                    require(log.data && depth_csv, "depth log write failed");
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        using ull = unsigned long long;
         for (auto &c : cameras)
             std::fprintf(
                 stderr,
                 "serial=%s received=%llu busy_drops=%llu counter_gaps=%llu counter_resets=%llu\n",
-                c->serial.c_str(), (unsigned long long)c->received.load(),
-                (unsigned long long)c->dropped.load(), (unsigned long long)c->counter_gaps.load(),
-                (unsigned long long)c->counter_resets.load());
+                c->serial.c_str(), ull(c->ir.received), ull(c->ir.dropped), ull(c->ir.counter_gaps),
+                ull(c->ir.counter_resets));
         for (auto &c : cameras)
-            if (c->depth)
+            if (c->with_depth)
                 std::fprintf(stderr,
                              "depth_serial=%s depth_received=%llu depth_busy_drops=%llu "
                              "depth_counter_gaps=%llu\n",
-                             c->serial.c_str(), (unsigned long long)c->depth_received.load(),
-                             (unsigned long long)c->depth_dropped.load(),
-                             (unsigned long long)c->depth_counter_gaps.load());
+                             c->serial.c_str(), ull(c->depth.received), ull(c->depth.dropped),
+                             ull(c->depth.counter_gaps));
         return failed ? 1 : 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Camera failed: %s\n", e.what());

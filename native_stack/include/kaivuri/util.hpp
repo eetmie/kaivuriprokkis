@@ -9,9 +9,13 @@
 #include <utility>
 
 namespace kaivuri {
-// Throws std::runtime_error(message) when the condition is false.
+// Throws std::runtime_error(message) when the condition is false. The const char * overloads
+// keep a passing check allocation-free (realtime loops); a std::string message is built even
+// when the check passes.
+void require(bool condition, const char *message);
 void require(bool condition, const std::string &message);
 // Throws std::runtime_error("what: strerror(errno)") when the condition is false.
+void require_errno(bool condition, const char *what);
 void require_errno(bool condition, const std::string &what);
 
 uint64_t monotonic_ns();

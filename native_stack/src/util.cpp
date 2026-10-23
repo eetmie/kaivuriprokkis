@@ -13,13 +13,20 @@
 #include <unistd.h>
 
 namespace kaivuri {
+void require(bool condition, const char *message) {
+    if (!condition)
+        throw std::runtime_error(message);
+}
 void require(bool condition, const std::string &message) {
     if (!condition)
         throw std::runtime_error(message);
 }
-void require_errno(bool condition, const std::string &what) {
+void require_errno(bool condition, const char *what) {
     if (!condition)
-        throw std::runtime_error(what + ": " + std::strerror(errno));
+        throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
+}
+void require_errno(bool condition, const std::string &what) {
+    require_errno(condition, what.c_str());
 }
 uint64_t monotonic_ns() {
     timespec t{};

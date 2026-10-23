@@ -17,18 +17,23 @@ def sha(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def libero_values(fixture, info):
+def common_values(fixture, info, raw0, raw1, tokens, mask):
     return {
         "image0": fixture["image_" + info["image_keys"][0]].astype(np.float16),
         "image1": fixture["image_" + info["image_keys"][1]].astype(np.float16),
-        "raw0": fixture["image"].astype(np.uint8),
-        "raw1": fixture["wrist"].astype(np.uint8),
-        "tokens": fixture["tokens"].astype(np.int64),
-        "mask": fixture["token_mask"].astype(np.bool_),
+        "raw0": fixture[raw0].astype(np.uint8),
+        "raw1": fixture[raw1].astype(np.uint8),
+        "tokens": tokens,
+        "mask": mask,
         "noise": fixture["noise"].astype(np.float32),
         "reference": fixture["fp16_actions_normalized"].astype(np.float32),
         "mixed_reference": fixture["actions"].astype(np.float32),
-    }, None
+    }
+
+
+def libero_values(fixture, info):
+    return common_values(fixture, info, "image", "wrist", fixture["tokens"].astype(np.int64),
+                         fixture["token_mask"].astype(np.bool_)), None
 
 
 def state_values(fixture, info):
@@ -42,15 +47,7 @@ def state_values(fixture, info):
     if fixture["raw_state"].dtype != np.float32:
         raise ValueError("raw_state must be the dataset's float32 state")
     return {
-        "image0": fixture["image_" + info["image_keys"][0]].astype(np.float16),
-        "image1": fixture["image_" + info["image_keys"][1]].astype(np.float16),
-        "raw0": fixture["raw_cam1"].astype(np.uint8),
-        "raw1": fixture["raw_cam2"].astype(np.uint8),
-        "tokens": tokens,
-        "mask": mask,
-        "noise": fixture["noise"].astype(np.float32),
-        "reference": fixture["fp16_actions_normalized"].astype(np.float32),
-        "mixed_reference": fixture["actions"].astype(np.float32),
+        **common_values(fixture, info, "raw_cam1", "raw_cam2", tokens, mask),
         "state": fixture["raw_state"],
         "state_normalized": fixture["state"].reshape(-1)[:info["state_dim"]].astype(np.float64),
         "robot_reference": fixture["fp16_actions_robot"].astype(np.float64),

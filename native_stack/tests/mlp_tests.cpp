@@ -161,7 +161,8 @@ void queued_restart() {
         void drive(const DriveSample &) override {}
         void close() override {
             entered.store(true, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+            while (!release.load(std::memory_order_acquire))
+                std::this_thread::yield();
         }
         void abort() noexcept override { release.store(true, std::memory_order_release); }
         std::vector<fs::path> paths() const override { return {}; }
@@ -179,16 +180,25 @@ void queued_restart() {
     auto barrier = std::make_shared<ClosingBarrier>();
     MlpWriter writer(root, metadata, 16, barrier);
     auto samples = [&](uint64_t tick) {
-        Record raw; raw.kind = RecordKind::Raw; raw.sample.imu.valid = true;
-        raw.sample.imu.sequence = tick + 1; raw.sample.imu.device_us = (tick + 1) * 10000;
+        Record raw;
+        raw.kind = RecordKind::Raw;
+        raw.sample.imu.valid = true;
+        raw.sample.imu.sequence = tick + 1;
+        raw.sample.imu.device_us = (tick + 1) * 10000;
         check(writer.push(raw), "restart raw queue failed");
-        Record drive; drive.kind = RecordKind::Drive; drive.sample = raw.sample;
-        drive.sample.tick = tick; drive.sample.start_ns = drive.sample.post_write_ns = 1000000000 + tick * 10000000;
+        Record drive;
+        drive.kind = RecordKind::Drive;
+        drive.sample = raw.sample;
+        drive.sample.tick = tick;
+        drive.sample.start_ns = drive.sample.post_write_ns = 1000000000 + tick * 10000000;
         check(writer.push(drive), "restart drive queue failed");
     };
-    check(writer.start(), "first restart take failed"); samples(0); writer.finish();
+    check(writer.start(), "first restart take failed");
+    samples(0);
+    writer.finish();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!barrier->entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+    while (!barrier->entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
     const bool entered = barrier->entered.load(std::memory_order_acquire);
     const bool accepted = entered && writer.start();
@@ -196,16 +206,20 @@ void queued_restart() {
     // instead of hanging in the writer destructor.
     barrier->release.store(true, std::memory_order_release);
     check(entered && accepted, "start during previous close was lost");
-    samples(1); writer.finish(); writer.shutdown();
+    samples(1);
+    writer.finish();
+    writer.shutdown();
     unsigned sessions = 0;
     for (const auto &entry : fs::directory_iterator(root))
         if (entry.path().filename().string().find("session_") == 0) {
             check(entry.path().extension() == ".json", "queued restart left an incomplete take");
             const auto m = YAML::LoadFile(entry.path().string());
-            check(m["complete"].as<bool>() && m["rows"].as<unsigned>() == 1, "queued take lost rows or completion");
+            check(m["complete"].as<bool>() && m["rows"].as<unsigned>() == 1,
+                  "queued take lost rows or completion");
             ++sessions;
         }
-    check(sessions == 2 && writer.state() == WriterState::Idle, "queued restart did not commit both takes");
+    check(sessions == 2 && writer.state() == WriterState::Idle,
+          "queued restart did not commit both takes");
     fs::remove_all(root);
 }
 int main(int argc, char **argv) {

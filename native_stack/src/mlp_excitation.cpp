@@ -30,29 +30,15 @@ const char *stage_name(Stage s) {
     return names[static_cast<unsigned>(s)];
 }
 const char *target_name(unsigned m) {
-    switch (m) {
-    case 14:
-        return "all";
-    case 2:
-        return "lift";
-    case 4:
-        return "tilt";
-    case 8:
-        return "scoop";
-    case 6:
-        return "lift+tilt";
-    case 10:
-        return "lift+scoop";
-    case 12:
-        return "tilt+scoop";
-    case 1:
-        return "slew";
-    default:
-        throw std::invalid_argument("invalid excitation target");
-    }
+    constexpr const char *names[]{"all",       "lift",       "tilt",       "scoop",
+                                  "lift+tilt", "lift+scoop", "tilt+scoop", "slew"};
+    for (unsigned i = 0; i < target_masks.size(); ++i)
+        if (target_masks[i] == m)
+            return names[i];
+    throw std::invalid_argument("invalid excitation target");
 }
 unsigned target_mask(const std::string &name) {
-    for (unsigned m : {14U, 2U, 4U, 8U, 6U, 10U, 12U, 1U})
+    for (unsigned m : target_masks)
         if (name == target_name(m))
             return m;
     throw std::invalid_argument("invalid excitation target: " + name);
@@ -92,9 +78,8 @@ void Excitation::begin(double now) {
         // Equal weight per frequency ratio retains slow strokes and fast corrections.
         p.carrier = std::exp(draw(std::log(sine_carrier_min_hz), std::log(sine_carrier_max_hz)));
         p.rate = .04 * draw(.70, 1.10);
-        p.depth =
-            std::min(.99 * draw(.70, 1.20),
-                     std::max(0., (sine_max_instant_hz / p.carrier - 1) / (2 * pi * p.rate)));
+        p.depth = std::min(.99 * draw(.70, 1.20),
+                           std::max(0., (sine_max_instant_hz / p.carrier - 1) / (2 * pi * p.rate)));
         p.cutoff = .25 * draw(.70, 1.30);
         p.noise = block_.options.waveform == Waveform::Sine ? .10 * draw(.70, 1.30) : 0;
         p.amplitude = std::isnan(block_.options.amplitude)

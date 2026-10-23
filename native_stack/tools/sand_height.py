@@ -34,7 +34,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_episodes import depth_frames, frame_rows  # noqa: E402
+from export_episodes import committed_episodes, depth_frames, frame_rows  # noqa: E402
 
 LINKS = ('slew', 'boom', 'arm', 'bucket')
 CELL = .005  # fused map resolution, m
@@ -69,6 +69,16 @@ GRAVITY_REFERENCE = None
 TILT_YAW = 0.          # cabin IMU axes relative to the upper-carriage axes, about vertical (rad)
 TILT_PIVOT = np.zeros(3)  # a point on the tipping axis, base frame
 TILT_DEADBAND = math.radians(.75)  # slewing rocks the base IMU by about 0.5 degrees; only real tipping counts
+
+
+def load_tilt(cal):
+    """Take the chassis tilt correction from a calibration that has one."""
+    global GRAVITY_REFERENCE, TILT_YAW, TILT_PIVOT, TILT_DEADBAND
+    if cal.get('base_gravity_reference'):
+        GRAVITY_REFERENCE = np.asarray(cal['base_gravity_reference'])
+        TILT_YAW = math.radians(cal.get('tilt_imu_yaw_deg', 0.))
+        TILT_PIVOT = np.asarray(cal.get('tilt_pivot_base_m', [0, 0, 0.]))
+        TILT_DEADBAND = math.radians(cal.get('tilt_deadband_deg', math.degrees(TILT_DEADBAND)))
 
 
 def base_gravity(status):
@@ -107,9 +117,11 @@ def level_rotation(n):
 
 
 class Rays:
-    """Per stored pixel ray in SDK camera coordinates (stored pixels may be turned 180 degrees)."""
-    def __init__(self, session, key):
-        c = json.loads((session / f'{key}.depth.json').read_text()); i = c['depth_intrinsics']
+    """Per stored pixel ray in SDK camera coordinates (stored pixels may be turned 180 degrees).
+    From a recorded session's camN.depth.json (session, key) or any camera depth JSON (path)."""
+    def __init__(self, session, key=None):
+        self.key, path = key, session if key is None else session / f'{key}.depth.json'
+        c = json.loads(Path(path).read_text()); i = c['depth_intrinsics']
         self.h, self.w, self.scale = i['height'], i['width'], c['depth_scale_m']
         v, u = np.mgrid[0:self.h, 0:self.w].astype(float)
         if c.get('rotation_deg', 0) == 180:
@@ -156,7 +168,7 @@ class Mount:
 
 
 def episode_path(session, index):
-    episodes = sorted(session.glob('episode-*.ready'))
+    episodes = committed_episodes(session)
     if not 0 <= index < len(episodes):
         raise SystemExit(f'{session}: no episode {index} ({len(episodes)} saved)')
     return episodes[index]
@@ -186,6 +198,18 @@ def lookup(grid, lo, xy):
     return g
 
 
+def height_map(W):
+    """Mean height of level points W on a grid around them with a 5 cm margin: (float32 map, lower corner)."""
+    lo = np.floor(W[:, :2].min(0) / CELL) * CELL - .05
+    shape = tuple(np.ceil((W[:, :2].max(0) + .05 - lo) / CELL).astype(int))
+    return raster(W[:, :2], W[:, 2], lo, shape)[0].astype(np.float32), lo
+
+
+def near_flat(W, band=.08):
+    """Level points within band of the flat-sand plane."""
+    return W[np.abs(W[:, 2]) < band]
+
+
 # ---------------------------------------------------------------- calibration
 def plane_ransac(P, rng, iters=150, tol=.006):
     best = (0, None, 0.)
@@ -205,8 +229,7 @@ def flat_samples(episode, rays, every=3, per_frame=150, seed=0):
     """Sand points (camera frame) from each sampled frame of the flat take, with the frame status."""
     rng = np.random.default_rng(seed); out = []
     rows = list(frame_rows(episode))
-    key = rays.key
-    for i, data in enumerate(depth_frames(episode / f'{key}.depth.zst')):
+    for i, data in enumerate(depth_frames(episode / f'{rays.key}.depth.zst')):
         if i % every or not rows[i]['status'].get('fk_valid'):
             continue
         P, _ = rays.points(data, 8, 1.)
@@ -316,8 +339,8 @@ def sweep_offset(episode, rays, mount, start, end):
         pre[i] = (P @ mount.R.T + mount.t, R, t)
 
     def world(i, o):
-        PL, R, t = pre[i]; W = mount.world((PL + o) @ R.T + t)
-        return W[np.abs(W[:, 2]) < .08]
+        PL, R, t = pre[i]
+        return near_flat(mount.world((PL + o) @ R.T + t))
     lo, shape = np.array([-1.2, -1.2]), (480, 480)
 
     def score(ox, oy):
@@ -352,12 +375,11 @@ def overlap_register(episode, rays, mounts, start, end):
     cab, wr = mounts['cam2'], mounts['cam1']
     F2, F1 = load(episode, 'cam2', ref), load(episode, 'cam1', wrist_frames)
     lo, shape = np.array([-1.2, -1.2]), (480, 480)
-    W = np.concatenate([cab.world(cab.base(rays['cam2'].points(F2[i][0], 4, .9)[0], F2[i][1])) for i in ref])
-    W = W[np.abs(W[:, 2]) < .08]; G, _ = raster(W[:, :2], W[:, 2], lo, shape)
+    W = near_flat(np.concatenate([cab.world(cab.base(rays['cam2'].points(F2[i][0], 4, .9)[0], F2[i][1])) for i in ref]))
+    G, _ = raster(W[:, :2], W[:, 2], lo, shape)
     wrist = {}
     for i in wrist_frames:
-        data, status = F1[i]; W1 = wr.world(wr.base(rays['cam1'].points(data, 4, .9)[0], status))
-        W1 = W1[np.abs(W1[:, 2]) < .08]
+        data, status = F1[i]; W1 = near_flat(wr.world(wr.base(rays['cam1'].points(data, 4, .9)[0], status)))
         if len(W1) >= 3000:
             wrist[i] = W1
     # Coarse: per-frame full-circle turn + FFT shift; keep confident frames.
@@ -404,9 +426,7 @@ def reference_map(episode, rays, mount, start, end):
     for data, status in load(episode, 'cam2', ref).values():
         P, _ = rays.points(data, 2, .9); Pb = mount.base(P, status); w = mount.world(Pb)
         W.append(w[(np.abs(w[:, 2]) < .08) & ~near_arm(Pb, status, .1)])
-    W = np.concatenate(W); lo = np.floor(W[:, :2].min(0) / CELL) * CELL - .05
-    shape = tuple(np.ceil((W[:, :2].max(0) + .05 - lo) / CELL).astype(int))
-    return raster(W[:, :2], W[:, 2], lo, shape)[0].astype(np.float32), lo, mode
+    return (*height_map(np.concatenate(W)), mode)
 
 
 def sand_rectangle(G, lo, margin=.05):
@@ -464,11 +484,14 @@ def tilt_pivot(session, episodes, rays, mount, every=6):
     return (best[1], np.array([*b[1], 0.]), -none * 1000, -b[0] * 1000, int(tipped.sum())), float(tilts.max())
 
 
+def p50_p90_mm(r):
+    return [round(float(np.median(np.abs(r))) * 1000, 2), round(float(np.percentile(np.abs(r), 90)) * 1000, 2)]
+
+
 def calibrate(args):
     session = args.session
+    path = args.output or session / 'sand-calibration.json'
     rays = {k: Rays(session, k) for k in ('cam1', 'cam2')}
-    for k, r in rays.items():
-        r.key = k
     flat = episode_path(session, args.flat)
     global GRAVITY_REFERENCE
     flat_rows = [r['status'] for r in frame_rows(flat) if r['status'].get('fk_valid')]
@@ -503,11 +526,10 @@ def calibrate(args):
         o, c0, c1, nref, noff, mode = sweep_offset(episode_path(session, ep), rays['cam2'], mounts['cam2'], start, end)
         xy = mounts['cam2'].t[:2] + o
         samples = flat_samples(flat, rays['cam2'])
-        moved = mounts['cam2']; moved = Mount(0, moved.R, np.r_[xy, moved.t[2]], moved.n, moved.d)
+        cab = mounts['cam2']; moved = Mount(0, cab.R, np.r_[xy, cab.t[2]], cab.n, cab.d)
         mounts['cam2'], r = fit_mount(samples, 0, start=moved)
         report['cam2'].update(sweep_offset_m=o.round(4).tolist(), sweep_correlation=[round(c0, 3), round(c1, 3)],
-                              flat_residual_mm_p50_p90=[round(float(np.median(np.abs(r))) * 1000, 2),
-                                                        round(float(np.percentile(np.abs(r), 90)) * 1000, 2)])
+                              flat_residual_mm_p50_p90=p50_p90_mm(r))
         print(f'cam2: slew-axis offset {o.round(3)} m from {nref} frames at {mode:.0f} deg vs {noff} slewed; '
               f'correlation {c0:.2f} -> {c1:.2f}; flat residual p50 {np.median(np.abs(r)) * 1000:.1f} mm', flush=True)
     if args.overlap:
@@ -525,8 +547,7 @@ def calibrate(args):
         report['overlap'] = {'cabin_yaw_deg': round(-math.degrees(psi), 2), 'wrist_cabin_shift_m': shift.round(4).tolist(),
                              'correlation_coarse_fine': [round(c0, 3), round(c1, 3)],
                              'confident_coarse_frames': n, 'slew_deg': round(mode, 1),
-                             'height_diff_mm_p50_p90': [round(float(np.median(np.abs(r))) * 1000, 2),
-                                                        round(float(np.percentile(np.abs(r), 90)) * 1000, 2)],
+                             'height_diff_mm_p50_p90': p50_p90_mm(r),
                              'height_bias_mm': round(float(np.median(r)) * 1000, 2)}
         print(f'overlap: cabin camera yaw {-math.degrees(psi):+.1f} deg, wrist shift {shift.round(3)} m (cabin frame); '
               f'correlation {c0:.2f} -> {c1:.2f}; wrist minus cabin height p50 |d| {np.median(np.abs(r)) * 1000:.1f} mm, '
@@ -535,7 +556,7 @@ def calibrate(args):
     if args.overlap:
         G, lo, mode = reference_map(episode_path(session, args.overlap[0]), rays['cam2'], mounts['cam2'], *args.overlap[1:])
         poly = sand_rectangle(G, lo)
-        reference = (args.output or session / 'sand-calibration.json').with_suffix('.reference.npz')
+        reference = path.with_suffix('.reference.npz')
         np.savez_compressed(reference, height=G, lo=lo)
         extra = {'reference_map': reference.name, 'reference_slew_deg': round(float(mode), 2)}
     else:
@@ -548,7 +569,6 @@ def calibrate(args):
            'tilt_imu_yaw_deg': math.degrees(TILT_YAW), 'tilt_pivot_base_m': TILT_PIVOT.tolist(),
            'tilt_deadband_deg': math.degrees(TILT_DEADBAND),
            'cameras': {k: m.to_json() for k, m in mounts.items()}, 'sand_polygon_level_xy_m': poly, **extra, 'report': report}
-    path = args.output or session / 'sand-calibration.json'
     path.write_text(json.dumps(out, indent=2) + '\n')
     print(f'wrote {path}')
 
@@ -591,8 +611,7 @@ class SlewTracker:
         Pb = Pb[~near_arm(Pb, status, .1)]
 
         def score(d):
-            W = self.mount.world(Pb @ rz(d).T)
-            return correlation(W[np.abs(W[:, 2]) < .08], self.G, self.lo) or -1.
+            return correlation(near_flat(self.mount.world(Pb @ rz(d).T)), self.G, self.lo) or -1.
 
         def best(centre, half, step):
             return max(((score(d), d) for d in centre + np.arange(-half, half + 1e-9, step)))
@@ -606,27 +625,73 @@ class SlewTracker:
         return self.delta
 
 
+class FieldMap:
+    """Level height map of the sand field on 5 mm cells: each frame's cameras fused by point count,
+    the change since each cell was first seen this take, and litres moved."""
+    def __init__(self, poly):
+        self.poly = poly
+        self.lo = poly.min(0) - .02; self.shape = tuple(np.ceil((poly.max(0) + .02 - self.lo) / CELL).astype(int))
+        cells = np.stack(np.meshgrid(np.arange(self.shape[0]), np.arange(self.shape[1]), indexing='ij'), -1)
+        centres = self.lo + (cells.reshape(-1, 2) + .5) * CELL
+        self.in_field = inside(poly, centres).reshape(self.shape)
+        middle = poly.mean(0); inner = poly + (middle - poly) * (.03 * math.sqrt(2) / np.linalg.norm(middle - poly, axis=1))[:, None]
+        self.in_metric = inside(inner, centres).reshape(self.shape)  # metrics keep 3 more cm off the walls
+        self.fused = np.full(self.shape, np.nan); self.start = np.full(self.shape, np.nan); self.change = self.fused
+
+    def points(self, mount, rays, data, status, turn, a):
+        """Level points of one depth frame, which to keep (inside the field, within a.below_m/a.above_m
+        of the sand and off the arm) and their flat pixel indices."""
+        P, idx = rays.points(data, a.stride, a.max_range_m)
+        Pb = mount.base(P, status); arm = near_arm(Pb, status, a.arm_radius_m)
+        W = mount.world(Pb @ turn.T)
+        good = (W[:, 2] > -a.below_m) & (W[:, 2] < a.above_m) & inside(self.poly, W[:, :2]) & ~arm
+        return W, good, idx
+
+    def begin(self):
+        self.update, self.weight = np.zeros(self.shape), np.zeros(self.shape)
+
+    def add(self, key, W, fusion):
+        """Add one camera's kept points to this frame, cabin camera (cam2) first."""
+        mean, count = raster(W[:, :2], W[:, 2], self.lo, self.shape)
+        seen = count > 0
+        if key == 'cam1' and fusion == 'fill':
+            seen &= self.weight == 0  # wrist camera only where the cabin camera sees nothing this frame
+        if key == 'cam1' and fusion == 'cabin':
+            seen[:] = False
+        self.update[seen] += mean[seen] * count[seen]; self.weight[seen] += count[seen]
+
+    def commit(self):
+        seen = self.weight > 0; self.fused[seen] = self.update[seen] / self.weight[seen]
+        new = seen & np.isnan(self.start); self.start[new] = self.fused[new]  # first look at each cell this take
+        self.change = self.fused - self.start
+
+    def metrics(self, deadband_mm):
+        known = np.isfinite(self.change) & self.in_metric; c, h = self.change[known], self.fused[known]
+        area = CELL * CELL * 1000; dead = deadband_mm / 1000  # litres per metre; ignore noise
+        dug = h[c < -dead]  # bottom of what was dug, against the flat sand (1st percentile)
+        return {'dug_l': float(-c[c < -dead].sum() * area), 'piled_l': float(c[c > dead].sum() * area),
+                'hole_bottom_mm': float(-np.percentile(dug, 1) * 1000) if len(dug) > 50 else 0.}
+
+    def image(self, grid, limit):
+        """Field cells of grid as a colour image, x right and y up."""
+        return diverging(np.where(self.in_field, grid, np.nan).T[::-1], limit)
+
+
 def view(args):
     import rerun as rr
     import rerun.blueprint as rrb
     session = args.session
     cal_path = args.calibration or session / 'sand-calibration.json'
     cal = json.loads(cal_path.read_text())
-    global GRAVITY_REFERENCE
-    if cal.get('base_gravity_reference') and not args.no_tilt:
-        global TILT_YAW, TILT_PIVOT
-        GRAVITY_REFERENCE = np.asarray(cal['base_gravity_reference'])
-        global TILT_DEADBAND
-        TILT_YAW, TILT_PIVOT = math.radians(cal.get('tilt_imu_yaw_deg', 0.)), np.asarray(cal.get('tilt_pivot_base_m', [0, 0, 0.]))
-        TILT_DEADBAND = math.radians(cal.get('tilt_deadband_deg', math.degrees(TILT_DEADBAND)))
+    if not args.no_tilt:
+        load_tilt(cal)
     mounts = {k: Mount.from_json(c) for k, c in cal['cameras'].items()}
     rays = {k: Rays(session, k) for k in mounts}
     tracker = None
     if 'reference_map' in cal and 'cam2' in mounts and not args.no_slew_correction:
         ref = np.load(cal_path.parent / cal['reference_map'])
         tracker = SlewTracker(ref['height'], ref['lo'], mounts['cam2'], rays['cam2'])
-    poly = np.asarray(cal['sand_polygon_level_xy_m'])
-    lo = poly.min(0) - .02; shape = tuple(np.ceil((poly.max(0) + .02 - lo) / CELL).astype(int))
+    field = FieldMap(np.asarray(cal['sand_polygon_level_xy_m']))
     episode = episode_path(session, args.episode)
     rows = list(frame_rows(episode))
     ir = {k: np.memmap(episode / f'{k}.y8', np.uint8, 'r').reshape(-1, rays[k].h, rays[k].w) for k in mounts}
@@ -649,12 +714,8 @@ def view(args):
     else:
         rr.spawn(default_blueprint=blueprint)
     rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
-    ring = np.vstack([poly, poly[:1]])
+    ring = np.vstack([field.poly, field.poly[:1]])
     rr.log('world/sand_field', rr.LineStrips3D([np.c_[ring, np.zeros(len(ring))]], radii=.002, colors=[[90, 90, 90]]), static=True)
-    fused = np.full(shape, np.nan); start = np.full(shape, np.nan); cells = np.stack(np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing='ij'), -1)
-    centres = lo + (cells.reshape(-1, 2) + .5) * CELL; in_field = inside(poly, centres).reshape(shape)
-    middle = poly.mean(0); inner = poly + (middle - poly) * (.03 * math.sqrt(2) / np.linalg.norm(middle - poly, axis=1))[:, None]
-    in_metric = inside(inner, centres).reshape(shape)  # metrics keep 3 more cm off the walls
     s = args.stride; t0 = time.monotonic()
     for i, row in enumerate(rows):
         data = {k: next(streams[k]) for k in mounts}
@@ -668,41 +729,26 @@ def view(args):
             delta = tracker.update(data['cam2'], status); turn = rz(delta)
             rr.log('slew/correction_deg', rr.Scalars(math.degrees(delta)))
             rr.log('slew/match', rr.Scalars(tracker.score))
-        update = np.zeros(shape); weight = np.zeros(shape); cloud = []
+        field.begin(); cloud = []
         for k in order:  # cabin camera first
-            m = mounts[k]
-            r = rays[k]; P, idx = r.points(data[k], s, args.max_range_m)
-            Pb = m.base(P, status); arm = near_arm(Pb, status, args.arm_radius_m)
-            W = m.world(Pb @ turn.T)
-            good = (W[:, 2] > -args.below_m) & (W[:, 2] < args.above_m) & inside(poly, W[:, :2]) & ~arm
+            r = rays[k]; W, good, idx = field.points(mounts[k], r, data[k], status, turn, args)
             gh, gw = len(range(0, r.h, s)), len(range(0, r.w, s))
             img = np.full(gh * gw, np.nan); img[idx[good]] = W[good, 2]
             rr.log(f'height/{k}', rr.Image(diverging(img.reshape(gh, gw), lim)))
             rr.log(f'ir/{k}', rr.Image(np.asarray(ir[k][i][::s, ::s])).compress(jpeg_quality=80))
-            mean, count = raster(W[good, :2], W[good, 2], lo, shape)
-            seen = count > 0
-            if k == 'cam1' and args.fusion == 'fill':
-                seen &= weight == 0  # wrist camera only where the cabin camera sees nothing this frame
-            if k == 'cam1' and args.fusion == 'cabin':
-                seen[:] = False
-            update[seen] += mean[seen] * count[seen]; weight[seen] += count[seen]
+            field.add(k, W[good], args.fusion)
             cloud.append(W[good][::2])
-        seen = weight > 0; fused[seen] = update[seen] / weight[seen]
-        new = seen & np.isnan(start); start[new] = fused[new]  # first look at each cell this take
-        change = fused - start
-        rr.log('map', rr.Image(diverging(np.where(in_field, fused, np.nan).T[::-1], lim)))  # x right, y up
-        rr.log('change', rr.Image(diverging(np.where(in_field, change, np.nan).T[::-1], lim)))
+        field.commit()
+        rr.log('map', rr.Image(field.image(field.fused, lim)))
+        rr.log('change', rr.Image(field.image(field.change, lim)))
         C = np.concatenate(cloud)
         rr.log('world/points', rr.Points3D(C, colors=diverging(C[:, 2], lim), radii=.0015))
-        chain = fk_chain(status)
         m = mounts.get('cam1') or mounts['cam2']
-        rr.log('world/arm', rr.LineStrips3D([m.world(chain @ turn.T)], radii=.004, colors=[[255, 200, 0]]))
-        known = np.isfinite(change) & in_metric; c, h = change[known], fused[known]
-        area = CELL * CELL * 1000; dead = args.deadband_mm / 1000  # litres per metre; ignore noise
-        rr.log('volume/dug_l', rr.Scalars(float(-c[c < -dead].sum() * area)))
-        rr.log('volume/piled_l', rr.Scalars(float(c[c > dead].sum() * area)))
-        dug = h[c < -dead]  # bottom of what was dug, against the flat sand (1st percentile)
-        rr.log('depth/hole_bottom_mm', rr.Scalars(float(-np.percentile(dug, 1) * 1000) if len(dug) > 50 else 0.))
+        rr.log('world/arm', rr.LineStrips3D([m.world(fk_chain(status) @ turn.T)], radii=.004, colors=[[255, 200, 0]]))
+        metrics = field.metrics(args.deadband_mm)
+        rr.log('volume/dug_l', rr.Scalars(metrics['dug_l']))
+        rr.log('volume/piled_l', rr.Scalars(metrics['piled_l']))
+        rr.log('depth/hole_bottom_mm', rr.Scalars(metrics['hole_bottom_mm']))
     rr.get_global_data_recording().flush(timeout_sec=20)
     print(f'{episode.name}: {len(rows)} frames, 1 in {args.every} shown, {time.monotonic() - t0:.0f} s', flush=True)
 

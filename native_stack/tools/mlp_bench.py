@@ -10,19 +10,15 @@ import statistics
 import subprocess
 import time
 
+from measure import percentile
+
 
 def percentiles(values):
     values = sorted(values)
     if not values:
         return {}
-
-    def at(fraction):
-        index = (len(values) - 1) * fraction
-        lo = int(index)
-        hi = min(lo + 1, len(values) - 1)
-        return values[lo] + (values[hi] - values[lo]) * (index - lo)
-
-    return {"p50": at(.5), "p99": at(.99), "p99_9": at(.999), "max": values[-1]}
+    return {"p50": percentile(values, .5), "p99": percentile(values, .99), "p99_9": percentile(values, .999),
+            "max": values[-1]}
 
 
 def summarize(root):

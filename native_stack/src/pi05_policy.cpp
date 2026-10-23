@@ -8,18 +8,8 @@
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <unistd.h>
 
 namespace kaivuri::pi05 {
-static void require(bool condition, const std::string &message) {
-    if (!condition)
-        throw std::runtime_error(message);
-}
-uint64_t now_ns() {
-    timespec t{};
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return uint64_t(t.tv_sec) * 1000000000ULL + t.tv_nsec;
-}
 std::vector<double> normalize(const std::vector<float> &x, const Quantiles &q) {
     require(q.q01.size() >= x.size() && q.q99.size() >= x.size(), "state quantiles too short");
     std::vector<double> out(x.size());
@@ -83,6 +73,33 @@ uint8_t clip8(int64_t v) {
     if (v >= (int64_t(1) << precision_bits << 8))
         return 255;
     return v <= 0 ? 0 : uint8_t(v >> precision_bits);
+}
+std::vector<int64_t> ids(const YAML::Node &node, const std::string &what) {
+    require(node && node.IsSequence() && node.size() > 0, "bundle " + what + " token ids");
+    std::vector<int64_t> out;
+    for (auto v : node)
+        out.push_back(v.as<int64_t>());
+    return out;
+}
+Quantiles quantiles(const YAML::Node &stats, size_t dims, const std::string &what) {
+    require(stats && stats["q01"] && stats["q99"], "norm_stats." + what + " lacks q01/q99");
+    Quantiles q;
+    for (auto v : stats["q01"])
+        q.q01.push_back(v.as<double>());
+    for (auto v : stats["q99"])
+        q.q99.push_back(v.as<double>());
+    require(q.q01.size() == q.q99.size() && q.q01.size() >= dims,
+            "norm_stats." + what + " quantiles shorter than the bundle dimension");
+    q.q01.resize(dims);
+    q.q99.resize(dims);
+    for (size_t i = 0; i < dims; ++i)
+        require(std::isfinite(q.q01[i]) && std::isfinite(q.q99[i]) && q.q99[i] >= q.q01[i],
+                "invalid norm_stats." + what + " quantiles");
+    return q;
+}
+// Single centered row: the arming hold before the first chunk (observation 0).
+Plan centered_hold() {
+    return Plan{{Commands{}}, 30, 0, 0};
 }
 } // namespace
 std::vector<uint8_t> pil_bilinear(const uint8_t *input, int width, int height, size_t row_stride,
@@ -151,29 +168,6 @@ std::vector<int> Contract::bins(const std::vector<float> &state) const {
 std::vector<int64_t> Contract::tokens(const std::string &task,
                                       const std::vector<float> &state) const {
     return prompt.compose(task, bins(state));
-}
-static std::vector<int64_t> ids(const YAML::Node &node, const std::string &what) {
-    require(node && node.IsSequence() && node.size() > 0, "bundle " + what + " token ids");
-    std::vector<int64_t> out;
-    for (auto v : node)
-        out.push_back(v.as<int64_t>());
-    return out;
-}
-static Quantiles quantiles(const YAML::Node &stats, size_t dims, const std::string &what) {
-    require(stats && stats["q01"] && stats["q99"], "norm_stats." + what + " lacks q01/q99");
-    Quantiles q;
-    for (auto v : stats["q01"])
-        q.q01.push_back(v.as<double>());
-    for (auto v : stats["q99"])
-        q.q99.push_back(v.as<double>());
-    require(q.q01.size() == q.q99.size() && q.q01.size() >= dims,
-            "norm_stats." + what + " quantiles shorter than the bundle dimension");
-    q.q01.resize(dims);
-    q.q99.resize(dims);
-    for (size_t i = 0; i < dims; ++i)
-        require(std::isfinite(q.q01[i]) && std::isfinite(q.q99[i]) && q.q99[i] >= q.q01[i],
-                "invalid norm_stats." + what + " quantiles");
-    return q;
 }
 Contract load_contract(const YAML::Node &b, const YAML::Node &norm) {
     require(b["policy"].as<std::string>() == "pi05_openpi_state", "not a pi05_openpi_state bundle");
@@ -313,7 +307,7 @@ std::vector<uint8_t> encode(Operation op, uint32_t flags, uint64_t sequence, uin
     return data;
 }
 void PlanSupervisor::hold(uint64_t now) {
-    plan_ = Plan{{Commands{}}, 30, 0, 0};
+    plan_ = centered_hold();
     holding_ = pending_ = true;
     hold_started_ = now;
 }
@@ -355,32 +349,25 @@ PlanSupervisor::Decision PlanSupervisor::next(uint64_t now, std::string &reason)
     }
     return pending_ || now - last_sent_ >= cfg_.renew_ns ? Decision::Send : Decision::Idle;
 }
-ControlLink::ControlLink(const std::string &path) {
-    fd_ = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    require(fd_ >= 0, "control socket failed");
+ControlLink::ControlLink(const std::string &path)
+    : fd_(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)) {
+    require(bool(fd_), "control socket failed");
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
-    if (path.size() < sizeof(address.sun_path))
-        std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (path.size() >= sizeof(address.sun_path) ||
-        connect(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
-        close(fd_);
-        throw std::runtime_error("cannot connect to controller at " + path);
-    }
-}
-ControlLink::~ControlLink() {
-    if (fd_ >= 0)
-        close(fd_);
+    require(path.size() < sizeof(address.sun_path), "cannot connect to controller at " + path);
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    require(connect(fd_.get(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0,
+            "cannot connect to controller at " + path);
 }
 void ControlLink::send(Operation op, uint32_t flags, const Plan *plan) {
-    auto data = encode(op, flags, ++sequence_, now_ns(), plan);
-    require(::send(fd_, data.data(), data.size(), MSG_DONTWAIT | MSG_NOSIGNAL) ==
+    auto data = encode(op, flags, ++sequence_, monotonic_ns(), plan);
+    require(::send(fd_.get(), data.data(), data.size(), MSG_DONTWAIT | MSG_NOSIGNAL) ==
                 ssize_t(data.size()),
             "control send failed");
 }
 std::string ControlLink::status() {
     send(Operation::Status);
-    pollfd p{fd_, POLLIN, 0};
+    pollfd p{fd_.get(), POLLIN, 0};
     int ready;
     do {
         ready = poll(&p, 1, 100);
@@ -389,7 +376,7 @@ std::string ControlLink::status() {
     char bytes[8192];
     ssize_t count;
     do {
-        count = recv(fd_, bytes, sizeof(bytes), MSG_TRUNC);
+        count = recv(fd_.get(), bytes, sizeof(bytes), MSG_TRUNC);
     } while (count < 0 && errno == EINTR);
     require(count > 0 && count <= ssize_t(sizeof(bytes)), "invalid/truncated status");
     return std::string(bytes, count);
@@ -417,23 +404,23 @@ Producer::~Producer() {
 void Producer::arm(double timeout_s) {
     require(!thread_.joinable(), "producer already armed once; restart to re-arm");
     const uint32_t pump = options_.pump ? pump_flag : 0;
-    const uint64_t begin = now_ns();
+    const uint64_t begin = monotonic_ns();
     supervisor_.hold(begin);
-    Plan centered{{Commands{}}, 30, 0, 0};
+    const Plan centered = centered_hold();
     for (;;) {
         link_.send(Operation::Drive, deadman_flag | arm_flag | pump, &centered);
         auto s = YAML::Load(link_.status());
         const auto state = s["state"].as<std::string>();
         if (state == "armed")
             break;
-        if (state == "fault" || now_ns() - begin > uint64_t(timeout_s * 1e9)) {
+        if (state == "fault" || monotonic_ns() - begin > uint64_t(timeout_s * 1e9)) {
             link_.send(Operation::Disarm);
             throw std::runtime_error("arming failed: " + state + " " +
                                      s["reason"].as<std::string>());
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-    supervisor_.sent(now_ns());
+    supervisor_.sent(monotonic_ns());
     running_ = true;
     thread_ = std::thread([this] { loop(); });
 }
@@ -443,13 +430,13 @@ bool Producer::post(Plan plan, std::string &reason) {
         reason = "producer stopped: " + reason_;
         return false;
     }
-    reason = supervisor_.offer(std::move(plan), now_ns());
+    reason = supervisor_.offer(std::move(plan), monotonic_ns());
     wake_.notify_all();
     return reason.empty();
 }
 void Producer::loop() {
     const uint32_t pump = options_.pump ? pump_flag : 0;
-    uint64_t last_status = 0, last_send = now_ns();
+    uint64_t last_status = 0, last_send = monotonic_ns();
     try {
         for (;;) {
             Plan send;
@@ -460,7 +447,7 @@ void Producer::loop() {
                 if (stopping_)
                     return;
                 std::string why;
-                const uint64_t now = now_ns();
+                const uint64_t now = monotonic_ns();
                 auto decision = supervisor_.next(now, why);
                 if (decision == PlanSupervisor::Decision::Stop) {
                     lock.unlock();
@@ -477,7 +464,7 @@ void Producer::loop() {
                 // Renewals resend the same rows, t0 and observation time; only the
                 // sequence and send time change.
                 link_.send(Operation::Drive, deadman_flag | pump, &send);
-                const uint64_t now = now_ns();
+                const uint64_t now = monotonic_ns();
                 std::lock_guard<std::mutex> lock(mutex_);
                 counters_.max_send_gap_ms =
                     std::max(counters_.max_send_gap_ms, (now - last_send) / 1e6);
@@ -489,7 +476,7 @@ void Producer::loop() {
                 else
                     ++counters_.renewals;
             }
-            const uint64_t now = now_ns();
+            const uint64_t now = monotonic_ns();
             if (now - last_status >= uint64_t(options_.status_s * 1e9)) {
                 last_status = now;
                 auto s = YAML::Load(link_.status());

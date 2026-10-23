@@ -4,7 +4,8 @@
 using namespace kaivuri;
 using namespace kaivuri::collection;
 int main(int argc, char **argv) {
-    if (argc != 2) return 1;
+    if (argc != 2)
+        return 1;
     const auto robot = load_robot(argv[1]);
     const Kinematics k(robot);
     for (unsigned n = 0; n < 400; ++n) {
@@ -18,8 +19,8 @@ int main(int argc, char **argv) {
                     q[0], q[1], q[2], pose[0], pose[1], pose[2]);
     }
     for (unsigned scenario = 0; scenario < 6; ++scenario) {
-        const Gains g{scenario == 0 ? 0. : 2., scenario == 1 ? 0. : .4,
-                      scenario == 2 ? 0. : .3, scenario == 3 ? 0. : .1};
+        const Gains g{scenario == 0 ? 0. : 2., scenario == 1 ? 0. : .4, scenario == 2 ? 0. : .3,
+                      scenario == 3 ? 0. : .1};
         Pid pid(g, .5);
         for (unsigned n = 0; n < 500; ++n) {
             const double dt = n % 17 == 0 ? .0001 : .01 + .01 * (n % 4);

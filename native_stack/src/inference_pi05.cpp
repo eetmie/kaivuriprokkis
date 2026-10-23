@@ -5,6 +5,7 @@
 // chunks go to kaivuri-control as drive plans through pi05::Producer; no I2C path here.
 #include "kaivuri/frame_store.hpp"
 #include "kaivuri/pi05_policy.hpp"
+#include "kaivuri/util.hpp"
 #include <NvInfer.h>
 #include <NvInferPlugin.h>
 #include <algorithm>
@@ -12,8 +13,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <csignal>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
@@ -23,7 +25,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <openssl/evp.h>
 #include <random>
 #include <regex>
 #include <set>
@@ -32,38 +33,21 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 #include <yaml-cpp/yaml.h>
 namespace fs = std::filesystem;
+namespace kp = kaivuri::pi05;
 using namespace nvinfer1;
-static volatile sig_atomic_t stopped = 0;
-static void stop_signal(int) {
-    stopped = 1;
-}
-static uint64_t mono_ns() {
-    timespec t{};
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return uint64_t(t.tv_sec) * 1000000000ULL + t.tv_nsec;
-}
-static void require(bool condition, const std::string &message) {
-    if (!condition)
-        throw std::runtime_error(message);
-}
-static void ck(cudaError_t code, const char *operation) {
+using kaivuri::monotonic_ns;
+using kaivuri::require;
+using kaivuri::stop_requested;
+
+namespace {
+void ck(cudaError_t code, const char *operation) {
     if (code != cudaSuccess)
         throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(code));
 }
-static std::string hash_bytes(const void *data, size_t bytes) {
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned length = 0;
-    require(EVP_Digest(data, bytes, digest, &length, EVP_sha256(), nullptr) == 1, "SHA256 failed");
-    std::ostringstream out;
-    for (unsigned i = 0; i < length; ++i)
-        out << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[i]);
-    return out.str();
-}
-static std::vector<char> read_file(const fs::path &path) {
+std::vector<char> read_file(const fs::path &path) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     require(bool(in), "cannot open " + path.string());
     auto size = in.tellg();
@@ -74,9 +58,9 @@ static std::vector<char> read_file(const fs::path &path) {
     require(bool(in), "short read " + path.string());
     return bytes;
 }
-static std::string hash_file(const fs::path &path) {
-    auto bytes = read_file(path);
-    return hash_bytes(bytes.data(), bytes.size());
+// The node's value, or the fallback when the key is absent.
+template <class T> T value_or(const YAML::Node &node, const T &fallback) {
+    return node ? node.as<T>() : fallback;
 }
 struct Npy {
     std::shared_ptr<void> mapping;
@@ -85,16 +69,12 @@ struct Npy {
     std::string dtype;
     std::vector<int64_t> shape;
     explicit Npy(const fs::path &path, const std::string &expected_sha = "") {
-        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        require(fd >= 0, "cannot open array " + path.string());
+        kaivuri::Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+        require(bool(fd), "cannot open array " + path.string());
         struct stat st{};
-        if (fstat(fd, &st) || st.st_size < 10) {
-            close(fd);
-            throw std::runtime_error("invalid array " + path.string());
-        }
+        require(fstat(fd.get(), &st) == 0 && st.st_size >= 10, "invalid array " + path.string());
         file_bytes = size_t(st.st_size);
-        void *address = mmap(nullptr, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
+        void *address = mmap(nullptr, file_bytes, PROT_READ, MAP_PRIVATE, fd.get(), 0);
         require(address != MAP_FAILED, "cannot map " + path.string());
         mapping = std::shared_ptr<void>(address, [size = file_bytes](void *p) { munmap(p, size); });
         auto p = static_cast<const uint8_t *>(address);
@@ -132,11 +112,11 @@ struct Npy {
         require(bytes == file_bytes - offset - length, "NPY payload length");
         data = p + offset + length;
         if (!expected_sha.empty())
-            require(hash_bytes(p, file_bytes) == expected_sha,
+            require(kaivuri::sha256_hex(p, file_bytes) == expected_sha,
                     "array checksum mismatch: " + path.string());
     }
 };
-static size_t item_size(DataType type) {
+size_t item_size(DataType type) {
     switch (type) {
     case DataType::kFLOAT:
     case DataType::kINT32:
@@ -206,6 +186,13 @@ struct Engine {
 struct Sample {
     double vision_ms = 0, language_ms = 0, denoise_ms = 0, total_ms = 0;
 };
+// Prompt row element: FP16 as rounded, or widened for an FP32 residual stream.
+void store(__half &target, __half value) {
+    target = value;
+}
+void store(float &target, __half value) {
+    target = __half2float(value);
+}
 class Pi05 {
     Logger logger;
     Allocator allocator;
@@ -241,11 +228,19 @@ class Pi05 {
         return make(std::vector<int64_t>(shape.d, shape.d + shape.nbDims),
                     e.getTensorDataType(tensor));
     }
-    void upload(Buffer *buffer, const void *data, size_t size) {
-        require(size == buffer->bytes, "upload size mismatch");
-        std::memcpy(buffer->staging(), data, size);
-        ck(cudaMemcpyAsync(buffer->ptr, buffer->host, size, cudaMemcpyHostToDevice, stream),
+    // The buffer's pinned staging copy as count elements of T, filled in place before push().
+    template <class T> T *staged(Buffer *buffer, size_t count) {
+        require(count * sizeof(T) == buffer->bytes, "upload size mismatch");
+        return static_cast<T *>(buffer->staging());
+    }
+    void push(Buffer *buffer) {
+        ck(cudaMemcpyAsync(buffer->ptr, buffer->host, buffer->bytes, cudaMemcpyHostToDevice,
+                           stream),
            "upload");
+    }
+    void upload(Buffer *buffer, const void *data, size_t size) {
+        std::memcpy(staged<uint8_t>(buffer, size), data, size);
+        push(buffer);
     }
     void copy(void *dst, const void *src, size_t bytes) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream), "device copy");
@@ -265,9 +260,9 @@ class Pi05 {
         require(e.context->enqueueV3(stream), "enqueue failed: " + name);
     }
     static std::string layer(const char *prefix, int n) {
-        std::ostringstream out;
-        out << prefix << '_' << std::setfill('0') << std::setw(2) << n;
-        return out.str();
+        char name[64];
+        std::snprintf(name, sizeof(name), "%s_%02d", prefix, n);
+        return name;
     }
     void record(int index) {
         ck(capturing ? cudaEventRecordWithFlags(events[index], stream, cudaEventRecordExternal)
@@ -306,22 +301,23 @@ class Pi05 {
         }
         record(2);
         for (int s = 0; s < steps; ++s) {
+            // Per step: two style rows per action layer, then the final one.
+            auto style = [&](int site) {
+                return offset(styles, (s * style_sites + site) * style_row_bytes);
+            };
             run("action_input", {{"actions", actions[s % 2]->ptr}, {"hidden", expert[0]->ptr}});
             for (int i = 0; i < action_layers; ++i)
-                run(layer("action", i),
-                    {{"hidden", expert[i % 2]->ptr},
-                     {"output", expert[1 - i % 2]->ptr},
-                     {"mask", s_mask->ptr},
-                     {"cos", s_cos->ptr},
-                     {"sin", s_sin->ptr},
-                     {"prefix_k", kv[i].first->ptr},
-                     {"prefix_v", kv[i].second->ptr},
-                     {"mod_in", offset(styles, (s * style_sites + 2 * i) * style_row_bytes)},
-                     {"mod_post",
-                      offset(styles, (s * style_sites + 2 * i + 1) * style_row_bytes)}});
+                run(layer("action", i), {{"hidden", expert[i % 2]->ptr},
+                                         {"output", expert[1 - i % 2]->ptr},
+                                         {"mask", s_mask->ptr},
+                                         {"cos", s_cos->ptr},
+                                         {"sin", s_sin->ptr},
+                                         {"prefix_k", kv[i].first->ptr},
+                                         {"prefix_v", kv[i].second->ptr},
+                                         {"mod_in", style(2 * i)},
+                                         {"mod_post", style(2 * i + 1)}});
             run("action_output", {{"hidden", expert[action_layers % 2]->ptr},
-                                  {"mod_final", offset(styles, (s * style_sites + style_sites - 1) *
-                                                                   style_row_bytes)},
+                                  {"mod_final", style(style_sites - 1)},
                                   {"velocity", velocity->ptr}});
             run(euler, {{"a", actions[s % 2]->ptr},
                         {"b", velocity->ptr},
@@ -359,19 +355,16 @@ class Pi05 {
         : info(YAML::LoadFile((bundle / "bundle.json").string())),
           embedding(bundle / "embedding_fp16.npy", info["embedding_sha256"].as<std::string>()),
           rope_cos(bundle / "rope_cos_fp16.npy"), rope_sin(bundle / "rope_sin_fp16.npy"),
-          conditioning(bundle / (info["conditioning"]
-                                     ? info["conditioning"].as<std::string>()
-                                     : std::string("conditioning_10step_fp16.npy"))),
+          conditioning(bundle /
+                       value_or(info["conditioning"], std::string("conditioning_10step_fp16.npy"))),
           graph_enabled(use_graph) {
         policy = info["policy"].as<std::string>();
         require(info["complete"].as<bool>() &&
                     (policy == "pi05_libero" || policy == "pi05_openpi_state") &&
-                    ((info["valid_camera_compute_only"] &&
-                      info["valid_camera_compute_only"].as<bool>()) ||
-                     (info["layout"] && info["layout"].as<std::string>() == "compact")),
+                    (value_or(info["valid_camera_compute_only"], false) ||
+                     value_or(info["layout"], std::string()) == "compact"),
                 "requires a compact OpenPI pi05_libero or pi05_openpi_state bundle");
-        const std::string residual =
-            info["language_residual"] ? info["language_residual"].as<std::string>() : "float16";
+        const auto residual = value_or(info["language_residual"], std::string("float16"));
         require(residual == "float16" || residual == "float32", "language_residual");
         horizon = info["action_horizon"].as<int>();
         width = info["action_dim"].as<int>();
@@ -404,13 +397,15 @@ class Pi05 {
             require(fs::canonical(candidate["bundle"].as<std::string>()) == fs::canonical(bundle),
                     "engine cache belongs to another bundle");
             for (auto entry : candidate["template_sha256"])
-                require(hash_file(bundle / "templates" / entry.first.as<std::string>()) ==
-                            entry.second.as<std::string>(),
-                        "template checksum mismatch");
+                require(
+                    kaivuri::sha256_file(bundle / "templates" / entry.first.as<std::string>()) ==
+                        entry.second.as<std::string>(),
+                    "template checksum mismatch");
             for (auto entry : candidate["engine_sha256"]) {
                 auto name = entry.first.as<std::string>();
                 auto bytes = read_file(cache / name);
-                require(hash_bytes(bytes.data(), bytes.size()) == entry.second.as<std::string>(),
+                require(kaivuri::sha256_hex(bytes.data(), bytes.size()) ==
+                            entry.second.as<std::string>(),
                         "engine checksum mismatch");
                 plans[fs::path(name).stem().string()] = std::move(bytes);
             }
@@ -419,7 +414,7 @@ class Pi05 {
                 std::ifstream key(cache / (kind + ".onnx.sha256"));
                 std::string onnx_sha;
                 require(bool(key >> onnx_sha), "native cache lacks " + kind + ".onnx.sha256");
-                require(onnx_sha == hash_file(bundle / "templates" / (kind + ".onnx")),
+                require(onnx_sha == kaivuri::sha256_file(bundle / "templates" / (kind + ".onnx")),
                         "native " + kind + " plan was built from another template");
                 plans[kind] = read_file(cache / (kind + ".engine"));
             }
@@ -441,10 +436,8 @@ class Pi05 {
             fs::path directory = bundle / "weights" / name;
             auto index = YAML::LoadFile((directory / "index.json").string());
             std::map<std::string, YAML::Node> by_name;
-            for (size_t i = 0; i < index["weights"].size(); ++i) {
-                YAML::Node wt = index["weights"][i];
+            for (YAML::Node wt : index["weights"])
                 by_name[wt["name"].as<std::string>()] = wt;
-            }
             std::unique_ptr<IRefitter> refitter(createInferRefitter(*item.engine, logger));
             require(bool(refitter), "cannot create refitter");
             int n = refitter->getAllWeights(0, nullptr);
@@ -573,7 +566,9 @@ class Pi05 {
     }
     // Called every step for pi05_openpi_state. Uploads the prompt rows (~hidden*4 bytes per
     // token), masks/RoPE only when the valid token count changes. The CUDA graph reads these
-    // buffers by address, so it is captured once and never rebuilt for a new prompt.
+    // buffers by address, so it is captured once and never rebuilt for a new prompt. Host data
+    // is written straight into the pinned staging buffers: every earlier upload from them has
+    // completed, since each inference (and the first prime) synchronizes the stream.
     void set_prompt(const std::vector<int64_t> &tokens) {
         if (tokens == current_tokens)
             return;
@@ -582,55 +577,53 @@ class Pi05 {
         require(embedding.shape.size() == 2 && embedding.shape[1] == prefix[0]->shape.back() &&
                     embedding.dtype == "<f2",
                 "embedding contract");
-        int hidden = embedding.shape[1], valid = 512 + tokens.size();
+        for (auto token : tokens)
+            require(token >= 0 && token < embedding.shape[0], "token outside embedding");
+        const int hidden = embedding.shape[1], valid = 512 + tokens.size();
         const float scale = std::sqrt(float(hidden));
-        // Rounded to FP16 as the export does, then widened for an FP32 residual stream.
-        auto row_value = [&](size_t i, int j) {
-            require(tokens[i] >= 0 && tokens[i] < embedding.shape[0], "token outside embedding");
-            auto source = reinterpret_cast<const __half *>(embedding.data) + tokens[i] * hidden;
-            return __float2half_rn(__half2float(source[j]) * scale);
-        };
         const size_t count = size_t(prefix_tokens - 512) * hidden;
-        if (rows->type == DataType::kHALF) {
-            std::vector<__half> prompt(count, __float2half(0));
-            for (size_t i = 0; i < tokens.size(); ++i)
+        // Scaled embedding rows rounded to FP16 as the export does; the tail stays zero.
+        auto fill = [&](auto *prompt) {
+            for (size_t k = tokens.size() * hidden; k < count; ++k)
+                store(prompt[k], __float2half(0));
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                auto source = reinterpret_cast<const __half *>(embedding.data) + tokens[i] * hidden;
                 for (int j = 0; j < hidden; ++j)
-                    prompt[i * hidden + j] = row_value(i, j);
-            upload(rows, prompt.data(), rows->bytes);
-        } else {
-            std::vector<float> prompt(count, 0.f);
-            for (size_t i = 0; i < tokens.size(); ++i)
-                for (int j = 0; j < hidden; ++j)
-                    prompt[i * hidden + j] = __half2float(row_value(i, j));
-            upload(rows, prompt.data(), rows->bytes);
-        }
+                    store(prompt[i * hidden + j], __float2half_rn(__half2float(source[j]) * scale));
+            }
+        };
+        if (rows->type == DataType::kHALF)
+            fill(staged<__half>(rows, count));
+        else
+            fill(staged<float>(rows, count));
+        push(rows);
         if (valid != valid_tokens) {
-            std::vector<float> mask(size_t(prefix_tokens) * prefix_tokens);
             constexpr float negative = -2.3819763e38f;
+            float *mask = staged<float>(p_mask, size_t(prefix_tokens) * prefix_tokens);
             for (int i = 0; i < prefix_tokens; ++i)
                 for (int j = 0; j < prefix_tokens; ++j)
                     mask[size_t(i) * prefix_tokens + j] = (i < valid && j < valid) ? 0.f : negative;
-            upload(p_mask, mask.data(), mask.size() * 4);
-            mask.resize(size_t(horizon) * (prefix_tokens + horizon));
+            push(p_mask);
+            const int keys = prefix_tokens + horizon;
+            mask = staged<float>(s_mask, size_t(horizon) * keys);
             for (int i = 0; i < horizon; ++i)
-                for (int j = 0; j < prefix_tokens + horizon; ++j)
-                    mask[size_t(i) * (prefix_tokens + horizon) + j] =
-                        (j < valid || j >= prefix_tokens) ? 0.f : negative;
-            upload(s_mask, mask.data(), mask.size() * 4);
+                for (int j = 0; j < keys; ++j)
+                    mask[size_t(i) * keys + j] = (j < valid || j >= prefix_tokens) ? 0.f : negative;
+            push(s_mask);
             require(rope_cos.dtype == "<f2" && rope_sin.dtype == "<f2" &&
                         rope_cos.shape == rope_sin.shape && rope_cos.shape.size() == 2,
                     "RoPE contract");
             auto rope = [&](Buffer *target, const Npy &table, bool suffix) {
-                size_t row_bytes = size_t(table.shape[1]) * 2;
-                int n = suffix ? horizon : prefix_tokens;
-                std::vector<uint8_t> bytes(size_t(n) * row_bytes);
+                const size_t row_bytes = size_t(table.shape[1]) * 2;
+                const int n = suffix ? horizon : prefix_tokens;
+                auto bytes = staged<uint8_t>(target, n * row_bytes);
                 for (int i = 0; i < n; ++i) {
                     int row = suffix ? valid + i + 1 : std::min(i + 1, valid);
                     require(row < table.shape[0], "RoPE position outside table");
-                    std::memcpy(bytes.data() + size_t(i) * row_bytes,
-                                table.data + size_t(row) * row_bytes, row_bytes);
+                    std::memcpy(bytes + size_t(i) * row_bytes, table.data + size_t(row) * row_bytes,
+                                row_bytes);
                 }
-                upload(target, bytes.data(), bytes.size());
+                push(target);
             };
             rope(p_cos, rope_cos, false);
             rope(p_sin, rope_sin, false);
@@ -687,7 +680,7 @@ class Pi05 {
     std::vector<float> infer(const void *image0, const void *image1, const float *noise,
                              Sample &timing) {
         require(!current_tokens.empty(), "set prompt before inference");
-        uint64_t start = mono_ns();
+        uint64_t start = monotonic_ns();
         upload(images[0], image0, images[0]->bytes);
         upload(images[1], image1, images[1]->bytes);
         upload(actions[0], noise, actions[0]->bytes);
@@ -700,14 +693,15 @@ class Pi05 {
                            stream),
            "download actions");
         ck(cudaStreamSynchronize(stream), "inference synchronize");
-        float ms = 0;
-        ck(cudaEventElapsedTime(&ms, events[0], events[1]), "vision timing");
-        timing.vision_ms = ms;
-        ck(cudaEventElapsedTime(&ms, events[1], events[2]), "language timing");
-        timing.language_ms = ms;
-        ck(cudaEventElapsedTime(&ms, events[2], events[3]), "denoise timing");
-        timing.denoise_ms = ms;
-        timing.total_ms = (mono_ns() - start) / 1e6;
+        auto elapsed = [&](int stage, const char *what) {
+            float ms = 0;
+            ck(cudaEventElapsedTime(&ms, events[stage], events[stage + 1]), what);
+            return double(ms);
+        };
+        timing.vision_ms = elapsed(0, "vision timing");
+        timing.language_ms = elapsed(1, "language timing");
+        timing.denoise_ms = elapsed(2, "denoise timing");
+        timing.total_ms = (monotonic_ns() - start) / 1e6;
         auto begin = static_cast<float *>(result->host);
         return {begin, begin + noise_count()};
     }
@@ -716,7 +710,7 @@ struct Tap {
     int index;
     float weight;
 };
-static std::vector<std::vector<Tap>> taps(int input, int output) {
+std::vector<std::vector<Tap>> taps(int input, int output) {
     double scale = double(output) / input, support = std::max(1., 1. / scale);
     int count = int(std::ceil(2 * support)) + 2;
     std::vector<std::vector<Tap>> result(output);
@@ -736,19 +730,36 @@ static std::vector<std::vector<Tap>> taps(int input, int output) {
     }
     return result;
 }
-// OpenPI's separable antialiased linear resize, centered black padding, uint8
-// round-to-even, [-1,1] normalization. Gray IR is replicated into three channels.
-static std::vector<__half> preprocess(const uint8_t *input, int width, int height, int stride,
-                                      int channels) {
+constexpr int side = 224, plane = side * side;
+// Aspect-preserving resize target inside the 224x224 model image, centered with padding.
+struct Fit {
+    int width, height, top, left;
+};
+Fit fit(int width, int height, int stride, int channels) {
     require(width > 0 && height > 0 && (channels == 1 || channels == 3) &&
                 stride >= width * channels,
             "invalid image");
-    double ratio = std::max(width / 224., height / 224.);
+    double ratio = std::max(width / double(side), height / double(side));
     int rh = int(height / ratio), rw = int(width / ratio);
     require(rh > 0 && rw > 0, "image aspect ratio");
-    auto yt = taps(height, rh), xt = taps(width, rw);
-    std::vector<float> vertical(size_t(rh) * width * channels);
-    for (int y = 0; y < rh; ++y)
+    return {rw, rh, (side - rh) / 2, (side - rw) / 2};
+}
+// Writes channel c of one padded-image pixel; gray input (one channel) fills all three.
+void put(std::vector<__half> &image, int channels, int c, int pixel, __half value) {
+    if (channels == 1)
+        for (int ch = 0; ch < 3; ++ch)
+            image[ch * plane + pixel] = value;
+    else
+        image[c * plane + pixel] = value;
+}
+// OpenPI's separable antialiased linear resize, centered black padding, uint8
+// round-to-even, [-1,1] normalization. Gray IR is replicated into three channels.
+std::vector<__half> preprocess(const uint8_t *input, int width, int height, int stride,
+                               int channels) {
+    const Fit f = fit(width, height, stride, channels);
+    auto yt = taps(height, f.height), xt = taps(width, f.width);
+    std::vector<float> vertical(size_t(f.height) * width * channels);
+    for (int y = 0; y < f.height; ++y)
         for (int x = 0; x < width; ++x)
             for (int c = 0; c < channels; ++c) {
                 float value = 0;
@@ -757,55 +768,37 @@ static std::vector<__half> preprocess(const uint8_t *input, int width, int heigh
                         float(input[size_t(tap.index) * stride + x * channels + c]) * tap.weight;
                 vertical[(size_t(y) * width + x) * channels + c] = value;
             }
-    std::vector<__half> result(3 * 224 * 224, __float2half(-1));
-    int top = (224 - rh) / 2, left = (224 - rw) / 2;
-    for (int y = 0; y < rh; ++y)
-        for (int x = 0; x < rw; ++x)
+    std::vector<__half> result(3 * plane, __float2half(-1));
+    for (int y = 0; y < f.height; ++y)
+        for (int x = 0; x < f.width; ++x)
             for (int c = 0; c < channels; ++c) {
                 float value = 0;
                 for (auto tap : xt[x])
                     value += vertical[(size_t(y) * width + tap.index) * channels + c] * tap.weight;
                 float pixel = std::clamp(std::nearbyint(value), 0.f, 255.f);
-                __half normalized = __float2half_rn((pixel / 255.f) * 2.f - 1.f);
-                if (channels == 1)
-                    for (int ch = 0; ch < 3; ++ch)
-                        result[ch * 224 * 224 + (y + top) * 224 + x + left] = normalized;
-                else
-                    result[c * 224 * 224 + (y + top) * 224 + x + left] = normalized;
+                put(result, channels, c, (y + f.top) * side + x + f.left,
+                    __float2half_rn((pixel / 255.f) * 2.f - 1.f));
             }
     return result;
 }
 // pi05_openpi_state: OpenPI's ResizeImages data transform (openpi_client image_tools: Pillow
 // BILINEAR, black padding), then the model's x/255*2-1. Gray IR is replicated.
-static std::vector<__half> preprocess_pil(const uint8_t *input, int width, int height, int stride,
-                                          int channels) {
-    require(width > 0 && height > 0 && (channels == 1 || channels == 3) &&
-                stride >= width * channels,
-            "invalid image");
-    double ratio = std::max(width / 224., height / 224.);
-    int rh = int(height / ratio), rw = int(width / ratio);
-    require(rh > 0 && rw > 0, "image aspect ratio");
-    const bool same = width == 224 && height == 224;
-    if (same)
-        rh = rw = 224;
-    int top = std::max(0, int((224 - rh) / 2.)), left = std::max(0, int((224 - rw) / 2.));
-    std::vector<__half> result(3 * 224 * 224, __float2half(-1));
+std::vector<__half> preprocess_pil(const uint8_t *input, int width, int height, int stride,
+                                   int channels) {
+    const Fit f = fit(width, height, stride, channels);
+    const bool same = width == side && height == side; // Pillow returns an unresampled copy
+    std::vector<__half> result(3 * plane, __float2half(-1));
     for (int c = 0; c < channels; ++c) {
         std::vector<uint8_t> resized;
-        if (same) {
-            resized.resize(224 * 224);
-            for (int y = 0; y < 224; ++y)
-                for (int x = 0; x < 224; ++x)
-                    resized[y * 224 + x] = input[size_t(y) * stride + x * channels + c];
-        } else
+        if (!same)
             resized =
-                kaivuri::pi05::pil_bilinear(input + c, width, height, stride, channels, rw, rh);
-        for (int y = 0; y < rh; ++y)
-            for (int x = 0; x < rw; ++x) {
-                __half normalized =
-                    __float2half_rn((float(resized[size_t(y) * rw + x]) / 255.f) * 2.f - 1.f);
-                for (int ch = channels == 1 ? 0 : c; ch < (channels == 1 ? 3 : c + 1); ++ch)
-                    result[ch * 224 * 224 + (y + top) * 224 + x + left] = normalized;
+                kp::pil_bilinear(input + c, width, height, stride, channels, f.width, f.height);
+        for (int y = 0; y < f.height; ++y)
+            for (int x = 0; x < f.width; ++x) {
+                const uint8_t value = same ? input[size_t(y) * stride + x * channels + c]
+                                           : resized[size_t(y) * f.width + x];
+                put(result, channels, c, (y + f.top) * side + x + f.left,
+                    __float2half_rn((float(value) / 255.f) * 2.f - 1.f));
             }
     }
     return result;
@@ -814,7 +807,7 @@ struct Comparison {
     double cosine = 0, max_abs = 0, mean_abs = 0;
     bool finite = true;
 };
-static Comparison compare(const std::vector<float> &values, const Npy &reference) {
+Comparison compare(const std::vector<float> &values, const Npy &reference) {
     require(reference.dtype == "<f4" && reference.count == values.size(), "reference shape/type");
     auto ref = reinterpret_cast<const float *>(reference.data);
     double dot = 0, a = 0, b = 0;
@@ -832,22 +825,39 @@ static Comparison compare(const std::vector<float> &values, const Npy &reference
     result.mean_abs /= values.size();
     return result;
 }
-static std::string comparison_json(const Comparison &c) {
+std::string comparison_json(const Comparison &c) {
     std::ostringstream out;
     out << std::setprecision(12) << "{\"cosine\":" << c.cosine << ",\"max_abs\":" << c.max_abs
         << ",\"mean_abs\":" << c.mean_abs << '}';
     return out.str();
 }
-static std::string join(const std::vector<int> &values) {
+// Values separated by sep, printed with the given stream precision.
+template <class T> std::string join(const std::vector<T> &values, char sep, int precision = 6) {
     std::ostringstream out;
-    for (size_t i = 0; i < values.size(); ++i)
-        out << (i ? " " : "") << values[i];
+    out << std::setprecision(precision);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i)
+            out << sep;
+        out << values[i];
+    }
     return out.str();
 }
-static std::vector<float> floats(const Npy &array) {
+std::vector<float> floats(const Npy &array) {
     require(array.dtype == "<f4", "float32 array required");
     auto begin = reinterpret_cast<const float *>(array.data);
     return {begin, begin + array.count};
+}
+// OpenPI Unnormalize of a normalized [horizon][width] chunk: the first robot_dim columns.
+std::vector<double> robot_chunk(const std::vector<float> &normalized, int horizon, int width,
+                                const kp::Contract &contract) {
+    const int r = contract.robot_dim;
+    std::vector<double> robot(size_t(horizon) * r);
+    for (int i = 0; i < horizon; ++i)
+        for (int j = 0; j < r; ++j)
+            robot[size_t(i) * r + j] =
+                kp::unnormalize(normalized[size_t(i) * width + j], contract.actions.q01[j],
+                                contract.actions.q99[j]);
+    return robot;
 }
 // Full normalized chunk vs the exporter's FP16 split reference. pi05_libero (AOT kernel in
 // the exported order) keeps 0.99999 / 0.005. pi05_openpi_state on native TensorRT attention
@@ -857,28 +867,29 @@ struct StateGate {
     double cosine = .99999, max_abs = .005;
     bool overridden = false;
 };
-static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path &prepared,
-                            const kaivuri::pi05::Contract *contract, const StateGate &gate) {
+std::string validate(Pi05 &model, const fs::path &bundle, const fs::path &prepared,
+                     const kp::Contract *contract, const StateGate &gate) {
     auto manifest = YAML::LoadFile((prepared / "manifest.json").string());
     require(fs::canonical(manifest["bundle"].as<std::string>()) == fs::canonical(bundle) &&
-                hash_file(bundle / "bundle.json") == manifest["bundle_sha256"].as<std::string>() &&
-                hash_file(bundle / "MANIFEST.sha256") ==
+                kaivuri::sha256_file(bundle / "bundle.json") ==
+                    manifest["bundle_sha256"].as<std::string>() &&
+                kaivuri::sha256_file(bundle / "MANIFEST.sha256") ==
                     manifest["source_manifest_sha256"].as<std::string>(),
             "prepared fixtures belong to another bundle");
-    const std::string policy =
-        manifest["policy"] ? manifest["policy"].as<std::string>() : "pi05_libero";
-    require(policy == model.policy_name(), "prepared fixtures are for another policy");
+    require(value_or(manifest["policy"], std::string("pi05_libero")) == model.policy_name(),
+            "prepared fixtures are for another policy");
     const bool state = contract != nullptr;
-    std::ostringstream report;
-    report << "[";
-    bool first = true;
     if (state)
         require(manifest["fixtures"].size() >= 1, "pi05_openpi_state fixtures required");
     else
         require(manifest["fixtures"].size() == 5, "all five OpenPI fixtures required");
+    auto prep = state ? preprocess_pil : preprocess;
+    std::ostringstream report;
+    const char *separator = "";
+    report << "[";
     for (auto entry : manifest["fixtures"]) {
         std::string name = entry["directory"].as<std::string>();
-        require(hash_file(bundle / "fixtures" / (name + ".npz")) ==
+        require(kaivuri::sha256_file(bundle / "fixtures" / (name + ".npz")) ==
                     entry["source_sha256"].as<std::string>(),
                 "original fixture changed");
         std::map<std::string, std::unique_ptr<Npy>> arrays;
@@ -900,26 +911,25 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
             auto &normalized = *arrays.at("state_normalized.npy");
             require(normalized.dtype == "<f8" && normalized.count == values.size(),
                     "fixture normalized state");
-            auto mine = kaivuri::pi05::normalize(values, contract->state);
+            auto mine = kp::normalize(values, contract->state);
             require(std::memcmp(mine.data(), normalized.data, normalized.bytes) == 0,
                     "state normalization differs from OpenPI: " + name);
-            auto composed = contract->tokens(entry["task"].as<std::string>(), values);
-            require(composed == valid, "board-composed state prompt differs from the "
-                                       "tokenizer's: " +
-                                           name);
-            extra << ",\"task\":" << std::quoted(entry["task"].as<std::string>()) << ",\"bins\":\""
-                  << join(contract->bins(values)) << "\",\"prompt_tokens\":" << valid.size()
+            const auto task = entry["task"].as<std::string>();
+            require(contract->tokens(task, values) == valid,
+                    "board-composed state prompt differs from the tokenizer's: " + name);
+            extra << ",\"task\":" << kaivuri::json_quote(task) << ",\"bins\":\""
+                  << join(contract->bins(values), ' ') << "\",\"prompt_tokens\":" << valid.size()
                   << ",\"prompt_matches_tokenizer\":true";
         }
-        const uint64_t prompt_start = mono_ns();
+        const uint64_t prompt_start = monotonic_ns();
         model.set_prompt(valid); // first fixture also primes and captures the CUDA graph
-        extra << ",\"set_prompt_ms\":" << (mono_ns() - prompt_start) / 1e6;
+        extra << ",\"set_prompt_ms\":" << (monotonic_ns() - prompt_start) / 1e6;
         auto &noise = *arrays.at("noise.npy");
         require(noise.dtype == "<f4" && noise.count == size_t(model.noise_count()),
                 "fixture noise contract");
         auto &image0 = *arrays.at("image0.npy"), &image1 = *arrays.at("image1.npy");
-        require(image0.dtype == "<f2" && image1.dtype == "<f2" && image0.count == 3 * 224 * 224 &&
-                    image1.count == 3 * 224 * 224,
+        require(image0.dtype == "<f2" && image1.dtype == "<f2" && image0.count == 3 * plane &&
+                    image1.count == 3 * plane,
                 "fixture image contract");
         Sample timing;
         auto actions = model.infer(image0.data, image1.data,
@@ -932,20 +942,15 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
                     fp16.max_abs <= gate.max_abs,
                 "C++ action parity failed: " + name + " " + comparison_json(fp16));
         if (state) {
-            // OpenPI Unnormalize of the FP16 reference, first robot_action_dim columns.
-            auto ref = floats(reference);
             auto &robot = *arrays.at("robot_reference.npy");
-            const int h = model.action_horizon(), w = model.action_dim(), r = contract->robot_dim;
-            require(robot.dtype == "<f8" && robot.count == size_t(h) * r, "robot reference shape");
+            const int h = model.action_horizon();
+            require(robot.dtype == "<f8" && robot.count == size_t(h) * contract->robot_dim,
+                    "robot reference shape");
+            auto mine = robot_chunk(floats(reference), h, model.action_dim(), *contract);
             auto expected = reinterpret_cast<const double *>(robot.data);
             double worst = 0;
-            for (int i = 0; i < h; ++i)
-                for (int j = 0; j < r; ++j)
-                    worst = std::max(worst,
-                                     std::abs(kaivuri::pi05::unnormalize(ref[size_t(i) * w + j],
-                                                                         contract->actions.q01[j],
-                                                                         contract->actions.q99[j]) -
-                                              expected[size_t(i) * r + j]));
+            for (size_t k = 0; k < mine.size(); ++k)
+                worst = std::max(worst, std::abs(mine[k] - expected[k]));
             require(worst <= 1e-12, "action unnormalization differs from OpenPI: " + name);
             extra << ",\"unnormalize_max_abs\":" << worst;
         }
@@ -959,7 +964,6 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
                         (channels == 1 || channels == 3),
                     "fixture raw image");
             const int h = raw.shape[0], w = raw.shape[1];
-            auto prep = state ? preprocess_pil : preprocess;
             auto image = prep(raw.data, w, h, w * channels, channels);
             auto ref = reinterpret_cast<const uint16_t *>(expected.data);
             for (size_t j = 0; j < image.size(); ++j) {
@@ -984,12 +988,10 @@ static std::string validate(Pi05 &model, const fs::path &bundle, const fs::path 
         require(different == 0, "C++ OpenPI image preprocessing differs: " + name + " (" +
                                     std::to_string(different) + " pixels)");
         require(gray_identical, "gray Y8 preprocessing differs from its 3-channel copy: " + name);
-        if (!first)
-            report << ',';
-        first = false;
-        report << "{\"fixture\":" << std::quoted(name) << ",\"fp16\":" << comparison_json(fp16)
-               << ",\"mixed\":" << comparison_json(mixed)
+        report << separator << "{\"fixture\":" << kaivuri::json_quote(name)
+               << ",\"fp16\":" << comparison_json(fp16) << ",\"mixed\":" << comparison_json(mixed)
                << ",\"preprocess_different_elements\":" << different << extra.str() << '}';
+        separator = ",";
         std::cerr << "[parity] " << name << " PASS " << comparison_json(fp16) << '\n';
     }
     report << ']';
@@ -1008,10 +1010,10 @@ struct FrameReader {
     }
     FrameMetadata read() {
         FrameMetadata metadata{};
-        uint64_t deadline = mono_ns() + 1000000000ULL;
-        while (!stopped && mono_ns() < deadline) {
+        uint64_t deadline = monotonic_ns() + 1000000000ULL;
+        while (!stop_requested && monotonic_ns() < deadline) {
             if (kaivuri_frame_read(handle, &metadata, pixels.data(), pixels.size()) == 1) {
-                auto now = mono_ns();
+                auto now = monotonic_ns();
                 if (metadata.host_monotonic_ns && metadata.host_monotonic_ns <= now &&
                     now - metadata.host_monotonic_ns <= 200000000ULL)
                     return metadata;
@@ -1022,103 +1024,136 @@ struct FrameReader {
     }
 };
 // norm_stats.json must be the bundle's own (listed in MANIFEST.sha256).
-static YAML::Node bundle_norm_stats(const fs::path &bundle) {
+YAML::Node bundle_norm_stats(const fs::path &bundle) {
     std::ifstream manifest(bundle / "MANIFEST.sha256");
     require(bool(manifest), "bundle lacks MANIFEST.sha256");
     std::string digest, name;
     while (manifest >> digest >> name)
         if (name == "norm_stats.json" || name == "*norm_stats.json") {
-            require(hash_file(bundle / "norm_stats.json") == digest, "norm_stats.json checksum");
+            require(kaivuri::sha256_file(bundle / "norm_stats.json") == digest,
+                    "norm_stats.json checksum");
             return YAML::LoadFile((bundle / "norm_stats.json").string());
         }
     throw std::runtime_error("norm_stats.json missing from MANIFEST.sha256");
 }
+// Training camera order: frame files are <serial>-ir<index>.frame (kaivuri-camera). Rotation
+// is applied by kaivuri-camera --rotate-180 and cannot be read back here. Returns the IR
+// index each slot's frames must carry.
+std::vector<uint32_t> bundle_cameras(const YAML::Node &info, const std::vector<fs::path> &frames) {
+    auto cameras = info["kaivuri"]["cameras"];
+    require(cameras && cameras.size() == 2, "bundle lacks kaivuri.cameras");
+    std::vector<uint32_t> ir_indices;
+    for (size_t k = 0; k < 2; ++k) {
+        auto spec = cameras[k]["camera"].as<std::string>();
+        auto colon = spec.find(':');
+        require(colon != std::string::npos, "camera spec SERIAL:IR_INDEX");
+        auto serial = spec.substr(0, colon), index = spec.substr(colon + 1);
+        require(frames[k].stem().string() == serial + "-ir" + index,
+                "camera " + std::to_string(k) + " must be " + spec + " (" + serial + "-ir" + index +
+                    ".frame) in the bundle's slot order");
+        ir_indices.push_back(std::stoul(index));
+        const int rotation = value_or(cameras[k]["rotation_deg"], 0);
+        if (rotation != 0)
+            std::cerr << "[cameras] " << spec << " was trained rotated " << rotation
+                      << " deg: kaivuri-camera must run with --rotate-180 " << serial << '\n';
+    }
+    return ir_indices;
+}
+double percentile(std::vector<double> values, double p) {
+    std::sort(values.begin(), values.end());
+    double pos = p * (values.size() - 1);
+    size_t lo = size_t(pos), hi = std::min(lo + 1, values.size() - 1);
+    return values[lo] + (values[hi] - values[lo]) * (pos - lo);
+}
+constexpr const char *usage =
+    "kaivuri-inference --bundle OPENPI_BUNDLE --cache VALIDATED_ENGINE_CACHE\n"
+    "  --fixtures PREPARED_FIXTURES --out NEW_REPORT.json [--validate-only]\n"
+    "  [--camera-frame FIRST.frame --camera-frame SECOND.frame]\n"
+    "  [--task EXPORTED_TASK --duration-s 60 --warmup 5 --no-graph]\n"
+    "  [--rate-hz 2] (0 = unrestricted; wait before reading fresh frames)\n"
+    "  pi05_openpi_state: [--control-socket PATH --max-state-age-ms 50]\n"
+    "    [--parity-cosine 0.9998 --parity-max-abs 0.01]\n"
+    "  Driving (pi05_openpi_state only; nothing is enabled implicitly):\n"
+    "    --drive [--allow-live] [--pump] [--enable-slew] [--enable-tracks]\n"
+    "    [--action-tolerance inf --renew-ms 100 --max-observation-age-ms 1400 "
+    "--action-offset-ms 0]\n"
+    "Without --drive, actions are recorded only and never drive hardware.\n";
+constexpr const char *csv_header =
+    "sample,start_ns,finish_ns,frame0_sequence,frame1_sequence,frame0_arrival_ns,"
+    "frame1_arrival_ns,frame0_sensor_us,frame1_sensor_us,frame0_exposure_us,frame1_exposure_us,"
+    "frame0_valid_bits,frame1_valid_bits,preprocess_ms,vision_ms,language_ms,denoise_ms,"
+    "inference_ms,iteration_ms,observation_age_start_ms,observation_to_result_ms,"
+    "camera_arrival_skew_ms,rate_wait_ms,rate_lateness_ms,state_imu_ns,state_age_ms,state_deg,"
+    "state_bins,prompt_tokens,prompt_ms,plan_t0_ns,plan_observation_ns,plan_sent,plan_clamped\n";
+} // namespace
+
 int main(int argc, char **argv) {
     try {
-        namespace kp = kaivuri::pi05;
         fs::path bundle, cache, fixtures, out;
         std::vector<fs::path> frames;
         std::string task = "pick up the red block";
-        std::string control_socket =
-            "/tmp/kaivuri-native-" + std::to_string(geteuid()) + "/control.sock";
+        std::string control_socket = (kaivuri::runtime_dir() / "control.sock").string();
         double duration = 60, rate_hz = 0, max_state_age_ms = 50, action_offset_ms = 0;
         int warmup = 5;
         bool only = false, graph = true, drive = false;
         kp::ProducerOptions producer_options;
+        auto &supervisor = producer_options.supervisor;
         StateGate gate;
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            auto value = [&]() {
-                require(++i < argc, "missing argument " + arg);
-                return std::string(argv[i]);
-            };
-            if (arg == "--bundle")
-                bundle = value();
-            else if (arg == "--cache")
-                cache = value();
-            else if (arg == "--fixtures")
-                fixtures = value();
-            else if (arg == "--out")
-                out = value();
-            else if (arg == "--camera-frame")
-                frames.push_back(value());
-            else if (arg == "--task")
-                task = value();
-            else if (arg == "--duration-s")
-                duration = std::stod(value());
-            else if (arg == "--rate-hz")
-                rate_hz = std::stod(value());
-            else if (arg == "--warmup")
-                warmup = std::stoi(value());
-            else if (arg == "--validate-only")
+        kaivuri::Args args(argc, argv);
+        while (args.next()) {
+            if (args.is("--bundle"))
+                bundle = args.value();
+            else if (args.is("--cache"))
+                cache = args.value();
+            else if (args.is("--fixtures"))
+                fixtures = args.value();
+            else if (args.is("--out"))
+                out = args.value();
+            else if (args.is("--camera-frame"))
+                frames.push_back(args.value());
+            else if (args.is("--task"))
+                task = args.value();
+            else if (args.is("--duration-s"))
+                duration = args.number();
+            else if (args.is("--rate-hz"))
+                rate_hz = args.number();
+            else if (args.is("--warmup"))
+                warmup = args.integer();
+            else if (args.is("--validate-only"))
                 only = true;
-            else if (arg == "--no-graph")
+            else if (args.is("--no-graph"))
                 graph = false;
-            else if (arg == "--control-socket")
-                control_socket = value();
-            else if (arg == "--max-state-age-ms")
-                max_state_age_ms = std::stod(value());
-            else if (arg == "--parity-cosine")
-                gate.cosine = std::stod(value()), gate.overridden = true;
-            else if (arg == "--parity-max-abs")
-                gate.max_abs = std::stod(value()), gate.overridden = true;
-            else if (arg == "--drive")
+            else if (args.is("--control-socket"))
+                control_socket = args.value();
+            else if (args.is("--max-state-age-ms"))
+                max_state_age_ms = args.number();
+            else if (args.is("--parity-cosine"))
+                gate.cosine = args.number(), gate.overridden = true;
+            else if (args.is("--parity-max-abs"))
+                gate.max_abs = args.number(), gate.overridden = true;
+            else if (args.is("--drive"))
                 drive = true;
-            else if (arg == "--allow-live")
+            else if (args.is("--allow-live"))
                 producer_options.allow_live = true;
-            else if (arg == "--pump")
+            else if (args.is("--pump"))
                 producer_options.pump = true;
-            else if (arg == "--enable-slew")
+            else if (args.is("--enable-slew"))
                 producer_options.gate.slew = true;
-            else if (arg == "--enable-tracks")
+            else if (args.is("--enable-tracks"))
                 producer_options.gate.tracks = true;
-            else if (arg == "--action-tolerance")
-                producer_options.gate.tolerance = std::stod(value());
-            else if (arg == "--renew-ms")
-                producer_options.supervisor.renew_ns = uint64_t(std::stod(value()) * 1e6);
-            else if (arg == "--max-observation-age-ms")
-                producer_options.supervisor.max_observation_age_ns =
-                    uint64_t(std::stod(value()) * 1e6);
-            else if (arg == "--action-offset-ms")
-                action_offset_ms = std::stod(value());
-            else if (arg == "--help") {
-                std::cout
-                    << "kaivuri-inference --bundle OPENPI_BUNDLE --cache "
-                       "VALIDATED_ENGINE_CACHE\n"
-                       "  --fixtures PREPARED_FIXTURES --out NEW_REPORT.json [--validate-only]\n"
-                       "  [--camera-frame FIRST.frame --camera-frame SECOND.frame]\n"
-                       "  [--task EXPORTED_TASK --duration-s 60 --warmup 5 --no-graph]\n"
-                       "  [--rate-hz 2] (0 = unrestricted; wait before reading fresh frames)\n"
-                       "  pi05_openpi_state: [--control-socket PATH --max-state-age-ms 50]\n"
-                       "    [--parity-cosine 0.9998 --parity-max-abs 0.01]\n"
-                       "  Driving (pi05_openpi_state only; nothing is enabled implicitly):\n"
-                       "    --drive [--allow-live] [--pump] [--enable-slew] [--enable-tracks]\n"
-                       "    [--action-tolerance inf --renew-ms 100 --max-observation-age-ms "
-                       "1400 --action-offset-ms 0]\n"
-                       "Without --drive, actions are recorded only and never drive hardware.\n";
+            else if (args.is("--action-tolerance"))
+                producer_options.gate.tolerance = args.number();
+            else if (args.is("--renew-ms"))
+                supervisor.renew_ns = uint64_t(args.number() * 1e6);
+            else if (args.is("--max-observation-age-ms"))
+                supervisor.max_observation_age_ns = uint64_t(args.number() * 1e6);
+            else if (args.is("--action-offset-ms"))
+                action_offset_ms = args.number();
+            else if (args.is("--help")) {
+                std::cout << usage;
                 return 0;
             } else
-                throw std::runtime_error("unknown option " + arg);
+                args.unknown();
         }
         require(!bundle.empty() && !cache.empty() && !fixtures.empty() && !out.empty(),
                 "bundle, cache, fixtures and out required");
@@ -1130,17 +1165,15 @@ int main(int argc, char **argv) {
                 "rate must be 0 (unrestricted) or 0.001..500 Hz");
         require(max_state_age_ms > 0 && max_state_age_ms <= 200, "state age limit 0..200 ms");
         require(std::abs(action_offset_ms) <= 100, "action offset must be within +-100 ms");
-        const auto &sup = producer_options.supervisor;
-        require(sup.renew_ns >= 10000000ULL && sup.renew_ns <= 250000000ULL &&
-                    sup.max_observation_age_ns >= 200000000ULL &&
-                    sup.max_observation_age_ns <= 1450000000ULL,
+        require(supervisor.renew_ns >= 10000000ULL && supervisor.renew_ns <= 250000000ULL &&
+                    supervisor.max_observation_age_ns >= 200000000ULL &&
+                    supervisor.max_observation_age_ns <= 1450000000ULL,
                 "renewal 10..250 ms (lease 500 ms); observation age 200..1450 ms (daemon 1500)");
         require(!fs::exists(out), "report already exists; choose a new path");
-        signal(SIGINT, stop_signal);
-        signal(SIGTERM, stop_signal);
-        uint64_t load_start = mono_ns();
+        kaivuri::install_stop_handlers();
+        uint64_t load_start = monotonic_ns();
         Pi05 model(bundle, cache, graph);
-        double load_ms = (mono_ns() - load_start) / 1e6;
+        double load_ms = (monotonic_ns() - load_start) / 1e6;
         std::unique_ptr<kp::Contract> contract;
         if (model.policy_name() == "pi05_openpi_state") {
             contract = std::make_unique<kp::Contract>(
@@ -1160,14 +1193,15 @@ int main(int argc, char **argv) {
             fs::create_directories(out.parent_path());
         std::ofstream summary(out);
         require(bool(summary), "cannot create report");
-        summary << std::setprecision(12) << "{\"model\":" << std::quoted(model.policy_name())
+        summary << std::setprecision(12)
+                << "{\"model\":" << kaivuri::json_quote(model.policy_name())
                 << ",\"runtime\":\"C++ TensorRT " << (model.native_cache() ? "native" : "+ AOT")
                 << "\",\"actuator_output\":" << (drive ? "true" : "false")
                 << ",\"cuda_graph\":" << (graph ? "true" : "false") << ",\"load_ms\":" << load_ms
                 << ",\"action_horizon\":" << model.action_horizon()
                 << ",\"action_dim\":" << model.action_dim()
-                << ",\"denoising_steps\":" << model.denoising_steps() << ",\"parity\":" << parity;
-        summary << ",\"parity_gate\":{\"cosine\":" << gate.cosine << ",\"max_abs\":" << gate.max_abs
+                << ",\"denoising_steps\":" << model.denoising_steps() << ",\"parity\":" << parity
+                << ",\"parity_gate\":{\"cosine\":" << gate.cosine << ",\"max_abs\":" << gate.max_abs
                 << '}';
         if (only) {
             summary << ",\"status\":\"PASS\"}\n";
@@ -1176,25 +1210,7 @@ int main(int argc, char **argv) {
         std::vector<uint32_t> ir_indices;
         if (contract) {
             require(contract->prompt.heads.count(task), "task has no token head in this bundle");
-            // Training camera order: frame files are <serial>-ir<index>.frame (kaivuri-camera).
-            // Rotation is applied by kaivuri-camera --rotate-180 and cannot be read back here.
-            auto cameras = model.bundle_info()["kaivuri"]["cameras"];
-            require(cameras && cameras.size() == 2, "bundle lacks kaivuri.cameras");
-            for (size_t k = 0; k < 2; ++k) {
-                auto spec = cameras[k]["camera"].as<std::string>();
-                auto colon = spec.find(':');
-                require(colon != std::string::npos, "camera spec SERIAL:IR_INDEX");
-                auto expected = spec.substr(0, colon) + "-ir" + spec.substr(colon + 1);
-                require(frames[k].stem().string() == expected,
-                        "camera " + std::to_string(k) + " must be " + spec + " (" + expected +
-                            ".frame) in the bundle's slot order");
-                ir_indices.push_back(std::stoul(spec.substr(colon + 1)));
-                if (cameras[k]["rotation_deg"] && cameras[k]["rotation_deg"].as<int>() != 0)
-                    std::cerr << "[cameras] " << spec << " was trained rotated "
-                              << cameras[k]["rotation_deg"].as<int>()
-                              << " deg: kaivuri-camera must run with --rotate-180 "
-                              << spec.substr(0, colon) << '\n';
-            }
+            ir_indices = bundle_cameras(model.bundle_info(), frames);
         } else
             model.set_prompt(model.task_tokens(task));
         FrameReader first(frames[0]), second(frames[1]);
@@ -1214,35 +1230,31 @@ int main(int argc, char **argv) {
         csv_path.replace_extension(".csv");
         std::ofstream csv(csv_path);
         require(bool(csv), "cannot create timing CSV");
-        csv << "sample,start_ns,finish_ns,frame0_sequence,frame1_sequence,frame0_arrival_ns,frame1_"
-               "arrival_ns,"
-               "frame0_sensor_us,frame1_sensor_us,frame0_exposure_us,frame1_exposure_us,frame0_"
-               "valid_bits,frame1_valid_bits,"
-               "preprocess_ms,vision_ms,language_ms,denoise_ms,inference_ms,iteration_ms,"
-               "observation_age_start_ms,observation_to_result_ms,camera_arrival_skew_ms,"
-               "rate_wait_ms,rate_lateness_ms,state_imu_ns,state_age_ms,state_deg,state_bins,"
-               "prompt_tokens,prompt_ms,plan_t0_ns,plan_observation_ns,plan_sent,plan_clamped\n";
-        std::vector<double> latencies, delays, prompt_times, warmup_delays;
+        csv << csv_header;
+        std::vector<double> latencies, delays, prompt_times, warmup_delays, waits;
         int count = 0;
         uint64_t begin = 0;
         const uint64_t period_ns = rate_hz ? static_cast<uint64_t>(std::llround(1e9 / rate_hz)) : 0;
         uint64_t next_start = 0, rate_overruns = 0;
-        std::vector<double> waits;
         std::vector<float> last_action;
         std::vector<double> last_robot;
-        while (!stopped && (!begin || (mono_ns() - begin) / 1e9 < duration)) {
-            const uint64_t wait_begin = mono_ns();
+        auto running = [&] {
+            return !stop_requested && (!begin || (monotonic_ns() - begin) / 1e9 < duration);
+        };
+        while (running()) {
+            const uint64_t wait_begin = monotonic_ns();
             if (next_start && wait_begin > next_start)
                 ++rate_overruns;
-            while (!stopped && next_start && mono_ns() < next_start) {
+            while (!stop_requested && next_start && monotonic_ns() < next_start) {
                 // Bounded absolute sleeps remain responsive to shutdown, even at low rates.
-                const uint64_t wake_ns = std::min<uint64_t>(next_start, mono_ns() + 50000000ULL);
+                const uint64_t wake_ns =
+                    std::min<uint64_t>(next_start, monotonic_ns() + 50000000ULL);
                 timespec wake{static_cast<time_t>(wake_ns / 1000000000ULL),
                               static_cast<long>(wake_ns % 1000000000ULL)};
                 const int result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
                 require(result == 0 || result == EINTR, "inference pacing sleep failed");
             }
-            if (stopped || (begin && (mono_ns() - begin) / 1e9 >= duration))
+            if (!running())
                 break;
             // Arm after warm-up, then hold centered until the first chunk.
             if (producer && count == warmup) {
@@ -1251,7 +1263,7 @@ int main(int argc, char **argv) {
                 const double worst = *std::max_element(warmup_delays.begin(), warmup_delays.end());
                 const double gap = (period_ns ? period_ns / 1e6 : worst) + worst;
                 const double plan_ms = (model.action_horizon() - 1) * 1000. / contract->fps;
-                const double age_ms = producer_options.supervisor.max_observation_age_ns / 1e6;
+                const double age_ms = supervisor.max_observation_age_ns / 1e6;
                 std::cerr << "[drive] next chunk after <= " << gap << " ms; plan covers " << plan_ms
                           << " ms; observation limit " << age_ms << " ms\n";
                 require(gap + 100 < plan_ms && gap + 50 < age_ms,
@@ -1260,7 +1272,7 @@ int main(int argc, char **argv) {
             }
             if (producer && count > warmup && !producer->running())
                 throw std::runtime_error("producer stopped: " + producer->stop_reason());
-            uint64_t start = mono_ns();
+            uint64_t start = monotonic_ns();
             const double rate_wait_ms = (start - wait_begin) / 1e6;
             const double rate_lateness_ms =
                 next_start && start > next_start ? (start - next_start) / 1e6 : 0;
@@ -1281,23 +1293,23 @@ int main(int argc, char **argv) {
             double prompt_ms = 0;
             if (contract) {
                 // State sampled right after the frames; never older than max_state_age_ms.
-                robot = kp::robot_state(state_link->status(), contract->state_joints, mono_ns(),
-                                        uint64_t(max_state_age_ms * 1e6));
+                robot = kp::robot_state(state_link->status(), contract->state_joints,
+                                        monotonic_ns(), uint64_t(max_state_age_ms * 1e6));
                 oldest = std::min(oldest, robot.imu_ns);
-                const uint64_t prompt_start = mono_ns();
+                const uint64_t prompt_start = monotonic_ns();
                 bins = contract->bins(robot.degrees);
                 auto tokens = contract->prompt.compose(task, bins);
                 prompt_tokens = tokens.size();
                 model.set_prompt(tokens);
-                prompt_ms = (mono_ns() - prompt_start) / 1e6;
+                prompt_ms = (monotonic_ns() - prompt_start) / 1e6;
             }
-            uint64_t observed = mono_ns();
+            uint64_t observed = monotonic_ns();
             require(observed >= oldest && observed - oldest <= 200000000ULL,
                     "oldest observation exceeds 200ms freshness limit");
             auto prep = contract ? preprocess_pil : preprocess;
             auto image0 = prep(first.pixels.data(), a.width, a.height, a.stride, 1);
             auto image1 = prep(second.pixels.data(), b.width, b.height, b.stride, 1);
-            double preprocess_ms = (mono_ns() - observed) / 1e6;
+            double preprocess_ms = (monotonic_ns() - observed) / 1e6;
             for (auto &value : noise)
                 value = gaussian(random);
             Sample timing;
@@ -1308,43 +1320,34 @@ int main(int argc, char **argv) {
             int clamped = 0;
             bool sent = false;
             if (contract) {
-                const int h = model.action_horizon(), w = model.action_dim(),
-                          r = contract->robot_dim;
-                last_robot.assign(size_t(h) * r, 0);
-                for (int i = 0; i < h; ++i)
-                    for (int j = 0; j < r; ++j)
-                        last_robot[size_t(i) * r + j] =
-                            kp::unnormalize(last_action[size_t(i) * w + j],
-                                            contract->actions.q01[j], contract->actions.q99[j]);
+                const int h = model.action_horizon(), r = contract->robot_dim;
+                last_robot = robot_chunk(last_action, h, model.action_dim(), *contract);
                 // Row 0 belongs to the observation instant; the controller starts at the
                 // row matching its own clock, which skips the inference delay.
                 const double fps = contract->fps > 0 ? contract->fps : 30;
                 const uint64_t t0 = uint64_t(int64_t(oldest) + int64_t(action_offset_ms * 1e6));
-                if (producer) {
+                try {
                     plan = kp::make_plan(last_robot, h, r, fps, t0, oldest, producer_options.gate,
                                          clamped);
-                    if (clamped > 0) {
-                        double worst = 0;
-                        for (auto v : last_robot)
-                            worst = std::max(worst, std::abs(v));
-                        std::cerr << "[drive] warning: sample " << count << " clamped " << clamped
-                                  << " actions to [-1,1] (max |v| " << worst << ")\n";
-                    }
+                } catch (const std::runtime_error &) {
+                    if (producer)
+                        throw;
+                    clamped = -1; // Record-only: report an out-of-range chunk, keep running.
                 }
-                else
-                    try { // Record-only: report an out-of-range chunk as -1 instead of stopping.
-                        plan = kp::make_plan(last_robot, h, r, fps, t0, oldest,
-                                             producer_options.gate, clamped);
-                    } catch (const std::runtime_error &) {
-                        clamped = -1;
-                    }
+                if (producer && clamped > 0) {
+                    double worst = 0;
+                    for (auto v : last_robot)
+                        worst = std::max(worst, std::abs(v));
+                    std::cerr << "[drive] warning: sample " << count << " clamped " << clamped
+                              << " actions to [-1,1] (max |v| " << worst << ")\n";
+                }
                 if (producer && count >= warmup) {
                     std::string reason;
                     require(producer->post(plan, reason), "drive plan refused: " + reason);
                     sent = true;
                 }
             }
-            uint64_t finish = mono_ns();
+            uint64_t finish = monotonic_ns();
             if (count < warmup)
                 warmup_delays.push_back((finish - oldest) / 1e6);
             if (count++ < warmup)
@@ -1359,9 +1362,6 @@ int main(int argc, char **argv) {
             waits.push_back(rate_wait_ms);
             prompt_times.push_back(prompt_ms);
             double skew = std::abs(double(a.host_monotonic_ns) - double(b.host_monotonic_ns)) / 1e6;
-            std::ostringstream degrees;
-            for (size_t i = 0; i < robot.degrees.size(); ++i)
-                degrees << (i ? " " : "") << std::setprecision(9) << robot.degrees[i];
             csv << std::setprecision(12) << latencies.size() << ',' << start << ',' << finish << ','
                 << a.sequence << ',' << b.sequence << ',' << a.host_monotonic_ns << ','
                 << b.host_monotonic_ns << ',' << a.sensor_timestamp_us << ','
@@ -1372,35 +1372,29 @@ int main(int argc, char **argv) {
                 << (observed - oldest) / 1e6 << ',' << delay << ',' << skew << ',' << rate_wait_ms
                 << ',' << rate_lateness_ms << ',' << robot.imu_ns << ','
                 << (robot.imu_ns ? (observed - std::min(observed, robot.imu_ns)) / 1e6 : 0) << ','
-                << degrees.str() << ',' << join(bins) << ',' << prompt_tokens << ',' << prompt_ms
-                << ',' << plan.t0_ns << ',' << plan.observation_ns << ',' << sent << ',' << clamped
-                << '\n';
+                << join(robot.degrees, ' ', 9) << ',' << join(bins, ' ') << ',' << prompt_tokens
+                << ',' << prompt_ms << ',' << plan.t0_ns << ',' << plan.observation_ns << ','
+                << sent << ',' << clamped << '\n';
             require(bool(csv), "timing write failed");
         }
         std::string producer_json;
         if (producer) {
-            producer->stop(stopped ? "signal" : "duration complete");
+            producer->stop(stop_requested ? "signal" : "duration complete");
             auto c = producer->counters();
             std::ostringstream p;
             p << std::setprecision(12) << ",\"producer\":{\"plans\":" << c.plans
               << ",\"renewals\":" << c.renewals << ",\"holds\":" << c.holds
               << ",\"max_send_gap_ms\":" << c.max_send_gap_ms
-              << ",\"stop_reason\":" << std::quoted(producer->stop_reason()) << '}';
+              << ",\"stop_reason\":" << kaivuri::json_quote(producer->stop_reason()) << '}';
             producer_json = p.str();
             producer.reset();
         }
         require(!latencies.empty(), "no inference samples");
-        auto percentile = [](std::vector<double> values, double p) {
-            std::sort(values.begin(), values.end());
-            double pos = p * (values.size() - 1);
-            size_t lo = size_t(pos), hi = std::min(lo + 1, values.size() - 1);
-            return values[lo] + (values[hi] - values[lo]) * (pos - lo);
-        };
-        summary << ",\"task\":" << std::quoted(task) << ",\"views\":2,\"input\":"
+        summary << ",\"task\":" << kaivuri::json_quote(task) << ",\"views\":2,\"input\":"
                 << (contract ? "\"IR Y8 replicated to RGB; joint-angle state prompt\""
                              : "\"IR Y8 replicated to RGB; unfinetuned LIBERO bench\"")
                 << ",\"samples\":" << latencies.size()
-                << ",\"elapsed_s\":" << (mono_ns() - begin) / 1e9 << ",\"rate_hz\":" << rate_hz
+                << ",\"elapsed_s\":" << (monotonic_ns() - begin) / 1e9 << ",\"rate_hz\":" << rate_hz
                 << ",\"rate_overruns\":" << rate_overruns
                 << ",\"rate_wait_p50_ms\":" << percentile(waits, .5)
                 << ",\"inference_p50_ms\":" << percentile(latencies, .5)
@@ -1411,19 +1405,9 @@ int main(int argc, char **argv) {
                 << ",\"prompt_max_ms\":" << percentile(prompt_times, 1)
                 << ",\"arrival_to_result_p50_ms\":" << percentile(delays, .5)
                 << ",\"arrival_to_result_p99_ms\":" << percentile(delays, .99) << producer_json
-                << ",\"last_normalized_chunk\":[";
-        for (size_t i = 0; i < last_action.size(); ++i) {
-            if (i)
-                summary << ',';
-            summary << last_action[i];
-        }
-        summary << "]";
-        if (contract) {
-            summary << ",\"last_robot_chunk\":[";
-            for (size_t i = 0; i < last_robot.size(); ++i)
-                summary << (i ? "," : "") << last_robot[i];
-            summary << "]";
-        }
+                << ",\"last_normalized_chunk\":[" << join(last_action, ',', 12) << ']';
+        if (contract)
+            summary << ",\"last_robot_chunk\":[" << join(last_robot, ',', 12) << ']';
         summary << ",\"status\":\"PASS\"}\n";
         require(bool(summary), "summary write failed");
         std::cout << "PASS samples=" << latencies.size() << " p50_ms=" << percentile(latencies, .5)

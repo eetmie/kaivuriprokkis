@@ -6,17 +6,40 @@ from pathlib import Path
 import time
 
 
-def snapshot(pid):
+def process_snapshot(pid):
+    """RSS/PSS/swap (MiB), user+system CPU seconds and thread count of one process."""
     root = Path("/proc") / str(pid)
     result = {}
     for line in (root / "smaps_rollup").read_text().splitlines():
         parts = line.split()
         if parts[0] in ("Rss:", "Pss:", "Swap:"):
-            result[parts[0].strip(":").lower() + "_mib"] = int(parts[1]) / 1024
+            result[parts[0][:-1].lower() + "_mib"] = int(parts[1]) / 1024
     fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
     result["cpu_seconds"] = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-    result["pid"] = pid
+    result["threads"] = int(fields[17])
     return result
+
+
+def system_snapshot():
+    info = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        parts = line.split()
+        info[parts[0][:-1]] = int(parts[1])
+    return {"used_mib": (info["MemTotal"] - info["MemAvailable"]) / 1024,
+            "available_mib": info["MemAvailable"] / 1024,
+            "swap_used_mib": (info["SwapTotal"] - info["SwapFree"]) / 1024}
+
+
+def percentile(ordered, fraction):
+    """Linear interpolation between the closest ranks of an ascending, non-empty list."""
+    pos = fraction * (len(ordered) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def snapshot(pid):
+    return dict(process_snapshot(pid), pid=pid)
 
 
 def measure(pids, seconds=10, interval=.2):

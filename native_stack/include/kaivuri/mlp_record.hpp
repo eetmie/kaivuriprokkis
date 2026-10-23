@@ -1,6 +1,7 @@
 #pragma once
 #include "kaivuri/core.hpp"
 #include "kaivuri/mlp_excitation.hpp"
+#include "kaivuri/util.hpp"
 #include <atomic>
 #include <filesystem>
 #include <memory>
@@ -49,8 +50,6 @@ struct RecordingMetadata {
     std::string collector = "kaivuri-mlp-collect";
     std::vector<std::pair<std::string, std::string>> files;
 };
-std::string sha256_file(const std::filesystem::path &);
-std::string json_quote(const std::string &);
 
 // Optional sidecar owner. Callbacks run only on the writer thread; paths use
 // .partial suffixes. The shared writer hashes/syncs/commits every attachment

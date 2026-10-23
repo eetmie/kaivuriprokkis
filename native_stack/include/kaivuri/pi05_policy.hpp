@@ -2,11 +2,12 @@
 // CUDA-free parts of the fine-tuned OpenPI pi0.5 runtime (bundle policy pi05_openpi_state):
 // per-step state prompt, OpenPI quantile normalization, controller state, and the
 // policy -> controller drive-plan producer. See notes/PI05_FINETUNE.md.
-#include <limits>
 #include "kaivuri/core.hpp"
+#include "kaivuri/util.hpp"
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -15,7 +16,6 @@
 #include <yaml-cpp/yaml.h>
 
 namespace kaivuri::pi05 {
-uint64_t now_ns();
 
 struct Quantiles {
     std::vector<double> q01, q99;
@@ -126,14 +126,11 @@ class PlanSupervisor {
 class ControlLink {
   public:
     explicit ControlLink(const std::string &socket_path);
-    ~ControlLink();
-    ControlLink(const ControlLink &) = delete;
-    ControlLink &operator=(const ControlLink &) = delete;
     void send(Operation op, uint32_t flags = 0, const Plan *plan = nullptr);
     std::string status();
 
   private:
-    int fd_ = -1;
+    Fd fd_; // move-only, so the link is too
     uint64_t sequence_ = 0;
 };
 

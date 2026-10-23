@@ -19,6 +19,7 @@ validated and copied losslessly to `native/episode-*/`, with the session's
 import argparse
 import ctypes
 import ctypes.util
+import functools
 import hashlib
 import json
 import math
@@ -43,24 +44,22 @@ CAM_INT_FIELDS = ('sequence', 'host_monotonic_ns', 'sensor_timestamp_us',
 STATUS_INT_FIELDS = ('imu_sequence', 'imu_device_us', 'imu_host_monotonic_ns',
                      'host_monotonic_ns', 'ticks', 'applied_command_sequence',
                      'applied_host_monotonic_ns')
+ROW_INT_FIELDS = ('sample_ns', 'episode_ns', 'requested_sequence')
+CLOCK_FLOAT_FIELDS = ('pair_skew_s', 'imu_age_s', 'teleop_lateness_ms', 'controller_worst_lateness_s', 'fk_work_us', 'loop')
+CAMERAS = ('cam1', 'cam2')
 JOINTS = {'slew': 0, 'lift': 1, 'tilt': 2, 'scoop': 3}
 
 
-_ZSTD = None
-
-
+@functools.cache
 def _zstd():
-    global _ZSTD
-    if _ZSTD is None:
-        lib = ctypes.CDLL(ctypes.util.find_library('zstd') or 'libzstd.so.1')
-        size, ptr = ctypes.c_size_t, ctypes.c_void_p
-        for name, res, args in (('ZSTD_findFrameCompressedSize', size, [ptr, size]),
-                                ('ZSTD_getFrameContentSize', ctypes.c_ulonglong, [ptr, size]),
-                                ('ZSTD_decompress', size, [ptr, size, ptr, size]),
-                                ('ZSTD_isError', ctypes.c_uint, [size])):
-            getattr(lib, name).restype, getattr(lib, name).argtypes = res, args
-        _ZSTD = lib
-    return _ZSTD
+    lib = ctypes.CDLL(ctypes.util.find_library('zstd') or 'libzstd.so.1')
+    size, ptr = ctypes.c_size_t, ctypes.c_void_p
+    for name, res, args in (('ZSTD_findFrameCompressedSize', size, [ptr, size]),
+                            ('ZSTD_getFrameContentSize', ctypes.c_ulonglong, [ptr, size]),
+                            ('ZSTD_decompress', size, [ptr, size, ptr, size]),
+                            ('ZSTD_isError', ctypes.c_uint, [size])):
+        getattr(lib, name).restype, getattr(lib, name).argtypes = res, args
+    return lib
 
 
 def depth_frames(path):
@@ -92,22 +91,28 @@ def feedback_key(field):
     return f"feedback.{'imu' if field.startswith('imu_') else 'fk'}.{field}"
 
 
-def frame_rows(episode):
-    with (episode / 'samples.jsonl').open() as stream:
+def samples(episode):
+    """Every row of an episode's samples.jsonl: frame rows and the high-rate status rows between them."""
+    with (Path(episode) / 'samples.jsonl').open() as stream:
         for line in stream:
-            row = json.loads(line)
-            if 'frame_index' in row:
-                yield row
+            yield json.loads(line)
+
+
+def frame_rows(episode):
+    return (row for row in samples(episode) if 'frame_index' in row)
+
+
+def committed_episodes(session):
+    """A session's saved takes in order; .partial (interrupted) takes are left out."""
+    return sorted(Path(session).glob('episode-*.ready'))
 
 
 def validate_episode(episode, session, rate_tolerance=.03):
     summary = json.loads((episode / 'episode.json').read_text())
     depth_keys = session.get('depth', [])
-    if summary.get('depth', []) != depth_keys or any(k not in ('cam1', 'cam2') for k in depth_keys):
+    if summary.get('depth', []) != depth_keys or any(k not in CAMERAS for k in depth_keys):
         raise ValueError(f'{episode}: depth cameras differ from session')
-    count, first, last, previous = 0, None, None, None
-    shape = None
-    gaps = []
+    count, first, previous, shape, gaps = 0, None, None, None, []
     for row in frame_rows(episode):
         if row['frame_index'] != count:
             raise ValueError(f'{episode}: non-contiguous frame indices')
@@ -117,7 +122,7 @@ def validate_episode(episode, session, rate_tolerance=.03):
         if len(status['applied_action']) != 6 or not all(math.isfinite(x) and abs(x) <= 1 for x in status['applied_action']):
             raise ValueError(f'{episode}: invalid applied action')
         shapes = []
-        for key in ('cam1', 'cam2'):
+        for key in CAMERAS:
             m = row[key]
             if m['stride'] != m['width'] or m['pixel_bytes'] != m['width'] * m['height']:
                 raise ValueError(f'{episode}: invalid packed Y8 geometry')
@@ -132,20 +137,17 @@ def validate_episode(episode, session, rate_tolerance=.03):
                 raise ValueError(f'{episode}: depth not paired with its IR exposure')
             if previous and d['sequence'] <= previous[f'{key}_depth']['sequence']:
                 raise ValueError(f'{episode}: duplicate/restarted depth stream')
-        if shape is None:
-            shape = shapes
+        shape = shape or shapes
         if shape != shapes:
             raise ValueError(f'{episode}: camera resolution changed')
         if previous:
-            delta = (row['cam1']['host_monotonic_ns'] - previous['cam1']['host_monotonic_ns']) / 1e9
-            gaps.append(delta)
-        first = row if first is None else first
-        last = row
+            gaps.append((row['cam1']['host_monotonic_ns'] - previous['cam1']['host_monotonic_ns']) / 1e9)
+        first = first or row
         previous = row
         count += 1
     if not count or count != summary['frames']:
         raise ValueError(f'{episode}: frame count mismatch')
-    for key, (height, width) in zip(('cam1', 'cam2'), shape):
+    for key, (height, width) in zip(CAMERAS, shape):
         if (episode / f'{key}.y8').stat().st_size != count * height * width:
             raise ValueError(f'{episode}: truncated/extra pixels in {key}')
         if key in depth_keys:
@@ -158,7 +160,7 @@ def validate_episode(episode, session, rate_tolerance=.03):
                 raise ValueError(f'{episode}: {frames} depth frames for {count} samples in {key}')
     if count < 2:
         raise ValueError(f'{episode}: at least two frames required for timing validation')
-    elapsed = (last['cam1']['host_monotonic_ns'] - first['cam1']['host_monotonic_ns']) / 1e9
+    elapsed = (previous['cam1']['host_monotonic_ns'] - first['cam1']['host_monotonic_ns']) / 1e9
     hz = (count - 1) / elapsed
     fps = session['fps']
     if abs(hz / fps - 1) > rate_tolerance or max(gaps) > 1.5 / fps:
@@ -167,28 +169,23 @@ def validate_episode(episode, session, rate_tolerance=.03):
 
 
 def build_features(shapes, tracks=False, state_joints=('lift', 'tilt', 'scoop')):
+    def spec(dtype, size=1, names=None):
+        return {'dtype': dtype, 'shape': (size,), 'names': names}
     width = 6 if tracks else 4
     features = {
-        'observation.state': {'dtype': 'float32', 'shape': (len(state_joints),), 'names': list(state_joints)},
-        'action': {'dtype': 'float32', 'shape': (width,), 'names': ['slew', 'lift', 'tilt', 'scoop', 'trackL', 'trackR'][:width]},
-        'diagnostics.requested_action': {'dtype': 'float32', 'shape': (width,), 'names': None},
-        'diagnostics.pulses_us': {'dtype': 'float32', 'shape': (9,), 'names': None},
+        'observation.state': spec('float32', len(state_joints), list(state_joints)),
+        'action': spec('float32', width, ['slew', 'lift', 'tilt', 'scoop', 'trackL', 'trackR'][:width]),
+        'diagnostics.requested_action': spec('float32', width),
+        'diagnostics.pulses_us': spec('float32', 9),
     }
-    for key, (height, width) in zip(('cam1', 'cam2'), shapes):
+    for key, (height, width) in zip(CAMERAS, shapes):
         features[f'observation.images.{key}'] = {'dtype': 'video', 'shape': (height, width, 3), 'names': ['height', 'width', 'channels']}
-        for field in CAM_INT_FIELDS:
-            features[f'clock.{key}.{field}'] = {'dtype': 'int64', 'shape': (1,), 'names': None}
-        for field in ('age_s', 'sdk_timestamp_ms'):
-            features[f'clock.{key}.{field}'] = {'dtype': 'float64', 'shape': (1,), 'names': None}
-    for key, size in POSE_FIELDS.items():
-        features[feedback_key(key)] = {'dtype': 'float32', 'shape': (size,), 'names': None}
-    for key in STATUS_INT_FIELDS:
-        features[f'clock.{key}'] = {'dtype': 'int64', 'shape': (1,), 'names': None}
-    for key in ('sample_ns', 'episode_ns', 'requested_sequence'):
-        features[f'clock.{key}'] = {'dtype': 'int64', 'shape': (1,), 'names': None}
-    for key in ('pair_skew_s', 'imu_age_s', 'teleop_lateness_ms', 'controller_worst_lateness_s', 'fk_work_us', 'loop'):
-        features[f'clock.{key}'] = {'dtype': 'float64', 'shape': (1,), 'names': None}
-    features['diagnostics.pump_on'] = {'dtype': 'int64', 'shape': (1,), 'names': None}
+        features.update({f'clock.{key}.{field}': spec('int64') for field in CAM_INT_FIELDS})
+        features.update({f'clock.{key}.{field}': spec('float64') for field in ('age_s', 'sdk_timestamp_ms')})
+    features.update({feedback_key(key): spec('float32', size) for key, size in POSE_FIELDS.items()})
+    features.update({f'clock.{key}': spec('int64') for key in (*STATUS_INT_FIELDS, *ROW_INT_FIELDS)})
+    features.update({f'clock.{key}': spec('float64') for key in CLOCK_FLOAT_FIELDS})
+    features['diagnostics.pump_on'] = spec('int64')
     return features
 
 
@@ -201,29 +198,26 @@ def convert_frame(row, pixels, session, state_joints):
              'action': np.array(s['applied_action'][:width], dtype=np.float32),
              'diagnostics.requested_action': np.array(row['requested_action'][:width], dtype=np.float32),
              'diagnostics.pulses_us': np.array(s['pulses_us'], dtype=np.float32)}
-    def scalar(key, value, dtype):
-        frame[key] = np.array([value], dtype=dtype)
-    for key, data in zip(('cam1', 'cam2'), pixels):
+
+    def scalars(dtype, values):
+        frame.update({key: np.array([value], dtype=dtype) for key, value in values})
+    for key, data in zip(CAMERAS, pixels):
         m = row[key]
         gray = np.frombuffer(data, dtype=np.uint8).reshape(m['height'], m['width'])
         frame[f'observation.images.{key}'] = np.repeat(gray[..., None], 3, axis=2)
-        for field in CAM_INT_FIELDS:
-            scalar(f'clock.{key}.{field}', m[field], np.int64)
-        scalar(f'clock.{key}.sdk_timestamp_ms', m['sdk_timestamp_ms'], np.float64)
-        scalar(f'clock.{key}.age_s', (row['sample_ns'] - m['host_monotonic_ns']) / 1e9, np.float64)
+        scalars(np.int64, ((f'clock.{key}.{field}', m[field]) for field in CAM_INT_FIELDS))
+        scalars(np.float64, ((f'clock.{key}.sdk_timestamp_ms', m['sdk_timestamp_ms']),
+                             (f'clock.{key}.age_s', (row['sample_ns'] - m['host_monotonic_ns']) / 1e9)))
     for key in POSE_FIELDS:
         frame[feedback_key(key)] = np.asarray(s[key], dtype=np.float32).reshape(-1)
-    for key in STATUS_INT_FIELDS:
-        scalar(f'clock.{key}', s[key], np.int64)
-    for key in ('sample_ns', 'episode_ns', 'requested_sequence'):
-        scalar(f'clock.{key}', row[key], np.int64)
-    values = {'pair_skew_s': (row['cam2']['host_monotonic_ns'] - row['cam1']['host_monotonic_ns']) / 1e9,
-              'imu_age_s': s['imu_age_s'], 'teleop_lateness_ms': row['teleop_lateness_ms'],
-              'controller_worst_lateness_s': s['worst_lateness_s'], 'fk_work_us': s['fk_work_us'],
-              'loop': row['episode_ns'] / 1e9}
-    for key, value in values.items():
-        scalar(f'clock.{key}', value, np.float64)
-    scalar('diagnostics.pump_on', int(s['pump_on']), np.int64)
+    scalars(np.int64, ((f'clock.{key}', s[key]) for key in STATUS_INT_FIELDS))
+    scalars(np.int64, ((f'clock.{key}', row[key]) for key in ROW_INT_FIELDS))
+    clock = {'pair_skew_s': (row['cam2']['host_monotonic_ns'] - row['cam1']['host_monotonic_ns']) / 1e9,
+             'imu_age_s': s['imu_age_s'], 'teleop_lateness_ms': row['teleop_lateness_ms'],
+             'controller_worst_lateness_s': s['worst_lateness_s'], 'fk_work_us': s['fk_work_us'],
+             'loop': row['episode_ns'] / 1e9}  # same keys and order as CLOCK_FLOAT_FIELDS
+    scalars(np.float64, ((f'clock.{key}', value) for key, value in clock.items()))
+    scalars(np.int64, [('diagnostics.pump_on', int(s['pump_on']))])
     return frame
 
 
@@ -231,7 +225,7 @@ def load_session(session_path):
     session = json.loads((session_path / 'session.json').read_text())
     if session['format'] != 'kaivuri-native-episode-v1':
         raise ValueError(f'{session_path}: unsupported native episode format')
-    episodes = sorted(session_path.glob('episode-*.ready'))
+    episodes = committed_episodes(session_path)
     if not episodes:
         raise ValueError(f'{session_path}: no committed episodes; .partial takes are intentionally excluded')
     return session, episodes
@@ -283,7 +277,7 @@ def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop'))
             for episode, (_, count, hz) in zip(episodes, group):
                 with (episode / 'cam1.y8').open('rb') as c1, (episode / 'cam2.y8').open('rb') as c2:
                     for row in frame_rows(episode):
-                        pixels = [stream.read(row[key]['pixel_bytes']) for stream, key in zip((c1, c2), ('cam1', 'cam2'))]
+                        pixels = [stream.read(row[key]['pixel_bytes']) for stream, key in zip((c1, c2), CAMERAS)]
                         dataset.add_frame(convert_frame(row, pixels, session, state_joints))
                 dataset.save_episode()
                 target = native / f'episode-{index:06d}'

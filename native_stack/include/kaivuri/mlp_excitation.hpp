@@ -1,12 +1,15 @@
 #pragma once
 #include "kaivuri/core.hpp"
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace kaivuri::mlp {
 inline constexpr unsigned excitation_version = 4;
 inline constexpr double sine_carrier_min_hz = .2, sine_carrier_max_hz = 10,
                         sine_max_instant_hz = 12;
+// Joint bitmasks (bit 0 slew .. bit 3 bucket) in D-pad cycling order; slew last.
+inline constexpr std::array<unsigned, 8> target_masks{14, 2, 4, 8, 6, 10, 12, 1};
 enum class Waveform { Sine, Chirp, Stroke };
 enum class Stage { Off, Run, Up, Down, Rest, Stroke, StrokeChirp };
 const char *waveform_name(Waveform);

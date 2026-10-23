@@ -34,10 +34,9 @@ def main():
     rates = joint_values("pid_rate_requested_hz")
     segments = protocol["segments"]
     duration = np.asarray([s["duration_requested_s"] for s in segments])
-    kp = np.asarray([[g["kp"] for g in s["pid_gains_requested"]] for s in segments])
-    ki = np.asarray([[g["ki"] for g in s["pid_gains_requested"]] for s in segments])
-    base_p = np.asarray([g["kp"] for g in protocol["base_gains"]])
-    base_i = np.asarray([g["ki"] for g in protocol["base_gains"]])
+    # Requested gains as multiples of the profile's (segments x joints).
+    scale_p, scale_i = (np.asarray([[g[k] for g in s["pid_gains_requested"]] for s in segments])
+                        / np.asarray([g[k] for g in protocol["base_gains"]]) for k in ("kp", "ki"))
     # Average per-block spectra with the same window/normalization for both modes.
     spectra = {"clean": [], "excited": []}
     for block in protocol["excitation_blocks"]:
@@ -79,8 +78,8 @@ def main():
     ax.set_xticks(range(len(choices)), labels=choices)
     ax.set(xlabel="Requested PID rate [Hz]", ylabel="Time [s]", title="Independent controller rates"); ax.legend(fontsize=8)
     ax = axes[1, 2]
-    ax.hist((kp / base_p).ravel(), bins=np.linspace(.5, 1.5, 21), alpha=.6, label="P gain")
-    ax.hist((ki / base_i).ravel(), bins=np.linspace(.5, 1.5, 21), histtype="step", lw=2, label="I gain")
+    ax.hist(scale_p.ravel(), bins=np.linspace(.5, 1.5, 21), alpha=.6, label="P gain")
+    ax.hist(scale_i.ravel(), bins=np.linspace(.5, 1.5, 21), histtype="step", lw=2, label="I gain")
     ax.set(xlabel="Multiplier of selected profile gain", ylabel="Joint/segment draws", title="Independent gain variation"); ax.legend()
     for ax in axes.flat: ax.grid(alpha=.15)
     figure.suptitle(f"Randomized IK/PID collection — synthetic {len(rows) / 100:g} s preview, seed {protocol['seed']}", fontsize=15)
@@ -91,8 +90,8 @@ def main():
         "synthetic_only": True,
         "collision_checked": False,
         "requested_segment_seconds_observed": [float(duration.min()), float(duration.max())],
-        "gain_scale_p_observed": [float((kp / base_p).min()), float((kp / base_p).max())],
-        "gain_scale_i_observed": [float((ki / base_i).min()), float((ki / base_i).max())],
+        "gain_scale_p_observed": [float(scale_p.min()), float(scale_p.max())],
+        "gain_scale_i_observed": [float(scale_i.min()), float(scale_i.max())],
         "pid_rate_choices_observed_hz": sorted(set(rates.ravel())),
         "measured_joint_range_deg": {name: [float(q[:, j].min()), float(q[:, j].max())] for j, name in enumerate(JOINTS)},
         "segment_kinds": {kind: sum(s["kind"] == kind for s in segments) for kind in ("coverage", "free", "reverse", "pitch", "hold")},

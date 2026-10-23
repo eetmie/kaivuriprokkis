@@ -1,21 +1,29 @@
 #pragma once
 #include "kaivuri/core.hpp"
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace kaivuri::collection {
 using Angles = std::array<double, 3>;
 using Matrix = std::array<Angles, 3>;
+using Limits = std::array<std::array<double, 2>, 3>;
+inline constexpr std::array<const char *, 3> joint_names{"boom", "arm", "bucket"};
+inline constexpr uint64_t output_period_ns = 10000000; // fixed 100 Hz output clock
 struct Gains {
     double kp = 0, ki = 0, kd = 0, tau = .1;
 };
 struct Robot {
     Config hardware;
-    std::array<std::array<double, 2>, 3> limits{};
+    Limits limits{};
     std::array<Gains, 3> gains{};
     double pitch_offset = 0;
 };
 Robot load_robot(const std::filesystem::path &profile);
+// profile.yaml followed by the control and servo files it names.
+std::vector<std::string> profile_files(const std::filesystem::path &profile);
+// Excitation limits in degrees: slew is unbounded, then boom/arm/bucket from the robot.
+std::array<std::array<double, 2>, 4> excitation_limits_deg(const Robot &);
 
 struct TaskState {
     Angles pose{}; // carriage-relative x [m], z [m], cutting-lip pitch [rad]
@@ -71,8 +79,9 @@ struct GuardResult {
 // A command-direction guard, not a braking model or collision certificate.
 // Outside either limit, only the direction back into the working range passes.
 class JointGuard {
-    std::array<std::array<double, 2>, 3> limits_{};
+    Limits limits_{};
     GuardOptions options_;
+
   public:
     JointGuard(const Robot &, GuardOptions = {});
     GuardResult apply(const Angles &q, const Angles &velocity, const Angles &command,
@@ -120,7 +129,8 @@ struct Output {
 class RandomCollection {
     Kinematics kin_;
     Options options_;
-    uint64_t rng_ = 0, previous_ns_ = 0, previous_schedule_ns_ = 0, goal_begin_ = 0, segment_id_ = 0;
+    uint64_t rng_ = 0, previous_ns_ = 0, previous_schedule_ns_ = 0, goal_begin_ = 0,
+             segment_id_ = 0;
     bool initialized_ = false, have_goal_ = false, recovering_ = false;
     Angles previous_q_{}, reference_{}, goal_q_{}, held_{};
     std::array<Pid, 3> pid_;
@@ -137,6 +147,9 @@ class RandomCollection {
     void choose_segment(uint64_t now, const Angles &q);
     void reset_pids(double limit);
     void begin_recovery(uint64_t now, const Angles &q);
+    // Row-major grid index with each joint's bin clamped to [first, end).
+    size_t grid_index(const Angles &q, const std::array<size_t, 3> &first,
+                      const std::array<size_t, 3> &end) const;
 
   public:
     RandomCollection(Robot, Options = {});
@@ -150,7 +163,9 @@ class RandomCollection {
     size_t visited_cells() const { return visited_cells_; }
     size_t working_cells() const { return working_cells_; }
     size_t visited_working_cells() const { return visited_working_cells_; }
-    double coverage_percent() const { return 100. * double(visited_working_cells_) / double(working_cells_); }
+    double coverage_percent() const {
+        return 100. * double(visited_working_cells_) / double(working_cells_);
+    }
     bool recovering() const { return recovering_; }
     const std::vector<double> &dwell() const { return dwell_; }
     const std::vector<double> &moving_dwell() const { return moving_; }

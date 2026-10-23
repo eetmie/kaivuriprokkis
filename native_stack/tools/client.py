@@ -4,12 +4,14 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import time
 
 HEADER = struct.Struct("<4sHHIQQIfQQ")
 DRIVE, DISARM, ESTOP, STATUS = 1, 2, 3, 4
 DEADMAN, ARM, PUMP = 1, 2, 4
-DEFAULT_SOCKET = f"/tmp/kaivuri-native-{os.geteuid()}/control.sock"
+RUNTIME_DIR = f"/tmp/kaivuri-native-{os.geteuid()}"  # sockets and the controller lock
+DEFAULT_SOCKET = f"{RUNTIME_DIR}/control.sock"
 
 
 class Client:
@@ -56,6 +58,19 @@ class Client:
 
     def __exit__(self, *_):
         self.close()
+
+
+def stop(processes, timeout=10):
+    """Terminate every running process, then wait for each; kill any still alive after timeout."""
+    for process in processes:
+        if process.poll() is None:
+            process.terminate()
+    for process in processes:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def main():

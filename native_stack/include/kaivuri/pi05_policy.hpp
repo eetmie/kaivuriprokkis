@@ -126,14 +126,11 @@ class PlanSupervisor {
 class ControlLink {
   public:
     explicit ControlLink(const std::string &socket_path);
-    ~ControlLink();
-    ControlLink(const ControlLink &) = delete;
-    ControlLink &operator=(const ControlLink &) = delete;
     void send(Operation op, uint32_t flags = 0, const Plan *plan = nullptr);
     std::string status();
 
   private:
-    int fd_ = -1;
+    Fd fd_; // move-only, so the link is too
     uint64_t sequence_ = 0;
 };
 

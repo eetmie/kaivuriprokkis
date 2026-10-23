@@ -1,9 +1,7 @@
 #include "kaivuri/frame_store.hpp"
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <limits>
 #include <new>
 #include <pthread.h>
 #include <stdexcept>
@@ -11,8 +9,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// Shared-memory layout (ABI v1): a 4 KiB header page, then one packed frame of pixels.
+// This library links only pthreads, so it keeps its own error helper instead of kaivuri_core's.
 namespace {
-constexpr size_t header_bytes = 4096;
+constexpr size_t header_bytes = 4096, max_pixel_bytes = 16 * 1024 * 1024;
 constexpr uint64_t magic = 0x31594b5652464d49ULL;
 struct Header {
     uint64_t magic_value;
@@ -26,27 +27,34 @@ struct Reader {
     size_t size;
     int fd;
 };
-bool acquire(pthread_mutex_t *mutex) {
-    int r = pthread_mutex_trylock(mutex);
-    if (r == EOWNERDEAD) {
-        pthread_mutex_consistent(mutex);
+uint8_t *pixels_of(void *mapping) {
+    return static_cast<uint8_t *>(mapping) + header_bytes;
+}
+// Non-blocking lock of the robust mutex. A holder that died mid-copy leaves a torn frame, so
+// recovery also invalidates the published frame (sequence 0).
+bool try_lock(Header *h) {
+    const int result = pthread_mutex_trylock(&h->mutex);
+    if (result == EOWNERDEAD) {
+        h->metadata.sequence = 0;
+        pthread_mutex_consistent(&h->mutex);
         return true;
     }
-    return r == 0;
+    return result == 0;
 }
 void verify(bool ok, const char *what) {
     if (!ok)
         throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
 }
 } // namespace
+
 kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint32_t height,
                                   uint32_t ir_index, uint32_t bytes_per_pixel)
     : bytes_per_pixel_(bytes_per_pixel) {
     if (width < 1 || height < 1 || (bytes_per_pixel != 1 && bytes_per_pixel != 2) ||
-        uint64_t(width) * height * bytes_per_pixel > 16 * 1024 * 1024)
+        uint64_t(width) * height * bytes_per_pixel > max_pixel_bytes)
         throw std::runtime_error("invalid frame dimensions");
     // Atomic rename preserves the previous mapping for already connected readers on restart.
-    std::string temporary = path + ".new." + std::to_string(getpid());
+    const std::string temporary = path + ".new." + std::to_string(getpid());
     try {
         lock_fd_ =
             ::open((path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -80,17 +88,12 @@ kaivuri::FrameWriter::FrameWriter(const std::string &path, uint32_t width, uint3
         h->metadata.ir_index = ir_index;
         verify(rename(temporary.c_str(), path.c_str()) == 0, "publish frame store");
     } catch (...) {
-        if (mapping_)
-            munmap(mapping_, size_);
-        if (fd_ >= 0)
-            ::close(fd_);
-        if (lock_fd_ >= 0)
-            ::close(lock_fd_);
+        release();
         unlink(temporary.c_str());
         throw;
     }
 }
-kaivuri::FrameWriter::~FrameWriter() {
+void kaivuri::FrameWriter::release() noexcept {
     if (mapping_)
         munmap(mapping_, size_);
     if (fd_ >= 0)
@@ -98,70 +101,63 @@ kaivuri::FrameWriter::~FrameWriter() {
     if (lock_fd_ >= 0)
         ::close(lock_fd_);
 }
+kaivuri::FrameWriter::~FrameWriter() {
+    release();
+}
 bool kaivuri::FrameWriter::publish(const FrameMetadata &m, const void *pixels) {
     auto *h = static_cast<Header *>(mapping_);
     if (!pixels || m.pixel_bytes > h->capacity || m.stride != m.width * bytes_per_pixel_ ||
         m.pixel_bytes != uint64_t(m.stride) * m.height)
         throw std::runtime_error("invalid packed frame");
-    if (!acquire(&h->mutex))
+    if (!try_lock(h))
         return false;
     // Copy pixels first: a recovered owner-dead lock must not expose partially copied pixels.
     h->metadata.sequence = 0;
-    std::memcpy(static_cast<uint8_t *>(mapping_) + header_bytes, pixels, m.pixel_bytes);
+    std::memcpy(pixels_of(mapping_), pixels, m.pixel_bytes);
     h->metadata = m;
     pthread_mutex_unlock(&h->mutex);
     return true;
 }
+
 extern "C" void *kaivuri_frame_open(const char *path) {
-    if (!path)
-        return nullptr;
-    int fd = ::open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    const int fd = path ? ::open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW) : -1;
     if (fd < 0)
         return nullptr;
     struct stat st{};
-    if (fstat(fd, &st) < 0 || st.st_size < static_cast<off_t>(header_bytes) ||
-        st.st_size > static_cast<off_t>(header_bytes + 16 * 1024 * 1024)) {
-        ::close(fd);
-        return nullptr;
+    if (fstat(fd, &st) == 0 && st.st_size >= off_t(header_bytes) &&
+        st.st_size <= off_t(header_bytes + max_pixel_bytes)) {
+        void *mapping = mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapping != MAP_FAILED) {
+            const auto *h = static_cast<Header *>(mapping);
+            if (h->magic_value == magic && h->version == 1 &&
+                h->capacity == st.st_size - header_bytes)
+                return new Reader{mapping, size_t(st.st_size), fd};
+            munmap(mapping, st.st_size);
+        }
     }
-    void *mapping = mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED) {
-        ::close(fd);
-        return nullptr;
-    }
-    auto *h = static_cast<Header *>(mapping);
-    if (h->magic_value != magic || h->version != 1 || h->capacity != st.st_size - header_bytes) {
-        munmap(mapping, st.st_size);
-        ::close(fd);
-        return nullptr;
-    }
-    return new Reader{mapping, static_cast<size_t>(st.st_size), fd};
+    ::close(fd);
+    return nullptr;
 }
 extern "C" int kaivuri_frame_read(void *handle, FrameMetadata *m, void *pixels, size_t capacity) {
     if (!handle || !m)
         return -1;
     auto *r = static_cast<Reader *>(handle);
     auto *h = static_cast<Header *>(r->mapping);
-    int result = pthread_mutex_trylock(&h->mutex);
-    if (result == EOWNERDEAD) {
-        h->metadata.sequence = 0;
-        pthread_mutex_consistent(&h->mutex);
-    } else if (result != 0)
+    if (!try_lock(h))
         return 0;
-    int ok = 0;
+    int result = 0; // no frame published yet
     if (h->metadata.sequence && h->metadata.pixel_bytes <= h->capacity) {
         if (pixels && h->metadata.pixel_bytes > capacity)
-            ok = -1;
+            result = -1;
         else {
             *m = h->metadata;
             if (pixels)
-                std::memcpy(pixels, static_cast<uint8_t *>(r->mapping) + header_bytes,
-                            m->pixel_bytes);
-            ok = 1;
+                std::memcpy(pixels, pixels_of(r->mapping), m->pixel_bytes);
+            result = 1;
         }
     }
     pthread_mutex_unlock(&h->mutex);
-    return ok;
+    return result;
 }
 extern "C" void kaivuri_frame_close(void *handle) {
     if (!handle)

@@ -24,6 +24,7 @@ class FrameWriter {
     size_t size_ = 0;
     int fd_ = -1, lock_fd_ = -1;
     uint32_t bytes_per_pixel_ = 1;
+    void release() noexcept;
 
   public:
     FrameWriter(const std::string &path, uint32_t width, uint32_t height, uint32_t ir_index,

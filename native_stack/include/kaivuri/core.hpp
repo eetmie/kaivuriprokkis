@@ -76,16 +76,30 @@ struct KinematicState {
 struct Attitude {
     Quat tilt{1, 0, 0, 0}; // level <- slewed carriage axes (no heading); identity when disabled
     double cabin_roll = 0, cabin_pitch = 0; // carriage axes, from gravity
-    std::array<double, 4>
-        link_roll{}; // about each link's X vs its parent; 0 for slew/near-vertical links
+    // About each link's X vs its parent; 0 for slew/near-vertical links.
+    std::array<double, 4> link_roll{};
 };
+// 'raw' is indexed by IMU sensor; 'corrected' is raw with the mounting offsets removed.
 std::array<Quat, 4> corrected_imu_quaternions(const Config &cfg, const std::array<Quat, 4> &raw);
 std::array<double, 4> joint_angles(const Config &cfg, const std::array<Quat, 4> &raw);
+std::array<double, 4> corrected_joint_angles(const Config &cfg,
+                                             const std::array<Quat, 4> &corrected);
 Attitude attitude(const Config &cfg, const std::array<Quat, 4> &raw);
+Attitude corrected_attitude(const Config &cfg, const std::array<Quat, 4> &corrected,
+                            const std::array<double, 4> &angles);
 // Without tilt/roll: the nominal level-machine chain (used for planning in the upper frame).
 KinematicState forward_kinematic_state(const Config &cfg, const std::array<double, 4> &angles,
                                        const Quat &tilt = {1, 0, 0, 0},
                                        const std::array<double, 4> &link_roll = {});
+// Everything derived from one IMU sample, correcting the quaternions once; the FK uses the
+// measured tilt, and the link roll when cfg.level.link_roll is set.
+struct Observation {
+    std::array<Quat, 4> corrected{};
+    std::array<double, 4> angles{};
+    Attitude attitude;
+    KinematicState fk;
+};
+Observation observe(const Config &cfg, const std::array<Quat, 4> &raw);
 Pose forward_kinematics(const Config &cfg, const std::array<double, 4> &angles);
 struct RampState {
     double pulse = 0, time = 0;
@@ -130,6 +144,7 @@ class ImuParser {
     bool have_ts_ = false;
     void consume(size_t n);
     void parse(double now);
+    void parse_sample(int type, int count, double now);
 };
 
 constexpr size_t max_steps = 128, wire_header = 52, max_packet = wire_header + max_steps * 6 * 4;
@@ -165,6 +180,7 @@ class ControlCore {
     double arm_started_ = 0, updated_ = 0, decay_started_ = 0;
     Packet plan_{};
     Commands previous_{}, decay_from_{};
+    void halt(SafetyState state, const char *reason);
     Commands evaluate(double now) const;
 };
 } // namespace kaivuri

@@ -30,29 +30,15 @@ const char *stage_name(Stage s) {
     return names[static_cast<unsigned>(s)];
 }
 const char *target_name(unsigned m) {
-    switch (m) {
-    case 14:
-        return "all";
-    case 2:
-        return "lift";
-    case 4:
-        return "tilt";
-    case 8:
-        return "scoop";
-    case 6:
-        return "lift+tilt";
-    case 10:
-        return "lift+scoop";
-    case 12:
-        return "tilt+scoop";
-    case 1:
-        return "slew";
-    default:
-        throw std::invalid_argument("invalid excitation target");
-    }
+    constexpr const char *names[]{"all",       "lift",       "tilt",       "scoop",
+                                  "lift+tilt", "lift+scoop", "tilt+scoop", "slew"};
+    for (unsigned i = 0; i < target_masks.size(); ++i)
+        if (target_masks[i] == m)
+            return names[i];
+    throw std::invalid_argument("invalid excitation target");
 }
 unsigned target_mask(const std::string &name) {
-    for (unsigned m : {14U, 2U, 4U, 8U, 6U, 10U, 12U, 1U})
+    for (unsigned m : target_masks)
         if (name == target_name(m))
             return m;
     throw std::invalid_argument("invalid excitation target: " + name);

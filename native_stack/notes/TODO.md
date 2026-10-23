@@ -21,6 +21,10 @@ The randomized IK/PID core now has its own initial collector described in
 from the manual MLP collector. Old MLP driving, circle tests and model training
 remain outside this logging milestone.
 
+## pi0.5 chunk consistency (RTC)
+
+- [ ] Inference-time soft inpainting between chunks (latency-aligned anchor, blend op in the denoise loop). Scope, reference mechanism and patch list: [RTC scope](RTC_SCOPE.md); phased work plan (A now, C-ready): [RTC plan](RTC_PLAN.md).
+
 ## IK-assisted collection
 
 - [x] Audit coverage reports, coordinate/calibration contracts, IK/PID references and native integration points; write the design and example settings.

@@ -6,6 +6,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 
 | Component | Current behavior |
 | --- | --- |
+| `flow-rtc-probe` | Analytic C++ flow sampling / RTC examples for OpenPI and GR00T N1.7; optional CUDA helper for GR00T's fused Euler engine; no robot connection ([research and integration plan](notes/FLOW_MATCHING_RTC.md)) |
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory; optional `--depth SERIAL` Z16 from the camera ASIC (`SERIAL-depth.frame` + calibration JSON) and `--depth-log DIR` zstd snapshots |
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |

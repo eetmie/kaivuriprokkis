@@ -17,8 +17,13 @@ controller state but armed and on any inference error. It never re-arms. With an
 exhausted chunk then falls back to manual instead of disarming. X toggles pump permission.
 Ctrl+C disarms, stops the services and still writes the summary.
 
-    python groot_live.py parity --bundle B --contract C.json --fixture F.npz
-    python groot_live.py run --bundle B --contract C.json --start-services --drive --seconds 60 --out DIR
+Prompts: bundles from spark-projects groot/excavator/export_bundle.py tokenize at runtime. The
+run starts on --task or the first trained task; D-pad right/left cycles the list, and a line
+typed in the terminal becomes a prompt, appended to the list. A change drops the current plan;
+the machine holds until the first chunk observed under the new prompt.
+
+    python groot_live.py parity --bundle B                 # every prompt fixture in the bundle
+    python groot_live.py run --bundle B --start-services --live-pwm --enable-slew --drive --out DIR
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import signal
 import stat
 import struct
@@ -80,10 +86,48 @@ class Boundary:
                                      np.float64)).astype(np.float32)
 
 
+def formalize(text: str) -> str:
+    """Gr00tN1d7Processor's formalize_language: lower case, drop punctuation."""
+    return re.sub(r"[^\w\s]", "", text.lower())
+
+
+class Prompts:
+    """Runtime prompt for a bundle with a `prompt` section (spark-projects export_bundle.py):
+    ids = prefix (chat start + image slots) + tokenize(formalize(text)) + suffix, exactly
+    Gr00tN1d7Processor's. A bundle without one runs only its baked prompt."""
+
+    def __init__(self, root: Path, b: dict):
+        pr = b.get("prompt")
+        self.dynamic = pr is not None
+        self.baked = b["task"]
+        self.tasks = list(pr["tasks"]) if pr else [b["task"]]
+        if pr:
+            from tokenizers import Tokenizer
+            self.tok = Tokenizer.from_file(str(root / pr["tokenizer"]))
+            self.prefix, self.suffix = pr["prefix_ids"], pr["suffix_ids"]
+            self.capacity = int(pr["capacity_tokens"])
+
+    def ids(self, text: str) -> list[int]:
+        """The real (unpadded) prompt ids; ValueError when the text cannot run."""
+        if not self.dynamic:
+            if text != self.baked:
+                raise ValueError(f"this bundle bakes {self.baked!r}; re-export with export_bundle.py "
+                                 "for runtime prompts")
+            return []
+        body = self.tok.encode(formalize(text), add_special_tokens=False).ids
+        if len(body) > self.capacity:
+            raise ValueError(f"{len(body)} tokens, the bundle holds {self.capacity}")
+        return self.prefix + body + self.suffix
+
+    def text_tokens(self, text: str) -> int:
+        """Token count of the instruction itself; ValueError as ids()."""
+        return len(self.ids(text)) - len(self.prefix) - len(self.suffix) if self.dynamic else len(self.ids(text))
+
+
 class Policy:
     """Bundle + engines + boundary; one current frame per camera (video_delta_indices [0])."""
 
-    def __init__(self, bundle: Path, contract: dict, cache: Path, vla_root: Path):
+    def __init__(self, bundle: Path, contract: dict | None, cache: Path, vla_root: Path):
         sys.path.insert(0, str(vla_root))
         os.chdir(vla_root)      # the engine builders run `-c "from bench.vendor..."` subprocesses
         from bench.vendor import groot17_trt as g17
@@ -94,9 +138,14 @@ class Policy:
         bb = self.b.b
         if bb["frames"] != 1 or bb["video_delta_indices"] != [0]:
             raise ValueError("this runtime handles current-frame-only bundles")
+        contract = contract or (bb.get("kaivuri") or {}).get("contract")
+        if contract is None:
+            raise ValueError("the bundle carries no normalization contract: pass --contract")
         if bb["embodiment"] != contract["embodiment"]:
             raise ValueError("contract and bundle embodiments differ")
+        self.contract = contract
         self.boundary = Boundary(contract)
+        self.prompts = Prompts(Path(bundle), bb)
         t0 = time.time()
         built = g16.prebuild_engines(self.b, cache)
         if self.b.mod:
@@ -104,11 +153,34 @@ class Policy:
         self.engines = g16.Engines(self.b, cache, skip=self.b.mod)
         self.load_s = round(time.time() - t0, 1)
         self.built = built
-        self.fixture = g17.validate_fixture(self.b, self.engines)
+        self.fixture = g17.validate_fixture(self.b, self.engines)   # on the baked prompt
         if self.fixture["status"] != "PASS":
             raise RuntimeError(f"bundle fixture gate failed: {self.fixture}")
         self.state_width = self.engine_shape("cond_0", "state")[-1]
         self.noise_shape = (1, bb["action_horizon"], bb["action_dim"])
+        self.task = bb["task"]
+        self.task_tokens = bb["prompt_tokens"]
+
+    def set_prompt(self, text: str) -> int:
+        """Condition the next inference on `text`; returns its token count. As Bundle.__init__
+        does for the baked prompt: embedded rows, image slots and the three key masks."""
+        ids = self.prompts.ids(text)
+        if not ids:                                     # baked-only bundle, same text
+            return self.task_tokens
+        bb, S = self.b.b, self.b.b["seq_len"]
+        full = np.asarray(ids + [bb["pad_token"]] * (S - len(ids)), np.int64)
+        valid = np.arange(S) < len(ids)
+        img = full == bb["image_token"]
+        if img.sum() != len(self.b.image_positions.nonzero()[0]):
+            raise RuntimeError("image slots moved: prefix does not match the bundle")
+        neg = np.float32(bb["mask_neg"])
+        self.b.image_positions = img
+        self.b.text_bias = np.where(~img & valid, 0.0, neg).astype(np.float32)[None, None]
+        self.b.image_bias = np.where(img & valid, 0.0, neg).astype(np.float32)[None, None]
+        self.b.pad_bias = np.where(valid, 0.0, neg).astype(np.float32)[None, None]
+        self.b.prompt_embeds = np.asarray(self.b.embed[full], dtype=np.float32)[None]
+        self.task, self.task_tokens = text, len(ids)
+        return len(ids)
 
     def engine_shape(self, graph, tensor):
         for n, _, shape, _, _ in self.engines.io[graph]:
@@ -138,20 +210,12 @@ def gray_to_rgb(y8: np.ndarray) -> np.ndarray:
 # ── parity ──────────────────────────────────────────────────────────────────
 
 
-def parity(a) -> int:
-    contract = json.loads(Path(a.contract).read_text())
-    pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root))
-    fx = np.load(a.fixture)
-    meta = json.loads(str(fx["meta"]))
-    if meta["contract"] != contract:
-        raise SystemExit("fixture contract differs from --contract")
-    bad = set(meta["tasks"]) - {pol.b.b["task"]}
-    if bad:
-        raise SystemExit(f"fixture tasks {bad} differ from the baked prompt {pol.b.b['task']!r}")
-    env = np.load(a.envelope) if a.envelope else None
+def check_fixture(pol: Policy, fx, env, min_cosine: float, max_abs: float) -> tuple[bool, list]:
+    """Raw frames + degrees -> valves through `pol` vs the fixture's FP32 Gr00tPolicy chunks.
+    Gate per sample: cosine, and no further from FP32 than bfloat16 Gr00tPolicy (`env`)."""
     if env is not None and not np.array_equal(env["noise"], fx["noise"]):
-        raise SystemExit("--envelope fixture uses different inputs")
-    rows, worst, ok = [], 0.0, True
+        raise SystemExit("envelope fixture uses different inputs")
+    rows, ok = [], True
     for i in range(len(fx["raw"])):
         raw = fx["raw"][i]
         # The dataset decodes gray IR as identical RGB channels; the live path does too.
@@ -162,36 +226,68 @@ def parity(a) -> int:
         ref = fx["actions"][i]
         d = np.abs(act - ref)
         cos = float((act.ravel() @ ref.ravel()) / (np.linalg.norm(act) * np.linalg.norm(ref)))
-        worst = max(worst, float(d.max()))
-        if env is not None:     # no further from FP32 than Gr00tPolicy's own bfloat16 inference
-            e = np.abs(env["actions"][i] - ref)
-            lim_max, lim_mean = float(e.max()), float(e.mean())
+        if env is not None:
+            e = np.abs(env["actions"][i] - ref)     # floored: bf16 can land closer than FP16 noise
+            lim_max, lim_mean = max(float(e.max()), max_abs), max(float(e.mean()), max_abs / 10)
         else:
-            lim_max, lim_mean = a.max_abs, np.inf
-        passed = bool(d.max() <= lim_max and d.mean() <= lim_mean and cos >= a.min_cosine)
+            lim_max, lim_mean = max_abs, np.inf
+        passed = bool(d.max() <= lim_max and d.mean() <= lim_mean and cos >= min_cosine)
         ok &= passed
-        rows.append({"pass": passed, "limit_max_abs": round(lim_max, 4),
-                     "limit_mean_abs": round(lim_mean, 5) if np.isfinite(lim_mean) else None,"episode": int(fx["episode"][i]), "frame": int(fx["frame"][i]), "gray_rgb": gray_ok,
+        rows.append({"pass": passed, "episode": int(fx["episode"][i]), "frame": int(fx["frame"][i]),
                      "cosine": round(cos, 6), "max_abs": round(float(d.max()), 4),
-                     "mean_abs": round(float(d.mean()), 5),
+                     "limit_max_abs": round(lim_max, 4), "mean_abs": round(float(d.mean()), 5),
+                     "limit_mean_abs": round(lim_mean, 5) if np.isfinite(lim_mean) else None,
                      "mean_abs_vs_recorded": round(float(np.abs(act - fx["gt"][i]).mean()), 4),
-                     "ms": round(t["total"], 1)})
-        print(json.dumps(rows[-1]), flush=True)
+                     "gray_rgb": gray_ok, "ms": round(t["total"], 1)})
+    return ok, rows
+
+
+def parity(a) -> int:
+    contract = json.loads(Path(a.contract).read_text()) if a.contract else None
+    pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root))
+    root = Path(a.bundle)
+    if a.fixture:
+        jobs = [{"task": None, "float32": a.fixture, "bfloat16": a.envelope}]
+    else:
+        jobs = (pol.b.b.get("prompt") or {}).get("fixtures") or []
+        if not jobs:
+            raise SystemExit("the bundle has no prompt fixtures: pass --fixture")
+        jobs = [{**j, "float32": root / j["float32"], "bfloat16": root / j["bfloat16"]} for j in jobs]
+    ok, results = True, []
+    for j in jobs:
+        fx = np.load(j["float32"])
+        meta = json.loads(str(fx["meta"]))
+        if meta["contract"] != pol.contract:
+            raise SystemExit(f"{j['float32']}: fixture contract differs from the bundle's")
+        task = j["task"] or meta["tasks"][0]
+        if set(meta["tasks"]) != {task}:
+            raise SystemExit(f"{j['float32']}: mixed tasks {set(meta['tasks'])}")
+        n = pol.set_prompt(task)         # runtime tokenization, compared with Gr00tPolicy's own
+        env = np.load(j["bfloat16"]) if j.get("bfloat16") else None
+        passed, rows = check_fixture(pol, fx, env, a.min_cosine, a.max_abs)
+        ok &= passed
+        results.append({"task": task, "tokens": n, "trained": j.get("trained"),
+                        "pass": passed, "samples": rows})
+        print(f"{'PASS' if passed else 'FAIL'} {task!r} ({n} tokens): "
+              + "  ".join(f"cos {r['cosine']:.5f} max {r['max_abs']:.4f}/{r['limit_max_abs']:.4f}"
+                          for r in rows), flush=True)
     summary = {"status": "PASS" if ok else "FAIL", "cosine_gate": a.min_cosine,
-               "gate": "bfloat16 Gr00tPolicy envelope" if env is not None else f"max_abs {a.max_abs}",
-               "worst_max_abs": worst, "bundle_fixture": pol.fixture, "engines_built_s": pol.built,
-               "load_s": pol.load_s, "samples": rows}
+               "gate": "bfloat16 Gr00tPolicy envelope", "bundle_fixture": pol.fixture,
+               "engines_built_s": pol.built, "load_s": pol.load_s,
+               "ms_p50": float(np.median([r["ms"] for x in results for r in x["samples"]])),
+               "prompts": results}
     if a.out:
         Path(a.out).write_text(json.dumps(summary, indent=1) + "\n")
-    print(json.dumps({k: summary[k] for k in ("status", "worst_max_abs", "load_s")}))
+    print(json.dumps({k: summary[k] for k in ("status", "load_s", "ms_p50")}))
     return 0 if ok else 1
 
 
 # ── live ────────────────────────────────────────────────────────────────────
 
 EV_SYN, EV_KEY, EV_ABS, SYN_DROPPED = 0, 1, 3, 3
-ABS_X, ABS_Y, ABS_RX, ABS_RY = 0, 1, 3, 4
+ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_HAT0X = 0, 1, 3, 4, 0x10
 BTN_A, BTN_B, BTN_X = 0x130, 0x131, 0x133   # BTN_SOUTH, BTN_EAST, BTN_NORTH (the recorder's X)
+BTN_DPAD_LEFT, BTN_DPAD_RIGHT = 0x222, 0x223
 _EVENT = struct.Struct("llHHi")              # struct input_event, 64-bit
 
 
@@ -236,6 +332,11 @@ class Pad:
                     (self.keys.add if val else self.keys.discard)(code)
                 elif typ == EV_ABS and code in self.axes:
                     self.axes[code][0] = val
+                elif typ == EV_ABS and code == ABS_HAT0X:   # xpad reports the D-pad as a hat
+                    for b, on in ((BTN_DPAD_LEFT, val < 0), (BTN_DPAD_RIGHT, val > 0)):
+                        if on and b not in self.keys:
+                            pressed.append(b)
+                        (self.keys.add if on else self.keys.discard)(b)
 
     def axis(self, code: int) -> float:
         v, lo, hi = self.axes[code]
@@ -249,6 +350,41 @@ class Pad:
 
     def close(self):
         os.close(self.fd)
+
+
+class TaskList:
+    """The prompts a run can switch between: the bundle's trained tasks, then --task and every
+    prompt typed in the terminal, appended so switching away never loses them."""
+
+    def __init__(self, tasks: list[str], start: str | None):
+        self.lock = threading.Lock()
+        self.items, self.i, self.version = list(tasks), 0, 0
+        if start:
+            self.add(start)
+
+    def add(self, text: str) -> int:
+        with self.lock:
+            same = [k for k, t in enumerate(self.items) if formalize(t) == formalize(text)]
+            if same:
+                self.i = same[0]
+            else:
+                self.items.append(text)
+                self.i = len(self.items) - 1
+            self.version += 1
+            return self.i
+
+    def step(self, d: int):
+        with self.lock:
+            self.i = (self.i + d) % len(self.items)
+            self.version += 1
+
+    def current(self) -> tuple[int, str, int]:
+        with self.lock:
+            return self.i, self.items[self.i], self.version
+
+    def show(self) -> str:
+        with self.lock:
+            return "\n".join(f"  {'>' if k == self.i else ' '} {k + 1}. {t}" for k, t in enumerate(self.items))
 
 
 def find_pad(arg: str | None) -> str | None:
@@ -268,12 +404,12 @@ class Supervisor(threading.Thread):
     """
 
     def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True,
-                 pump=False, pad: Pad | None = None, start_model=False):
+                 pump=False, pad: Pad | None = None, start_model=False, tasks: TaskList | None = None):
         super().__init__(daemon=True)
         self.c = client_mod
         self.control = client_mod.Client(socket_path)
         self.fps, self.max_age, self.renew = fps, max_obs_age_s, renew_s
-        self.slew, self.pump, self.pad = slew, pump, pad
+        self.slew, self.pump, self.pad, self.tasks = slew, pump, pad, tasks
         self.mode = "model" if (pad is None or start_model) else "manual"
         self.model_since = time.monotonic_ns()
         self.lock = threading.Lock()
@@ -305,6 +441,13 @@ class Supervisor(threading.Thread):
             self.plan = None      # never resume a plan from before the switch
             self.model_since = time.monotonic_ns()
         self.note(f"{mode.upper()}{' (' + why + ')' if why else ''}")
+
+    def drop_plan(self):
+        """A new instruction: stop the old instruction's plan now (centred hold until the first
+        chunk observed after this moment)."""
+        with self.lock:
+            self.plan = None
+            self.model_since = time.monotonic_ns()
 
     def offer(self, rows: np.ndarray, t0_ns: int, obs_ns: int):
         with self.lock:
@@ -358,6 +501,11 @@ class Supervisor(threading.Thread):
                         elif b == BTN_X:
                             self.pump = not self.pump
                             self.note(f"pump {'ON' if self.pump else 'OFF'}")
+                        elif b in (BTN_DPAD_LEFT, BTN_DPAD_RIGHT) and self.tasks:
+                            self.drop_plan()
+                            self.tasks.step(1 if b == BTN_DPAD_RIGHT else -1)
+                            k, text, _ = self.tasks.current()
+                            self.note(f"task {k + 1}: {text}")
                 if self.mode == "model":
                     self._model_tick(now)
                 else:
@@ -415,11 +563,12 @@ def start_services(a, runtime: Path):
                                              runtime / "cameras" / f"{CAM2}-ir1.frame"]
 
 
-def write_summary(out: Path, a, chunks, sup, interrupted) -> dict:
+def write_summary(out: Path, a, chunks, sup, interrupted, tasks=None) -> dict:
     np.save(out / "chunks.npy", np.stack(chunks) if chunks else np.zeros((0,)))
     summary = {"chunks": len(chunks), "drive": a.drive, "interrupted": interrupted,
                "stop_reason": (sup.stop_reason if sup else None) or ("Ctrl+C" if interrupted else None),
-               "plans_sent": sup.sent if sup else 0, "pad_events": sup.events if sup else []}
+               "plans_sent": sup.sent if sup else 0, "pad_events": sup.events if sup else [],
+               "tasks": tasks.items if tasks else None}
     if sup and sup.applied:
         planned = np.array([p for _, p, _ in sup.applied])
         applied = np.array([q for _, _, q in sup.applied])
@@ -430,6 +579,8 @@ def write_summary(out: Path, a, chunks, sup, interrupted) -> dict:
         json.dump(sup.applied, open(out / "applied.json", "w"))
     recs = [json.loads(l) for l in open(out / "chunks.jsonl")] if (out / "chunks.jsonl").exists() else []
     if recs:
+        summary["chunks_per_task"] = {t: sum(r.get("task") == t for r in recs)
+                                      for t in dict.fromkeys(r.get("task") for r in recs)}
         lat = [r["obs_to_plan_ms"] for r in recs]
         inf = [r["timings_ms"]["total"] for r in recs]
         summary.update(obs_to_plan_ms={"p50": float(np.percentile(lat, 50)), "p99": float(np.percentile(lat, 99)),
@@ -447,10 +598,10 @@ def run_live(a) -> int:
     import client as client_mod
     from frame_reader import FrameReader
 
-    contract = json.loads(Path(a.contract).read_text())
+    contract = json.loads(Path(a.contract).read_text()) if a.contract else None
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    procs, tmp, sup, pad = [], None, None, None
+    procs, tmp, sup, pad, tasks = [], None, None, None, None
     chunks, interrupted = [], False
     try:
         pad_path = find_pad(a.gamepad) if a.drive else None
@@ -467,6 +618,13 @@ def run_live(a) -> int:
         pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root))
         print(f"[groot] engines ready in {pol.load_s} s, fixture {pol.fixture['status']} "
               f"(chunk cos {pol.fixture['reports']['chunk']['cosine']:.6f})", flush=True)
+        if a.task:
+            pol.prompts.ids(a.task)                     # refuse an unusable --task before arming
+        tasks = TaskList(pol.prompts.tasks, a.task)
+        prompt_note = (f"type a prompt + Enter to switch to it (kept in the list, up to "
+                       f"{pol.prompts.capacity} tokens); '?' lists the tasks"
+                       if pol.prompts.dynamic else "this bundle bakes one prompt")
+        print(f"[task] {prompt_note}; D-pad right/left cycles\n{tasks.show()}", flush=True)
         readers = [FrameReader(p, Path(a.build) / "libkaivuri_frames.so", max_age_s=a.max_frame_age_ms / 1e3)
                    for p in cam_files]
         status_conn = client_mod.Client(sock)
@@ -504,10 +662,32 @@ def run_live(a) -> int:
                       rng.standard_normal(pol.noise_shape).astype(np.float32))
         if a.drive:
             sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew,
-                             pump=a.pump, pad=pad, start_model=a.start_model)
+                             pump=a.pump, pad=pad, start_model=a.start_model, tasks=tasks)
             sup.arm()
             sup.start()
             print(f"[groot] armed, {sup.mode.upper()} mode, pump {'ON' if a.pump else 'OFF'}", flush=True)
+        def read_prompts():
+            """Terminal lines become prompts: appended to the task list and selected."""
+            for line in sys.stdin:
+                text = line.strip()
+                if not text:
+                    continue
+                if text == "?":
+                    print(tasks.show(), flush=True)
+                    continue
+                try:
+                    n = pol.prompts.text_tokens(text)
+                except ValueError as e:
+                    print(f"[task] not used: {e}", flush=True)
+                    continue
+                if sup:
+                    sup.drop_plan()
+                k = tasks.add(text)
+                print(f"[task] {k + 1}: {text} ({n} text tokens)", flush=True)
+
+        if sys.stdin and not sys.stdin.closed:
+            threading.Thread(target=read_prompts, daemon=True).start()
+        applied = None
         t_end = time.monotonic() + a.seconds if a.seconds > 0 else float("inf")
         next_start = time.monotonic()
         while time.monotonic() < t_end and not (sup and sup.halt.is_set()):
@@ -518,6 +698,11 @@ def run_live(a) -> int:
             if a.rate_hz > 0:
                 time.sleep(max(0.0, next_start - time.monotonic()))
                 next_start += 1.0 / a.rate_hz
+            k, text, version = tasks.current()
+            if version != applied:
+                n = pol.set_prompt(text)
+                applied = version
+                print(f"[task {k + 1}/{len(tasks.items)}] {text!r} ({n} prompt tokens)", flush=True)
             frames, st, obs_ns, skew = observe()
             if not chunks:        # what the model saw first, for an orientation check
                 for k, f in enumerate(frames, 1):
@@ -534,7 +719,10 @@ def run_live(a) -> int:
             rows[:, pol.boundary.action_cols] = np.clip(act, -1.0, 1.0)
             if not a.enable_slew:
                 rows[:, 0] = 0.0
-            accepted = sup.offer(rows, obs_ns + int(a.action_offset_ms * 1e6), obs_ns) if sup else None
+            # A chunk of an instruction that changed meanwhile is never offered.
+            current = tasks.current()[2] == applied
+            accepted = (sup.offer(rows, obs_ns + int(a.action_offset_ms * 1e6), obs_ns)
+                        if sup and current else (False if sup else None))
             lag_rows = (done_ns - obs_ns) / 1e9 * fps
             rec = {"i": len(chunks), "obs_ns": obs_ns, "done_ns": done_ns,
                    "obs_to_plan_ms": round((done_ns - obs_ns) / 1e6, 1), "stale_rows": round(lag_rows, 1),
@@ -542,7 +730,7 @@ def run_live(a) -> int:
                    "row_now": act[min(int(lag_rows), len(act) - 1)].round(3).tolist(),
                    "row0": act[0].round(3).tolist(), "abs_max": np.abs(act).max(0).round(3).tolist(),
                    "timings_ms": {k: round(v, 1) for k, v in t.items()}, "accepted": accepted,
-                   "pump": sup.pump if sup else None}
+                   "pump": sup.pump if sup else None, "task": pol.task}
             chunks.append(act)
             log.write(json.dumps(rec) + "\n")
             log.flush()
@@ -569,8 +757,8 @@ def run_live(a) -> int:
         if pad:
             pad.close()
         try:
-            summary = write_summary(out, a, chunks, sup, interrupted)
-            print(json.dumps({k: v for k, v in summary.items() if k != "pad_events"}), flush=True)
+            summary = write_summary(out, a, chunks, sup, interrupted, tasks)
+            print(json.dumps({k: v for k, v in summary.items() if k not in ("pad_events", "tasks")}), flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[groot] summary not written: {e!r}", flush=True)
         signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -583,14 +771,15 @@ def main():
     for name in ("parity", "run"):
         s = sub.add_parser(name)
         s.add_argument("--bundle", required=True)
-        s.add_argument("--contract", required=True)
+        s.add_argument("--contract", help="normalization contract JSON (default: the bundle's kaivuri.contract)")
         s.add_argument("--cache", default="~/.cache/kaivuri-groot/default")
         s.add_argument("--vla-root", default=str(Path.home() / "jetson-orin-nano-vla"))
         s.add_argument("--out")
     s = sub.choices["parity"]
-    s.add_argument("--fixture", required=True)
+    s.add_argument("--fixture", help="one physical fixture (default: every prompt fixture in the bundle)")
     s.add_argument("--envelope", help="the same fixture from bfloat16 Gr00tPolicy: per-sample error limits")
-    s.add_argument("--max-abs", type=float, default=0.03, help="valve-command units, without --envelope")
+    s.add_argument("--max-abs", type=float, default=0.02,
+                   help="valve units: the max-error gate without an envelope, the floor of the envelope gate")
     s.add_argument("--min-cosine", type=float, default=0.999)
     s = sub.choices["run"]
     s.add_argument("--tools", default=str(Path.home() / "kaivuriprokkis/native_stack/tools"))
@@ -608,6 +797,7 @@ def main():
     s.add_argument("--pump", action="store_true", help="start with pump permission (X toggles it on the pad)")
     s.add_argument("--gamepad", default="auto", help="evdev path, 'auto' (first by-id joystick) or 'none'")
     s.add_argument("--start-model", action="store_true", help="with a gamepad, start in model mode, not manual")
+    s.add_argument("--task", help="starting prompt (default: the first trained task); added to the list")
     s.add_argument("--seconds", type=float, default=30, help="0 = until Ctrl+C")
     s.add_argument("--rate-hz", type=float, default=0, help="0 = back to back")
     s.add_argument("--fps", type=float, default=30)

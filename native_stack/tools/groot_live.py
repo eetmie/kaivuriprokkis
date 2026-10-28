@@ -12,8 +12,7 @@ frames and degrees to valve commands. `run` reads live cameras and the controlle
 continuously and, with --drive, sends each chunk as a timed plan (t0 = observation time, so
 the rows that went stale during inference are skipped by the controller). A supervisor thread
 renews the plan every 100 ms and disarms on chunk exhaustion, on observation age, on any
-controller state but armed and on any inference error. It never re-arms and never sends pump
-permission.
+controller state but armed and on any inference error. It never re-arms; pump permission only with --pump.
 
     python groot_live.py parity --bundle B --contract C.json --fixture F.npz
     python groot_live.py run --bundle B --contract C.json --start-services --drive --seconds 60 --out DIR
@@ -188,12 +187,14 @@ def parity(a) -> int:
 class Supervisor(threading.Thread):
     """Owns the drive connection: arms, renews the newest plan, stops on any doubt."""
 
-    def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True):
+    def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True, pump=False):
         super().__init__(daemon=True)
         self.c = client_mod
         self.control = client_mod.Client(socket_path)
         self.fps, self.max_age, self.renew = fps, max_obs_age_s, renew_s
         self.slew = slew
+        self.flags = client_mod.DEADMAN | (client_mod.PUMP if pump else 0)
+        self.pump = pump
         self.lock = threading.Lock()
         self.plan = None          # (rows [N,6], t0_ns, obs_ns)
         self.stop_reason = None
@@ -206,7 +207,7 @@ class Supervisor(threading.Thread):
         st = self.control.status()
         if st["state"] != "disarmed":
             raise RuntimeError(f"controller is {st['state']} ({st.get('reason')}), not disarmed")
-        self.control.arm(pump=False)
+        self.control.arm(pump=self.pump)
 
     def offer(self, rows: np.ndarray, t0_ns: int, obs_ns: int):
         with self.lock:
@@ -228,7 +229,7 @@ class Supervisor(threading.Thread):
                 with self.lock:
                     plan = self.plan
                 if plan is None:          # centered hold until the first chunk
-                    self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.c.DEADMAN)
+                    self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags)
                 else:
                     rows, t0, obs = plan
                     if (now - obs) / 1e9 > self.max_age:
@@ -238,7 +239,7 @@ class Supervisor(threading.Thread):
                         self.stop("chunk exhausted")
                         break
                     self.control.send(self.c.DRIVE, [tuple(map(float, r)) for r in rows],
-                                      flags=self.c.DEADMAN, fps=self.fps, t0_ns=t0, observation_ns=obs)
+                                      flags=self.flags, fps=self.fps, t0_ns=t0, observation_ns=obs)
                     self.by_sequence[self.control.sequence] = (t0, rows)
                     self.sent += 1
                 st = self.control.status()
@@ -348,10 +349,10 @@ def run_live(a) -> int:
             pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
                       rng.standard_normal(pol.noise_shape).astype(np.float32))
         if a.drive:
-            sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew)
+            sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew, pump=a.pump)
             sup.arm()
             sup.start()
-            print("[groot] armed (no pump permission)", flush=True)
+            print(f"[groot] armed ({'PUMP PERMITTED' if a.pump else 'no pump permission'})", flush=True)
         t_end = time.monotonic() + a.seconds
         next_start = time.monotonic()
         while time.monotonic() < t_end and not (sup and sup.halt.is_set()):
@@ -452,6 +453,7 @@ def main():
     s.add_argument("--control-socket")
     s.add_argument("--camera-frame", action="append", help="cam1 then cam2 frame files")
     s.add_argument("--drive", action="store_true")
+    s.add_argument("--pump", action="store_true", help="operator pump permission (hydraulics); needs --drive")
     s.add_argument("--seconds", type=float, default=30)
     s.add_argument("--rate-hz", type=float, default=0, help="0 = back to back")
     s.add_argument("--fps", type=float, default=30)
@@ -464,6 +466,8 @@ def main():
     a = p.parse_args()
     if a.cmd == "run" and not a.out:
         p.error("run needs --out")
+    if a.cmd == "run" and a.pump and not a.drive:
+        p.error("--pump needs --drive")
     # Policy() changes into --vla-root (its engine builders import from there).
     for k in ("bundle", "contract", "cache", "vla_root", "out", "fixture", "envelope", "tools", "build",
               "profile", "safety", "control_socket"):

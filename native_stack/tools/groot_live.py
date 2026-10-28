@@ -20,16 +20,30 @@ Ctrl+C disarms, stops the services and still writes the summary.
 Prompts: bundles from spark-projects groot/excavator/export_bundle.py tokenize at runtime. The
 run starts on --task or the first trained task; D-pad right/left cycles the list, and a line
 typed in the terminal becomes a prompt, appended to the list. A change drops the current plan;
-the machine holds until the first chunk observed under the new prompt.
+the machine holds until the first chunk observed under the new prompt, at most
+--first-plan-timeout-s.
 
-    python groot_live.py parity --bundle B                 # every prompt fixture in the bundle
+RTC (bundles with an `rtc` section, a training-time RTC checkpoint): each inference commits the
+first d rows of its chunk to what the running plan executes at those times (read back from the
+plan the controller holds, in normalized model units), and the model denoises only the rest. d
+covers the observation -> new-plan-applied latency (recent maximum + --rtc-margin-ms), capped at
+the trained maximum, so the new plan agrees with the old one where the controller switches.
+`--rtc off` runs the stock sampler on the same engines.
+
+Exit status: 0 run finished, 130 Ctrl+C, 3 gamepad lost, 4 controller fault, 5 plan stopped
+(observation age, chunk exhausted, no first plan), 1 any other error.
+
+    python groot_live.py parity --bundle B                 # every prompt (and RTC) fixture
     python groot_live.py run --bundle B --start-services --live-pwm --enable-slew --drive --out DIR
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import fcntl
+import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -77,9 +91,15 @@ class Boundary:
         return out
 
     def actions(self, model: np.ndarray) -> np.ndarray:
-        """[1,H,W] model actions -> [H,A] valve commands (unnormalize_values_minmax)."""
+        """[1,H,W] model actions -> [H,A] valve commands (unnormalize_values_minmax).
+        Callers check the raw model output first: clipping turns +-inf into valid bounds."""
         x = np.clip(model[0, :, :len(self.a_lo)].astype(np.float64), -1.0, 1.0)
         return ((x + 1.0) / 2.0 * (self.a_hi - self.a_lo) + self.a_lo).astype(np.float32)
+
+    def model_actions(self, valves: np.ndarray) -> np.ndarray:
+        """[N,A] valve commands -> normalized model units, clipped (the processor's training targets)."""
+        x = np.asarray(valves, np.float64)
+        return np.clip(2 * (x - self.a_lo) / (self.a_hi - self.a_lo) - 1, -1.0, 1.0).astype(np.float32)
 
     def degrees(self, status: dict) -> np.ndarray:
         return np.rad2deg(np.asarray([status["angles_rad"][i] for i in self.state_idx],
@@ -146,6 +166,15 @@ class Policy:
         self.contract = contract
         self.boundary = Boundary(contract)
         self.prompts = Prompts(Path(bundle), bb)
+        self.horizon, self.width = bb["action_horizon"], bb["action_dim"]
+        self.rtc = bb.get("rtc")
+        self.rtc_max = int(self.rtc["max_delay"]) if self.rtc else 0
+        if self.rtc:
+            # RTC graphs take rtc_mask/prefix: added to the DiT pool at groot17_trt's one denoise
+            # call (both its infer and its fixture gate go through it). All zero = stock sampler.
+            self._rtc_feeds = self.rtc_feeds(0, None)
+            real = g17.denoise
+            g17.denoise = lambda bundle, run, pool, noise: real(bundle, run, {**pool, **self._rtc_feeds}, noise)
         t0 = time.time()
         built = g16.prebuild_engines(self.b, cache)
         if self.b.mod:
@@ -188,8 +217,27 @@ class Policy:
                 return shape
         raise KeyError(tensor)
 
+    def rtc_feeds(self, delay: int, prefix: np.ndarray | None) -> dict:
+        """rtc_mask [1,H,1] and prefix [1,H,D] for `delay` committed rows. Fresh arrays every call:
+        Engines.run skips the upload of an array object it uploaded last time."""
+        if not 0 <= delay <= self.rtc_max:
+            raise ValueError(f"RTC delay {delay} outside [0, {self.rtc_max}]")
+        mask = np.zeros((1, self.horizon, 1), np.float32)
+        mask[0, :delay] = 1.0
+        full = np.zeros((1, self.horizon, self.width), np.float32)
+        if delay:
+            p = np.asarray(prefix, np.float32)
+            if p.ndim != 2 or p.shape[0] < delay or p.shape[1] > self.width or not np.isfinite(p[:delay]).all():
+                raise ValueError(f"bad RTC prefix {p.shape}")
+            full[0, :delay, :p.shape[1]] = p[:delay]
+        return {"rtc_mask": mask, "prefix": full}
+
     def infer(self, frames_rgb: list[np.ndarray], degrees: np.ndarray, noise: np.ndarray,
-              timings: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+              timings: dict | None = None, rtc_delay: int = 0,
+              rtc_prefix: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Valve chunk [H,A] and the raw model chunk. rtc_prefix: [>=d, A or D] model units."""
+        if rtc_delay and not self.rtc:
+            raise ValueError("this bundle has no RTC inputs")
         t = {} if timings is None else timings
         t0 = time.perf_counter()
         pv = np.stack([self.b.preprocess(f) for f in frames_rgb])
@@ -197,10 +245,20 @@ class Policy:
         t1 = time.perf_counter()
         enc = self.g17.encode_frames(self.b, self.engines.run, pv)
         t2 = time.perf_counter()
+        if self.rtc:
+            self._rtc_feeds = self.rtc_feeds(rtc_delay, rtc_prefix)
         model = self.g17.infer(self.b, self.engines.run, [enc], state, noise, timings=t)
         t3 = time.perf_counter()
         t.update(preprocess=(t1 - t0) * 1e3, vision=(t2 - t1) * 1e3, total=(t3 - t0) * 1e3)
-        return self.boundary.actions(model), model
+        # Raw output first: the boundary clips, which would turn +-inf into valid commands.
+        if model.shape != (1, self.horizon, self.width):
+            raise RuntimeError(f"model chunk shape {model.shape}")
+        if not np.isfinite(model).all():
+            raise RuntimeError("non-finite model output")
+        act = self.boundary.actions(model)
+        if not (np.isfinite(act).all() and np.abs(act).max() <= 1.0):
+            raise RuntimeError("valve commands outside [-1, 1]")
+        return act, model
 
 
 def gray_to_rgb(y8: np.ndarray) -> np.ndarray:
@@ -222,7 +280,9 @@ def check_fixture(pol: Policy, fx, env, min_cosine: float, max_abs: float) -> tu
         gray_ok = all(np.array_equal(raw[v][..., 0], raw[v][..., c]) for v in range(len(raw)) for c in (1, 2))
         frames = [gray_to_rgb(raw[v][..., 0]) if gray_ok else raw[v] for v in range(len(raw))]
         t = {}
-        act, _ = pol.infer(frames, fx["state_deg"][i], fx["noise"][i][None], t)
+        delay = int(fx["rtc_delay"][i]) if "rtc_delay" in fx.files else 0
+        act, model = pol.infer(frames, fx["state_deg"][i], fx["noise"][i][None], t, rtc_delay=delay,
+                               rtc_prefix=fx["rtc_prefix"][i] if delay else None)
         ref = fx["actions"][i]
         d = np.abs(act - ref)
         cos = float((act.ravel() @ ref.ravel()) / (np.linalg.norm(act) * np.linalg.norm(ref)))
@@ -232,8 +292,14 @@ def check_fixture(pol: Policy, fx, env, min_cosine: float, max_abs: float) -> tu
         else:
             lim_max, lim_mean = max_abs, np.inf
         passed = bool(d.max() <= lim_max and d.mean() <= lim_mean and cos >= min_cosine)
+        held = None
+        if delay:   # committed rows come back bit-exact in model units
+            want = fx["rtc_prefix"][i][:delay]
+            held = bool(np.array_equal(model[0, :delay, :want.shape[1]], want))
+            passed &= held
         ok &= passed
-        rows.append({"pass": passed, "episode": int(fx["episode"][i]), "frame": int(fx["frame"][i]),
+        rows.append({"pass": passed, "rtc_delay": delay, "prefix_exact": held,
+                     "episode": int(fx["episode"][i]), "frame": int(fx["frame"][i]),
                      "cosine": round(cos, 6), "max_abs": round(float(d.max()), 4),
                      "limit_max_abs": round(lim_max, 4), "mean_abs": round(float(d.mean()), 5),
                      "limit_mean_abs": round(lim_mean, 5) if np.isfinite(lim_mean) else None,
@@ -252,6 +318,7 @@ def parity(a) -> int:
         jobs = (pol.b.b.get("prompt") or {}).get("fixtures") or []
         if not jobs:
             raise SystemExit("the bundle has no prompt fixtures: pass --fixture")
+        jobs = jobs + [{**j, "rtc": True} for j in (pol.rtc or {}).get("fixtures", [])]
         jobs = [{**j, "float32": root / j["float32"], "bfloat16": root / j["bfloat16"]} for j in jobs]
     ok, results = True, []
     for j in jobs:
@@ -266,10 +333,11 @@ def parity(a) -> int:
         env = np.load(j["bfloat16"]) if j.get("bfloat16") else None
         passed, rows = check_fixture(pol, fx, env, a.min_cosine, a.max_abs)
         ok &= passed
-        results.append({"task": task, "tokens": n, "trained": j.get("trained"),
+        results.append({"task": task, "tokens": n, "trained": j.get("trained"), "rtc": bool(j.get("rtc")),
                         "pass": passed, "samples": rows})
-        print(f"{'PASS' if passed else 'FAIL'} {task!r} ({n} tokens): "
-              + "  ".join(f"cos {r['cosine']:.5f} max {r['max_abs']:.4f}/{r['limit_max_abs']:.4f}"
+        print(f"{'PASS' if passed else 'FAIL'} {'RTC ' if j.get('rtc') else ''}{task!r} ({n} tokens): "
+              + "  ".join((f"d{r['rtc_delay']}{'=' if r['prefix_exact'] else '!'} " if r["rtc_delay"] else "")
+                          + f"cos {r['cosine']:.5f} max {r['max_abs']:.4f}/{r['limit_max_abs']:.4f}"
                           for r in rows), flush=True)
     summary = {"status": "PASS" if ok else "FAIL", "cosine_gate": a.min_cosine,
                "gate": "bfloat16 Gr00tPolicy envelope", "bundle_fixture": pol.fixture,
@@ -394,33 +462,50 @@ def find_pad(arg: str | None) -> str | None:
     return str(found[0]) if found else None
 
 
+def interp_rows(rows: np.ndarray, pos) -> np.ndarray:
+    """The controller's linear interpolation of plan rows at fractional row positions (clamped)."""
+    pos = np.clip(np.asarray(pos, np.float64), 0.0, len(rows) - 1)
+    i = np.floor(pos).astype(int)
+    j = np.minimum(i + 1, len(rows) - 1)
+    f = (pos - i)[..., None]
+    return rows[i] + (rows[j] - rows[i]) * f
+
+
 class Supervisor(threading.Thread):
     """Owns the drive connection: arms, sends the newest plan (or the sticks), stops on doubt.
 
     Model mode renews the newest plan every `renew_s`. Manual mode (gamepad) sends the sticks
     every 25 ms. A toggles model/manual, X toggles pump permission. Without a gamepad a stale or
-    exhausted plan disarms; with one it falls back to manual (sticks centred = hold). Any
+    exhausted plan, or no first plan within `first_plan_s` of entering model mode or changing
+    the prompt, disarms; with one it falls back to manual (sticks centred = hold). Any
     controller state but armed ends the run. It never re-arms.
     """
 
+    LOG = 100_000      # bounded record buffers for unlimited runs
+
     def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True,
-                 pump=False, pad: Pad | None = None, start_model=False, tasks: TaskList | None = None):
+                 pump=False, pad: Pad | None = None, start_model=False, tasks: TaskList | None = None,
+                 first_plan_s=2.0):
         super().__init__(daemon=True)
         self.c = client_mod
         self.control = client_mod.Client(socket_path)
-        self.fps, self.max_age, self.renew = fps, max_obs_age_s, renew_s
+        self.fps, self.max_age, self.renew, self.first_plan_s = fps, max_obs_age_s, renew_s, first_plan_s
         self.slew, self.pump, self.pad, self.tasks = slew, pump, pad, tasks
         self.mode = "model" if (pad is None or start_model) else "manual"
         self.model_since = time.monotonic_ns()
         self.lock = threading.Lock()
-        self.plan = None          # (rows [N,6], t0_ns, obs_ns)
+        self.plan = None          # (rows [N,6], t0_ns, obs_ns, plan id)
         self.fresh = False
-        self.stop_reason = None
+        self.next_id = 0
+        self.stop_reason = self.stop_kind = None
         self.sent = 0
-        self.applied = []         # (row position, planned [4] interpolated, controller applied_action [4])
-        self.by_sequence = {}     # drive packet sequence -> (t0 ns, rows)
-        self.events = []          # (monotonic s, what)
+        self.applied = collections.deque(maxlen=self.LOG)    # (row pos, planned [4], applied_action [4])
+        self.by_sequence = collections.OrderedDict()         # drive packet sequence -> (t0 ns, rows)
+        self.dispatch = collections.deque(maxlen=self.LOG)   # first send of each plan: handover record
+        self.events = collections.deque(maxlen=self.LOG)     # (monotonic s, what)
+        self.ticks = collections.deque(maxlen=self.LOG)      # supervisor loop periods, ms
         self.halt = threading.Event()
+        self.last_send = 0
 
     def flags(self):
         return self.c.DEADMAN | (self.c.PUMP if self.pump else 0)
@@ -449,53 +534,90 @@ class Supervisor(threading.Thread):
             self.plan = None
             self.model_since = time.monotonic_ns()
 
-    def offer(self, rows: np.ndarray, t0_ns: int, obs_ns: int):
+    def running_plan(self):
+        """(rows, t0_ns, plan id) the controller is executing, or None."""
         with self.lock:
-            if self.mode != "model" or obs_ns <= self.model_since:
-                return False
-            if self.plan is not None and obs_ns <= self.plan[2]:
-                return False
-            self.plan = (rows, t0_ns, obs_ns)
-            self.fresh = True
-            return True
+            return None if self.plan is None else (self.plan[0], self.plan[1], self.plan[3])
 
-    def stop(self, reason):
+    def offer(self, rows: np.ndarray, t0_ns: int, obs_ns: int):
+        """-> (accepted, reason, plan id)."""
+        with self.lock:
+            if self.mode != "model":
+                return False, "manual mode", None
+            if obs_ns <= self.model_since:
+                return False, "observed before the mode/prompt change", None
+            if self.plan is not None and obs_ns <= self.plan[2]:
+                return False, "not newer than the running plan", None
+            self.next_id += 1
+            self.plan = (rows, t0_ns, obs_ns, self.next_id)
+            self.fresh = True
+            return True, None, self.next_id
+
+    def stop(self, reason, kind="finished"):
         if self.stop_reason is None:
-            self.stop_reason = reason
+            self.stop_reason, self.stop_kind = reason, kind
         self.halt.set()
+
+    def _hold(self, problem):
+        """A plan problem: manual fallback with a pad, otherwise end the run (disarm)."""
+        if self.pad is None:
+            self.stop(problem, "plan")
+            return
+        self.set_mode("manual", problem)
+        self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags())
 
     def _model_tick(self, now):
         with self.lock:
-            plan, fresh = self.plan, self.fresh
+            plan, fresh, since = self.plan, self.fresh, self.model_since
             self.fresh = False
-        if plan is None:          # centred hold until the first chunk after a switch
+        if plan is None:          # centred hold until the first chunk after a switch, bounded
+            if (now - since) / 1e9 > self.first_plan_s:
+                self._hold(f"no plan {self.first_plan_s:.1f} s after entering model mode / the prompt change")
+                return
             self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags())
             return
-        rows, t0, obs = plan
+        rows, t0, obs, pid = plan
         problem = (f"observation age {(now - obs) / 1e9:.2f} s" if (now - obs) / 1e9 > self.max_age
                    else "chunk exhausted" if now >= t0 + int((len(rows) - 1) / self.fps * 1e9) else None)
         if problem:
-            if self.pad is None:
-                self.stop(problem)
-                return
-            self.set_mode("manual", problem)
-            self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags())
+            self._hold(problem)
             return
         if fresh or now - self.last_send >= self.renew * 1e9:
+            prev = self._sent_plan if fresh else None
             self.control.send(self.c.DRIVE, [tuple(map(float, r)) for r in rows],
                               flags=self.flags(), fps=self.fps, t0_ns=t0, observation_ns=obs)
             self.by_sequence[self.control.sequence] = (t0, rows)
+            while len(self.by_sequence) > 256:
+                self.by_sequence.popitem(last=False)
+            if fresh:     # handover: where each plan stood at this send, and how far they disagree
+                pos = (now - t0) * self.fps / 1e9
+                rec = {"plan": pid, "send_ns": now, "row": round(pos, 2)}
+                if prev is not None:
+                    old = interp_rows(prev[0][:, :4], (now - prev[1]) * self.fps / 1e9)
+                    rec["jump"] = np.round(np.abs(interp_rows(rows[:, :4], pos) - old), 4).tolist()
+                    rec["prev"] = prev[2]
+                self.dispatch.append(rec)
+            self._sent_plan = (rows, t0, pid)
             self.sent += 1
             self.last_send = now
 
     def run(self):
-        self.last_send = 0
+        self._sent_plan = None
         period = 0.025 if self.pad else min(self.renew, 0.05)
+        last = None
         try:
             while not self.halt.is_set():
                 now = time.monotonic_ns()
+                if last is not None:
+                    self.ticks.append(round((now - last) / 1e6, 2))
+                last = now
                 if self.pad:
-                    for b in self.pad.poll():
+                    try:
+                        pressed = self.pad.poll()
+                    except RuntimeError as e:
+                        self.stop(str(e), "gamepad")
+                        break
+                    for b in pressed:
                         if b == BTN_A:
                             self.set_mode("manual" if self.mode == "model" else "model")
                         elif b == BTN_X:
@@ -517,24 +639,31 @@ class Supervisor(threading.Thread):
                 if held:   # the controller's command at that tick: the packet it held, interpolated
                     t0, rows = held
                     pos = min(max((st["applied_host_monotonic_ns"] - t0) * self.fps / 1e9, 0.0), len(rows) - 1)
-                    i = int(pos)
-                    j = min(i + 1, len(rows) - 1)
-                    due = rows[i][:4] + (rows[j][:4] - rows[i][:4]) * (pos - i)
+                    due = interp_rows(rows[:, :4], pos)
                     self.applied.append((round(pos, 2), due.tolist(), st["applied_action"][:4]))
                 if st["state"] != "armed":
-                    self.stop(f"controller {st['state']}: {st.get('reason')}")
+                    self.stop(f"controller {st['state']}: {st.get('reason')}", "controller")
                     break
                 self.halt.wait(period)
         except Exception as e:  # noqa: BLE001
-            self.stop(f"supervisor error: {e!r}")
+            self.stop(f"supervisor error: {e!r}", "error")
         finally:
-            try:
-                self.control.send(self.c.DISARM)
-            finally:
-                self.control.close()
+            self.shutdown()
+
+    def shutdown(self):
+        """Disarm and close the connection; safe before start() and when called twice."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            self.control.send(self.c.DISARM)
+        finally:
+            self.control.close()
 
 
-def start_services(a, runtime: Path):
+def start_services(a, runtime: Path, procs: list):
+    """Start the controller and cameras. Each child joins `procs` as soon as it exists, so the
+    caller can stop whatever started when a later step fails."""
     build = Path(a.build)
     control = [build / "kaivuri-control", "--profile", a.profile, "--safety", a.safety,
                "--socket", runtime / "control.sock", "--control-hz", str(a.control_hz),
@@ -546,7 +675,6 @@ def start_services(a, runtime: Path):
     cams = [build / "kaivuri-camera", "--camera", f"{CAM1}:2", "--camera", f"{CAM2}:1",
             "--output-dir", runtime / "cameras", "--fps", "30", "--width", "640", "--height", "480",
             "--rotate-180", CAM1]
-    procs = []
     log = open(runtime / "services.log", "w")
     for cmd, ready in ((control, [runtime / "control.sock"]),
                        (cams, [runtime / "cameras" / f"{CAM1}-ir2.frame", runtime / "cameras" / f"{CAM2}-ir1.frame"])):
@@ -559,16 +687,156 @@ def start_services(a, runtime: Path):
                 raise RuntimeError(f"{cmd[0].name} did not start (see {runtime / 'services.log'})")
             time.sleep(0.1)
     time.sleep(1.5)       # USB streams start one after the other
-    return procs, runtime / "control.sock", [runtime / "cameras" / f"{CAM1}-ir2.frame",
-                                             runtime / "cameras" / f"{CAM2}-ir1.frame"]
+    return runtime / "control.sock", [runtime / "cameras" / f"{CAM1}-ir2.frame",
+                                      runtime / "cameras" / f"{CAM2}-ir1.frame"]
 
 
-def write_summary(out: Path, a, chunks, sup, interrupted, tasks=None) -> dict:
+def stop_services(procs: list) -> None:
+    for p in procs:
+        if p.poll() is None:
+            p.send_signal(signal.SIGINT)
+    for p in procs:
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=5)
+
+
+# ── observation ─────────────────────────────────────────────────────────────
+
+
+class Incoherent(RuntimeError):
+    """This snapshot cannot condition a plan; the loop observes again. `kind` groups the log."""
+
+    def __init__(self, kind: str, detail: str = ""):
+        super().__init__(f"{kind}{' (' + detail + ')' if detail else ''}")
+        self.kind = kind
+
+
+class Observer:
+    """One coherent snapshot of both cameras and the controller status.
+
+    Each source is read, then the whole set is validated at ONE final monotonic time: every frame
+    fresh and not from the future, the expected geometry and IR stream, no sequence going
+    backwards (a restarted camera), camera-to-camera skew and state-to-image separation bounded,
+    the IMU healthy, fresh and not from the future. The observation time is the oldest source.
+    """
+
+    def __init__(self, readers, files, status_conn, a):
+        self.readers, self.status_conn, self.a = readers, status_conn, a
+        self.ir = [int(m.group(1)) if (m := re.search(r"-ir(\d)\.frame$", str(f))) else None for f in files]
+        self.last_seq = [None] * len(readers)
+
+    def __call__(self):
+        a = self.a
+        frames, metas = [], []
+        for r in self.readers:
+            snap, end = None, time.monotonic() + 0.5
+            while snap is None:
+                snap = r.read()
+                if snap is None:
+                    if time.monotonic() > end:
+                        raise Incoherent("no fresh camera frame")
+                    time.sleep(0.002)
+            m, px = snap
+            frames.append(np.frombuffer(px, np.uint8).reshape(m.height, m.width).copy())
+            metas.append((m.sequence, m.host_monotonic_ns, m.width, m.height, m.ir_index))
+        st = self.status_conn.status()
+        now = time.monotonic_ns()
+        cams = []
+        for k, (seq, t, w, h, ir) in enumerate(metas):
+            age = (now - t) / 1e6
+            if age < 0:
+                raise Incoherent("frame from the future", f"cam{k + 1} {age:.1f} ms")
+            if age > a.max_frame_age_ms:
+                raise Incoherent("stale frame", f"cam{k + 1} {age:.0f} ms at the snapshot")
+            if (w, h) != (640, 480) or (self.ir[k] is not None and ir != self.ir[k]):
+                raise Incoherent("wrong camera stream", f"cam{k + 1} is {w}x{h} ir{ir}, expected 640x480 ir{self.ir[k]}")
+            if self.last_seq[k] is not None and seq < self.last_seq[k]:
+                was, self.last_seq = self.last_seq[k], [None] * len(self.readers)
+                raise Incoherent("camera restarted", f"cam{k + 1} sequence {was} -> {seq}")
+            cams.append(t)
+        skew = (max(cams) - min(cams)) / 1e6
+        if skew > a.max_camera_skew_ms:
+            raise Incoherent("camera skew", f"{skew:.1f} ms")
+        if not (st["imu_healthy"] and st["fk_valid"]):
+            raise Incoherent("IMU unhealthy / FK invalid")
+        imu = st["imu_host_monotonic_ns"]
+        imu_age = (now - imu) / 1e6
+        if imu_age < -1.0:
+            raise Incoherent("IMU from the future", f"{imu_age:.1f} ms")
+        if imu_age > a.max_imu_age_ms:
+            raise Incoherent("stale IMU", f"{imu_age:.0f} ms")
+        sep = max(abs(imu - t) for t in cams) / 1e6
+        if sep > a.max_state_skew_ms:
+            raise Incoherent("state-to-image separation", f"{sep:.1f} ms")
+        self.last_seq = [m[0] for m in metas]
+        sources = {"snapshot_ns": now, "imu_ns": imu, "cameras": [
+            {"seq": int(m[0]), "ns": int(m[1])} for m in metas]}
+        return frames, st, min([*cams, imu]), skew, sources
+
+
+# ── RTC ─────────────────────────────────────────────────────────────────────
+
+
+class RtcDelay:
+    """Committed rows d: from the observation (row 0) until the controller applies the new plan.
+    The recent maximum observation -> result latency plus a dispatch margin, capped at the trained
+    maximum; the prefix must also lie inside the running plan."""
+
+    def __init__(self, max_delay: int, fps: float, margin_ms: float, window: int = 20):
+        self.max, self.fps, self.margin = max_delay, fps, margin_ms
+        self.lat = collections.deque(maxlen=window)
+
+    def add(self, ms: float):
+        self.lat.append(ms)
+
+    def want(self) -> int:
+        if not self.lat or self.max == 0:
+            return self.max
+        return min(self.max, math.ceil((max(self.lat) + self.margin) * self.fps / 1e3))
+
+
+def committed_rows(pol: Policy, running, t0_ns: int, want: int, fps: float):
+    """(d, prefix [d,A] model units, plan id): what `running` (rows, t0, id) executes at rows
+    0..d-1 of a chunk anchored at t0_ns, as the controller interpolates it."""
+    if running is None or want == 0:
+        return 0, None, None
+    rows, t0_old, pid = running
+    pos = (t0_ns - t0_old) * fps / 1e9 + np.arange(want)
+    d = int(np.sum((pos >= 0) & (pos <= len(rows) - 1)))
+    if d == 0 or pos[0] < 0:
+        return 0, None, pid
+    valves = interp_rows(rows[:, pol.boundary.action_cols], pos[:d])
+    return d, pol.boundary.model_actions(valves), pid
+
+
+# ── live ────────────────────────────────────────────────────────────────────
+
+EXIT = {"finished": 0, "interrupted": 130, "gamepad": 3, "controller": 4, "plan": 5, "error": 1}
+
+
+def sha256(path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def stats(xs) -> dict | None:
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return None
+    return {"n": len(xs), "p50": round(float(np.percentile(xs, 50)), 3),
+            "p99": round(float(np.percentile(xs, 99)), 3), "max": round(float(max(xs)), 3)}
+
+
+def write_summary(out: Path, a, chunks, sup, outcome: dict, tasks=None, extra=None) -> dict:
     np.save(out / "chunks.npy", np.stack(chunks) if chunks else np.zeros((0,)))
-    summary = {"chunks": len(chunks), "drive": a.drive, "interrupted": interrupted,
-               "stop_reason": (sup.stop_reason if sup else None) or ("Ctrl+C" if interrupted else None),
-               "plans_sent": sup.sent if sup else 0, "pad_events": sup.events if sup else [],
-               "tasks": tasks.items if tasks else None}
+    summary = {"outcome": outcome, "chunks": len(chunks), "drive": a.drive,
+               "plans_sent": sup.sent if sup else 0, "pad_events": list(sup.events) if sup else [],
+               "tasks": tasks.items if tasks else None, **(extra or {})}
     if sup and sup.applied:
         planned = np.array([p for _, p, _ in sup.applied])
         applied = np.array([q for _, _, q in sup.applied])
@@ -576,16 +844,27 @@ def write_summary(out: Path, a, chunks, sup, interrupted, tasks=None) -> dict:
             "samples": len(applied), "mean_abs": float(np.abs(applied - planned).mean()),
             "max_abs": float(np.abs(applied - planned).max()),
             "row_due": {"min": min(k for k, _, _ in sup.applied), "max": max(k for k, _, _ in sup.applied)}}
-        json.dump(sup.applied, open(out / "applied.json", "w"))
+        json.dump(list(sup.applied), open(out / "applied.json", "w"))
+    if sup:
+        json.dump(list(sup.dispatch), open(out / "dispatch.json", "w"))
+        jumps = [max(r["jump"]) for r in sup.dispatch if "jump" in r]
+        summary["handover"] = {"max_jump": stats(jumps), "row": stats([r["row"] for r in sup.dispatch]),
+                               "over_0.5": sum(j > 0.5 for j in jumps)}
+        summary["supervisor_tick_ms"] = stats(list(sup.ticks))
     recs = [json.loads(l) for l in open(out / "chunks.jsonl")] if (out / "chunks.jsonl").exists() else []
+    inferred = [r for r in recs if "obs_to_plan_ms" in r]
     if recs:
-        summary["chunks_per_task"] = {t: sum(r.get("task") == t for r in recs)
-                                      for t in dict.fromkeys(r.get("task") for r in recs)}
-        lat = [r["obs_to_plan_ms"] for r in recs]
-        inf = [r["timings_ms"]["total"] for r in recs]
-        summary.update(obs_to_plan_ms={"p50": float(np.percentile(lat, 50)), "p99": float(np.percentile(lat, 99)),
-                                       "max": max(lat)},
-                       infer_ms={"p50": float(np.percentile(inf, 50)), "p99": float(np.percentile(inf, 99))})
+        summary["rejected_observations"] = collections.Counter(r["rejected"] for r in recs if "rejected" in r)
+        summary["offers"] = collections.Counter(r.get("reason") or ("accepted" if r.get("accepted") else "not offered")
+                                                for r in inferred)
+    if inferred:
+        summary["chunks_per_task"] = {t: sum(r.get("task") == t for r in inferred)
+                                      for t in dict.fromkeys(r.get("task") for r in inferred)}
+        summary.update(obs_to_plan_ms=stats([r["obs_to_plan_ms"] for r in inferred]),
+                       infer_ms=stats([r["timings_ms"]["total"] for r in inferred]),
+                       camera_skew_ms=stats([r["camera_skew_ms"] for r in inferred]),
+                       rtc_delay=stats([r["rtc_delay"] for r in inferred]),
+                       rtc_short=sum(r["rtc_delay"] < r["rtc_want"] for r in inferred))
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     return summary
 
@@ -601,8 +880,16 @@ def run_live(a) -> int:
     contract = json.loads(Path(a.contract).read_text()) if a.contract else None
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    procs, tmp, sup, pad, tasks = [], None, None, None, None
-    chunks, interrupted = [], False
+    identity = {"argv": sys.argv, "groot_live_sha256": sha256(__file__), "bundle": a.bundle,
+                "bundle_json_sha256": sha256(Path(a.bundle) / "bundle.json"), "cache": a.cache,
+                "vla_root": a.vla_root, "profile": a.profile, "safety": a.safety,
+                "safety_sha256": sha256(a.safety), "control_hz": a.control_hz, "fps": a.fps,
+                "start_monotonic_ns": time.monotonic_ns(), "start_unix": time.time()}
+    (out / "run.json").write_text(json.dumps(identity, indent=1) + "\n")
+    procs, tmp, sup, pad, tasks, status_conn, readers, pol = [], None, None, None, None, None, [], None
+    chunks = collections.deque(maxlen=20_000)
+    outcome = {"kind": "finished", "reason": "run finished"}
+    rtc_on = False
     try:
         pad_path = find_pad(a.gamepad) if a.drive else None
         if pad_path:
@@ -612,12 +899,17 @@ def run_live(a) -> int:
             print("[pad] no gamepad: model drives until the run ends; Ctrl+C = stop", flush=True)
         if a.start_services:
             tmp = tempfile.TemporaryDirectory(prefix="kvr-groot-")
-            procs, sock, cam_files = start_services(a, Path(tmp.name))
+            sock, cam_files = start_services(a, Path(tmp.name), procs)
         else:
             sock, cam_files = a.control_socket, a.camera_frame
         pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root))
+        rtc_on = bool(pol.rtc) and a.rtc != "off"
+        if a.rtc == "on" and not pol.rtc:
+            raise ValueError("--rtc on: this bundle has no RTC inputs")
         print(f"[groot] engines ready in {pol.load_s} s, fixture {pol.fixture['status']} "
-              f"(chunk cos {pol.fixture['reports']['chunk']['cosine']:.6f})", flush=True)
+              f"(chunk cos {pol.fixture['reports']['chunk']['cosine']:.6f}), RTC "
+              + (f"ON (max {pol.rtc_max} rows, margin {a.rtc_margin_ms:g} ms)" if rtc_on
+                 else "off" + (" (--rtc off)" if pol.rtc else " (bundle has none)")), flush=True)
         if a.task:
             pol.prompts.ids(a.task)                     # refuse an unusable --task before arming
         tasks = TaskList(pol.prompts.tasks, a.task)
@@ -625,47 +917,40 @@ def run_live(a) -> int:
                        f"{pol.prompts.capacity} tokens); '?' lists the tasks"
                        if pol.prompts.dynamic else "this bundle bakes one prompt")
         print(f"[task] {prompt_note}; D-pad right/left cycles\n{tasks.show()}", flush=True)
-        readers = [FrameReader(p, Path(a.build) / "libkaivuri_frames.so", max_age_s=a.max_frame_age_ms / 1e3)
-                   for p in cam_files]
+        for p in cam_files:
+            readers.append(FrameReader(p, Path(a.build) / "libkaivuri_frames.so",
+                                       max_age_s=a.max_frame_age_ms / 1e3))
         status_conn = client_mod.Client(sock)
+        observe = Observer(readers, cam_files, status_conn, a)
         rng = np.random.default_rng(a.seed)
         fps = float(a.fps)
+        delay = RtcDelay(pol.rtc_max if rtc_on else 0, fps, a.rtc_margin_ms)
         log = open(out / "chunks.jsonl", "w")
 
-        def observe():
-            frames, arrivals = [], []
-            for r in readers:
-                snap = None
-                end = time.monotonic() + 1.0
-                while snap is None:
-                    snap = r.read()
-                    if snap is None:
-                        if time.monotonic() > end:
-                            raise RuntimeError("no fresh camera frame")
-                        time.sleep(0.002)
-                m, px = snap
-                frames.append(np.frombuffer(px, np.uint8).reshape(m.height, m.width).copy())
-                arrivals.append(m.host_monotonic_ns)
-            st = status_conn.status()
-            now = time.monotonic_ns()
-            if not (st["imu_healthy"] and st["fk_valid"]):
-                raise RuntimeError("IMU unhealthy / FK invalid")
-            if (now - st["imu_host_monotonic_ns"]) / 1e6 > a.max_imu_age_ms:
-                raise RuntimeError("IMU sample too old")
-            skew = (max(arrivals) - min(arrivals)) / 1e6
-            return frames, st, min([*arrivals, st["imu_host_monotonic_ns"]]), skew
+        def observe_retry(deadline_s=2.0):
+            end = time.monotonic() + deadline_s
+            while True:
+                try:
+                    return observe()
+                except Incoherent:
+                    if time.monotonic() > end:
+                        raise
+                    time.sleep(0.005)
 
         # Warm-up: a few inferences before arming, so the first plan's latency is known.
         for _ in range(a.warmup):
-            frames, st, obs_ns, _ = observe()
+            frames, st, obs_ns, _, _ = observe_retry()
             pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
                       rng.standard_normal(pol.noise_shape).astype(np.float32))
+            delay.add((time.monotonic_ns() - obs_ns) / 1e6)
         if a.drive:
             sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew,
-                             pump=a.pump, pad=pad, start_model=a.start_model, tasks=tasks)
+                             pump=a.pump, pad=pad, start_model=a.start_model, tasks=tasks,
+                             first_plan_s=a.first_plan_timeout_s)
             sup.arm()
             sup.start()
             print(f"[groot] armed, {sup.mode.upper()} mode, pump {'ON' if a.pump else 'OFF'}", flush=True)
+
         def read_prompts():
             """Terminal lines become prompts: appended to the task list and selected."""
             for line in sys.stdin:
@@ -687,9 +972,10 @@ def run_live(a) -> int:
 
         if sys.stdin and not sys.stdin.closed:
             threading.Thread(target=read_prompts, daemon=True).start()
-        applied = None
+        applied, virtual, first_written = None, None, False
         t_end = time.monotonic() + a.seconds if a.seconds > 0 else float("inf")
         next_start = time.monotonic()
+        n = 0
         while time.monotonic() < t_end and not (sup and sup.halt.is_set()):
             if sup and sup.mode != "model":       # manual: no inference, sticks drive
                 time.sleep(0.02)
@@ -700,69 +986,119 @@ def run_live(a) -> int:
                 next_start += 1.0 / a.rate_hz
             k, text, version = tasks.current()
             if version != applied:
-                n = pol.set_prompt(text)
-                applied = version
-                print(f"[task {k + 1}/{len(tasks.items)}] {text!r} ({n} prompt tokens)", flush=True)
-            frames, st, obs_ns, skew = observe()
-            if not chunks:        # what the model saw first, for an orientation check
-                for k, f in enumerate(frames, 1):
-                    (out / f"cam{k}_first.pgm").write_bytes(
+                pol.set_prompt(text)
+                applied, virtual = version, None
+                print(f"[task {k + 1}/{len(tasks.items)}] {text!r} ({pol.task_tokens} prompt tokens)", flush=True)
+            try:
+                frames, st, obs_ns, skew, sources = observe()
+            except Incoherent as e:
+                log.write(json.dumps({"rejected": e.kind, "detail": str(e), "ns": time.monotonic_ns()}) + "\n")
+                time.sleep(0.005)
+                continue
+            if not first_written:        # what the model saw first, for an orientation check
+                for c, f in enumerate(frames, 1):
+                    (out / f"cam{c}_first.pgm").write_bytes(
                         f"P5\n{f.shape[1]} {f.shape[0]}\n255\n".encode() + f.tobytes())
+                first_written = True
             deg = pol.boundary.degrees(st)
             t = {}
             noise = rng.standard_normal(pol.noise_shape).astype(np.float32)
-            act, model = pol.infer([gray_to_rgb(f) for f in frames], deg, noise, t)
-            if not np.isfinite(act).all():
-                raise RuntimeError("non-finite actions")
+            t0_ns = obs_ns + int(a.action_offset_ms * 1e6)
+            want = delay.want() if rtc_on else 0
+            running = sup.running_plan() if sup else virtual
+            d, prefix, prefix_plan = committed_rows(pol, running, t0_ns, want, fps)
+            act, model = pol.infer([gray_to_rgb(f) for f in frames], deg, noise, t, rtc_delay=d, rtc_prefix=prefix)
             done_ns = time.monotonic_ns()
+            delay.add((done_ns - obs_ns) / 1e6)
             rows = np.zeros((len(act), 6), np.float32)
-            rows[:, pol.boundary.action_cols] = np.clip(act, -1.0, 1.0)
+            rows[:, pol.boundary.action_cols] = act
             if not a.enable_slew:
                 rows[:, 0] = 0.0
             # A chunk of an instruction that changed meanwhile is never offered.
-            current = tasks.current()[2] == applied
-            accepted = (sup.offer(rows, obs_ns + int(a.action_offset_ms * 1e6), obs_ns)
-                        if sup and current else (False if sup else None))
+            if tasks.current()[2] != applied:
+                accepted, reason, pid = False, "prompt changed during inference", None
+            elif sup:
+                accepted, reason, pid = sup.offer(rows, t0_ns, obs_ns)
+            else:                         # no drive: the chunk becomes the virtual running plan
+                accepted, reason, pid = None, None, n + 1
+                virtual = (rows, t0_ns, pid)
             lag_rows = (done_ns - obs_ns) / 1e9 * fps
-            rec = {"i": len(chunks), "obs_ns": obs_ns, "done_ns": done_ns,
+            rec = {"i": n, "obs_ns": obs_ns, "t0_ns": t0_ns, "done_ns": done_ns,
                    "obs_to_plan_ms": round((done_ns - obs_ns) / 1e6, 1), "stale_rows": round(lag_rows, 1),
-                   "camera_skew_ms": round(skew, 1), "state_deg": deg.round(2).tolist(),
+                   "camera_skew_ms": round(skew, 1), "sources": sources, "state_deg": deg.round(2).tolist(),
+                   "rtc_delay": d, "rtc_want": want, "prefix_plan": prefix_plan,
                    "row_now": act[min(int(lag_rows), len(act) - 1)].round(3).tolist(),
                    "row0": act[0].round(3).tolist(), "abs_max": np.abs(act).max(0).round(3).tolist(),
-                   "timings_ms": {k: round(v, 1) for k, v in t.items()}, "accepted": accepted,
-                   "pump": sup.pump if sup else None, "task": pol.task}
+                   "timings_ms": {kk: round(v, 1) for kk, v in t.items()}, "accepted": accepted,
+                   "reason": reason, "plan_id": pid, "pump": sup.pump if sup else None, "task": pol.task}
             chunks.append(act)
+            n += 1
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(f"[{rec['i']:4d}] obs->plan {rec['obs_to_plan_ms']:6.1f} ms  infer {t['total']:6.1f}  "
-                  f"deg {deg.round(1)}  now {np.round(rec['row_now'], 2)}", flush=True)
+                  f"rtc {d:2d}/{want:2d}  deg {deg.round(1)}  now {np.round(rec['row_now'], 2)}", flush=True)
+        if sup and sup.stop_kind:
+            outcome = {"kind": sup.stop_kind, "reason": sup.stop_reason}
     except KeyboardInterrupt:
-        interrupted = True
+        outcome = {"kind": "interrupted", "reason": "Ctrl+C"}
         print("\n[groot] Ctrl+C: disarming and stopping services", flush=True)
+    except Exception as e:  # noqa: BLE001
+        outcome = {"kind": "error", "reason": repr(e)}
+        import traceback
+        traceback.print_exc()
     finally:
         signal.signal(signal.SIGINT, signal.SIG_IGN)   # let the cleanup finish
-        if sup:
-            sup.stop(sup.stop_reason or ("Ctrl+C" if interrupted else "run finished"))
-            sup.join(timeout=2)
-        for p in procs:
-            if p.poll() is None:
-                p.send_signal(signal.SIGINT)
-        for p in procs:
+        cleanup = []
+
+        def step(name, fn):
             try:
-                p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                p.kill()
+                fn()
+            except Exception as e:  # noqa: BLE001
+                cleanup.append(f"{name}: {e!r}")
+
+        if sup:
+            step("supervisor stop", lambda: sup.stop(outcome["reason"], outcome["kind"]))
+            if sup.ident is not None:
+                step("supervisor join", lambda: sup.join(timeout=2))
+            if sup.is_alive():
+                cleanup.append("supervisor did not finish in 2 s")
+            step("disarm", sup.shutdown)        # no-op after run(); disarms when arming failed
+            if sup.stop_kind and outcome["kind"] == "finished":
+                outcome = {"kind": sup.stop_kind, "reason": sup.stop_reason}
+        final = {}
+        if status_conn:
+            def final_status():
+                """The controller's own state after the disarm; armed past 1 s is a cleanup error."""
+                end = time.monotonic() + 1.0
+                while True:
+                    st = status_conn.status()
+                    if st["state"] != "armed" or not sup or time.monotonic() > end:
+                        break
+                    time.sleep(0.02)
+                final.update({k: st.get(k) for k in ("state", "reason", "pump_on")})
+                if sup and st["state"] == "armed":
+                    raise RuntimeError("controller still armed 1 s after the disarm")
+            step("final status", final_status)
+            step("status close", status_conn.close)
+        step("services", lambda: stop_services(procs))
+        for r in readers:
+            step("frame reader", r.close)
         if tmp:
-            tmp.cleanup()
+            step("runtime dir", tmp.cleanup)
         if pad:
-            pad.close()
+            step("gamepad", pad.close)
+        outcome["final_controller"] = final or None
+        outcome["cleanup_errors"] = cleanup
+        outcome["exit"] = EXIT.get(outcome["kind"], 1)
         try:
-            summary = write_summary(out, a, chunks, sup, interrupted, tasks)
+            summary = write_summary(out, a, chunks, sup, outcome, tasks,
+                                    {"rtc": {"on": rtc_on, "max_delay": pol.rtc_max if rtc_on else 0,
+                                             "margin_ms": a.rtc_margin_ms} if pol else None})
             print(json.dumps({k: v for k, v in summary.items() if k not in ("pad_events", "tasks")}), flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[groot] summary not written: {e!r}", flush=True)
         signal.signal(signal.SIGINT, signal.default_int_handler)
-    return 0
+    return outcome["exit"]
 
 
 def main():
@@ -807,6 +1143,15 @@ def main():
     s.add_argument("--max-frame-age-ms", type=float, default=200)
     s.add_argument("--max-imu-age-ms", type=float, default=50)
     s.add_argument("--max-observation-age-ms", type=float, default=1400)
+    s.add_argument("--max-camera-skew-ms", type=float, default=50,
+                   help="camera-to-camera arrival skew (recorded live max 22.8 ms; 30 fps = 33 ms/frame)")
+    s.add_argument("--max-state-skew-ms", type=float, default=100, help="IMU sample vs each camera frame")
+    s.add_argument("--first-plan-timeout-s", type=float, default=2.0,
+                   help="model mode without a plan (start, A, prompt change) holds centred at most this long")
+    s.add_argument("--rtc", choices=("auto", "on", "off"), default="auto",
+                   help="auto: training-time RTC when the bundle has RTC inputs")
+    s.add_argument("--rtc-margin-ms", type=float, default=40,
+                   help="added to the recent max observation->result latency: supervisor tick + dispatch")
     a = p.parse_args()
     if a.cmd == "run" and not a.out:
         p.error("run needs --out")

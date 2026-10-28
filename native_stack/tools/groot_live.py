@@ -12,7 +12,10 @@ frames and degrees to valve commands. `run` reads live cameras and the controlle
 continuously and, with --drive, sends each chunk as a timed plan (t0 = observation time, so
 the rows that went stale during inference are skipped by the controller). A supervisor thread
 renews the plan every 100 ms and disarms on chunk exhaustion, on observation age, on any
-controller state but armed and on any inference error. It never re-arms; pump permission only with --pump.
+controller state but armed and on any inference error. It never re-arms. With an Xbox pad
+(--gamepad auto): A toggles manual (sticks drive, inference paused) and model; a stale or
+exhausted chunk then falls back to manual instead of disarming. X toggles pump permission.
+Ctrl+C disarms, stops the services and still writes the summary.
 
     python groot_live.py parity --bundle B --contract C.json --fixture F.npz
     python groot_live.py run --bundle B --contract C.json --start-services --drive --seconds 60 --out DIR
@@ -20,9 +23,12 @@ controller state but armed and on any inference error. It never re-arms; pump pe
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -183,25 +189,109 @@ def parity(a) -> int:
 
 # ── live ────────────────────────────────────────────────────────────────────
 
+EV_SYN, EV_KEY, EV_ABS, SYN_DROPPED = 0, 1, 3, 3
+ABS_X, ABS_Y, ABS_RX, ABS_RY = 0, 1, 3, 4
+BTN_A, BTN_B, BTN_X = 0x130, 0x131, 0x133   # BTN_SOUTH, BTN_EAST, BTN_NORTH (the recorder's X)
+_EVENT = struct.Struct("llHHi")              # struct input_event, 64-bit
+
+
+class Pad:
+    """Xbox evdev pad without python-evdev: same axes, signs and 25% deadzone as
+    native_stack/src/gamepad.cpp, so manual driving feels like recording."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        self.axes, self.keys = {}, set()
+        if stat.S_ISFIFO(os.fstat(self.fd).st_mode):   # tools/virtual_gamepad.py: xpad ranges
+            self.axes = {code: [0, -32768, 32767] for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY)}
+            return
+        for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY):
+            buf = bytearray(24)               # struct input_absinfo, six int32
+            fcntl.ioctl(self.fd, (2 << 30) | (24 << 16) | (ord("E") << 8) | (0x40 + code), buf)
+            v, lo, hi = struct.unpack_from("iii", buf)
+            if hi <= lo:
+                raise RuntimeError("gamepad must expose Xbox X/Y/RX/RY axes")
+            self.axes[code] = [v, lo, hi]
+
+    def poll(self) -> list[int]:
+        """Read all pending events; return buttons newly pressed since the last poll."""
+        pressed = []
+        while True:
+            try:
+                data = os.read(self.fd, _EVENT.size * 64)
+            except BlockingIOError:
+                return pressed
+            except OSError as e:
+                raise RuntimeError(f"gamepad disconnected ({e})") from e
+            if not data:
+                raise RuntimeError("gamepad disconnected")
+            for off in range(0, len(data) - len(data) % _EVENT.size, _EVENT.size):
+                _, _, typ, code, val = _EVENT.unpack_from(data, off)
+                if typ == EV_SYN and code == SYN_DROPPED:
+                    raise RuntimeError("gamepad event queue overrun")
+                if typ == EV_KEY:
+                    if val and code not in self.keys:
+                        pressed.append(code)
+                    (self.keys.add if val else self.keys.discard)(code)
+                elif typ == EV_ABS and code in self.axes:
+                    self.axes[code][0] = val
+
+    def axis(self, code: int) -> float:
+        v, lo, hi = self.axes[code]
+        x = min(max(v / max(abs(lo), abs(hi) + 1), -1.0), 1.0)
+        return 0.0 if abs(x) < 0.25 else float(np.copysign((abs(x) - 0.25) / 0.75, x))
+
+    def action(self, slew: bool) -> tuple:
+        """[slew, boom, arm, bucket, trackL, trackR] as Pad::action, tracks off."""
+        return (-self.axis(ABS_X) if slew else 0.0, -self.axis(ABS_RY), self.axis(ABS_Y),
+                -self.axis(ABS_RX), 0.0, 0.0)
+
+    def close(self):
+        os.close(self.fd)
+
+
+def find_pad(arg: str | None) -> str | None:
+    if arg not in (None, "auto"):
+        return arg if arg != "none" else None
+    found = sorted(Path("/dev/input/by-id").glob("*-event-joystick"))
+    return str(found[0]) if found else None
+
 
 class Supervisor(threading.Thread):
-    """Owns the drive connection: arms, renews the newest plan, stops on any doubt."""
+    """Owns the drive connection: arms, sends the newest plan (or the sticks), stops on doubt.
 
-    def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True, pump=False):
+    Model mode renews the newest plan every `renew_s`. Manual mode (gamepad) sends the sticks
+    every 25 ms. A toggles model/manual, X toggles pump permission. Without a gamepad a stale or
+    exhausted plan disarms; with one it falls back to manual (sticks centred = hold). Any
+    controller state but armed ends the run. It never re-arms.
+    """
+
+    def __init__(self, client_mod, socket_path, fps, max_obs_age_s=1.4, renew_s=0.1, slew=True,
+                 pump=False, pad: Pad | None = None, start_model=False):
         super().__init__(daemon=True)
         self.c = client_mod
         self.control = client_mod.Client(socket_path)
         self.fps, self.max_age, self.renew = fps, max_obs_age_s, renew_s
-        self.slew = slew
-        self.flags = client_mod.DEADMAN | (client_mod.PUMP if pump else 0)
-        self.pump = pump
+        self.slew, self.pump, self.pad = slew, pump, pad
+        self.mode = "model" if (pad is None or start_model) else "manual"
+        self.model_since = time.monotonic_ns()
         self.lock = threading.Lock()
         self.plan = None          # (rows [N,6], t0_ns, obs_ns)
+        self.fresh = False
         self.stop_reason = None
-        self.sent = self.renewals = 0
+        self.sent = 0
         self.applied = []         # (row position, planned [4] interpolated, controller applied_action [4])
         self.by_sequence = {}     # drive packet sequence -> (t0 ns, rows)
+        self.events = []          # (monotonic s, what)
         self.halt = threading.Event()
+
+    def flags(self):
+        return self.c.DEADMAN | (self.c.PUMP if self.pump else 0)
+
+    def note(self, what):
+        self.events.append((round(time.monotonic(), 3), what))
+        print(f"[pad] {what}", flush=True)
 
     def arm(self):
         st = self.control.status()
@@ -209,8 +299,17 @@ class Supervisor(threading.Thread):
             raise RuntimeError(f"controller is {st['state']} ({st.get('reason')}), not disarmed")
         self.control.arm(pump=self.pump)
 
+    def set_mode(self, mode, why=""):
+        with self.lock:
+            self.mode = mode
+            self.plan = None      # never resume a plan from before the switch
+            self.model_since = time.monotonic_ns()
+        self.note(f"{mode.upper()}{' (' + why + ')' if why else ''}")
+
     def offer(self, rows: np.ndarray, t0_ns: int, obs_ns: int):
         with self.lock:
+            if self.mode != "model" or obs_ns <= self.model_since:
+                return False
             if self.plan is not None and obs_ns <= self.plan[2]:
                 return False
             self.plan = (rows, t0_ns, obs_ns)
@@ -222,32 +321,54 @@ class Supervisor(threading.Thread):
             self.stop_reason = reason
         self.halt.set()
 
+    def _model_tick(self, now):
+        with self.lock:
+            plan, fresh = self.plan, self.fresh
+            self.fresh = False
+        if plan is None:          # centred hold until the first chunk after a switch
+            self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags())
+            return
+        rows, t0, obs = plan
+        problem = (f"observation age {(now - obs) / 1e9:.2f} s" if (now - obs) / 1e9 > self.max_age
+                   else "chunk exhausted" if now >= t0 + int((len(rows) - 1) / self.fps * 1e9) else None)
+        if problem:
+            if self.pad is None:
+                self.stop(problem)
+                return
+            self.set_mode("manual", problem)
+            self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags())
+            return
+        if fresh or now - self.last_send >= self.renew * 1e9:
+            self.control.send(self.c.DRIVE, [tuple(map(float, r)) for r in rows],
+                              flags=self.flags(), fps=self.fps, t0_ns=t0, observation_ns=obs)
+            self.by_sequence[self.control.sequence] = (t0, rows)
+            self.sent += 1
+            self.last_send = now
+
     def run(self):
+        self.last_send = 0
+        period = 0.025 if self.pad else min(self.renew, 0.05)
         try:
             while not self.halt.is_set():
                 now = time.monotonic_ns()
-                with self.lock:
-                    plan = self.plan
-                if plan is None:          # centered hold until the first chunk
-                    self.control.send(self.c.DRIVE, [(0.0,) * 6], flags=self.flags)
+                if self.pad:
+                    for b in self.pad.poll():
+                        if b == BTN_A:
+                            self.set_mode("manual" if self.mode == "model" else "model")
+                        elif b == BTN_X:
+                            self.pump = not self.pump
+                            self.note(f"pump {'ON' if self.pump else 'OFF'}")
+                if self.mode == "model":
+                    self._model_tick(now)
                 else:
-                    rows, t0, obs = plan
-                    if (now - obs) / 1e9 > self.max_age:
-                        self.stop(f"observation age {(now - obs) / 1e9:.2f} s")
-                        break
-                    if now >= t0 + int((len(rows) - 1) / self.fps * 1e9):
-                        self.stop("chunk exhausted")
-                        break
-                    self.control.send(self.c.DRIVE, [tuple(map(float, r)) for r in rows],
-                                      flags=self.flags, fps=self.fps, t0_ns=t0, observation_ns=obs)
-                    self.by_sequence[self.control.sequence] = (t0, rows)
-                    self.sent += 1
+                    self.control.send(self.c.DRIVE, [self.pad.action(self.slew)], flags=self.flags())
+                if self.halt.is_set():
+                    break
                 st = self.control.status()
-                applied_ns = st["applied_host_monotonic_ns"]
                 held = self.by_sequence.get(st["applied_command_sequence"])
                 if held:   # the controller's command at that tick: the packet it held, interpolated
                     t0, rows = held
-                    pos = min(max((applied_ns - t0) * self.fps / 1e9, 0.0), len(rows) - 1)
+                    pos = min(max((st["applied_host_monotonic_ns"] - t0) * self.fps / 1e9, 0.0), len(rows) - 1)
                     i = int(pos)
                     j = min(i + 1, len(rows) - 1)
                     due = rows[i][:4] + (rows[j][:4] - rows[i][:4]) * (pos - i)
@@ -255,7 +376,7 @@ class Supervisor(threading.Thread):
                 if st["state"] != "armed":
                     self.stop(f"controller {st['state']}: {st.get('reason')}")
                     break
-                self.halt.wait(self.renew)
+                self.halt.wait(period)
         except Exception as e:  # noqa: BLE001
             self.stop(f"supervisor error: {e!r}")
         finally:
@@ -281,6 +402,7 @@ def start_services(a, runtime: Path):
     log = open(runtime / "services.log", "w")
     for cmd, ready in ((control, [runtime / "control.sock"]),
                        (cams, [runtime / "cameras" / f"{CAM1}-ir2.frame", runtime / "cameras" / f"{CAM2}-ir1.frame"])):
+        # Own session: a terminal Ctrl+C reaches only this script, which stops them in order.
         p = subprocess.Popen([str(x) for x in cmd], start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
         procs.append(p)
         end = time.time() + 30
@@ -293,7 +415,34 @@ def start_services(a, runtime: Path):
                                              runtime / "cameras" / f"{CAM2}-ir1.frame"]
 
 
+def write_summary(out: Path, a, chunks, sup, interrupted) -> dict:
+    np.save(out / "chunks.npy", np.stack(chunks) if chunks else np.zeros((0,)))
+    summary = {"chunks": len(chunks), "drive": a.drive, "interrupted": interrupted,
+               "stop_reason": (sup.stop_reason if sup else None) or ("Ctrl+C" if interrupted else None),
+               "plans_sent": sup.sent if sup else 0, "pad_events": sup.events if sup else []}
+    if sup and sup.applied:
+        planned = np.array([p for _, p, _ in sup.applied])
+        applied = np.array([q for _, _, q in sup.applied])
+        summary["applied_vs_planned"] = {
+            "samples": len(applied), "mean_abs": float(np.abs(applied - planned).mean()),
+            "max_abs": float(np.abs(applied - planned).max()),
+            "row_due": {"min": min(k for k, _, _ in sup.applied), "max": max(k for k, _, _ in sup.applied)}}
+        json.dump(sup.applied, open(out / "applied.json", "w"))
+    recs = [json.loads(l) for l in open(out / "chunks.jsonl")] if (out / "chunks.jsonl").exists() else []
+    if recs:
+        lat = [r["obs_to_plan_ms"] for r in recs]
+        inf = [r["timings_ms"]["total"] for r in recs]
+        summary.update(obs_to_plan_ms={"p50": float(np.percentile(lat, 50)), "p99": float(np.percentile(lat, 99)),
+                                       "max": max(lat)},
+                       infer_ms={"p50": float(np.percentile(inf, 50)), "p99": float(np.percentile(inf, 99))})
+    (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
+    return summary
+
+
 def run_live(a) -> int:
+    # Started in the background by a non-interactive shell, SIGINT arrives ignored; restore it
+    # so Ctrl+C / kill -INT always takes the graceful path below.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     sys.path.insert(0, str(Path(a.tools)))
     import client as client_mod
     from frame_reader import FrameReader
@@ -301,9 +450,15 @@ def run_live(a) -> int:
     contract = json.loads(Path(a.contract).read_text())
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
-    procs, tmp = [], None
-    sup = None
+    procs, tmp, sup, pad = [], None, None, None
+    chunks, interrupted = [], False
     try:
+        pad_path = find_pad(a.gamepad) if a.drive else None
+        if pad_path:
+            pad = Pad(pad_path)
+            print(f"[pad] {pad_path}: A = model/manual, X = pump on/off, Ctrl+C = stop", flush=True)
+        elif a.drive:
+            print("[pad] no gamepad: model drives until the run ends; Ctrl+C = stop", flush=True)
         if a.start_services:
             tmp = tempfile.TemporaryDirectory(prefix="kvr-groot-")
             procs, sock, cam_files = start_services(a, Path(tmp.name))
@@ -318,7 +473,6 @@ def run_live(a) -> int:
         rng = np.random.default_rng(a.seed)
         fps = float(a.fps)
         log = open(out / "chunks.jsonl", "w")
-        chunks = []
 
         def observe():
             frames, arrivals = [], []
@@ -349,13 +503,18 @@ def run_live(a) -> int:
             pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
                       rng.standard_normal(pol.noise_shape).astype(np.float32))
         if a.drive:
-            sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew, pump=a.pump)
+            sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew,
+                             pump=a.pump, pad=pad, start_model=a.start_model)
             sup.arm()
             sup.start()
-            print(f"[groot] armed ({'PUMP PERMITTED' if a.pump else 'no pump permission'})", flush=True)
-        t_end = time.monotonic() + a.seconds
+            print(f"[groot] armed, {sup.mode.upper()} mode, pump {'ON' if a.pump else 'OFF'}", flush=True)
+        t_end = time.monotonic() + a.seconds if a.seconds > 0 else float("inf")
         next_start = time.monotonic()
         while time.monotonic() < t_end and not (sup and sup.halt.is_set()):
+            if sup and sup.mode != "model":       # manual: no inference, sticks drive
+                time.sleep(0.02)
+                next_start = time.monotonic()
+                continue
             if a.rate_hz > 0:
                 time.sleep(max(0.0, next_start - time.monotonic()))
                 next_start += 1.0 / a.rate_hz
@@ -382,36 +541,20 @@ def run_live(a) -> int:
                    "camera_skew_ms": round(skew, 1), "state_deg": deg.round(2).tolist(),
                    "row_now": act[min(int(lag_rows), len(act) - 1)].round(3).tolist(),
                    "row0": act[0].round(3).tolist(), "abs_max": np.abs(act).max(0).round(3).tolist(),
-                   "timings_ms": {k: round(v, 1) for k, v in t.items()}, "accepted": accepted}
+                   "timings_ms": {k: round(v, 1) for k, v in t.items()}, "accepted": accepted,
+                   "pump": sup.pump if sup else None}
             chunks.append(act)
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(f"[{rec['i']:4d}] obs->plan {rec['obs_to_plan_ms']:6.1f} ms  infer {t['total']:6.1f}  "
                   f"deg {deg.round(1)}  now {np.round(rec['row_now'], 2)}", flush=True)
-        np.save(out / "chunks.npy", np.stack(chunks) if chunks else np.zeros((0,)))
-        summary = {"chunks": len(chunks), "drive": a.drive,
-                   "stop_reason": sup.stop_reason if sup else None,
-                   "plans_sent": sup.sent if sup else 0}
-        if sup and sup.applied:
-            planned = np.array([p for _, p, _ in sup.applied])
-            applied = np.array([q for _, _, q in sup.applied])
-            summary["applied_vs_planned"] = {
-                "samples": len(applied), "mean_abs": float(np.abs(applied - planned).mean()),
-                "max_abs": float(np.abs(applied - planned).max()),
-                "row_due": {"min": min(k for k, _, _ in sup.applied), "max": max(k for k, _, _ in sup.applied)}}
-            json.dump(sup.applied, open(out / "applied.json", "w"))
-        lat = [json.loads(l)["obs_to_plan_ms"] for l in open(out / "chunks.jsonl")]
-        inf = [json.loads(l)["timings_ms"]["total"] for l in open(out / "chunks.jsonl")]
-        if lat:
-            summary.update(obs_to_plan_ms={"p50": float(np.percentile(lat, 50)), "p99": float(np.percentile(lat, 99)),
-                                           "max": max(lat)},
-                           infer_ms={"p50": float(np.percentile(inf, 50)), "p99": float(np.percentile(inf, 99))})
-        (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
-        print(json.dumps(summary), flush=True)
-        return 0
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[groot] Ctrl+C: disarming and stopping services", flush=True)
     finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)   # let the cleanup finish
         if sup:
-            sup.stop(sup.stop_reason or "run finished")
+            sup.stop(sup.stop_reason or ("Ctrl+C" if interrupted else "run finished"))
             sup.join(timeout=2)
         for p in procs:
             if p.poll() is None:
@@ -423,6 +566,15 @@ def run_live(a) -> int:
                 p.kill()
         if tmp:
             tmp.cleanup()
+        if pad:
+            pad.close()
+        try:
+            summary = write_summary(out, a, chunks, sup, interrupted)
+            print(json.dumps({k: v for k, v in summary.items() if k != "pad_events"}), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[groot] summary not written: {e!r}", flush=True)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    return 0
 
 
 def main():
@@ -453,8 +605,10 @@ def main():
     s.add_argument("--control-socket")
     s.add_argument("--camera-frame", action="append", help="cam1 then cam2 frame files")
     s.add_argument("--drive", action="store_true")
-    s.add_argument("--pump", action="store_true", help="operator pump permission (hydraulics); needs --drive")
-    s.add_argument("--seconds", type=float, default=30)
+    s.add_argument("--pump", action="store_true", help="start with pump permission (X toggles it on the pad)")
+    s.add_argument("--gamepad", default="auto", help="evdev path, 'auto' (first by-id joystick) or 'none'")
+    s.add_argument("--start-model", action="store_true", help="with a gamepad, start in model mode, not manual")
+    s.add_argument("--seconds", type=float, default=30, help="0 = until Ctrl+C")
     s.add_argument("--rate-hz", type=float, default=0, help="0 = back to back")
     s.add_argument("--fps", type=float, default=30)
     s.add_argument("--warmup", type=int, default=3)

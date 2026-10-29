@@ -101,7 +101,7 @@ class TestMergeTasks(unittest.TestCase):
 
 
 class TestResolveTasks(unittest.TestCase):
-    """The SmolVLA side; xvla_split.resolve_tasks is covered in test_xvla_bundle."""
+    """X-VLA task selection shares the same D-pad controller."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -109,23 +109,23 @@ class TestResolveTasks(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def bundle(self, **fields):
-        (self.root / "export_info.json").write_text(json.dumps(fields))
+        (self.root / "bundle.json").write_text(json.dumps(fields))
         return str(self.root)
 
     def test_reads_the_recorded_task(self):
         d = self.bundle(task="move sand to container")
-        self.assertEqual(run_inference.resolve_tasks(d, None),
+        self.assertEqual(run_inference.xvla.resolve_tasks(d, None),
                          ["move sand to container"])
 
     def test_reads_a_recorded_task_list_in_order(self):
         tasks = ["move sand to container", "move rock to container"]
-        self.assertEqual(run_inference.resolve_tasks(self.bundle(tasks=tasks), None),
+        self.assertEqual(run_inference.xvla.resolve_tasks(self.bundle(tasks=tasks), None),
                          tasks)
 
     def test_repeated_task_flags_lead_the_list_in_the_order_given(self):
         d = self.bundle(tasks=["move sand to container", "move rock to container"])
         self.assertEqual(
-            run_inference.resolve_tasks(d, ["move rock to container",
+            run_inference.xvla.resolve_tasks(d, ["move rock to container",
                                             "move sand to container"]),
             ["move rock to container", "move sand to container"])
 
@@ -134,7 +134,7 @@ class TestResolveTasks(unittest.TestCase):
         # checkpoint knows both, so both stay selectable.
         d = self.bundle(tasks=["move sand to container", "move rock to container"])
         self.assertEqual(
-            run_inference.resolve_tasks(d, ["move rock to container"]),
+            run_inference.xvla.resolve_tasks(d, ["move rock to container"]),
             ["move rock to container", "move sand to container"])
 
     def test_task_the_bundle_does_not_record_warns_but_runs(self):
@@ -144,13 +144,13 @@ class TestResolveTasks(unittest.TestCase):
         # Warned by policy.warn_off_bundle, which both resolvers share. The
         # recorded task stays reachable behind the unrecorded one.
         with self.assertLogs("policy", level="WARNING") as logs:
-            self.assertEqual(run_inference.resolve_tasks(d, ["dig a hole"]),
+            self.assertEqual(run_inference.xvla.resolve_tasks(d, ["dig a hole"]),
                              ["dig a hole", "move sand to container"])
         self.assertIn("out of distribution", "\n".join(logs.output))
 
     def test_no_task_anywhere_refuses_rather_than_defaulting(self):
         with self.assertRaises(SystemExit) as ctx:
-            run_inference.resolve_tasks(self.bundle(fps=30), None)
+            run_inference.xvla.resolve_tasks(self.bundle(fps=30), None)
         self.assertIn("--task", str(ctx.exception))
 
 

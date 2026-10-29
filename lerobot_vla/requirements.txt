@@ -1,0 +1,14 @@
+# Python recorder + direct TensorRT X-VLA; JetPack provides TensorRT/CUDA.
+lerobot==0.6.1
+datasets==4.8.5
+av==15.1.0
+numpy==2.2.6
+opencv-python-headless==4.13.0.92
+pyrealsense2==2.58.4.10922
+numba==0.68.0
+scipy==1.18.1
+pandas==3.1.0
+inputs==0.5
+pyserial==3.5
+smbus2==0.6.1
+tokenizers==0.22.2

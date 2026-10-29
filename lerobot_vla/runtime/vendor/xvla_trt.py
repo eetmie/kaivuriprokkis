@@ -1,0 +1,225 @@
+# Extracted from eetmie/jetson-orin-nano-vla @ 7474f6c.
+# X-VLA-only integration; see TRT_UPSTREAM.md for local changes.
+# ─────────────────────────────────────────────────────────────────────────────
+# Written for this repo (not vendored). The host loop follows xvla_split_ort.py, which
+# is the tested ORT implementation; the engines, serial builds and fixture comparison
+# are GR00T's (groot_trt.py).
+# ─────────────────────────────────────────────────────────────────────────────
+"""X-VLA split-engine inference on the TensorRT runtime, numpy host glue.
+
+The same twelve graphs as the ORT backend, but each weight is held once: ORT's TensorRT
+EP keeps the ONNX initializers in host memory next to the engine (~5.5 bytes/param
+measured for X-VLA), and on unified memory both count.
+
+Per observation (V real views of `num_image_views` slots, `steps` denoising steps):
+
+    vision_k        [V,3,224,224] -> [V,T,1024]
+    host            scatter the views into a zero [num_image_views,T,1024] buffer
+    text_encoder_k  BART over (prompt tokens + view 0)
+    cond            loop-invariant projections of the VLM features and the other views
+    steps x:        x_t = x1 * t + action * (1 - t)   (not an Euler step)
+                    denoise_0 .. denoise_3 -> the clean-action estimate
+    host            sigmoid on the gripper channels
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+
+from .trt_engines import FIXTURE_MAX_PCT_RANGE, FIXTURE_MIN_COSINE, _cmp
+
+# XVLAImageNetNormalizeProcessorStep, applied to [0,1] images.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
+
+def _normalize_table() -> np.ndarray:
+    """[1,256,3] float32: the /255 + ImageNet normalization of every uint8 value per
+    channel, by the same float32 expression, so a lookup through it is exact."""
+    v = np.arange(256, dtype=np.uint8).reshape(1, 1, 256).repeat(3, 0)
+    x = (v.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+    return np.ascontiguousarray(x[:, 0, :].T[None])
+
+
+NORMALIZE_LUT = _normalize_table()
+
+# BaseActionSpace.postprocess applies a sigmoid to these channels after the loop; the
+# pre-step zeroing is baked into denoise_0.
+GRIPPER_BY_MODE = {"auto": (), "ee6d": (9, 19), "agibot_ee6d": (9, 19), "joint": (6, 13),
+                   "so101_bimanual": (5, 11)}
+
+
+def _chain(names: list[str], prefix: str) -> list[str]:
+    """Graphs of one family in execution order: numeric, so denoise_10 follows denoise_9."""
+    out = [n for n in names if n == prefix or n.startswith(prefix + "_")]
+    return sorted(out, key=lambda n: int(n.rsplit("_", 1)[1]) if n != prefix else 0)
+
+
+class Bundle:
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+        self.b = json.loads((self.root / "bundle.json").read_text())
+        b = self.b
+        if "denoise_0" not in {g["name"] for g in b["graphs"]} or "tokens_per_view" not in b:
+            raise ValueError(f"{root} is not an X-VLA split bundle")
+        if b.get("denoise_input_mode", "x_t") != "x_t":
+            raise ValueError("this runtime forms x_t on the host; re-export without "
+                             "--fuse-denoise-interpolation")
+        self.names = [g["name"] for g in b["graphs"]]
+        self.files = {g["name"]: self.root / g["file"] for g in b["graphs"]}
+        self.vision = _chain(self.names, "vision")
+        self.text = _chain(self.names, "text_encoder")
+        self.denoise = _chain(self.names, "denoise")
+        self.num_views = int(b["num_image_views"])
+        self.valid_views = int(b["valid_views"])
+        self.tokens_per_view = int(b["tokens_per_view"])
+        self.lang_len = int(b["lang_len"])
+        self.chunk_size = int(b["chunk_size"])
+        self.state_dim = int(b["max_state_dim"])
+        self.action_dim = int(b["max_action_dim"])
+        self.steps = int(b["num_denoising_steps"])
+        mode = b["action_mode"]
+        if mode not in GRIPPER_BY_MODE:
+            raise ValueError(f"action_mode {mode!r} has no gripper mapping here; "
+                             "postprocess would be wrong")
+        self.gripper = list(GRIPPER_BY_MODE[mode])
+        self._tokenizer = None
+        self.tokenizer_path = self.root / b["tokenizer"]["path"]
+        self._ids: dict[str, np.ndarray] = {}
+
+    def onnx_path(self, name: str) -> Path:
+        return self.files[name]
+
+    def input_ids(self, task: str) -> np.ndarray:
+        """Tokenize with the exported Rust fast-tokenizer; no transformers/torch."""
+        if task not in self._ids:
+            if self._tokenizer is None:
+                from tokenizers import Tokenizer
+                path = self.tokenizer_path / "tokenizer.json"
+                if not path.is_file():
+                    raise ValueError(f"Missing fast tokenizer: {path}")
+                self._tokenizer = Tokenizer.from_file(str(path))
+                cfg_path = self.tokenizer_path / "tokenizer_config.json"
+                cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+                pad = cfg.get("pad_token", "<pad>")
+                if isinstance(pad, dict): pad = pad["content"]
+                pad_id = self._tokenizer.token_to_id(pad)
+                if pad_id is None:
+                    raise ValueError(f"Tokenizer pad token {pad!r} is missing")
+                self._tokenizer.enable_truncation(self.lang_len, direction="right")
+                self._tokenizer.enable_padding(direction="right", length=self.lang_len,
+                                                pad_id=pad_id, pad_token=pad)
+            self._ids[task] = np.asarray([self._tokenizer.encode(task).ids], np.int64)
+        return self._ids[task]
+
+    def preprocess(self, image_u8: np.ndarray, size: int = 224) -> np.ndarray:
+        """uint8 HxWx3 -> [3,size,size]: /255, ImageNet normalize, then lerobot's
+        resize_with_pad (bilinear, keep aspect, pad left and top with 0 in normalized
+        space), the order XVLAPolicy applies them in."""
+        import cv2
+
+        # cv2.LUT through NORMALIZE_LUT gives the HWC floats of the elementwise
+        # normalization bit for bit, ~14x faster than numpy at 480x640.
+        x = cv2.LUT(np.ascontiguousarray(image_u8), NORMALIZE_LUT)
+        h, w, c = x.shape
+        if (h, w) == (size, size):
+            return np.ascontiguousarray(x.transpose(2, 0, 1))
+        ratio = max(w / size, h / size)
+        rh, rw = int(h / ratio), int(w / ratio)
+        r = cv2.resize(x, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((c, size, size), np.float32)
+        canvas[:, size - rh:, size - rw:] = r.transpose(2, 0, 1)
+        return canvas
+
+
+def encode(bundle: Bundle, run, pixel_values: np.ndarray, input_ids: np.ndarray,
+           timings: dict | None = None) -> np.ndarray:
+    """Cold path, once per observation: pixels [V,3,224,224] -> cond_tokens."""
+    t = {} if timings is None else timings
+    t0 = time.perf_counter()
+    x = pixel_values
+    for name in bundle.vision:
+        x = next(iter(run(name, {"pixel_values" if name == bundle.vision[0]
+                                 else "hidden_in": x}).values()))
+    t1 = time.perf_counter()
+    # forward_vlm scatters the real views into a zero buffer: a padded view reads as
+    # exactly zero, not as the tower's response to a blank image.
+    full = np.zeros((bundle.num_views, bundle.tokens_per_view, x.shape[-1]), np.float32)
+    full[:len(x)] = x
+    h = next(iter(run(bundle.text[0], {"input_ids": input_ids,
+                                       "image_tokens": full[0:1]}).values()))
+    for name in bundle.text[1:]:
+        h = next(iter(run(name, {"hidden_in": h}).values()))
+    t2 = time.perf_counter()
+    cond = next(iter(run("cond", {"vlm_features": h,
+                                  "aux_visual": full[1:].reshape(1, -1, full.shape[-1])}
+                         ).values()))
+    t3 = time.perf_counter()
+    t.update(vision=(t1 - t0) * 1e3, text=(t2 - t1) * 1e3, cond=(t3 - t2) * 1e3)
+    return cond
+
+
+def infer(bundle: Bundle, run, pixel_values: np.ndarray, input_ids: np.ndarray,
+          proprio: np.ndarray, x1: np.ndarray, timings: dict | None = None) -> np.ndarray:
+    """One action chunk [1,chunk,action_dim]. proprio [1,state_dim], x1 [1,chunk,action_dim]."""
+    t = {} if timings is None else timings
+    cond = encode(bundle, run, pixel_values, input_ids, t)
+    t0 = time.perf_counter()
+    x1 = np.ascontiguousarray(x1, np.float32)
+    action = np.zeros_like(x1)
+    for i in range(bundle.steps, 0, -1):
+        s = i / bundle.steps
+        x_t = x1 * np.float32(s) + action * np.float32(1.0 - s)
+        h = next(iter(run(bundle.denoise[0], {"x_t": x_t, "t": np.array([s], np.float32),
+                                              "proprio": proprio,
+                                              "cond_tokens": cond}).values()))
+        for name in bundle.denoise[1:]:
+            h = next(iter(run(name, {"hidden_in": h}).values()))
+        action = h
+    action = action.copy()
+    g = bundle.gripper
+    action[..., g] = 1.0 / (1.0 + np.exp(-action[..., g]))
+    t["denoise"] = (time.perf_counter() - t0) * 1e3
+    return action
+
+
+def validate_fixture(bundle: Bundle, engines) -> dict:
+    """Engines vs the stock-PyTorch FP32 chunk the exporter stored in the bundle.
+
+    Same pixels, prompt ids, proprio and noise as the reference; fails closed on the full
+    chunk. `image_preprocess` and `input_ids` check this runtime's own host preprocessing
+    and tokenizer against the stock pipeline's for the same raw frames and task.
+    """
+    fx = bundle.b.get("fixture") or {}
+    path = bundle.root / fx.get("file", "fixture.npz")
+    if not path.exists():
+        return {"status": "MISSING", "file": str(path)}
+    r = np.load(path)
+    act = infer(bundle, engines.run, r["pixel_values"].astype(np.float32),
+                r["input_ids"].astype(np.int64), r["proprio"].astype(np.float32), r["x1"])
+    ref = r["action_pred"]
+    pre = np.stack([bundle.preprocess(np.ascontiguousarray(im)) for im in r["raw"]])
+    ids_match = bool(np.array_equal(bundle.input_ids(fx["task"]), r["input_ids"]))
+    reports = {
+        "action": _cmp(act[:, 0], ref[:, 0]),
+        "chunk": _cmp(act, ref),
+        "image_preprocess": _cmp(pre, r["pixel_values"]),
+    }
+    # OpenCV and PyTorch bilinear coordinates differ slightly in FP32. At the
+    # retained 640x480 fixture: max 2.76e-4 normalized units (<0.02 uint8 levels).
+    # Gate that known floor, and separately gate actions from the RAW images.
+    preprocess_match = bool(np.allclose(pre, r["pixel_values"], rtol=0, atol=5e-4))
+    raw_act = infer(bundle, engines.run, pre, bundle.input_ids(fx["task"]),
+                    r["proprio"].astype(np.float32), r["x1"])
+    reports["raw_chunk"] = _cmp(raw_act, ref)
+    ok = (preprocess_match and reports["chunk"]["cosine"] >= FIXTURE_MIN_COSINE
+          and reports["chunk"]["max_pct_range"] <= FIXTURE_MAX_PCT_RANGE
+          and reports["raw_chunk"]["cosine"] >= FIXTURE_MIN_COSINE
+          and reports["raw_chunk"]["max_pct_range"] <= FIXTURE_MAX_PCT_RANGE and ids_match)
+    return {"status": "PASS" if ok else "FAIL", "threshold": FIXTURE_MIN_COSINE,
+            "max_pct_range_threshold": FIXTURE_MAX_PCT_RANGE, "input_ids_match": ids_match, "preprocess_match": preprocess_match,
+            "source": fx.get("source", "stock PyTorch float32"), "reports": reports}

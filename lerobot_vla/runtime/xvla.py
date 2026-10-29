@@ -1,47 +1,9 @@
-"""X-VLA split-engine policy, wrapped to the seam `run_inference` drives.
+"""X-VLA bundle contracts and the excavator's direct TensorRT policy wrapper.
 
-    IR cam1 + joint angles + task -> X-VLA-0.9B (12 split ONNX/TRT engines) -> valves
-
-The runtime itself is vendored under `runtime/vendor/xvla_split_ort.py` (from
-spark-projects/vla-onnx/xvla). This module is only the excavator side of
-it: the call-shape bridge, the bundle resolution `run_inference` expects, and the
-gate that stops a base checkpoint from ever reaching a valve.
-
-Almost no maths lives here, and that is deliberate. A schema-v2 bundle ships a
-`processor_contract` describing the *physical* boundary — which feature is state,
-its real dimension, its MEAN_STD statistics, the same for the action — and the
-vendored runtime applies it inside `sample_actions`: it normalizes the state on
-the way in, trims the model's padded 20 action dims back to the real 4 on the way
-out, and unnormalizes those. So a correctly exported fine-tune hands us
-`(chunk, 4)` in valve units with nothing left to do. Re-deriving any of that here
-would be a second source of truth for the one thing that must not drift.
-
-What this module refuses to do is the interesting part. `lerobot/xvla-base` is a
-20-dim `ee6d` arm policy — end-effector xyz + 6D rotation + gripper, for robots
-that have those — and its chunk is 20 columns of arm motion, not 4 of valve
-command. Nothing about the shape says so: slicing `[..., :4]` yields a
-well-formed, plausible-looking action chunk that is pure nonsense on a hydraulic
-excavator. The bundle records the difference (schema v1 with no processor
-contract, or `physical_boundary_complete: false`), so this refuses to construct a
-drivable policy from one unless `allow_base_bundle=True`, and then marks itself
-`feasibility_only` so `--live` stays shut. That override is only for model/engine
-diagnostics; it never enables valve output.
-
-Differences from `smolvla_split.SmolVLASplitPolicy`, all absorbed here:
-
-| | SmolVLA | X-VLA |
-|---|---|---|
-| images | one HxWx3 uint8 | a LIST, one per real camera |
-| state | normalized by `NormStats` from stats.json | normalized by the bundle's own contract |
-| action | 32 model dims, 4 used, unnormalized by `NormStats` | 20 model dims, trimmed + unnormalized by the contract |
-| chunk | read from the decode graph | `chunk_size` in bundle.json |
-| engines | 9, prebuilt in `__init__` | 12, prebuilt here before the sessions are made |
-| engine cache | `/tmp/smolvla_split_cache` (rebuilt every boot) | `<split-dir>/trt_cache` (survives reboot) |
-
-**Do not load this alongside SmolVLA.** Measured on this board: X-VLA's twelve
-sessions sit at 5.5 GB resident with the robot stack beside them, out of 7.4 GB.
-SmolVLA's nine do not fit in what is left, so which model runs is a restart-level
-choice — `policy.make_policy` says so rather than leaving it to an OOM mid-run.
+The saved processor contract defines physical state/action dimensions and
+normalization. Incomplete/base exports remain model-only, with --live refused.
+The accelerated implementation is in xvla_native.py; shared upstream TensorRT
+helpers are vendored so this project runs independently of the benchmark repo.
 """
 
 from __future__ import annotations
@@ -63,7 +25,7 @@ LOG = logging.getLogger("xvla_split")
 #: engines are a ~5 minute cold build and /tmp is cleared on reboot, which would
 #: mean paying that at every boot. (The SmolVLA side still uses /tmp and does
 #: exactly that.)
-ENGINE_CACHE_DIRNAME = "trt_cache"
+ENGINE_CACHE_DIRNAME = "trt_native_cache"
 
 
 def is_xvla_bundle(split_dir: str | Path) -> bool:
@@ -194,32 +156,28 @@ def resolve_fps(split_dir: str | Path, explicit_fps: float | None) -> float:
         f"pass --fps explicitly if you know the rate the dataset was recorded at.")
 
 
-def check_camera(split_dir: str | Path, camera_key: str) -> None:
-    """Refuse a camera the checkpoint was not trained on.
-
-    A cam1(IR)-trained policy fed colour frames is out of distribution in a way
-    that looks like nothing at all: the shapes match, inference succeeds, and the
-    machine drives badly. The contract carries the training `input_features`, so
-    the mismatch is knowable before the first engine loads.
-    """
-    contract = contract_of(load_bundle(split_dir))
-    if contract is None:
-        return
+def resolve_cameras(split_dir: str | Path, selected=None, *, allow_unknown=False) -> list[str]:
+    """Use checkpoint VISUAL feature order, never filesystem/device order."""
+    bundle = load_bundle(split_dir)
+    contract = contract_of(bundle) or {}
     features = contract.get("input_features") or {}
-    trained = sorted(name for name, spec in features.items()
-                     if str(spec.get("type", "")).upper() == "VISUAL")
-    if not trained:
-        return
-    if camera_key not in trained:
-        raise SystemExit(
-            f"--camera selects {camera_key}, but this checkpoint was trained on "
-            f"{trained}.\nA policy fed the imager it never saw is out of "
-            f"distribution and nothing downstream detects it. Pass the --camera "
-            f"matching the dataset the checkpoint was fine-tuned on.")
-    if len(trained) > 1:
-        LOG.warning("Checkpoint was trained on %s but this loop feeds one camera "
-                    "(%s). A multi-camera checkpoint has no deploy path here yet.",
-                    trained, camera_key)
+    trained = [name for name, spec in features.items()
+               if str(spec.get("type", "")).upper() == "VISUAL"]
+    requested = ([selected] if isinstance(selected, str) else list(selected)) if selected else None
+    keys = requested or trained or ["observation.images.cam1"]
+    if trained and keys != trained:
+        raise SystemExit(f"Camera selection {keys} does not match checkpoint view order {trained}.")
+    unsupported = set(keys) - {"observation.images.cam1", "observation.images.cam2"}
+    if (unsupported and not allow_unknown) or len(set(keys)) != len(keys):
+        raise SystemExit(f"Unsupported or duplicate camera features: {keys}")
+    valid = bundle.get("valid_views")
+    if valid is not None and int(valid) != len(keys):
+        raise SystemExit(f"Bundle requires {valid} camera views but selection supplies {len(keys)}.")
+    return keys
+
+
+def check_camera(split_dir: str | Path, camera_key: str) -> None:
+    resolve_cameras(split_dir, camera_key)
 
 
 class XVLAExcavatorPolicy:
@@ -234,7 +192,8 @@ class XVLAExcavatorPolicy:
                  seed: int | None = None,
                  tokenizer_dir: str | Path | None = None,
                  state_joints: list[str] | None = None,
-                 allow_base_bundle: bool = False):
+                 allow_base_bundle: bool = False,
+                 chain: str = "graph"):
         split_dir = Path(split_dir)
         self.bundle = load_bundle(split_dir)
         self.contract = contract_of(self.bundle)
@@ -251,35 +210,13 @@ class XVLAExcavatorPolicy:
         if self.feasibility_only and not allow_base_bundle:
             raise SystemExit(self._base_bundle_message())
 
-        # Keep the heavy ONNX Runtime import behind the bundle safety gate. A
-        # base or incomplete bundle must be rejected from metadata alone, before
-        # any inference dependency is required or a TensorRT engine can load.
-        from lerobot_vla.runtime.vendor.xvla_split_ort import (
-            XVLASplitPolicy, clear_engine_cache, prebuild_engines)
-
+        from lerobot_vla.runtime.xvla_native import XVLANativePolicy
         cache_dir = Path(cache_dir) if cache_dir else split_dir / ENGINE_CACHE_DIRNAME
-        if rebuild:
-            # A suspected cache is not trusted in any part, timing cache included,
-            # so this is the ~5 min cold build.
-            LOG.info("clearing engine cache %s (asked for a rebuild)", cache_dir)
-            clear_engine_cache(cache_dir)
-
-        # Build every engine in its OWN subprocess before the sessions exist. Not
-        # an optimization: two TRT builders resident in one process was enough to
-        # OOM 8 GB during the SmolVLA work, and this model has twelve. Skipped for
-        # a bundle with no MANIFEST.sha256 — the prebuild's cache-identity check
-        # hashes it, and a v1 export predates the manifest entirely. Those bundles
-        # are feasibility-only anyway, and their engines get built by the first
-        # session (or are already cached).
-        if (split_dir / "MANIFEST.sha256").is_file():
-            LOG.info("Prebuilding TRT engines (one subprocess per graph; "
-                     "~5 min cold, seconds when cached)...")
-            result = prebuild_engines(split_dir, str(cache_dir), precision)
-            LOG.info("Engine cache %s (%s files)", result["status"], result["n_files"])
-        else:
-            LOG.warning("No MANIFEST.sha256 in %s — skipping the engine prebuild. "
-                        "Engines will be built inside this process on first use, "
-                        "which risks OOM on this 8 GB board.", split_dir)
+        if rebuild and cache_dir.exists():
+            # Only generated runtime cache artifacts belong to the rebuild.
+            for pattern in ("*.engine", "*.onnx.sha256", "*.engine.sha256", "timing.cache"):
+                for path in cache_dir.glob(pattern):
+                    path.unlink()
 
         # A schema-v2 bundle materializes its own tokenizer and verify_bundle
         # checks the tree hash, so the bundle's copy is the right one and an
@@ -293,13 +230,14 @@ class XVLAExcavatorPolicy:
                 f"one does not, so pass --tokenizer <dir> (the X-VLA base tokenizer "
                 f"lives in the bundle's tokenizer/ dir).")
 
-        self.policy = XVLASplitPolicy(
+        self.policy = XVLANativePolicy(
             split_dir,
             cache_dir=str(cache_dir),
             precision=precision,
             tokenizer_dir=str(tokenizer_dir),
             num_denoising_steps=num_steps,
             seed=seed,
+            chain=chain,
         )
 
         self.chunk_size = self.policy.chunk_size
@@ -354,7 +292,7 @@ class XVLAExcavatorPolicy:
             f"To run it anyway as a model-only feasibility test (engines, latency, "
             f"memory), pass --allow-base-bundle. That mode refuses --live.")
 
-    def sample_actions(self, image_hwc_uint8: np.ndarray, instruction: str,
+    def sample_actions(self, image_hwc_uint8: np.ndarray | list[np.ndarray], instruction: str,
                        state: np.ndarray) -> np.ndarray:
         """One observation -> (chunk_size, action_dim) chunk in valve units.
 
@@ -362,8 +300,8 @@ class XVLAExcavatorPolicy:
         state with the bundle's own statistics, runs the vision/text/cond cold path
         once and the 24-block policy transformer `steps` times over it, trims the
         model's padded action width back to the real one, and unnormalizes. What is
-        left for us is the call shape — one image becomes a one-element list,
-        because X-VLA takes one entry per real camera view.
+        left for us is the call shape: one ordered entry per real camera view.
+        A single ndarray remains accepted for single-view checkpoints.
         """
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         if self.feasibility_only:
@@ -373,9 +311,16 @@ class XVLAExcavatorPolicy:
             padded = np.zeros(self.state_dim, dtype=np.float32)
             padded[: min(state.size, self.state_dim)] = state[: self.state_dim]
             state = padded
-        return self.policy.sample_actions([image_hwc_uint8], instruction, state)
+        images = (list(image_hwc_uint8) if isinstance(image_hwc_uint8, (list, tuple))
+                  else [image_hwc_uint8])
+        if len(images) != self.policy.valid_views:
+            raise ValueError(f"Expected {self.policy.valid_views} camera views, got {len(images)}")
+        return self.policy.sample_actions(images, instruction, state)
 
     @property
     def last_timings(self) -> dict:
         """Per-stage milliseconds from the last inference (vision/text/cond/denoise)."""
         return self.policy.last_timings
+
+    def close(self):
+        self.policy.close()

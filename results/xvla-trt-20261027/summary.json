@@ -1,0 +1,441 @@
+{
+  "status": "complete",
+  "host": "joel@pikkumasi2tb",
+  "checkout": "/home/joel/kaivuriprokkis-python",
+  "branch": "feat/python-dual-ir",
+  "upstream_commit": "7474f6c03d349a83a47b69e04649bb44f6120ebe",
+  "focused_tests_passed": 89,
+  "graph_vs_trt_host_latency_reduction_pct": 5.5555326115591885,
+  "graph_vs_historical_ort_rss_reduction_pct": 49.024703720526894,
+  "historical_ort_rss_mib": 4843.4,
+  "model_benchmark_profile": "three-view base model, 10 denoising steps, 30 actions, no Triton",
+  "host_chain": {
+    "host": "pikkumasi2tb",
+    "chain": "host",
+    "bundle": "/home/joel/vla-clean-install-20261012/bundles/xvla-base",
+    "purpose": "Model benchmark; no camera, controller, PWM or pump is opened",
+    "load_s": 8.976599304000047,
+    "rss_before_mib": 27.0390625,
+    "rss_loaded_mib": 2477.70703125,
+    "rss_after_benchmark_mib": 2484.2734375,
+    "samples": 149,
+    "latency_ms_p50_p95_p99": [
+      404.3630750002194,
+      408.85843340001884,
+      409.8872869998013
+    ],
+    "stage_mean_ms": {
+      "vision_ms": 98.27902490616798,
+      "text_ms": 7.289782503287049,
+      "cond_ms": 0.6076801678043909,
+      "denoise_ms": 295.1608384228166,
+      "preprocess_ms": 2.6264689664250738,
+      "total_ms": 404.0345770604931
+    },
+    "chunk_shape": [
+      30,
+      20
+    ],
+    "fixture": {
+      "status": "PASS",
+      "threshold": 0.999,
+      "max_pct_range_threshold": 1.0,
+      "input_ids_match": true,
+      "preprocess_match": true,
+      "source": "stock LeRobot XVLAPolicy, float32 on the CPU",
+      "reports": {
+        "action": {
+          "cosine": 0.9999997418013359,
+          "max_abs": 0.000323321670293808,
+          "mean_abs": 0.00014326845994219183,
+          "max_pct_range": 0.03241649675374132
+        },
+        "chunk": {
+          "cosine": 0.9999998291122838,
+          "max_abs": 0.0005675945430994034,
+          "mean_abs": 0.00010358941042795777,
+          "max_pct_range": 0.05558685578788019
+        },
+        "image_preprocess": {
+          "cosine": 0.9999999993521184,
+          "max_abs": 0.0002759099006652832,
+          "mean_abs": 1.1787152084440847e-05,
+          "max_pct_range": 0.005949434357753356
+        },
+        "raw_chunk": {
+          "cosine": 0.9999998313947666,
+          "max_abs": 0.0005523357540369034,
+          "mean_abs": 0.00010300774049634734,
+          "max_pct_range": 0.054092500147173594
+        }
+      }
+    },
+    "torch_imported": false,
+    "onnxruntime_imported": false,
+    "scratch_mib": 50.53125
+  },
+  "graph_chain": {
+    "host": "pikkumasi2tb",
+    "chain": "graph",
+    "bundle": "/home/joel/vla-clean-install-20261012/bundles/xvla-base",
+    "purpose": "Model benchmark; no camera, controller, PWM or pump is opened",
+    "load_s": 9.661056251001355,
+    "rss_before_mib": 26.8125,
+    "rss_loaded_mib": 2468.9375,
+    "rss_after_benchmark_mib": 2471.671875,
+    "samples": 158,
+    "latency_ms_p50_p95_p99": [
+      381.8985524994787,
+      384.64268415000333,
+      389.2466348804919
+    ],
+    "stage_mean_ms": {
+      "vision_ms": 93.06067715415472,
+      "text_ms": 6.184092352661906,
+      "cond_ms": 0.0,
+      "denoise_ms": 278.87093015260336,
+      "total_ms": 381.5513959303252,
+      "preprocess_ms": 2.608534512569637
+    },
+    "chunk_shape": [
+      30,
+      20
+    ],
+    "fixture": {
+      "status": "PASS",
+      "threshold": 0.999,
+      "max_pct_range_threshold": 1.0,
+      "input_ids_match": true,
+      "preprocess_match": true,
+      "source": "stock LeRobot XVLAPolicy, float32 on the CPU",
+      "reports": {
+        "action": {
+          "cosine": 0.9999997418013359,
+          "max_abs": 0.000323321670293808,
+          "mean_abs": 0.00014326845994219183,
+          "max_pct_range": 0.03241649675374132
+        },
+        "chunk": {
+          "cosine": 0.9999998291122838,
+          "max_abs": 0.0005675945430994034,
+          "mean_abs": 0.00010358941042795777,
+          "max_pct_range": 0.05558685578788019
+        },
+        "image_preprocess": {
+          "cosine": 0.9999999993521184,
+          "max_abs": 0.0002759099006652832,
+          "mean_abs": 1.1787152084440847e-05,
+          "max_pct_range": 0.005949434357753356
+        },
+        "raw_chunk": {
+          "cosine": 0.9999998313947666,
+          "max_abs": 0.0005523357540369034,
+          "mean_abs": 0.00010300774049634734,
+          "max_pct_range": 0.054092500147173594
+        }
+      },
+      "device_vs_host": {
+        "cosine": 0.9999999612754534,
+        "max_abs": 0.000274658203125,
+        "mean_abs": 2.8266062339146933e-05,
+        "max_pct_range": 0.02689880899218779
+      },
+      "device_vs_stock": {
+        "cosine": 0.9999998304763763,
+        "max_abs": 0.0005523357540369034,
+        "mean_abs": 0.00010351980803534389,
+        "max_pct_range": 0.054092500147173594
+      }
+    },
+    "torch_imported": false,
+    "onnxruntime_imported": false,
+    "scratch_mib": 50.53125
+  },
+  "real_robot_load": {
+    "purpose": "Base-model load test beside real robot threads. All valve commands stay zero.\nThe base fixture needs 3 views: 2 live IR views plus its fixed test image.\nThis is explicitly not a three-camera robot policy or an excavator demo.\n",
+    "status": "passed",
+    "samples": 77,
+    "rss_mib": 2673.6484375,
+    "infer_ms_p50_p95_p99": [
+      387.6275229995372,
+      391.84734120062785,
+      394.93837943999097
+    ],
+    "observation_age_ms_p50_p99_max": [
+      [
+        1.6290519997710362,
+        19.74927499941259,
+        6.366827999954694
+      ],
+      [
+        2.7016677603387476,
+        33.71350984009041,
+        12.640424478959176
+      ],
+      [
+        3.186870000718045,
+        33.75689899985446,
+        12.644340000406373
+      ]
+    ],
+    "control_loop": {
+      "avg_loop_time_ms": 9.9999181209987,
+      "min_loop_time_ms": 8.400695000091218,
+      "max_loop_time_ms": 11.605677000261494,
+      "std_loop_time_ms": 0.2858408165054288,
+      "jitter_p95_ms": 10.127253999598906,
+      "jitter_p99_ms": 11.459624000053736,
+      "max_step_ms": 1.605677000261494,
+      "avg_compute_time_ms": 1.9338877300106105,
+      "min_compute_time_ms": 1.474710999900708,
+      "max_compute_time_ms": 5.398088000220014,
+      "std_compute_time_ms": 0.498848789291493,
+      "avg_headroom_ms": 8.06611226998939,
+      "cpu_usage_pct": 19.338877300106105,
+      "loop_util_pct": 19.338877300106105,
+      "process_cpu_pct": 26.8110473268369,
+      "actual_hz": 100.00231181809056,
+      "violation_pct": 0.0,
+      "violation_count": 0,
+      "compute_overrun_pct": 0.0,
+      "compute_overrun_count": 0,
+      "compute_overrun_count_recent": 0,
+      "compute_overrun_pct_recent": 0.0,
+      "deadline_miss_count": 1490,
+      "deadline_miss_pct": 49.43596549435966,
+      "deadline_miss_count_recent": 489,
+      "deadline_miss_pct_recent": 48.9,
+      "deadline_miss_1pct_count": 259,
+      "deadline_miss_1pct_pct": 8.593231585932317,
+      "deadline_miss_1pct_count_recent": 64,
+      "deadline_miss_1pct_pct_recent": 6.4,
+      "deadline_window_sec": 9.9999181209987,
+      "overrun_count_recent": 489,
+      "overrun_pct_recent": 48.9,
+      "overrun_window_sec": 9.9999181209987,
+      "sample_count": 1000,
+      "avg_sensor_ms": 0.5024194979978347,
+      "min_sensor_ms": 0.23940099890751299,
+      "max_sensor_ms": 3.2065190007415367,
+      "avg_ik_fk_ms": 0.0,
+      "min_ik_fk_ms": 0.0,
+      "max_ik_fk_ms": 0.0,
+      "avg_pwm_ms": 1.4146897679529502,
+      "min_pwm_ms": 1.2120120009058155,
+      "max_pwm_ms": 4.103383998881327,
+      "ik_vel_lim_enabled": false,
+      "last_joint_vel_degps": [
+        "0.044381507",
+        "0.055823613",
+        "-0.029818824",
+        "-0.06310496"
+      ],
+      "effective_vel_cap_degps": []
+    },
+    "torch_imported": false,
+    "onnxruntime_imported": false
+  },
+  "recorder_check": {
+    "purpose": "Camera and encoder test only. State/actions are dummy zeros; no robot controller is opened.",
+    "episodes": [
+      {
+        "frames": 901,
+        "elapsed_s": 30.025266749000366,
+        "fps": 30.008059796171406,
+        "skipped_repeated_pairs": 1,
+        "add_ms_p50_p99_max": [
+          0.3658989990071859,
+          0.6231539991858881,
+          3.3221129997400567
+        ],
+        "pair_skew_ms_max": 20.55413499874703,
+        "cam1_gap_ms_max": 66.80219800000486
+      },
+      {
+        "frames": 302,
+        "elapsed_s": 10.026182618999883,
+        "fps": 30.12113497989773,
+        "skipped_repeated_pairs": 0,
+        "add_ms_p50_p99_max": [
+          0.39471499985666014,
+          0.5229273100303546,
+          3.150459999233135
+        ],
+        "pair_skew_ms_max": 20.418931999302004,
+        "cam1_gap_ms_max": 33.78658600013296
+      }
+    ],
+    "videos": [
+      {
+        "path": "videos/observation.images.cam1/chunk-000/file-001.mp4",
+        "codec": "h264",
+        "frames": 302,
+        "width": 640,
+        "height": 480
+      },
+      {
+        "path": "videos/observation.images.cam1/chunk-000/file-000.mp4",
+        "codec": "h264",
+        "frames": 901,
+        "width": 640,
+        "height": 480
+      },
+      {
+        "path": "videos/observation.images.cam2/chunk-000/file-001.mp4",
+        "codec": "h264",
+        "frames": 302,
+        "width": 640,
+        "height": 480
+      },
+      {
+        "path": "videos/observation.images.cam2/chunk-000/file-000.mp4",
+        "codec": "h264",
+        "frames": 901,
+        "width": 640,
+        "height": 480
+      }
+    ],
+    "status": "passed",
+    "parquet_frames": 1203
+  },
+  "neutral_recorder_check": {
+    "episodes": 4,
+    "frames": 238,
+    "all_actions_zero": true,
+    "all_states_finite": true,
+    "clock.cam1_age_p50_p99_max_ms": [
+      1.6494515002705157,
+      2.612057419028133,
+      26.920080184936523
+    ],
+    "clock.cam2_age_p50_p99_max_ms": [
+      11.004935950040817,
+      15.532916942611335,
+      15.791477635502815
+    ],
+    "clock.state_age_p50_p99_max_ms": [
+      6.814247462898493,
+      11.053721429780126,
+      11.39962486922741
+    ]
+  },
+  "two_view_auto_gpu_check": [
+    {
+      "views": 2,
+      "horizon": 30,
+      "mode": "auto",
+      "chunk": [
+        30,
+        4
+      ],
+      "max_physical_error": 1.9073486328125e-06,
+      "fixture": {
+        "status": "PASS",
+        "threshold": 0.999,
+        "max_pct_range_threshold": 1.0,
+        "input_ids_match": true,
+        "preprocess_match": true,
+        "source": "analytic NumPy graph; not trained robot policy",
+        "reports": {
+          "action": {
+            "cosine": 0.9999999999999993,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.71661376953125e-06,
+            "max_pct_range": 0.00023899031372258482
+          },
+          "chunk": {
+            "cosine": 1.0000000000000007,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.7992655436197917e-06,
+            "max_pct_range": 0.00017883968810358396
+          },
+          "image_preprocess": {
+            "cosine": 1.0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0,
+            "max_pct_range": 0.0
+          },
+          "raw_chunk": {
+            "cosine": 1.0000000000000007,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.7992655436197917e-06,
+            "max_pct_range": 0.00017883968810358396
+          }
+        },
+        "device_vs_host": {
+          "cosine": 0.9999999999999999,
+          "max_abs": 0.0,
+          "mean_abs": 0.0,
+          "max_pct_range": 0.0
+        },
+        "device_vs_stock": {
+          "cosine": 1.0000000000000007,
+          "max_abs": 3.814697265625e-06,
+          "mean_abs": 1.7992655436197917e-06,
+          "max_pct_range": 0.00017883968810358396
+        }
+      }
+    },
+    {
+      "views": 2,
+      "horizon": 50,
+      "mode": "auto",
+      "chunk": [
+        50,
+        4
+      ],
+      "max_physical_error": 1.9073486328125e-06,
+      "fixture": {
+        "status": "PASS",
+        "threshold": 0.999,
+        "max_pct_range_threshold": 1.0,
+        "input_ids_match": true,
+        "preprocess_match": true,
+        "source": "analytic NumPy graph; not trained robot policy",
+        "reports": {
+          "action": {
+            "cosine": 0.9999999999999993,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.71661376953125e-06,
+            "max_pct_range": 0.00023899031372258482
+          },
+          "chunk": {
+            "cosine": 1.0000000000000009,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.7852783203125e-06,
+            "max_pct_range": 0.00016793823903321314
+          },
+          "image_preprocess": {
+            "cosine": 1.0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0,
+            "max_pct_range": 0.0
+          },
+          "raw_chunk": {
+            "cosine": 1.0000000000000009,
+            "max_abs": 3.814697265625e-06,
+            "mean_abs": 1.7852783203125e-06,
+            "max_pct_range": 0.00016793823903321314
+          }
+        },
+        "device_vs_host": {
+          "cosine": 1.0000000000000002,
+          "max_abs": 0.0,
+          "mean_abs": 0.0,
+          "max_pct_range": 0.0
+        },
+        "device_vs_stock": {
+          "cosine": 1.0000000000000009,
+          "max_abs": 3.814697265625e-06,
+          "mean_abs": 1.7852783203125e-06,
+          "max_pct_range": 0.00016793823903321314
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "New two-view excavator checkpoint must be validated when trained.",
+    "The old ONNX Runtime memory comparison is historical; host-vs-graph timing is freshly paired.",
+    "Real robot load test used two live IR images plus a fixed third base-fixture image; policy actions were never sent."
+  ]
+}

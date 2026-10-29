@@ -1,0 +1,65 @@
+{
+  "host": "pikkumasi2tb",
+  "chain": "host",
+  "bundle": "/home/joel/vla-clean-install-20261012/bundles/xvla-base",
+  "purpose": "Model benchmark; no camera, controller, PWM or pump is opened",
+  "load_s": 8.976599304000047,
+  "rss_before_mib": 27.0390625,
+  "rss_loaded_mib": 2477.70703125,
+  "rss_after_benchmark_mib": 2484.2734375,
+  "samples": 149,
+  "latency_ms_p50_p95_p99": [
+    404.3630750002194,
+    408.85843340001884,
+    409.8872869998013
+  ],
+  "stage_mean_ms": {
+    "vision_ms": 98.27902490616798,
+    "text_ms": 7.289782503287049,
+    "cond_ms": 0.6076801678043909,
+    "denoise_ms": 295.1608384228166,
+    "preprocess_ms": 2.6264689664250738,
+    "total_ms": 404.0345770604931
+  },
+  "chunk_shape": [
+    30,
+    20
+  ],
+  "fixture": {
+    "status": "PASS",
+    "threshold": 0.999,
+    "max_pct_range_threshold": 1.0,
+    "input_ids_match": true,
+    "preprocess_match": true,
+    "source": "stock LeRobot XVLAPolicy, float32 on the CPU",
+    "reports": {
+      "action": {
+        "cosine": 0.9999997418013359,
+        "max_abs": 0.000323321670293808,
+        "mean_abs": 0.00014326845994219183,
+        "max_pct_range": 0.03241649675374132
+      },
+      "chunk": {
+        "cosine": 0.9999998291122838,
+        "max_abs": 0.0005675945430994034,
+        "mean_abs": 0.00010358941042795777,
+        "max_pct_range": 0.05558685578788019
+      },
+      "image_preprocess": {
+        "cosine": 0.9999999993521184,
+        "max_abs": 0.0002759099006652832,
+        "mean_abs": 1.1787152084440847e-05,
+        "max_pct_range": 0.005949434357753356
+      },
+      "raw_chunk": {
+        "cosine": 0.9999998313947666,
+        "max_abs": 0.0005523357540369034,
+        "mean_abs": 0.00010300774049634734,
+        "max_pct_range": 0.054092500147173594
+      }
+    }
+  },
+  "torch_imported": false,
+  "onnxruntime_imported": false,
+  "scratch_mib": 50.53125
+}

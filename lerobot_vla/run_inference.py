@@ -1,105 +1,16 @@
 #!/usr/bin/env python3
-"""VLA inference loop for the MASI excavator (split TRT engines).
+"""X-VLA split-engine inference for the MASI excavator.
 
-    IR cam1 + joint angles + task -> SmolVLA or X-VLA (split ONNX/TRT) -> valves
-
-Which architecture runs is read from the bundle rather than chosen with a flag —
-see policy.py. SmolVLA is the deployed path; X-VLA is 12 engines instead of 9,
-~3x the inference time, and 2.5x the resident memory, and only one of the two
-fits in this board's 8 GB at a time, so switching models means restarting.
-
-Modes (safety ladder):
-    --synthetic     no robot, no camera — synthetic image + zero state. Proves
-                    the model pipeline + engine builds. Safe anywhere.
-    (default)       robot connected, observations real, actions PRINTED ONLY.
-    --live          actions are actually sent to the valves. Base (un-finetuned)
-                    weights produce garbage actions — do not use --live until a
-                    finetuned checkpoint is in place and the pump is your call.
-
-    --allow-base-bundle loads an X-VLA export that carries no physical boundary
-                    (the base ee6d checkpoint). Its chunk is arm dimensions, not
-                    valve commands, so that mode refuses --live outright: it
-                    exists only for model/engine diagnostics.
-
-The policy emits an action chunk per observation (length is a property of the
-bundle -- 50 for the base export, 12 for the deployed digging bundle) and the
-WHOLE chunk is handed to the controller as a trajectory at --fps. Re-inference
-starts as soon as the previous one finishes, unless --min-replan-s throttles it.
-Whatever part of the chunk has not played when the next one lands is simply
-replaced, so the EXECUTED horizon is set by inference latency (~infer_s * fps),
-not by any flag: at the measured 0.12 s inference and 30 Hz that is ~4 steps.
-The unplayed tail is the late-inference fallback — a slow replan keeps following
-the predicted plan instead of degrading into hold->decay-to-zero.
-
---fps is normally NOT passed. The chunk is rate commands sampled at the rate the
-checkpoint was trained on, so the playback rate belongs to the checkpoint: it is
-read from the export bundle (export_info.json / info.json). Checkpoints trained
-on decimated data (10 or 6 fps) played back at 30 Hz move the machine at a third
-or a fifth of the intended speed, silently. An explicit --fps that contradicts
-the bundle is refused.
-
-The chunk is NOT replayed step-by-step from this thread. It is handed to
-ExcavatorController's direct-command mode, whose 100 Hz control thread indexes
-into it by elapsed time and interpolates. This thread only has to produce the
-next chunk before the current one runs out — inference being far slower than
-the valve update rate is exactly what that split is for. Re-inference starts
-early by the measured inference time, so the schedule does not go stale in the
-gap; if it does anyway, the held command decays to zero rather than latching.
-
---task is the same flag, and must carry the same string, as
-record_episodes.py --task: the policy conditions on that language embedding, so
-a phrasing the checkpoint was not finetuned on is out of distribution and
-nothing downstream notices. It has no default. Like --fps it is read from the
-export bundle when the bundle records one, and so are the tokenizer and the
-normalization stats — a finetuned bundle ships all three, which is why the
-correct invocation is --split-dir and (almost) nothing else.
-
-A checkpoint finetuned on a multi-task dataset has more than one phrasing in
-distribution, and its export records them as a "tasks" LIST (the same strings as
-the dataset's meta/tasks.parquet). Then the run carries all of them and the D-pad
-picks which one is live: right = next, left = previous. Only the string changes —
-one policy, one set of engines, one process — so a switch costs one text-encoder
-run the first time an instruction is used and nothing afterwards; it is nothing
-like the model switch in the paragraph above. Repeating --task does the same from
-the command line, in the order given — and a --task the bundle already records is a
-REORDERING, not a filter: it goes first, the rest stay behind it on the D-pad, so
-naming the task to start on never costs the operator the others. Switching drops
-the chunk in flight and
-stops the machine first: that chunk was planned under the old instruction, and
-half of one task's plan followed by half of another's is a trajectory neither of
-them meant.
-
-A gamepad, if one is plugged in, can take the machine over during a --live
-run: A toggles between the policy and the sticks. The two are exclusive rather
-than summed — manual control drops the chunk in flight, and no inference runs
-while the operator drives, so the chunk that resumes control is inferred from
-the pose they left the machine in. A missing pad is not an error; the run
-proceeds exactly as it would without one. Takeover is live-only, but the D-pad's
-task selector is not: a multi-task run opens the pad without --live too, with A
-disabled, because picking the next inference's instruction never writes a valve.
-
---enable-tracks is the same flag as record_episodes.py --enable-tracks. A model
-trained on a track-enabled recording emits a 6-wide action, [slew, lift, tilt,
-scoop, trackL, trackR]; the flag decides whether the last two are DRIVEN. Without
-it (the default) a 6-wide model still runs, its track columns logged but never
-sent, so the tracks stay stopped. With it, gamepad takeover drives the tracks from
-the triggers/bumpers too. The flag on a 4-wide model is refused, checked against
-the stats (SmolVLA) or the bundle's action width (X-VLA) before anything is driven.
-
-First run builds the TRT engines (minutes); later runs load from
---cache-dir in seconds. The cache is per bundle — a second --split-dir builds
-its own engines beside the first one's rather than colliding with them, and
-either model then starts in seconds. --rebuild forces one bundle's rebuild.
-
-Usage (model-only check):
-    .venv-lerobot/bin/python -m lerobot_vla.run_inference \
-        --split-dir <bundle> --synthetic --loops 3
+--synthetic checks the model only; default mode reads real observations and
+prints actions; --live sends chunks to the existing 100 Hz Python controller.
+Camera order, action rate, task and normalization come from the X-VLA bundle.
+Dual IR capture uses the same identities and orientation as record_episodes.
+A toggles manual takeover during live inference; D-pad cycles trained tasks.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 import threading
@@ -121,34 +32,14 @@ from lerobot_vla.excavator_robot import _CONTROL_CHANNELS as CONTROL_CHANNELS
 from lerobot_vla.excavator_robot import _TRACK_CHANNELS as TRACK_CHANNELS
 from lerobot_vla.record_episodes import manual_action_from_axes
 from lerobot_vla.runtime import xvla
-from lerobot_vla.policy import (
-    bundle_tasks, detect_architecture, make_policy, merge_tasks, warn_off_bundle,
-)
-from lerobot_vla.runtime.smolvla import NormStats
+from lerobot_vla.policy import detect_architecture, make_policy
 from lerobot_vla.gamepad import BTN_A, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, LocalGamepadInput
-
-#: Where deployable export bundles live on the Jetson. Only used to make error
-#: messages concrete — there is deliberately NO default bundle. A checkpoint is the
-#: single biggest thing deciding what the machine does, so it gets named out loud
-#: rather than inherited from an argparse default. (The old default was a public
-#: base-weight split that did not work here; see the README.)
-BUNDLE_ROOT = Path.home() / "bundles"
-DEFAULT_TOKENIZER = BUNDLE_ROOT / "smolvlm2-tokenizer"
 
 LOG = logging.getLogger("run_inference")
 
 #: --camera choice -> the dataset image key it selects.
-CAMERA_KEYS = {"ir": "observation.images.cam1", "rgb": "observation.images.cam2"}
-
-#: Used only when nothing in the export bundle records the training rate.
-DEFAULT_FPS = 30.0
-
-#: Argparse defaults kept as names because the X-VLA path has to tell "left at
-#: the default" from "asked for explicitly": its runtime derives both from the
-#: bundle (engine cache beside the graphs, denoise steps from bundle.json), so a
-#: default carried over from the SmolVLA side would silently override them.
-DEFAULT_CACHE_DIR = "/tmp/smolvla_split_cache"
-DEFAULT_NUM_STEPS = 10
+CAMERA_KEYS = {"ir": "observation.images.cam1", "cam1": "observation.images.cam1",
+               "cam2": "observation.images.cam2"}
 
 #: Rate the manual setpoint is fed at while the operator drives. Deliberately
 #: NOT --fps: that is the checkpoint's action rate, and a 6 fps checkpoint would
@@ -160,252 +51,6 @@ BUTTON_POLL_HZ = 50.0
 
 #: How long to wait for a pad at startup. Short, because it is optional.
 GAMEPAD_TIMEOUT_S = 3.0
-
-
-def resolve_policy_fps(split_dir: str, stats_path: str | None,
-                       explicit_fps: float | None) -> float:
-    """Work out the control rate this checkpoint was trained at.
-
-    A chunk is a sequence of RATE commands, played back at ``--fps``. That rate
-    is a property of the checkpoint, not a free choice: a model trained on 10 fps
-    data expects each action to be held for 100 ms, so replaying it at 30 Hz holds
-    each one for 33 ms and the machine travels a third of the intended distance.
-    Nothing about that failure is loud — the excavator just moves feebly.
-
-    Since we now have checkpoints trained at 30, 10 and 6 fps, the rate is read
-    from the export bundle where possible instead of defaulting. Search order:
-
-        1. ``fps`` in <split-dir>/export_info.json   (written by the exporter)
-        2. ``fps`` in <split-dir>/info.json          (a copied LeRobot info.json)
-        3. ``fps`` in <stats-dir>/info.json          (stats copied with its info)
-
-    An explicit --fps that disagrees with the bundle is treated as a mistake and
-    refused. If nothing records the rate we fall back to 30 with a warning.
-    """
-    candidates = [Path(split_dir) / "export_info.json", Path(split_dir) / "info.json"]
-    if stats_path:
-        candidates.append(Path(stats_path).parent / "info.json")
-
-    recorded, source = None, None
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            fps = json.loads(path.read_text()).get("fps")
-        except (json.JSONDecodeError, OSError) as exc:
-            LOG.warning("Could not read %s for the training fps: %s", path, exc)
-            continue
-        if fps:
-            recorded, source = float(fps), path
-            break
-
-    if recorded is not None:
-        if explicit_fps is not None and abs(explicit_fps - recorded) > 1e-6:
-            raise SystemExit(
-                f"--fps {explicit_fps:g} contradicts the training rate recorded in "
-                f"{source} ({recorded:g} fps).\n"
-                f"The action chunk is rate commands sampled at {recorded:g} Hz; playing it "
-                f"at {explicit_fps:g} Hz scales the executed motion by "
-                f"{recorded / explicit_fps:.2f}x.\n"
-                f"Drop --fps to use the recorded rate, or pass --fps {recorded:g}.")
-        LOG.info("Control rate %.4g Hz (training rate recorded in %s)", recorded, source.name)
-        return recorded
-
-    if explicit_fps is not None:
-        LOG.warning("No training fps recorded in the export bundle; using --fps %.4g. "
-                    "Make sure this matches the rate the checkpoint was trained at.",
-                    explicit_fps)
-        return explicit_fps
-
-    LOG.warning("No training fps recorded in the export bundle and no --fps given; "
-                "assuming %.4g Hz. If this checkpoint was trained on decimated data "
-                "(10 or 6 fps) the machine will move at the wrong speed. Record the "
-                "rate in <split-dir>/export_info.json to remove this guess.",
-                DEFAULT_FPS)
-    return DEFAULT_FPS
-
-
-def resolve_state_blind(split_dir: str, explicit: bool) -> bool:
-    """Whether this checkpoint was trained camera-only, so state must be fed as zeros.
-
-    A state-blind checkpoint (the excav_E* bundles) saw ``observation.state == 0`` at
-    every training frame, and its normalizer was patched to mean 0 / std 1. That makes
-    normalization the identity, so a real joint reading is NOT scaled down on its way
-    into ``state_proj`` — raw degrees land in a projector whose weight never received a
-    gradient and still sits at its pretrained value. Measured on the E@017500 bundle,
-    feeding plausible angles instead of zeros moves the commanded action by up to 0.434
-    on the [-1, 1] joystick scale. Like the fps mismatch above, nothing about that
-    failure is loud: the machine just drives somewhere else.
-
-    Read from ``state_blind`` in <split-dir>/export_info.json; --state-blind forces it
-    on for a bundle that predates the flag.
-    """
-    path = Path(split_dir) / "export_info.json"
-    recorded = None
-    if path.is_file():
-        try:
-            recorded = json.loads(path.read_text()).get("state_blind")
-        except (json.JSONDecodeError, OSError) as exc:
-            LOG.warning("Could not read %s for the state_blind flag: %s", path, exc)
-
-    if recorded:
-        LOG.warning("CAMERA-ONLY checkpoint (state_blind in %s): observation.state is "
-                    "fed to the policy as ZEROS; the IMU reading is logged but unused.",
-                    path.name)
-        return True
-    if explicit:
-        LOG.warning("--state-blind given: observation.state is fed to the policy as "
-                    "ZEROS even though %s does not record state_blind.", path.name)
-        return True
-    return False
-
-
-def resolve_tasks(split_dir: str, explicit: list[str] | None) -> list[str]:
-    """The instruction strings this run may condition on, in order.
-
-    The task is a property of the checkpoint, not a free choice: SmolVLA
-    conditions on the language embedding, so a phrasing the model never trained
-    on is simply out of distribution. Unlike a wrong --fps or another run's
-    stats, nothing downstream can detect it — the prefix is well-formed, the
-    chunk is well-shaped, and the machine just drives somewhere else.
-
-    There used to be a default here (``"scoop sand and dump it to the left"``,
-    the kaivuri task). It silently mislabelled every run against any other
-    checkpoint, so it is gone: the strings now come from ``tasks``/``task`` in
-    <split-dir>/export_info.json, or from --task, or the run refuses to start.
-
-    A checkpoint finetuned on a multi-task dataset has more than one phrasing IN
-    distribution, and its export records them as a list (see policy.bundle_tasks).
-    A single-task bundle is the one-element case of that, so both come back as a
-    list and the loop never branches on which kind it was handed. The first entry
-    is the one the run starts on; the operator cycles the rest with the D-pad.
-
-    An explicit --task goes to the FRONT of the list rather than replacing it
-    (policy.merge_tasks): the flag picks which instruction the run starts on, and
-    the bundle's other tasks stay on the D-pad behind it. An explicit --task the
-    bundle does not record is allowed but warned about. Passing the flag is a
-    statement of intent — probing how much the phrasing matters is a real thing to
-    want — where omitting it is just an omission, and is refused rather than
-    guessed.
-    """
-    path = Path(split_dir) / "export_info.json"
-    recorded: list[str] = []
-    if path.is_file():
-        try:
-            recorded = bundle_tasks(json.loads(path.read_text()))
-        except (json.JSONDecodeError, OSError) as exc:
-            LOG.warning("Could not read %s for the task string: %s", path, exc)
-
-    if explicit:
-        warn_off_bundle(explicit, recorded, path.name)
-        tasks = merge_tasks(explicit, recorded)
-        LOG.info("Task%s %s (--task first, then the rest of %s)",
-                 "s" if len(tasks) > 1 else "",
-                 ", ".join(repr(t) for t in tasks), path.name)
-        return tasks
-    if recorded:
-        LOG.info("Task%s %s (recorded in %s)", "s" if len(recorded) > 1 else "",
-                 ", ".join(repr(t) for t in recorded), path.name)
-        return recorded
-    raise SystemExit(
-        f"No --task given and {path} records none.\n"
-        f"The policy conditions on the instruction string, so there is no safe "
-        f"default: a phrasing this checkpoint was not finetuned on is out of "
-        f"distribution and nothing downstream will notice.\n"
-        f'Pass --task "<the instruction the training dataset was recorded with>", '
-        f'or add a "task" key (or a "tasks" list, for a multi-task checkpoint) '
-        f"to the bundle's export_info.json.")
-
-
-def resolve_bundle_path(split_dir: str, explicit: str | None, name: str,
-                        fallback: str | None, what: str) -> str | None:
-    """Prefer what the export bundle ships over a historical default path.
-
-    The finetuned bundles carry their own ``tokenizer/`` and ``stats.json``, so
-    the correct invocation is ``--split-dir <bundle>`` and nothing else. Every
-    path an operator has to remember separately is a chance to pair a checkpoint
-    with another run's normalization — the failure check_state_blind_stats
-    exists to catch, and the one that turns real degrees into an
-    out-of-distribution state token when --dataset-stats is simply forgotten.
-    """
-    if explicit:
-        return explicit
-    shipped = Path(split_dir) / name
-    if shipped.exists():
-        LOG.info("Using the %s shipped in the bundle: %s", what, shipped)
-        return str(shipped)
-    return fallback
-
-
-def check_camera_against_stats(camera_key: str, stats_path: str | None) -> None:
-    """Refuse an imager the training dataset never carried.
-
-    record_episodes always writes both cam1 and cam2 off one pipeline, but a
-    training run derives its dataset from one of them, and the stats.json that
-    comes with it has an entry per image key that survived. That settles which
-    imager the checkpoint saw. A cam1-trained policy fed colour frames is out of
-    distribution in exactly the silent way a wrong --task is, so check it.
-    """
-    if not stats_path:
-        return
-    try:
-        stats = json.loads(Path(stats_path).read_text())
-    except (json.JSONDecodeError, OSError):
-        return  # load_norm reports the real error
-    image_keys = sorted(k for k in stats if k.startswith("observation.images."))
-    if not image_keys or camera_key in image_keys:
-        return
-    suggest = next((flag for flag, key in CAMERA_KEYS.items() if key in image_keys), None)
-    raise SystemExit(
-        f"--camera selects {camera_key}, but {stats_path} was built from "
-        f"{image_keys}.\n"
-        f"This checkpoint never saw that imager; feeding it is out of distribution "
-        f"and it will drive badly."
-        + (f"\nPass --camera {suggest} to match." if suggest else ""))
-
-
-def check_state_blind_stats(norm: NormStats, stats_path: str | None) -> None:
-    """Refuse a camera-only checkpoint paired with another run's normalization stats.
-
-    Zeroing the state in ``for_policy`` is not sufficient on its own: the zeros are
-    normalized afterwards, inside ``sample_actions``. Pointing --dataset-stats at the
-    state-fed dataset (masi_kaivuri_juusto) turns those zeros back into
-    ``(0 - mean)/std = [0.172, 1.028, -4.104, 0.869]`` — a state token four sigma out,
-    which is precisely what feeding the raw IMU would have done. The state-blind bundle
-    ships its own stats.json (mean 0 / std 1) for this reason.
-
-    Checked as the invariant that actually matters — zeros must normalize to zeros —
-    rather than by comparing file paths.
-    """
-    if norm.state_mean is None:
-        return
-    probe = norm.normalize_state(np.zeros_like(norm.state_mean))
-    if np.allclose(probe, 0.0, atol=1e-6):
-        return
-    raise SystemExit(
-        f"--dataset-stats {stats_path} cannot be used with a state_blind (camera-only) "
-        f"checkpoint.\n"
-        f"This model was trained with observation.state == 0 and expects identity "
-        f"normalization (mean 0 / std 1), but these stats normalize zeros to "
-        f"[{' '.join(f'{v:+.3f}' for v in probe)}].\n"
-        f"That puts an out-of-distribution state token into the prefix — the same failure "
-        f"as feeding the raw IMU.\n"
-        f"Use the stats.json shipped inside the bundle: "
-        f"--dataset-stats {BUNDLE_ROOT}/<bundle>/stats.json")
-
-
-STATE_KEY_NAME = "observation.state"
-
-
-def load_norm(stats_path: str | None) -> NormStats:
-    if not stats_path:
-        LOG.warning("No --dataset-stats given: state/action normalization is "
-                    "IDENTITY. Fine for base-weight plumbing tests only.")
-        return NormStats()
-    stats = json.loads(Path(stats_path).read_text())
-    norm = NormStats.from_lerobot_stats(stats)
-    LOG.info("Loaded normalization stats from %s", stats_path)
-    return norm
 
 
 def check_action_width(width: int, enable_tracks: bool, source: str) -> list[str]:
@@ -551,23 +196,12 @@ def make_teleop(robot, allow_takeover: bool = True) -> GamepadTeleop | None:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="SmolVLA split-engine inference loop.")
-    p.add_argument("--split-dir", required=True,
-                   help="The export bundle to drive with, e.g. "
-                        f"{BUNDLE_ROOT}/smolvla-digging-clean-ir12-35k. Required: "
-                        "the checkpoint is the single biggest thing that decides "
-                        "what the machine does, so it is never defaulted")
-    p.add_argument("--tokenizer", default=None,
-                   help="Tokenizer dir. Normally omitted — <split-dir>/tokenizer "
-                        f"is used when the bundle ships one (SmolVLA fallback: "
-                        f"{DEFAULT_TOKENIZER}; an X-VLA bundle that ships none is "
-                        f"a base export and needs this passed explicitly)")
-    p.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR,
-                   help="Root of the TRT engine cache. Each bundle gets its own "
-                        "subdirectory under it, so switching --split-dir needs "
-                        "no extra flag and switching back is still instant. "
-                        "Left alone, an X-VLA bundle caches into its own "
-                        "<split-dir>/trt_cache instead, which survives a reboot.")
+    p = argparse.ArgumentParser(description="X-VLA split-engine inference loop.")
+    p.add_argument("--split-dir", required=True, help="Fine-tuned X-VLA export bundle directory")
+    p.add_argument("--tokenizer", default=None, help="Override <split-dir>/tokenizer")
+    p.add_argument("--cache-dir", default=None, help="Override <split-dir>/trt_native_cache")
+    p.add_argument("--trt-chain", choices=("graph", "device", "host"), default="graph",
+                   help="TensorRT execution; graph is fastest, host is for diagnostics")
     p.add_argument("--rebuild", action="store_true",
                    help="Wipe this bundle's engine cache and rebuild it "
                         "(minutes). The cache is dropped automatically when the "
@@ -583,7 +217,7 @@ def main() -> int:
                         "wrong instruction is out of distribution and silent. "
                         "REPEAT the flag for a multi-task checkpoint: the run "
                         "starts on the first and the pad's D-pad cycles the rest")
-    p.add_argument("--num-steps", type=int, default=DEFAULT_NUM_STEPS,
+    p.add_argument("--num-steps", type=int, default=None,
                    help="Denoise steps. Left alone, an X-VLA bundle uses the "
                         "num_denoising_steps it was exported with")
     p.add_argument("--min-replan-s", type=float, default=0.0,
@@ -594,16 +228,9 @@ def main() -> int:
                         "latency (~infer_s * fps), not by this flag")
     p.add_argument("--fps", type=float, default=None,
                    help="Action execution rate. Normally omitted — it is read from "
-                        "the export bundle, since it is a property of the checkpoint "
-                        f"(default if nothing records it: {DEFAULT_FPS:g})")
-    p.add_argument("--dataset-stats", default=None,
-                   help="LeRobot stats.json for state/action normalization. "
-                        "Normally omitted — <split-dir>/stats.json is used when "
-                        "the bundle ships one")
+                        "the X-VLA bundle; no default is assumed")
     p.add_argument("--state-blind", action="store_true",
-                   help="Feed observation.state to the policy as zeros (camera-only "
-                        "checkpoint). Normally omitted — it is read from the export "
-                        "bundle's state_blind flag")
+                   help="Explicitly feed zero state for a camera-only checkpoint")
     p.add_argument("--allow-base-bundle", action="store_true",
                    help="Load an X-VLA bundle that carries no physical boundary "
                         "(the base ee6d checkpoint, or an export missing its "
@@ -615,23 +242,12 @@ def main() -> int:
     p.add_argument("--state-joints", default="lift,tilt,scoop",
                    help="Joints fed to the policy as observation.state. MUST "
                         "match what the checkpoint was trained on — checked "
-                        "against --dataset-stats when that is given. Slew is out "
+                        "against the X-VLA processor contract. Slew is out "
                         "by default (unanchored yaw; see excavator_robot.py)")
-    p.add_argument("--exposure-ir", type=float, default=None,
-                   help="Lock cam1 (IR) exposure, microseconds — use the SAME "
-                        "value the dataset was recorded with")
-    p.add_argument("--gain-ir", type=float, default=None,
-                   help="cam1 (IR) sensor gain 16..248")
-    p.add_argument("--camera", choices=("ir", "rgb"), default="ir",
-                   help="Which imager the policy sees: ir = cam1, rgb = cam2. "
-                        "Must match what the checkpoint was TRAINED on — a "
-                        "cam1-trained policy fed colour frames is out of "
-                        "distribution and will drive badly")
-    p.add_argument("--exposure-rgb", type=float, default=None,
-                   help="Lock cam2 (RGB) exposure, microseconds — separate sensor "
-                        "from the IR one, so --exposure-ir does not apply to it")
-    p.add_argument("--gain-rgb", type=float, default=None,
-                   help="cam2 (RGB) sensor gain 0..128")
+    from lerobot_vla.camera import add_camera_arguments, config_from_args, fresh_observation
+    add_camera_arguments(p)
+    p.add_argument("--camera", choices=("auto", "ir", "cam1", "cam2", "both"), default="auto",
+                   help="auto uses checkpoint view order; both selects wrist + cabin IR")
     p.add_argument("--synthetic", action="store_true",
                    help="No robot/camera; synthetic observation (model-only test)")
     p.add_argument("--live", action="store_true",
@@ -645,19 +261,6 @@ def main() -> int:
     p.add_argument("--loops", type=int, default=0,
                    help="Stop after N infer+execute cycles (0 = run until Ctrl+C)")
     p.add_argument("--seed", type=int, default=None, help="Fix the denoise noise seed")
-    # Both default to the settings validated on this board in
-    # jetson-orin-nano-vla (docs/06-optimization-backlog.md): together they cut
-    # p50 from 229.8 to 134.8 ms with bit-identical output. The opt-outs exist
-    # so a regression can be A/B'd against the old loop, not because there is a
-    # reason to run them.
-    p.add_argument("--projectors", choices=("gpu", "cpu"), default="gpu",
-                   help="Where the four per-step action/time projectors run. "
-                        "gpu (default) keeps the denoise loop off the CPU; "
-                        "cpu reproduces the pre-benchmark loop")
-    p.add_argument("--no-iobinding", dest="iobinding", action="store_false",
-                   help="Re-feed the KV cache as numpy on every denoise step "
-                        "instead of binding it to the device once. Slower, and "
-                        "bit-identical — for regression comparison only")
     p.add_argument("--setpoint-hold-s", type=float, default=0.25,
                    help="How long a chunk's last action holds full authority "
                         "after the chunk runs out, before decaying to zero")
@@ -714,11 +317,13 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # The architecture is a property of the bundle, not a flag — see policy.py.
-    architecture = detect_architecture(args.split_dir)
-    LOG.info("Architecture: %s (detected from %s)", architecture, args.split_dir)
-
-    camera_key = CAMERA_KEYS[args.camera]
+    if detect_architecture(args.split_dir) != "xvla":
+        raise SystemExit("This checkout runs X-VLA bundles only.")
+    selected_cameras = (["observation.images.cam1", "observation.images.cam2"]
+                        if args.camera == "both" else
+                        None if args.camera == "auto" else [CAMERA_KEYS[args.camera]])
+    camera_keys = xvla.resolve_cameras(args.split_dir, selected_cameras,
+        allow_unknown=args.synthetic and args.allow_base_bundle)
     act_names = action_names(args.enable_tracks)
     state_joints = [j.strip() for j in args.state_joints.split(",") if j.strip()]
     unknown = [j for j in state_joints if j not in JOINT_NAMES]
@@ -745,89 +350,22 @@ def main() -> int:
         if args.lag_comp == 0:
             args.lag_comp = None
 
-    # Everything below resolves BEFORE any engine is built, so a wrong rate, task
-    # or camera fails in a second rather than after a multi-minute TRT build.
-    # The two architectures record the same facts in different files: SmolVLA in
-    # export_info.json + stats.json, X-VLA in its bundle.json + processor
-    # contract. Each resolver lives beside the runtime that owns that format.
-    if architecture == "xvla":
-        if args.dataset_stats:
-            raise SystemExit(
-                "--dataset-stats does not apply to an X-VLA bundle: its "
-                "normalization is carried in bundle.json's processor contract, "
-                "which the runtime applies at the physical boundary itself.")
-        # Refuse the non-drivable combination BEFORE the engines load: the
-        # authoritative check is on the constructed policy below, but that costs a
-        # 25 s engine load first, and --allow-base-bundle is the only way a
-        # feasibility bundle gets in at all.
-        if args.live and args.allow_base_bundle:
-            raise SystemExit(
-                "--live and --allow-base-bundle are contradictory: a bundle that "
-                "needs --allow-base-bundle emits arm dimensions, not valve "
-                "commands. Run it without --live to watch it against real "
-                "observations.")
-        tasks = xvla.resolve_tasks(args.split_dir, args.tasks)
-        args.fps = xvla.resolve_fps(args.split_dir, args.fps)
-        xvla.check_camera(args.split_dir, camera_key)
-        state_blind = args.state_blind
-        if args.projectors != "gpu" or not args.iobinding:
-            LOG.warning("--projectors / --no-iobinding are SmolVLA-only knobs and "
-                        "are ignored for an X-VLA bundle.")
-        policy = make_policy(
-            "xvla", args.split_dir,
-            cache_dir=args.cache_dir if args.cache_dir != DEFAULT_CACHE_DIR else None,
-            rebuild=args.rebuild,
-            num_steps=args.num_steps if args.num_steps != DEFAULT_NUM_STEPS else None,
-            seed=args.seed,
-            tokenizer_dir=args.tokenizer,
-            state_joints=state_joints,
-            allow_base_bundle=args.allow_base_bundle,
-        )
-    else:
-        args.tokenizer = resolve_bundle_path(args.split_dir, args.tokenizer,
-                                             "tokenizer", str(DEFAULT_TOKENIZER),
-                                             "tokenizer")
-        args.dataset_stats = resolve_bundle_path(args.split_dir, args.dataset_stats,
-                                                 "stats.json", None,
-                                                 "normalization stats")
-        tasks = resolve_tasks(args.split_dir, args.tasks)
-        args.fps = resolve_policy_fps(args.split_dir, args.dataset_stats, args.fps)
-        state_blind = resolve_state_blind(args.split_dir, args.state_blind)
-        check_camera_against_stats(camera_key, args.dataset_stats)
-
-        norm = load_norm(args.dataset_stats)
-        # The state layout is a contract between the training dataset and this loop.
-        # Getting it wrong is silent: a 3-dim policy fed 4 values, or the same count
-        # in a different order, still runs and still drives — just wrongly. The stats
-        # file carries one number that settles it, so check it.
-        if norm.state_mean is not None and len(norm.state_mean) != len(state_joints):
-            raise SystemExit(
-                f"--state-joints has {len(state_joints)} joints {state_joints} but "
-                f"--dataset-stats {args.dataset_stats} was built from a "
-                f"{len(norm.state_mean)}-dim observation.state.\n"
-                f"Check the training dataset's meta/info.json -> "
-                f"features['{STATE_KEY_NAME}']['names'] and pass the same list.")
-        # Same contract for the action. The model pads its action to 32, so its
-        # width is not visible in the engines -- the stats carry it. Without stats
-        # (identity normalization, plumbing only) assume the layout the flag asks for.
-        model_names = check_action_width(
-            len(norm.action_mean) if norm.action_mean is not None else len(act_names),
-            args.enable_tracks, f"--dataset-stats {args.dataset_stats}")
-        if state_blind:
-            check_state_blind_stats(norm, args.dataset_stats)
-
-        policy = make_policy(
-            "smolvla", args.split_dir,
-            tokenizer_dir=args.tokenizer,
-            cache_dir=args.cache_dir,
-            rebuild=args.rebuild,
-            num_steps=args.num_steps,
-            action_dim=len(model_names),
-            norm=norm,
-            seed=args.seed,
-            projectors=args.projectors,
-            iobinding=args.iobinding,
-        )
+    if args.live and args.allow_base_bundle:
+        raise SystemExit("--live cannot be combined with --allow-base-bundle.")
+    tasks = xvla.resolve_tasks(args.split_dir, args.tasks)
+    args.fps = xvla.resolve_fps(args.split_dir, args.fps)
+    state_blind = args.state_blind
+    policy = make_policy(
+        "xvla", args.split_dir,
+        cache_dir=args.cache_dir,
+        rebuild=args.rebuild,
+        num_steps=args.num_steps,
+        seed=args.seed,
+        tokenizer_dir=args.tokenizer,
+        state_joints=state_joints,
+        allow_base_bundle=args.allow_base_bundle,
+        chain=args.trt_chain,
+    )
 
     # A bundle with no physical boundary emits arm dimensions, not valve commands
     # (see runtime/xvla.py). It is loadable for model/engine diagnostics, but it
@@ -840,10 +378,9 @@ def main() -> int:
     # X-VLA's width comes from the bundle's physical boundary, so it can only be
     # checked once the policy is built. A feasibility bundle's columns are arm
     # dimensions with no layout to check; it never drives.
-    if architecture == "xvla":
-        model_names = (act_names if policy.feasibility_only else
-                       check_action_width(policy.action_dim, args.enable_tracks,
-                                          f"The bundle {args.split_dir}"))
+    model_names = (act_names if policy.feasibility_only else
+                   check_action_width(policy.action_dim, args.enable_tracks,
+                                      f"The bundle {args.split_dir}"))
     ignored_tracks = len(model_names) > len(act_names) and not getattr(
         policy, "feasibility_only", False)
     if ignored_tracks:
@@ -854,21 +391,22 @@ def main() -> int:
     robot = None
     if not args.synthetic:
         from lerobot_vla.excavator_robot import MasiExcavator
-        from lerobot_vla.camera import CameraConfig
         robot = MasiExcavator(
             profile=args.robot,
-            camera_config=CameraConfig(exposure_us=args.exposure_ir,
-                                         gain=args.gain_ir,
-                                         enable_color=args.camera == "rgb",
-                                         color_exposure_us=args.exposure_rgb,
-                                         color_gain=args.gain_rgb),
+            camera_config=config_from_args(args,
+                enable_cam2="observation.images.cam2" in camera_keys),
             use_control_thread=not args.legacy_direct_write,
             setpoint_hold_s=args.setpoint_hold_s,
             setpoint_decay_s=args.setpoint_decay_s,
             setpoint_blend_s=args.blend_s,
             state_joints=state_joints,
             enable_tracks=args.enable_tracks)
-        robot.connect()
+        try:
+            robot.connect()
+        except BaseException:
+            robot.disconnect()
+            policy.close()
+            raise
         if args.live:
             LOG.warning("LIVE MODE: actions will drive the valves. Pump is under "
                         "your control (it is NOT auto-enabled).")
@@ -897,18 +435,19 @@ def main() -> int:
                     "another one first.", len(tasks), tasks[0])
 
     if not args.synthetic:
-        LOG.info("Policy camera: %s (%s)", camera_key,
-                 "IR cam1" if args.camera == "ir" else "colour cam2")
+        LOG.info("Policy IR cameras in checkpoint order: %s", camera_keys)
     LOG.info("observation.state = %s%s", state_joints,
              "" if "slew" in state_joints else "   (slew excluded: unanchored yaw)")
 
     def get_observation():
         if robot is not None:
-            obs = robot.get_observation()
-            return obs[camera_key], obs["observation.state"]
+            obs = fresh_observation(robot.get_observation, camera_keys)
+            images = [obs[key] for key in camera_keys]
+            return images, obs["observation.state"]
         img = (np.random.default_rng(0).integers(0, 255, (480, 640, 3))
                .astype(np.uint8))
-        return img, np.zeros(len(state_joints), dtype=np.float32)
+        images = [img.copy() for _ in camera_keys]
+        return images, np.zeros(len(state_joints), dtype=np.float32)
 
     def for_policy(state):
         """What the policy actually receives. A camera-only checkpoint gets zeros;
@@ -932,6 +471,7 @@ def main() -> int:
             "live": bool(args.live),
             "synthetic": bool(args.synthetic),
             "camera": args.camera,
+            "camera_keys": camera_keys,
             "state_joints": list(state_joints),
             "state_blind": bool(state_blind),
             "min_replan_s": args.min_replan_s,
@@ -947,10 +487,20 @@ def main() -> int:
 
     # Warmup / engine build happens on the first sample_actions call.
     LOG.info("Warmup inference (builds TRT engines on first ever run)...")
-    img, state = get_observation()
-    t0 = time.perf_counter()
-    policy.sample_actions(img, tasks[0], for_policy(state))
-    LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
+    try:
+        img, state = get_observation()
+        t0 = time.perf_counter()
+        policy.sample_actions(img, tasks[0], for_policy(state))
+        LOG.info("Warmup done in %.1fs", time.perf_counter() - t0)
+    except BaseException:
+        if action_log is not None:
+            action_log.close()
+        if teleop is not None:
+            teleop.close()
+        if robot is not None:
+            robot.disconnect()
+        policy.close()
+        raise
 
     cycle = 0
     # Index into `tasks`. Only the D-pad moves it, and only between chunks: the
@@ -1097,6 +647,7 @@ def main() -> int:
             except Exception:
                 pass
             robot.disconnect()
+        policy.close()
 
     LOG.info("Done: %d cycles.", cycle)
     return 0

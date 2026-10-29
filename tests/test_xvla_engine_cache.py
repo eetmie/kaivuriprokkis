@@ -1,63 +1,53 @@
-"""X-VLA engine-cache manifest: a boot-cleared cache rebuilds, a mixed one refuses.
-
-clear-build-caches deletes *.engine at every boot and keeps *.timing. The manifest
-left behind used to fail validation, so the first run after any reboot (or power
-cut) died instead of rebuilding.
-"""
-
-import json
-import sys
-import unittest
+"""Direct TensorRT cache identity and corruption checks without a GPU build."""
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
-
-from lerobot_vla.runtime.vendor import xvla_split_ort as ort_mod  # noqa: E402
-
-IDENTITY = {"version": 1, "precision": "fp16"}
-ENGINE = "TensorrtExecutionProvider_TRTKernel_graph_main_graph_1_0_0_fp16_sm87.engine"
-TIMING = "TensorrtExecutionProvider_cache_sm87.timing"
+from lerobot_vla.runtime.vendor import trt_engines as runtime
 
 
-def _built_cache(root: Path) -> Path:
-    (root / ENGINE).write_bytes(b"engine")
-    (root / TIMING).write_bytes(b"timing")
-    (root / ort_mod._ENGINE_CACHE_MANIFEST).write_text(json.dumps(
-        {"identity": IDENTITY, "files": ort_mod._engine_cache_files(root)}))
-    return root
+class EngineCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name)
+        (self.root/'stage.onnx').write_bytes(b'graph-v1')
+        self.bundle=SimpleNamespace(root=self.root,names=['stage'])
+        self.cache=self.root/'cache'
+        self.calls=[]
+        def build(argv,**kwargs):
+            self.calls.append(argv)
+            Path(argv[4]).write_bytes(b'engine')
+        for name,value in [('_trt_version',lambda:'10.16'),('_cudart_version',lambda:13020)]:
+            patcher=patch.object(runtime,name,value);patcher.start();self.addCleanup(patcher.stop)
+        patcher=patch.object(runtime.subprocess,'run',build);patcher.start();self.addCleanup(patcher.stop)
+
+    def test_cached_bytes_are_reused(self):
+        self.assertIn('stage',runtime.prebuild_engines(self.bundle,self.cache))
+        self.assertEqual(runtime.prebuild_engines(self.bundle,self.cache),{})
+        self.assertEqual(len(self.calls),1)
+
+    def test_changed_graph_invalidates_engine(self):
+        runtime.prebuild_engines(self.bundle,self.cache)
+        (self.root/'stage.onnx').write_bytes(b'graph-v2')
+        self.assertIn('stage',runtime.prebuild_engines(self.bundle,self.cache))
+        self.assertEqual(len(self.calls),2)
+
+    def test_changed_builder_precision_invalidates_engine(self):
+        runtime.prebuild_engines(self.bundle,self.cache,accumulate='fp32')
+        self.assertIn('stage',runtime.prebuild_engines(self.bundle,self.cache,accumulate='auto'))
+
+    def test_engine_removed_after_reboot_is_rebuilt(self):
+        runtime.prebuild_engines(self.bundle,self.cache)
+        (self.cache/'stage.engine').unlink()
+        self.assertIn('stage',runtime.prebuild_engines(self.bundle,self.cache))
+
+    def test_corrupted_engine_refused(self):
+        runtime.prebuild_engines(self.bundle,self.cache)
+        (self.cache/'stage.engine').write_bytes(b'broken')
+        with self.assertRaisesRegex(ValueError,'--rebuild'):
+            runtime.prebuild_engines(self.bundle,self.cache)
 
 
-class EngineCacheManifestTest(unittest.TestCase):
-    def test_intact_cache_is_a_hit(self):
-        with TemporaryDirectory() as d:
-            cache = _built_cache(Path(d))
-            self.assertIsNotNone(ort_mod._validate_engine_cache_manifest(cache, IDENTITY))
-
-    def test_engines_cleared_at_boot_rebuilds_and_keeps_timing(self):
-        with TemporaryDirectory() as d:
-            cache = _built_cache(Path(d))
-            (cache / ENGINE).unlink()
-            self.assertIsNone(ort_mod._validate_engine_cache_manifest(cache, IDENTITY))
-            self.assertFalse((cache / ort_mod._ENGINE_CACHE_MANIFEST).exists())
-            self.assertTrue((cache / TIMING).exists())
-
-    def test_truncated_engine_still_refuses(self):
-        with TemporaryDirectory() as d:
-            cache = _built_cache(Path(d))
-            (cache / ENGINE).write_bytes(b"eng")
-            with self.assertRaisesRegex(ValueError, "--rebuild"):
-                ort_mod._validate_engine_cache_manifest(cache, IDENTITY)
-
-    def test_rebuild_clear_drops_timing_but_not_unrelated_files(self):
-        with TemporaryDirectory() as d:
-            cache = _built_cache(Path(d))
-            (cache / "notes.txt").write_text("keep")
-            ort_mod.clear_engine_cache(cache)
-            self.assertEqual(sorted(p.name for p in cache.iterdir()), ["notes.txt"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__=='__main__':unittest.main()

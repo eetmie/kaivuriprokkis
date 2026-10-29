@@ -1,0 +1,84 @@
+{
+  "purpose": "Base-model load test beside real robot threads. All valve commands stay zero.\nThe base fixture needs 3 views: 2 live IR views plus its fixed test image.\nThis is explicitly not a three-camera robot policy or an excavator demo.\n",
+  "status": "passed",
+  "samples": 77,
+  "rss_mib": 2673.6484375,
+  "infer_ms_p50_p95_p99": [
+    387.6275229995372,
+    391.84734120062785,
+    394.93837943999097
+  ],
+  "observation_age_ms_p50_p99_max": [
+    [
+      1.6290519997710362,
+      19.74927499941259,
+      6.366827999954694
+    ],
+    [
+      2.7016677603387476,
+      33.71350984009041,
+      12.640424478959176
+    ],
+    [
+      3.186870000718045,
+      33.75689899985446,
+      12.644340000406373
+    ]
+  ],
+  "control_loop": {
+    "avg_loop_time_ms": 9.9999181209987,
+    "min_loop_time_ms": 8.400695000091218,
+    "max_loop_time_ms": 11.605677000261494,
+    "std_loop_time_ms": 0.2858408165054288,
+    "jitter_p95_ms": 10.127253999598906,
+    "jitter_p99_ms": 11.459624000053736,
+    "max_step_ms": 1.605677000261494,
+    "avg_compute_time_ms": 1.9338877300106105,
+    "min_compute_time_ms": 1.474710999900708,
+    "max_compute_time_ms": 5.398088000220014,
+    "std_compute_time_ms": 0.498848789291493,
+    "avg_headroom_ms": 8.06611226998939,
+    "cpu_usage_pct": 19.338877300106105,
+    "loop_util_pct": 19.338877300106105,
+    "process_cpu_pct": 26.8110473268369,
+    "actual_hz": 100.00231181809056,
+    "violation_pct": 0.0,
+    "violation_count": 0,
+    "compute_overrun_pct": 0.0,
+    "compute_overrun_count": 0,
+    "compute_overrun_count_recent": 0,
+    "compute_overrun_pct_recent": 0.0,
+    "deadline_miss_count": 1490,
+    "deadline_miss_pct": 49.43596549435966,
+    "deadline_miss_count_recent": 489,
+    "deadline_miss_pct_recent": 48.9,
+    "deadline_miss_1pct_count": 259,
+    "deadline_miss_1pct_pct": 8.593231585932317,
+    "deadline_miss_1pct_count_recent": 64,
+    "deadline_miss_1pct_pct_recent": 6.4,
+    "deadline_window_sec": 9.9999181209987,
+    "overrun_count_recent": 489,
+    "overrun_pct_recent": 48.9,
+    "overrun_window_sec": 9.9999181209987,
+    "sample_count": 1000,
+    "avg_sensor_ms": 0.5024194979978347,
+    "min_sensor_ms": 0.23940099890751299,
+    "max_sensor_ms": 3.2065190007415367,
+    "avg_ik_fk_ms": 0.0,
+    "min_ik_fk_ms": 0.0,
+    "max_ik_fk_ms": 0.0,
+    "avg_pwm_ms": 1.4146897679529502,
+    "min_pwm_ms": 1.2120120009058155,
+    "max_pwm_ms": 4.103383998881327,
+    "ik_vel_lim_enabled": false,
+    "last_joint_vel_degps": [
+      "0.044381507",
+      "0.055823613",
+      "-0.029818824",
+      "-0.06310496"
+    ],
+    "effective_vel_cap_degps": []
+  },
+  "torch_imported": false,
+  "onnxruntime_imported": false
+}

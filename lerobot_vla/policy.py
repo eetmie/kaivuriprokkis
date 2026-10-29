@@ -1,30 +1,7 @@
-"""One entry point for loading a VLA policy: the model is a bundle, not a code path.
+"""X-VLA task metadata and the single-policy loader for this Python project.
 
-`run_inference` drives whatever `make_policy` returns, and both architectures
-expose the same three things:
-
-    policy.sample_actions(image_hwc_uint8, task, state) -> (chunk_size, action_dim)
-    policy.chunk_size
-    policy.action_dim
-
-Which architecture loads is **detected from the bundle**, not selected with a
-flag. That follows the rule the rest of this loop already works by: a checkpoint
-is the single biggest thing deciding what the machine does, so it is named out
-loud on the command line — and everything else about it (its task phrasing, its
-control rate, its normalization, and now its architecture) is a property *of that
-checkpoint*, read from what it ships. An `--arch` flag would only add a way for
-the operator to contradict the bundle.
-
-    X-VLA   <split-dir>/bundle.json
-    SmolVLA <split-dir>/export_info.json + smolvlm_vision.onnx
-
-**Only one policy per process.** Measured on this board on 2026-08-31: X-VLA's
-twelve engines sit at 5.47 GB resident with the D435i reader and the 100 Hz
-control thread beside them, against 7.4 GB total — an available floor of 1.48 GB.
-SmolVLA's nine engines (2.2 GB with the same robot stack) do not fit in what is
-left. So switching models is a restart, not a runtime toggle, and constructing a
-second policy in one process raises here rather than being discovered as an OOM
-part-way through a --live run.
+Models are explicit bundles. Keep one policy per process and restart to change
+models, so a model replacement cannot overlap GPU allocations during robot use.
 """
 
 from __future__ import annotations
@@ -96,7 +73,7 @@ def warn_off_bundle(explicit: list[str], recorded: list[str], where: str) -> Non
 
 
 def detect_architecture(split_dir: str | Path) -> str:
-    """"smolvla" or "xvla", from what the bundle ships. Refuses to guess."""
+    """Recognize an X-VLA bundle and reject incompatible export formats."""
     split_dir = Path(split_dir)
     if not split_dir.is_dir():
         raise SystemExit(f"--split-dir {split_dir} does not exist.")
@@ -113,12 +90,8 @@ def detect_architecture(split_dir: str | Path) -> str:
     if is_xvla:
         return "xvla"
     if is_smolvla:
-        return "smolvla"
-    raise SystemExit(
-        f"{split_dir} is not a recognisable export bundle: it has neither "
-        f"bundle.json (X-VLA) nor export_info.json / smolvlm_vision.onnx "
-        f"(SmolVLA).\nPoint --split-dir at an export bundle, e.g. "
-        f"lerobot_vla/model/smolvla-digging-clean-ir12-35k.")
+        raise SystemExit("This Python project runs X-VLA bundles only; expected bundle.json.")
+    raise SystemExit(f"{split_dir} is not an X-VLA bundle: bundle.json is missing.")
 
 
 def make_policy(architecture: str, split_dir: str | Path, **kwargs):
@@ -130,16 +103,9 @@ def make_policy(architecture: str, split_dir: str | Path, **kwargs):
     """
     global _LOADED
     if _LOADED is not None:
-        raise RuntimeError(
-            f"A {_LOADED} policy is already loaded in this process and a "
-            f"{architecture} one was requested. The two do not fit in 8 GB "
-            f"together (see the module docstring) — switching models is a "
-            f"restart, not a runtime toggle.")
+        raise RuntimeError(f"A {_LOADED} policy is already loaded; switch models with a restart.")
 
-    if architecture == "smolvla":
-        from lerobot_vla.runtime.smolvla import SmolVLASplitPolicy
-        policy = SmolVLASplitPolicy(split_dir=str(split_dir), **kwargs)
-    elif architecture == "xvla":
+    if architecture == "xvla":
         from lerobot_vla.runtime.xvla import XVLAExcavatorPolicy
         policy = XVLAExcavatorPolicy(split_dir=split_dir, **kwargs)
     else:

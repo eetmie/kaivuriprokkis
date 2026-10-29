@@ -72,8 +72,9 @@ class TestDetectArchitecture(BundleTestCase):
     def test_xvla_bundle_detected(self):
         self.assertEqual(policy_mod.detect_architecture(self.write_xvla()), "xvla")
 
-    def test_smolvla_bundle_detected(self):
-        self.assertEqual(policy_mod.detect_architecture(self.write_smolvla()), "smolvla")
+    def test_smolvla_bundle_refused_in_xvla_project(self):
+        with self.assertRaises(SystemExit):
+            policy_mod.detect_architecture(self.write_smolvla())
 
     def test_both_markers_is_ambiguous_rather_than_first_match(self):
         d = self.write_xvla()
@@ -212,11 +213,10 @@ class TestOnePolicyPerProcess(unittest.TestCase):
         self.addCleanup(setattr, policy_mod, "_LOADED", self._prev)
 
     def test_second_policy_in_one_process_is_refused(self):
-        # X-VLA is 5.5 GB resident with the robot stack; SmolVLA's 2.2 GB does not
-        # fit in what is left of 7.4 GB. Better a clear error than an OOM mid-run.
+        # Changing models should restart instead of overlapping GPU allocations.
         policy_mod._LOADED = "xvla"
         with self.assertRaises(RuntimeError) as ctx:
-            policy_mod.make_policy("smolvla", "/nonexistent")
+            policy_mod.make_policy("xvla", "/nonexistent")
         self.assertIn("restart", str(ctx.exception))
 
 

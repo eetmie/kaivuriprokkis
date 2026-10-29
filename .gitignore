@@ -246,3 +246,10 @@ lerobot_vla/model/
 data_collection/coverage_plots/
 .venv-lerobot061/
 .venv-rerun/
+
+# Generated X-VLA runtime caches and diagnostic recordings
+.deps/
+**/trt_native_cache/
+results/**/camera-only-test-dataset/
+results/**/robot-neutral-test-dataset/
+results/**/analytic-two-view/

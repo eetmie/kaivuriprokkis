@@ -7,11 +7,10 @@ Observation:
     observation.state          float32[N]  joint angles, degrees. Defaults to
                                            [lift, tilt, scoop] — slew is left out,
                                            see DEFAULT_STATE_JOINTS below
-    observation.images.cam1    uint8 HxWx3 infrared left imager, emitter off
-    observation.images.cam2    uint8 HxWx3 color imager — only when the camera
-                                           config sets enable_color
+    observation.images.cam1    uint8 HxWx3 wrist IR2, rotated 180 degrees, emitter off
+    observation.images.cam2    uint8 HxWx3 cabin IR1 — when enable_cam2 is set
 
-    img_ts / rgb_ts            float       perf_counter when the camera thread
+    img_ts / cam2_ts            float       perf_counter when the camera thread
                                            stored that frame
     state_ts / imu_device_us   float, int  perf_counter when the IMU frame behind
                                            observation.state was read, and that
@@ -85,8 +84,8 @@ def action_names(enable_tracks: bool) -> list[str]:
     """
     return JOINT_NAMES + TRACK_NAMES if enable_tracks else list(JOINT_NAMES)
 
-CAMERA_KEY = "observation.images.cam1"          # D435i infrared left imager
-CAMERA_KEY_RGB = "observation.images.cam2"      # D435i color imager (optional)
+CAMERA_KEY = "observation.images.cam1"          # wrist IR2
+CAMERA_KEY_CAM2 = "observation.images.cam2"      # cabin IR1 (optional)
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 
@@ -207,7 +206,7 @@ class MasiExcavator:
 
         if start_camera:
             print("[robot] Starting IR camera (emitter off)"
-                  + (" + RGB camera..." if self.camera.color_enabled else "..."))
+                  + (" + cabin IR camera..." if self.camera.second_enabled else "..."))
             self.camera.start()
             self.camera.wait_for_frame()
 
@@ -271,9 +270,9 @@ class MasiExcavator:
         return angles[self._state_idx], state_ts, imu_us
 
     @property
-    def has_color(self) -> bool:
-        """Whether cam2 (the RGB imager) is part of the observation."""
-        return self.camera.color_enabled
+    def has_cam2(self) -> bool:
+        """Whether cam2 (the cabin IR imager) is part of the observation."""
+        return self.camera.second_enabled
 
     def wait_for_next_frame(self, after_ts: float, timeout_s: float) -> float:
         """Block until the camera publishes a frame newer than ``after_ts``.
@@ -286,7 +285,7 @@ class MasiExcavator:
         return self.camera.wait_for_next(after_ts, timeout_s)
 
     def get_observation(self) -> dict:
-        img, img_ts = self.camera.get_latest()
+        img, img_ts, cam2, cam2_ts = self.camera.get_frames()
         state, state_ts, imu_us = self.get_state()
         # The *_ts entries are capture clocks, not observation channels: the
         # camera runs its own thread behind a latest-frame cache and the joint
@@ -299,12 +298,9 @@ class MasiExcavator:
             "state_ts": state_ts,
             "imu_device_us": imu_us,
         }
-        if self.has_color:
-            # Same pipeline as cam1, so the pair shares a capture instant; the
-            # separate timestamp is still reported for drop diagnosis.
-            rgb, rgb_ts = self.camera.get_latest_color()
-            obs[CAMERA_KEY_RGB] = rgb
-            obs["rgb_ts"] = rgb_ts
+        if self.has_cam2:
+            obs[CAMERA_KEY_CAM2] = cam2
+            obs["cam2_ts"] = cam2_ts
         return obs
 
     def send_action(self, action: np.ndarray) -> np.ndarray:

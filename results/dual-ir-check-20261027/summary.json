@@ -1,0 +1,63 @@
+{
+  "purpose": "Camera and encoder test only. State/actions are dummy zeros; no robot controller is opened.",
+  "episodes": [
+    {
+      "frames": 901,
+      "elapsed_s": 30.025266749000366,
+      "fps": 30.008059796171406,
+      "skipped_repeated_pairs": 1,
+      "add_ms_p50_p99_max": [
+        0.3658989990071859,
+        0.6231539991858881,
+        3.3221129997400567
+      ],
+      "pair_skew_ms_max": 20.55413499874703,
+      "cam1_gap_ms_max": 66.80219800000486
+    },
+    {
+      "frames": 302,
+      "elapsed_s": 10.026182618999883,
+      "fps": 30.12113497989773,
+      "skipped_repeated_pairs": 0,
+      "add_ms_p50_p99_max": [
+        0.39471499985666014,
+        0.5229273100303546,
+        3.150459999233135
+      ],
+      "pair_skew_ms_max": 20.418931999302004,
+      "cam1_gap_ms_max": 33.78658600013296
+    }
+  ],
+  "videos": [
+    {
+      "path": "videos/observation.images.cam1/chunk-000/file-001.mp4",
+      "codec": "h264",
+      "frames": 302,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "path": "videos/observation.images.cam1/chunk-000/file-000.mp4",
+      "codec": "h264",
+      "frames": 901,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "path": "videos/observation.images.cam2/chunk-000/file-001.mp4",
+      "codec": "h264",
+      "frames": 302,
+      "width": 640,
+      "height": 480
+    },
+    {
+      "path": "videos/observation.images.cam2/chunk-000/file-000.mp4",
+      "codec": "h264",
+      "frames": 901,
+      "width": 640,
+      "height": 480
+    }
+  ],
+  "status": "passed",
+  "parquet_frames": 1203
+}

@@ -2,13 +2,12 @@
 """LeRobot dataset collection for the MASI excavator (gamepad teleop).
 
 Drives the valves open-loop from a local gamepad while recording synchronized
-episodes into the LeRobot v3 dataset format (lerobot 0.5.1 — the same version
-pinned on the DGX Spark finetune side).
+episodes into the LeRobot v3 dataset format (lerobot 0.6.1).
 
 Per frame (at --fps, default 30):
     observation.state        float32[4]  joint angles [slew, lift, tilt, scoop] deg
-    observation.images.cam1  uint8 480x640x3  D435i infrared left imager (emitter OFF)
-    observation.images.cam2  uint8 480x640x3  D435i color imager
+    observation.images.cam1  uint8 480x640x3  wrist D435i IR2, rotated 180 degrees (emitter OFF)
+    observation.images.cam2  uint8 480x640x3  cabin D435i IR1 (emitter OFF)
     action                   float32[4]  normalized valve cmds actually sent [-1,1]
                                          [slew, lift, tilt, scoop], or float32[6]
                                          with [trackL, trackR] appended under
@@ -27,10 +26,10 @@ sit behind latest-value caches this loop samples at its own rate. Without these
 a repeated frame, a late tick and a clean recording all look identical
 afterwards. Training ignores them: policies select their features by name.
 
-Both imagers are always recorded, off one RealSense pipeline, so a cam1/cam2
-pair shares a capture instant. They are separate sensors with separate exposure
-controls: --exposure-ir and --exposure-rgb. Drop whichever camera a given
-training run does not want when deriving its dataset, not at record time.
+Both IR devices are recorded on independent acquisition threads. They are NOT
+hardware synchronized; clock.cam1_age and clock.cam2_age preserve host arrival
+ages. Stale frames and repeated cam2 frames are skipped. Camera identities and
+orientation are saved in meta/camera_config.json and checked on explicit --resume.
 
 This loop runs at --fps because that is the dataset frame rate. It does NOT
 drive the valves at that rate: the recorded action is handed to
@@ -79,10 +78,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from lerobot_vla.excavator_robot import (
-    ACTION_KEY, CAMERA_KEY, CAMERA_KEY_RGB, DEFAULT_STATE_JOINTS,
+    ACTION_KEY, CAMERA_KEY, CAMERA_KEY_CAM2, DEFAULT_STATE_JOINTS,
     JOINT_NAMES, STATE_KEY, MasiExcavator, action_names,
 )
-from lerobot_vla.camera import CameraConfig
+from lerobot_vla.camera import add_camera_arguments, config_from_args, check_frames
+from dataclasses import asdict
+import json
 from lerobot_vla.gamepad import (
     BTN_A, BTN_B, BTN_X, BTN_Y, LocalGamepadInput,
 )
@@ -114,7 +115,7 @@ def clock_fields(obs: dict, tick: float, ep_perf0: float) -> dict:
     return {
         CLOCK_LOOP: np.array([tick - ep_perf0], dtype=np.float64),
         CLOCK_CAM1_AGE: np.array([age(obs.get("img_ts"))], dtype=np.float32),
-        CLOCK_CAM2_AGE: np.array([age(obs.get("rgb_ts"))], dtype=np.float32),
+        CLOCK_CAM2_AGE: np.array([age(obs.get("cam2_ts", obs.get("rgb_ts")))], dtype=np.float32),
         CLOCK_STATE_AGE: np.array([age(obs.get("state_ts"))], dtype=np.float32),
         CLOCK_IMU_US: np.array([-1 if imu_us is None else int(imu_us)], dtype=np.int64),
     }
@@ -146,7 +147,7 @@ def build_features(cam_h: int, cam_w: int,
             "names": act_names,
         },
         CAMERA_KEY: dict(video),
-        CAMERA_KEY_RGB: dict(video),
+        CAMERA_KEY_CAM2: dict(video),
         CLOCK_LOOP: {"dtype": "float64", "shape": (1,), "names": None},
         CLOCK_CAM1_AGE: {"dtype": "float32", "shape": (1,), "names": None},
         CLOCK_CAM2_AGE: {"dtype": "float32", "shape": (1,), "names": None},
@@ -231,19 +232,7 @@ def main() -> int:
                         "magnetometer, so its origin is arbitrary across power "
                         "cycles. Actions stay 4-dim either way. "
                         f"Pass '{','.join(JOINT_NAMES)}' to record it anyway.")
-    # Both imagers are always recorded: they ride one pipeline, the extra cost
-    # is one video encode, and which one a policy should use is a training-time
-    # question. Drop the unwanted camera when deriving the training dataset.
-    p.add_argument("--exposure-ir", type=float, default=None,
-                   help="Lock cam1 (IR) exposure, microseconds "
-                        "(default: auto; find a value with tools/tune_exposure.py)")
-    p.add_argument("--gain-ir", type=float, default=None,
-                   help="cam1 (IR) sensor gain 16..248 (only with --exposure-ir)")
-    p.add_argument("--exposure-rgb", type=float, default=None,
-                   help="Lock cam2 (RGB) exposure, microseconds. Separate sensor "
-                        "from the IR one, so --exposure-ir does not apply to it")
-    p.add_argument("--gain-rgb", type=float, default=None,
-                   help="cam2 (RGB) sensor gain 0..128 (only with --exposure-rgb)")
+    add_camera_arguments(p)
     p.add_argument("--resume", action="store_true",
                    help="Append to an existing dataset instead of creating a new one")
     args = p.parse_args()
@@ -257,20 +246,24 @@ def main() -> int:
     print(f"[state] observation.state = {state_joints}"
           + ("" if "slew" in state_joints else "   (slew excluded: unanchored yaw)"))
 
-    cam_cfg = CameraConfig(width=640, height=480, fps=args.fps,
-                             exposure_us=args.exposure_ir, gain=args.gain_ir,
-                             enable_color=True,
-                             color_exposure_us=args.exposure_rgb,
-                             color_gain=args.gain_rgb)
-    print(f"[camera] cam1 (IR) -> {CAMERA_KEY}")
-    print(f"[camera] cam2 (RGB) -> {CAMERA_KEY_RGB}")
-    for lbl, exp, flag in (("cam1 (IR)", args.exposure_ir, "--exposure-ir"),
-                           ("cam2 (RGB)", args.exposure_rgb, "--exposure-rgb")):
-        if not exp:
-            print(f"[camera] {lbl}: AUTO exposure — lock it with {flag} "
-                  f"for consistent training data")
+    cam_cfg = config_from_args(args, fps=args.fps)
+    contract_path = root / "meta" / "camera_config.json"
+    camera_contract = {"format": "python-dual-ir-v1", **asdict(cam_cfg)}
+    # Exposure is environmental; identity, imager, orientation and size must match.
+    def invariant(contract):
+        return {k: v for k, v in contract.items()
+                if k not in {"exposure_us", "gain", "cam2_exposure_us", "cam2_gain", "warmup_frames"}}
+    if args.resume:
+        if not contract_path.is_file():
+            print("Cannot --resume: no dual-IR camera identity metadata. Use a new dataset.")
+            return 1
+        if invariant(json.loads(contract_path.read_text())) != invariant(camera_contract):
+            print("Cannot --resume: camera identities, orientation or capture settings changed.")
+            return 1
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.configs.video import RGBEncoderConfig
+    encoder = RGBEncoderConfig(vcodec="h264", crf=18, preset="veryfast")
 
     stub = unresumable_reason(root)
     if args.resume:
@@ -280,7 +273,7 @@ def main() -> int:
                 print(f"There is no episode data to lose. Remove it and record "
                       f"without --resume:\n    rm -rf {root}")
             return 1
-        dataset = LeRobotDataset.resume(args.repo_id, root=root, vcodec="h264",
+        dataset = LeRobotDataset.resume(args.repo_id, root=root, rgb_encoder=encoder,
                                         streaming_encoding=True)
         # Catch a schema change here rather than on the first add_frame. lerobot
         # validates every frame against the stored features, so appending to a
@@ -331,7 +324,7 @@ def main() -> int:
             root=root,
             robot_type=MasiExcavator.robot_type,
             use_videos=True,
-            vcodec="h264",
+            rgb_encoder=encoder,
             # Without this lerobot writes a PNG per camera per frame, on this
             # thread: measured 46 ms each, so two cameras alone blow the 33.3 ms
             # budget and the loop settles at ~14.5 Hz while still stamping
@@ -342,6 +335,9 @@ def main() -> int:
             streaming_encoding=True,
         )
         print(f"[dataset] Created {root}")
+
+    if not args.resume:
+        contract_path.write_text(json.dumps(camera_contract, indent=2) + "\n")
 
     saved_eps = dataset.meta.total_episodes
 
@@ -407,6 +403,8 @@ def main() -> int:
     # Capture time of the last frame this loop consumed. The loop paces on the
     # camera publishing a frame newer than this, rather than on its own sleep.
     last_cam_ts = 0.0
+    last_pair_ts = (0.0, 0.0)
+    pair_rejections = 0
     stalls = 0
     mask_prev = 0
     recording = False
@@ -496,7 +494,7 @@ def main() -> int:
                         ep_start = time.time()
                         ep_perf0 = time.perf_counter()
                         ep_frames = 0
-                        print(f"\n[EP] recording episode {saved_eps}...")
+                        print(f"\n[EP] recording episode {saved_eps + 1}...")
                     else:
                         stop_episode(save=True, reason="button A")
                         saved_eps += 1
@@ -523,8 +521,18 @@ def main() -> int:
                 # Every declared camera must be present in the frame, so a
                 # missing cam2 drops the whole frame rather than desynchronizing
                 # the two video streams against the parquet rows.
-                cam_keys = [CAMERA_KEY, CAMERA_KEY_RGB]
-                if all(obs.get(k) is not None for k in cam_keys):
+                cam_keys = [CAMERA_KEY, CAMERA_KEY_CAM2]
+                try:
+                    check_frames(obs, cam_keys)
+                    pair_ts = (obs["img_ts"], obs["cam2_ts"])
+                    if any(now <= before for now, before in zip(pair_ts, last_pair_ts)):
+                        raise RuntimeError("waiting for fresh frames from both IR cameras")
+                except RuntimeError as exc:
+                    pair_rejections += 1
+                    if pair_rejections % 30 == 1:
+                        print(f"\n[camera] skipped pair ({pair_rejections} total): {exc}")
+                else:
+                    last_pair_ts = pair_ts
                     frame = {
                         STATE_KEY: obs[STATE_KEY],
                         ACTION_KEY: sent,
@@ -546,7 +554,7 @@ def main() -> int:
             if now - last_status >= 5.0:
                 last_status = now
                 ja, _, _ = robot.get_joint_angles()
-                state = (f"REC ep{saved_eps} {ep_frames} frames" if recording else "idle")
+                state = (f"REC ep{saved_eps + 1} {ep_frames} frames" if recording else "idle")
                 sp = robot.get_setpoint_status()
                 # decay < 1 means this loop is not feeding setpoints fast enough
                 # and the control thread is ramping the valves down.

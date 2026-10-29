@@ -30,6 +30,12 @@ covers the observation -> new-plan-applied latency (recent maximum + --rtc-margi
 the trained maximum, so the new plan agrees with the old one where the controller switches.
 `--rtc off` runs the stock sampler on the same engines.
 
+Frame history (bundles trained with GROOT_VIDEO_DELTAS="-k,0"): the model also sees each camera k
+dataset frames earlier. The runtime keeps the vision encodes of its own earlier observations and
+feeds the one closest to k/fps old, within --history-tolerance-ms; until it has one (start-up)
+no plan is made, only the encode is stored. Manual mode keeps encoding, so A returns to a plan
+at once. `parity` takes the past frames from the fixture (`raw_past`).
+
 Exit status: 0 run finished, 130 Ctrl+C, 3 gamepad lost, 4 controller fault, 5 plan stopped
 (observation age, chunk exhausted, no first plan), 1 any other error.
 
@@ -144,10 +150,55 @@ class Prompts:
         return len(self.ids(text)) - len(self.prefix) - len(self.suffix) if self.dynamic else len(self.ids(text))
 
 
-class Policy:
-    """Bundle + engines + boundary; one current frame per camera (video_delta_indices [0])."""
+def frame_slots(bb: dict) -> tuple[int, float]:
+    """(time slots, lag s) of a bundle: video_delta_indices [0] -> (1, 0); [-k, 0] -> (2, k/fps)
+    with the dataset rate the export recorded (kaivuri.fps)."""
+    deltas = list(bb["video_delta_indices"])
+    if bb["frames"] != len(deltas) or not (deltas == [0] or (len(deltas) == 2 and deltas[0] < 0 and deltas[1] == 0)):
+        raise ValueError(f"video_delta_indices {deltas}: this runtime handles [0] and [-k, 0]")
+    if len(deltas) == 1:
+        return 1, 0.0
+    fps = (bb.get("kaivuri") or {}).get("fps")
+    if not fps:
+        raise ValueError("a frame-history bundle needs kaivuri.fps (the dataset rate)")
+    return 2, -deltas[0] / float(fps)
 
-    def __init__(self, bundle: Path, contract: dict | None, cache: Path, vla_root: Path):
+
+class HistoryFilling(RuntimeError):
+    """A two-frame bundle has no earlier encode near the lag yet; this frame was stored."""
+
+
+class History:
+    """Vision encodes of earlier observations by capture time. The past slot is the entry closest
+    to `lag_s` old; none within `tolerance_s` -> None (still filling, or a gap)."""
+
+    def __init__(self, lag_s: float, tolerance_s: float):
+        self.lag, self.tol = lag_s, tolerance_s
+        self.entries = collections.deque()      # (capture ns, encode), oldest first
+
+    def push(self, t_ns: int, enc) -> None:
+        if self.entries and t_ns <= self.entries[-1][0]:
+            return                              # same frame again: keep the first encode
+        self.entries.append((t_ns, enc))
+        # Ages only grow: an entry past lag + tolerance can never be picked again.
+        while (t_ns - self.entries[0][0]) / 1e9 > self.lag + self.tol:
+            self.entries.popleft()
+
+    def pick(self, t_ns: int):
+        """(encode, age s) of the entry closest to the lag, or None."""
+        best = min(self.entries, key=lambda e: abs((t_ns - e[0]) / 1e9 - self.lag), default=None)
+        if best is None:
+            return None
+        age = (t_ns - best[0]) / 1e9
+        return (best[1], age) if abs(age - self.lag) <= self.tol else None
+
+
+class Policy:
+    """Bundle + engines + boundary. Each camera's current frame (video_delta_indices [0]), or
+    the current frame and one k dataset frames earlier ([-k, 0])."""
+
+    def __init__(self, bundle: Path, contract: dict | None, cache: Path, vla_root: Path,
+                 history_tolerance_s: float = 0.15):
         sys.path.insert(0, str(vla_root))
         os.chdir(vla_root)      # the engine builders run `-c "from bench.vendor..."` subprocesses
         from bench.vendor import groot17_trt as g17
@@ -156,8 +207,8 @@ class Policy:
         self.g17, self.g16 = g17, g16
         self.b = g17.Bundle(bundle)
         bb = self.b.b
-        if bb["frames"] != 1 or bb["video_delta_indices"] != [0]:
-            raise ValueError("this runtime handles current-frame-only bundles")
+        self.frames, self.lag_s = frame_slots(bb)
+        self.history = History(self.lag_s, history_tolerance_s) if self.frames == 2 else None
         contract = contract or (bb.get("kaivuri") or {}).get("contract")
         if contract is None:
             raise ValueError("the bundle carries no normalization contract: pass --contract")
@@ -232,24 +283,55 @@ class Policy:
             full[0, :delay, :p.shape[1]] = p[:delay]
         return {"rtc_mask": mask, "prefix": full}
 
+    def encode(self, frames_rgb: list[np.ndarray], t: dict | None = None):
+        """One frame per camera -> the vision engines' outputs for one time slot. Adds the
+        preprocess and vision milliseconds to `t`."""
+        t0 = time.perf_counter()
+        pv = np.stack([self.b.preprocess(f) for f in frames_rgb])
+        t1 = time.perf_counter()
+        enc = self.g17.encode_frames(self.b, self.engines.run, pv)
+        if t is not None:
+            t["preprocess"] = t.get("preprocess", 0.0) + (t1 - t0) * 1e3
+            t["vision"] = t.get("vision", 0.0) + (time.perf_counter() - t1) * 1e3
+        return enc
+
+    def remember(self, frames_rgb: list[np.ndarray], capture_ns: int) -> None:
+        """Encode and store a frame for later history slots (no plan: manual mode)."""
+        if self.history is not None:
+            self.history.push(capture_ns, self.encode(frames_rgb))
+
     def infer(self, frames_rgb: list[np.ndarray], degrees: np.ndarray, noise: np.ndarray,
               timings: dict | None = None, rtc_delay: int = 0,
-              rtc_prefix: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """Valve chunk [H,A] and the raw model chunk. rtc_prefix: [>=d, A or D] model units."""
+              rtc_prefix: np.ndarray | None = None, capture_ns: int | None = None,
+              past_rgb: list[np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Valve chunk [H,A] and the raw model chunk. rtc_prefix: [>=d, A or D] model units.
+
+        Two-frame bundles: `past_rgb` gives the earlier frames (parity); otherwise the history at
+        `capture_ns` does, and this frame joins it. HistoryFilling: nothing near the lag yet."""
         if rtc_delay and not self.rtc:
             raise ValueError("this bundle has no RTC inputs")
         t = {} if timings is None else timings
         t0 = time.perf_counter()
-        pv = np.stack([self.b.preprocess(f) for f in frames_rgb])
         state = self.boundary.state(degrees, self.state_width)
-        t1 = time.perf_counter()
-        enc = self.g17.encode_frames(self.b, self.engines.run, pv)
-        t2 = time.perf_counter()
+        enc = self.encode(frames_rgb, t)
+        slots = [enc]
+        if self.frames == 2:
+            if past_rgb is not None:
+                slots = [self.encode(past_rgb, t), enc]
+            else:
+                if capture_ns is None:
+                    raise ValueError("a frame-history bundle needs the capture time")
+                got = self.history.pick(capture_ns)
+                self.history.push(capture_ns, enc)
+                if got is None:
+                    raise HistoryFilling(f"no encode {self.lag_s:.2f} s old yet")
+                slots = [got[0], enc]
+                t["history_age"] = got[1] * 1e3
         if self.rtc:
             self._rtc_feeds = self.rtc_feeds(rtc_delay, rtc_prefix)
-        model = self.g17.infer(self.b, self.engines.run, [enc], state, noise, timings=t)
+        model = self.g17.infer(self.b, self.engines.run, slots, state, noise, timings=t)
         t3 = time.perf_counter()
-        t.update(preprocess=(t1 - t0) * 1e3, vision=(t2 - t1) * 1e3, total=(t3 - t0) * 1e3)
+        t["total"] = (t3 - t0) * 1e3
         # Raw output first: the boundary clips, which would turn +-inf into valid commands.
         if model.shape != (1, self.horizon, self.width):
             raise RuntimeError(f"model chunk shape {model.shape}")
@@ -273,16 +355,22 @@ def check_fixture(pol: Policy, fx, env, min_cosine: float, max_abs: float) -> tu
     Gate per sample: cosine, and no further from FP32 than bfloat16 Gr00tPolicy (`env`)."""
     if env is not None and not np.array_equal(env["noise"], fx["noise"]):
         raise SystemExit("envelope fixture uses different inputs")
+    if pol.frames == 2 and "raw_past" not in fx.files:
+        raise SystemExit("frame-history bundle, fixture without raw_past: re-run physical_fixture.py")
+
+    def as_live(raw):
+        # The dataset decodes gray IR as identical RGB channels; the live path does too.
+        gray = all(np.array_equal(raw[v][..., 0], raw[v][..., c]) for v in range(len(raw)) for c in (1, 2))
+        return [gray_to_rgb(raw[v][..., 0]) if gray else raw[v] for v in range(len(raw))], gray
+
     rows, ok = [], True
     for i in range(len(fx["raw"])):
-        raw = fx["raw"][i]
-        # The dataset decodes gray IR as identical RGB channels; the live path does too.
-        gray_ok = all(np.array_equal(raw[v][..., 0], raw[v][..., c]) for v in range(len(raw)) for c in (1, 2))
-        frames = [gray_to_rgb(raw[v][..., 0]) if gray_ok else raw[v] for v in range(len(raw))]
+        frames, gray_ok = as_live(fx["raw"][i])
+        past = as_live(fx["raw_past"][i])[0] if pol.frames == 2 else None
         t = {}
         delay = int(fx["rtc_delay"][i]) if "rtc_delay" in fx.files else 0
         act, model = pol.infer(frames, fx["state_deg"][i], fx["noise"][i][None], t, rtc_delay=delay,
-                               rtc_prefix=fx["rtc_prefix"][i] if delay else None)
+                               rtc_prefix=fx["rtc_prefix"][i] if delay else None, past_rgb=past)
         ref = fx["actions"][i]
         d = np.abs(act - ref)
         cos = float((act.ravel() @ ref.ravel()) / (np.linalg.norm(act) * np.linalg.norm(ref)))
@@ -326,6 +414,9 @@ def parity(a) -> int:
         meta = json.loads(str(fx["meta"]))
         if meta["contract"] != pol.contract:
             raise SystemExit(f"{j['float32']}: fixture contract differs from the bundle's")
+        if meta.get("video_delta_indices", [0]) != pol.b.b["video_delta_indices"]:
+            raise SystemExit(f"{j['float32']}: fixture frames {meta.get('video_delta_indices', [0])}, "
+                             f"bundle {pol.b.b['video_delta_indices']}")
         task = j["task"] or meta["tasks"][0]
         if set(meta["tasks"]) != {task}:
             raise SystemExit(f"{j['float32']}: mixed tasks {set(meta['tasks'])}")
@@ -781,6 +872,11 @@ class Observer:
         return frames, st, min([*cams, imu]), skew, sources
 
 
+def frame_ns(sources: dict) -> int:
+    """An observation's image time for the frame history: its oldest camera frame."""
+    return min(c["ns"] for c in sources["cameras"])
+
+
 # ── RTC ─────────────────────────────────────────────────────────────────────
 
 
@@ -868,7 +964,8 @@ def write_summary(out: Path, a, chunks, sup, outcome: dict, tasks=None, extra=No
                        infer_ms=stats([r["timings_ms"]["total"] for r in inferred]),
                        camera_skew_ms=stats([r["camera_skew_ms"] for r in inferred]),
                        rtc_delay=stats([r["rtc_delay"] for r in inferred]),
-                       rtc_short=sum(r["rtc_delay"] < r["rtc_want"] for r in inferred))
+                       rtc_short=sum(r["rtc_delay"] < r["rtc_want"] for r in inferred),
+                       history_age_ms=stats([r["timings_ms"].get("history_age") for r in inferred]))
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     return summary
 
@@ -906,7 +1003,8 @@ def run_live(a) -> int:
             sock, cam_files = start_services(a, Path(tmp.name), procs)
         else:
             sock, cam_files = a.control_socket, a.camera_frame
-        pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root))
+        pol = Policy(Path(a.bundle), contract, Path(a.cache).expanduser(), Path(a.vla_root),
+                     history_tolerance_s=a.history_tolerance_ms / 1e3)
         rtc_on = bool(pol.rtc) and a.rtc != "off"
         if a.rtc == "on" and not pol.rtc:
             raise ValueError("--rtc on: this bundle has no RTC inputs")
@@ -914,6 +1012,10 @@ def run_live(a) -> int:
               f"(chunk cos {pol.fixture['reports']['chunk']['cosine']:.6f}), RTC "
               + (f"ON (max {pol.rtc_max} rows, margin {a.rtc_margin_ms:g} ms)" if rtc_on
                  else "off" + (" (--rtc off)" if pol.rtc else " (bundle has none)")), flush=True)
+        if pol.history:
+            print(f"[groot] frame history: each camera now and {pol.lag_s:.2f} s ago "
+                  f"(video_delta_indices {pol.b.b['video_delta_indices']}, "
+                  f"tolerance {a.history_tolerance_ms:g} ms)", flush=True)
         if a.task:
             pol.prompts.ids(a.task)                     # refuse an unusable --task before arming
         tasks = TaskList(pol.prompts.tasks, a.task)
@@ -941,12 +1043,20 @@ def run_live(a) -> int:
                         raise
                     time.sleep(0.005)
 
-        # Warm-up: a few inferences before arming, so the first plan's latency is known.
-        for _ in range(a.warmup):
-            frames, st, obs_ns, _, _ = observe_retry()
-            pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
-                      rng.standard_normal(pol.noise_shape).astype(np.float32))
+        # Warm-up: a few inferences before arming, so the first plan's latency is known (and a
+        # frame-history bundle starts with its history filled).
+        done, fill_end = 0, time.monotonic() + pol.lag_s + 10
+        while done < a.warmup:
+            frames, st, obs_ns, _, src = observe_retry()
+            try:
+                pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
+                          rng.standard_normal(pol.noise_shape).astype(np.float32), capture_ns=frame_ns(src))
+            except HistoryFilling:
+                if time.monotonic() > fill_end:
+                    raise RuntimeError("the frame history did not fill during the warm-up")
+                continue
             delay.add((time.monotonic_ns() - obs_ns) / 1e6)
+            done += 1
         if a.drive:
             sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew,
                              pump=a.pump, pad=pad, start_model=a.start_model, tasks=tasks,
@@ -982,6 +1092,12 @@ def run_live(a) -> int:
         n = 0
         while time.monotonic() < t_end and not (sup and sup.halt.is_set()):
             if sup and sup.mode != "model":       # manual: no inference, sticks drive
+                if pol.history:                   # keep the history warm for the switch back
+                    try:
+                        frames, _, _, _, src = observe()
+                        pol.remember([gray_to_rgb(f) for f in frames], frame_ns(src))
+                    except Incoherent:
+                        pass
                 time.sleep(0.02)
                 next_start = time.monotonic()
                 continue
@@ -1011,7 +1127,13 @@ def run_live(a) -> int:
             want = delay.want() if rtc_on else 0
             running = sup.running_plan() if sup else virtual
             d, prefix, prefix_plan = committed_rows(pol, running, t0_ns, want, fps)
-            act, model = pol.infer([gray_to_rgb(f) for f in frames], deg, noise, t, rtc_delay=d, rtc_prefix=prefix)
+            try:
+                act, model = pol.infer([gray_to_rgb(f) for f in frames], deg, noise, t, rtc_delay=d,
+                                       rtc_prefix=prefix, capture_ns=frame_ns(sources))
+            except HistoryFilling as e:           # the encode is stored; no plan from this frame
+                log.write(json.dumps({"rejected": "history filling", "detail": str(e),
+                                      "ns": time.monotonic_ns()}) + "\n")
+                continue
             done_ns = time.monotonic_ns()
             delay.add((done_ns - obs_ns) / 1e6)
             rows = np.zeros((len(act), 6), np.float32)
@@ -1040,7 +1162,8 @@ def run_live(a) -> int:
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(f"[{rec['i']:4d}] obs->plan {rec['obs_to_plan_ms']:6.1f} ms  infer {t['total']:6.1f}  "
-                  f"rtc {d:2d}/{want:2d}  deg {deg.round(1)}  now {np.round(rec['row_now'], 2)}", flush=True)
+                  + (f"past {t['history_age']:5.0f} ms  " if "history_age" in t else "")
+                  + f"rtc {d:2d}/{want:2d}  deg {deg.round(1)}  now {np.round(rec['row_now'], 2)}", flush=True)
         if sup and sup.stop_kind:
             outcome = {"kind": sup.stop_kind, "reason": sup.stop_reason}
     except KeyboardInterrupt:
@@ -1156,6 +1279,9 @@ def main():
                    help="auto: training-time RTC when the bundle has RTC inputs")
     s.add_argument("--rtc-margin-ms", type=float, default=40,
                    help="added to the recent max observation->result latency: supervisor tick + dispatch")
+    s.add_argument("--history-tolerance-ms", type=float, default=150,
+                   help="frame-history bundles: how far the past frame may sit from the trained lag "
+                        "(back-to-back inference stores one every ~250 ms)")
     a = p.parse_args()
     if a.cmd == "run" and not a.out:
         p.error("run needs --out")

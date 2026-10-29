@@ -1,4 +1,4 @@
-"""groot_live.py without hardware or GPU: raw-output gate, RTC prefix/feeds, supervisor stops and
+"""groot_live.py without hardware or GPU: raw-output gate, RTC prefix/feeds, frame history, supervisor stops and
 cleanup, observation coherence, partial service start. In-memory fakes only.
 
     python tests/groot_live_test.py native_stack
@@ -38,6 +38,7 @@ def policy(model_out, rtc_max=0):
     pol = object.__new__(gl.Policy)
     pol.boundary, pol.horizon, pol.width, pol.state_width = gl.Boundary(CONTRACT), H, D, 132
     pol.rtc, pol.rtc_max = ({"max_delay": rtc_max} if rtc_max else None), rtc_max
+    pol.frames, pol.history, pol.lag_s = 1, None, 0.0
     pol.b = SimpleNamespace(preprocess=lambda f: np.zeros((3, 4, 4), np.float32))
     pol.engines = SimpleNamespace(run=None)
     pol.g17 = SimpleNamespace(encode_frames=lambda *a: [], infer=lambda *a, **k: model_out)
@@ -54,6 +55,61 @@ for bad in (np.inf, -np.inf, np.nan):
     raises(lambda: policy(out).infer(frames, deg, noise), "non-finite")
 raises(lambda: policy(np.zeros((1, H, 4), np.float32)).infer(frames, deg, noise), "shape")
 raises(lambda: policy(ok).infer(frames, deg, noise, rtc_delay=3, rtc_prefix=np.zeros((3, 4))), "no RTC")
+
+# ── frame history (video_delta_indices [-k, 0]) ─────────────────────────────
+
+assert gl.frame_slots({"frames": 1, "video_delta_indices": [0]}) == (1, 0.0)
+assert gl.frame_slots({"frames": 2, "video_delta_indices": [-30, 0], "kaivuri": {"fps": 30}}) == (2, 1.0)
+raises(lambda: gl.frame_slots({"frames": 2, "video_delta_indices": [-30, 0]}), "kaivuri.fps")
+for bad in ([0, -30], [-30, -15], [-30, -15, 0]):
+    raises(lambda: gl.frame_slots({"frames": len(bad), "video_delta_indices": bad, "kaivuri": {"fps": 30}}),
+           "handles [0] and [-k, 0]")
+
+MS = 1_000_000
+hist = gl.History(1.0, 0.15)
+assert hist.pick(0) is None
+for k in range(0, 1300, 250):                                       # one encode every 250 ms
+    hist.push(k * MS, f"e{k}")
+hist.push(1250 * MS, "again")                                       # same frame twice: first encode kept
+assert hist.pick(2000 * MS) == ("e1000", 1.0)
+assert hist.pick(2100 * MS)[0] == "e1000" and hist.pick(2200 * MS)[0] == "e1250"
+assert hist.pick(1300 * MS)[0] == "e250"
+assert hist.pick(2500 * MS) is None                                 # nearest is 1.25 s old: outside 150 ms
+hist.push(3000 * MS, "e3000")
+assert [e for _, e in hist.entries] == ["e3000"]                    # everything older can never be picked
+
+
+def two_frame_policy():
+    pol = policy(ok)
+    pol.frames, pol.lag_s = 2, 1.0
+    pol.history = gl.History(1.0, 0.15)
+    pol.b = SimpleNamespace(preprocess=lambda f: np.full((3, 4, 4), f[0, 0, 0], np.float32))
+    pol.slots = []
+    pol.g17 = SimpleNamespace(encode_frames=lambda b, run, pv: [int(pv[0, 0, 0, 0])],
+                              infer=lambda b, run, slots, *a, **k: pol.slots.append(slots) or ok)
+    return pol
+
+
+def cams(v):
+    return [np.full((4, 4, 3), v, np.uint8)] * 2
+
+
+pol = two_frame_policy()
+raises(lambda: pol.infer(cams(1), deg, noise), "capture time")
+for k, ms in enumerate(range(0, 800, 100)):                         # start-up: stored, no plan
+    raises(lambda: pol.infer(cams(k), deg, noise, capture_ns=ms * MS), "s old yet")
+assert pol.slots == [] and len(pol.history.entries) == 8
+t = {}
+pol.infer(cams(50), deg, noise, t, capture_ns=1020 * MS)
+assert pol.slots == [[[0], [50]]] and abs(t["history_age"] - 1020) < 1e-6   # oldest first: past, now
+pol.remember(cams(60), 1100 * MS)                                    # manual mode keeps encoding
+pol.infer(cams(70), deg, noise, capture_ns=2090 * MS)
+assert pol.slots[-1] == [[60], [70]]
+pol.infer(cams(3), deg, noise, past_rgb=cams(9))                     # parity: the fixture's past frames
+assert pol.slots[-1] == [[9], [3]]
+pol1 = policy(ok)
+pol1.remember(cams(1), 0)                                            # one-frame bundles keep no history
+assert pol1.history is None
 
 # Valve <-> model units round-trip, and a clipped command maps to the bound.
 b = gl.Boundary(CONTRACT)

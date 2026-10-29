@@ -68,13 +68,20 @@ imu:
     # Production CAD (2026-10-07): liftboom IMU mounting magnitude 13.832 deg;
     # sign not yet confirmed. Keep active quaternion until sign is verified.
     boom: [0.9927048, 0.0, 0.12057, 0.0]
-    # Active correction: +0.612 deg about Y (hardware removes this rotation).
-    # Production CAD (2026-10-07): tiltboom IMU mounting magnitude 0.612 deg;
-    # Updated magnitude to CAD; retained existing positive sign (not independently verified).
-    arm: [0.999985738456, 0.0, 0.005340682122, 0.0]
+    # Active correction: -0.612 deg about Y (hardware removes this rotation).
+    # Production CAD (2026-10-07): tiltboom IMU mounting magnitude 0.612 deg.
+    # Sign verified 2026-10-21 against a plumb line: with +0.612 the arm read 88.3 deg
+    # level pitch where the side camera put its pin line at 89.2-89.5 deg; -0.612 reads 89.5.
+    arm: [0.999985738456, 0.0, -0.005340682122, 0.0]
     bucket: [1.0, 0.0, 0.0, 0.0]
 
 robot:
+  # Level frame: base-frame FK (fk_xyz_m, fk_joint_xyz_m, ...) includes the cabin IMU's
+  # roll/pitch, so it stays gravity level when the machine tilts. link_roll also adds each
+  # link's gravity roll relative to its parent IMU (hinge play; set mounting offsets first).
+  level_frame:
+    cabin_tilt: true
+    link_roll: false
   # URDF-style chain. Each joint has a fixed translation from its parent's
   # rotated frame (parent_to_joint_xyz) and a unit rotation axis. The tool
   # has a single rigid offset from the last joint's rotated frame to the
@@ -82,7 +89,7 @@ robot:
   joints:
     - name: slew
       axis: [0.0, 0.0, 1.0]
-      parent_to_joint_xyz: [0.0, 0.0, 0.07]      # ground -> slew origin
+      parent_to_joint_xyz: [0.0, 0.0, 0.1045]    # ground -> slew origin (ground touches: boom pin 169 mm above the table, hand ~170; was 0.07 until 2026-10-21)
     - name: boom
       axis: [0.0, 1.0, 0.0]
       parent_to_joint_xyz: [0.0165, 0.0, 0.0645] # slew -> boom pivot
@@ -91,11 +98,17 @@ robot:
       parent_to_joint_xyz: [0.468, 0.0, 0.0]     # boom -> arm pivot
     - name: bucket
       axis: [0.0, 1.0, 0.0]
-      parent_to_joint_xyz: [0.250, 0.0, 0.0]     # arm  -> bucket pivot
+      parent_to_joint_xyz: [0.240, 0.0, 0.0]     # arm  -> bucket pivot (hand 240 mm, side camera 237 mm; was 0.250 until 2026-10-21)
   tool:
-    # Bucket pivot -> tool tip. Combines coupler length (0.031 along bucket x)
-    # with bucket tip drop (-0.142 along bucket z).
-    parent_to_tip_xyz: [0.031, 0.0, -0.142]
+    # Bucket pivot -> contact edge (the lip's bottom edge), in the bucket IMU frame. 2026-10-21:
+    # fitted to 14 soft table touches at bucket pitch -36..+12 deg (flat to 0.63 mm rms); the
+    # plumb-line pose gave [-0.020, 0, -0.1335] to the top edge. Was [0.031, 0.0, -0.142].
+    parent_to_tip_xyz: [-0.009, 0.0, -0.1335]
+    # Cutting-lip pitch relative to the bucket frame, for IK/PID task poses [x, z, lip pitch].
+    # From the CAD/USD bucket profile (dropped 2026-10-21); its tip vector agrees with the
+    # measured one above to 3 mm, so the bucket frame matches.
+    name: bucket
+    pitch_offset_rad: 2.806488513946533
 
 pid:
   # PID controller gains for each joint

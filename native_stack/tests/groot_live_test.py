@@ -173,11 +173,19 @@ jump[:, 1] += 0.8
 assert sup.offer(jump, t1, now + 2)[0]
 time.sleep(0.15)
 assert sup.offer(rows, t1, now + 2) == (False, "not newer than the running plan", None)
+# A mode or prompt switch: the first plan after it follows the centred hold, so it is no handover
+# (comparing it with the plan from before the switch reported 0.6-1.05 "jumps" live).
+for switch in (sup.drop_plan, lambda: sup.set_mode("model")):
+    switch()
+    t2 = time.monotonic_ns()
+    assert sup.offer(jump, t2, t2)[0]
+    time.sleep(0.15)
+assert sup.is_alive(), sup.stop_reason
 sup.stop("done")
 sup.join(timeout=2)
 hand = [r for r in sup.dispatch if "jump" in r]
 assert len(hand) == 2 and max(hand[0]["jump"]) < 1e-5 and abs(max(hand[1]["jump"]) - 0.8) < 1e-4, hand
-assert sup.running_plan()[2] == 3
+assert len(sup.dispatch) == 5 and sup.running_plan()[2] == 5
 
 # ── observation coherence ────────────────────────────────────────────────────
 

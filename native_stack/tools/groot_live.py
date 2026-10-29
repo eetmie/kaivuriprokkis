@@ -524,6 +524,7 @@ class Supervisor(threading.Thread):
         with self.lock:
             self.mode = mode
             self.plan = None      # never resume a plan from before the switch
+            self._sent_plan = None  # the next plan follows the centred hold, not the old plan
             self.model_since = time.monotonic_ns()
         self.note(f"{mode.upper()}{' (' + why + ')' if why else ''}")
 
@@ -532,6 +533,7 @@ class Supervisor(threading.Thread):
         chunk observed after this moment)."""
         with self.lock:
             self.plan = None
+            self._sent_plan = None
             self.model_since = time.monotonic_ns()
 
     def running_plan(self):

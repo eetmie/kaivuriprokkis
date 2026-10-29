@@ -625,6 +625,8 @@ class Supervisor(threading.Thread):
                         elif b == BTN_X:
                             self.pump = not self.pump
                             self.note(f"pump {'ON' if self.pump else 'OFF'}")
+                        elif b == BTN_B:   # operator marker only: one successful operation
+                            self.note("success")
                         elif b in (BTN_DPAD_LEFT, BTN_DPAD_RIGHT) and self.tasks:
                             self.drop_plan()
                             self.tasks.step(1 if b == BTN_DPAD_RIGHT else -1)

@@ -328,10 +328,17 @@ import ctypes  # noqa: E402
 
 class FakePi05Lib:
     def __init__(self, robot, rc=0):
-        self.robot, self.rc, self.calls = np.asarray(robot, np.float64), rc, []
+        self.robot, self.rc, self.calls, self.prefixes = np.asarray(robot, np.float64), rc, [], []
 
-    def kvr_pi05_infer(self, h, task, angles, f0, f1, w, hgt, noise, robot, deg, timings, tokens, err, n):
+    def kvr_pi05_infer(self, h, task, angles, f0, f1, w, hgt, noise, rtc_rows, rtc_prefix, robot, deg,
+                       timings, tokens, err, n):
         self.calls.append((task, w, hgt))
+        if rtc_rows:   # what crosses the boundary: rtc_rows x robot_dim float32 at the pointer
+            buf = (ctypes.c_float * (rtc_rows * 4)).from_address(rtc_prefix)
+            self.prefixes.append((rtc_rows, np.frombuffer(buf, np.float32).reshape(rtc_rows, 4).copy()))
+        else:
+            assert rtc_prefix is None
+            self.prefixes.append((0, None))
         if self.rc:
             ctypes.memmove(err, b"task has no token head\0", 23)
             return self.rc
@@ -348,7 +355,20 @@ def pi05(robot, rc=0):
     m.horizon, m.width, m.task = 3, 32, "scoop"
     m.info = {"robot_dim": 4, "state_dim": 3}
     m._tasks = ["scoop", "rock"]
+    m.action_cols = [vo.JOINTS[n] for n in ("slew", "lift", "tilt", "scoop")]
+    m.set_action_quantiles(Q01, Q99)
     return m
+
+
+# The digging_complete_train action quantiles (slew, lift, tilt, scoop).
+Q01 = [-0.906, -1.0, -1.0, -1.0]
+Q99 = [0.761, 0.577, 1.0, 1.0]
+
+
+def unnormalize(x, q01, q99):
+    """The runtime's robot_chunk (pi05_policy.cpp unnormalize): float32 (x + 1) / 2, then float64."""
+    half = ((np.asarray(x, np.float32) + np.float32(1)) / np.float32(2)).astype(np.float64)
+    return half * (np.asarray(q99) - np.asarray(q01) + 1e-6) + np.asarray(q01)
 
 
 y8 = [np.zeros((480, 640), np.uint8)] * 2
@@ -367,6 +387,48 @@ raises(lambda: m.step(y8, {"angles_rad": [0, 0, 0]}, pnoise, {}), "four joints")
 raises(lambda: m.step(y8, status, np.zeros(5, np.float32), {}), "noise")
 raises(lambda: m.set_prompt("dig a hole"), "exported tasks")
 assert m.set_prompt("rock") == 31 and m.task == "rock"
+assert m.lib.prefixes[-1] == (0, None)                             # RTC off: no rows, NULL prefix
+
+# ── pi0.5 Mode C: units across the prefix, limits, what reaches the runtime ──
+
+# model_actions is the exact inverse of the runtime's unnormalize, beyond the quantiles too
+# (training saw unclipped actions; a clamped -1 command is not the model's -1).
+norm = np.array([[0.0, 0.0, 0.0, 0.0], [-1.0, 1.0, -1.0, 1.0], [0.37, -0.81, 0.05, -0.6],
+                 [-1.3, 1.6, 0.9, -0.2]], np.float32)
+assert np.allclose(m.model_actions(unnormalize(norm, Q01, Q99)), norm, atol=2e-7)
+assert m.model_actions([[-1.0, 1.0, 1.0, 1.0]])[0, 1] > 1.0        # lift +1 lies past q99 = 0.577
+raises(lambda: m.model_actions([[0.0, 0.0, 0.0]]), "expected")
+raises(lambda: m.set_action_quantiles([0, 0, 0, 0], [1, 1, 1, 0]), "quantiles")
+
+assert vla_pi05.Model.rtc is None and m.rtc is None and m.rtc_max == 0
+r = pi05([[0.1, 0.2, 0.3, 0.4]] * 3)
+r.rtc, r.rtc_max = {"row_time": True, "max_prefix": 20}, 20
+pre = np.arange(24, dtype=np.float32).reshape(6, 4) / 10
+r.step(y8, status, pnoise, {}, rtc_delay=5, rtc_prefix=pre)       # a longer prefix is cut to d rows
+assert r.lib.prefixes[-1][0] == 5 and np.array_equal(r.lib.prefixes[-1][1], pre[:5])
+r.step(y8, status, pnoise, {}, rtc_delay=20, rtc_prefix=np.zeros((20, 4)))
+r.step(y8, status, pnoise, {}, rtc_delay=0, rtc_prefix=pre)       # d = 0: the prefix is ignored
+assert r.lib.prefixes[-2][0] == 20 and r.lib.prefixes[-1] == (0, None)
+raises(lambda: r.step(y8, status, pnoise, {}, rtc_delay=21, rtc_prefix=np.zeros((21, 4))), "outside")
+raises(lambda: r.step(y8, status, pnoise, {}, rtc_delay=7, rtc_prefix=pre), "bad RTC prefix")
+raises(lambda: r.step(y8, status, pnoise, {}, rtc_delay=2, rtc_prefix=None), "bad RTC prefix")
+raises(lambda: r.step(y8, status, pnoise, {}, rtc_delay=2, rtc_prefix=np.zeros((2, 32))), "bad RTC prefix")
+raises(lambda: r.step(y8, status, pnoise, {}, rtc_delay=2, rtc_prefix=[[np.nan] * 4] * 2), "bad RTC prefix")
+
+# End to end through vla_live's committed_rows: a plan the runtime produced from normalized rows,
+# executed by the controller, comes back as those normalized rows (the model's own continuation).
+H50 = 50
+chunk = np.stack([np.sin(np.linspace(0, 3, H50) + k) * [0.9, 1.2, 0.8, 1.1][k] for k in range(4)], -1)
+plan = np.zeros((H50, 6), np.float32)
+plan[:, r.action_cols] = np.clip(unnormalize(chunk, Q01, Q99), -1, 1)   # as vla_pi05.step returns it
+t_old = 2_000_000_000
+d, got, pid = vl.committed_rows(r, (plan, t_old, 3), t_old + int(12 / 30.0 * 1e9), 14, 30.0)
+assert d == 14 and pid == 3 and got.shape == (14, 4) and got.dtype == np.float32
+inside = np.abs(unnormalize(chunk, Q01, Q99))[12:26] <= 1            # rows the controller did not clamp
+assert np.allclose(got[inside], chunk[12:26][inside], atol=1e-5)
+assert np.allclose(unnormalize(got, Q01, Q99), plan[12:26, :4], atol=1e-6)   # what really ran
+r.step(y8, status, pnoise, {}, rtc_delay=d, rtc_prefix=got)
+assert np.array_equal(r.lib.prefixes[-1][1], got)
 
 # ── CLI: the bundle picks the model; model-specific flags are refused for the other one ──
 

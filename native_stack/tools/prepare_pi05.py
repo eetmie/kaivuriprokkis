@@ -3,6 +3,11 @@ fixtures for C++.
 
 Build-time utility only. Use the validated VLA numpy environment; the inference
 executable does not import Python, Torch, Triton or ONNX Runtime.
+
+Mode C bundles (kaivuri.rtc.row_time) also get their clean-prefix references unpacked
+(rtc/rtc_fixture_<i>.npz -> rtc_<i>/): the noise, the anchor (d committed rows, robot dims) and
+the exporter's FP16 split outputs with RTC off and with the prefix. Each runs on its source
+fixture's images and prompt.
 """
 import argparse
 import hashlib
@@ -54,6 +59,44 @@ def state_values(fixture, info):
     }, tasks[0]
 
 
+def mode_c_fixtures(bundle, output, info, prepared):
+    """rtc/rtc_fixture_<i>.npz -> rtc_<i>/ {noise, anchor, off, clean}.npy, refusing references the
+    runtime must not be held to: a prefix that is not the anchor, or padding left on the noise
+    path (exporters before the zero-padding fix in rtc.py)."""
+    horizon, width = info["action_horizon"], info["action_dim"]
+    max_rows = info["kaivuri"]["rtc"]["max_prefix"]
+    entries = []
+    for source in sorted((bundle / "rtc").glob("rtc_fixture_*.npz")):
+        with np.load(source, allow_pickle=False) as rtc:
+            rows, dims = int(rtc["rows"]), int(rtc["dims"])
+            anchor, clean = rtc["anchor"].astype(np.float32), rtc["clean"].astype(np.float32)
+            if not 0 < rows <= max_rows or anchor.shape != (rows, dims) or clean.shape != (horizon, width):
+                raise ValueError(f"{source.name}: RTC fixture shape (rows {rows}, anchor {anchor.shape})")
+            if not np.array_equal(clean[:rows, :dims], anchor):
+                raise ValueError(f"{source.name}: the Mode C reference's prefix is not its anchor")
+            if np.any(clean[:rows, dims:]):
+                raise ValueError(f"{source.name}: the Mode C reference keeps noise in the prefix padding; "
+                                 "re-export with the zero-padding fix (rtc.py)")
+            src = f"fixture_{int(rtc['source_fixture'])}"
+            if src not in prepared:
+                raise ValueError(f"{source.name}: source fixture {src} was not prepared")
+            values = {"noise": rtc["noise"].astype(np.float32), "anchor": anchor,
+                      "off": rtc["off"].astype(np.float32), "clean": clean}
+        directory = source.stem.replace("rtc_fixture_", "rtc_")
+        target = output / directory
+        target.mkdir()
+        files = {}
+        for name, value in values.items():
+            path = target / (name + ".npy")
+            np.save(path, np.ascontiguousarray(value), allow_pickle=False)
+            files[path.name] = sha(path)
+        entries.append({"directory": directory, "file": f"rtc/{source.name}", "source": src,
+                        "rows": rows, "dims": dims, "source_sha256": sha(source), "files": files})
+    if not entries:
+        raise ValueError("Mode C bundle has no RTC fixtures (rtc/rtc_fixture_*.npz)")
+    return entries
+
+
 def prepare(bundle, output):
     bundle = bundle.resolve()
     info = json.loads((bundle / "bundle.json").read_text())
@@ -86,8 +129,11 @@ def prepare(bundle, output):
             record["fixtures"].append(entry)
     if not record["fixtures"]:
         raise ValueError("bundle has no parity fixtures")
+    if info.get("kaivuri", {}).get("rtc", {}).get("row_time"):
+        record["rtc"] = mode_c_fixtures(bundle, output, info, {f["directory"] for f in record["fixtures"]})
     (output / "manifest.json").write_text(json.dumps(record, indent=2) + "\n")
-    print(f"Verified bundle and prepared {len(record['fixtures'])} fixtures at {output}")
+    print(f"Verified bundle and prepared {len(record['fixtures'])} fixtures"
+          + (f" and {len(record['rtc'])} Mode C fixtures" if "rtc" in record else "") + f" at {output}")
 
 
 if __name__ == "__main__":

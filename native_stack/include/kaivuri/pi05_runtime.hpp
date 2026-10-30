@@ -50,6 +50,18 @@ class Runtime {
     // Two preprocessed images and [horizon][action_dim] noise -> the normalized chunk.
     std::vector<float> infer(const void *image0, const void *image1, const float *noise,
                              Timing &timing);
+    // Training-time RTC (Mode C; bundle kaivuri.rtc.row_time, action templates with per-row
+    // modulation [1, horizon, hidden]). The first `prefix_rows` rows are the committed actions:
+    // `prefix` is [prefix_rows][prefix_dims] normalized model units (the robot dims), padded
+    // with zeros to action_dim, exactly as training sees a clean row. Those rows start clean,
+    // get the t = 0 style in every step and are reset to the prefix after every Euler step, so
+    // they come back bit-exact. prefix_rows = 0 is the plain sampler on the same graph.
+    std::vector<float> infer(const void *image0, const void *image1, const float *noise,
+                             Timing &timing, int prefix_rows, const float *prefix,
+                             int prefix_dims);
+    // Mode C bundle (per-row action templates), and the most prefix rows it was trained for.
+    bool row_time() const;
+    int max_prefix() const;
 
   private:
     class Impl;

@@ -9,7 +9,7 @@ picks the model; the observation, operator, supervisor, logging and CLI are shar
 | `tools/vla_operator.py` | Xbox pad, task list, supervisor thread (arming, plan renewal, stop rules) |
 | `tools/vla_observe.py` | `--start-services`, coherent snapshot of both IR cameras + controller status |
 | `tools/vla_groot.py` | GR00T adapter: jetson-orin-nano-vla engines, min-max boundary, runtime prompts, RTC, frame history |
-| `tools/vla_pi05.py` | pi0.5 adapter: ctypes over `build/libkaivuri_pi05_runtime.so` (`src/pi05_capi.cpp`) |
+| `tools/vla_pi05.py` | pi0.5 adapter: ctypes over `build/libkaivuri_pi05_runtime.so` (`src/pi05_capi.cpp`), Mode C RTC |
 | `src/pi05_runtime.cpp` | pi0.5 TensorRT runtime, shared by the library and `kaivuri-inference` |
 
 ## Run
@@ -44,9 +44,31 @@ history, lag_s`, `describe(rtc_on, a)`, `check_prompt(text)`, `same_prompt(a, b)
 rtc_prefix, capture_ns) -> (commands [H, A] in [-1, 1], degrees)`, `keep_warm(frames_y8,
 capture_ns)` and, for RTC, `model_actions(commands)`.
 
+## pi0.5 RTC (Mode C, training-time)
+
+A `pi05_excavator_rtc` checkpoint exported with `--row-time --rtc-max-rows 20` (spark-projects
+`vla-onnx/kaivuriprokkis/export.sh`) declares `kaivuri.rtc.row_time`, and `vla_live.py run` turns RTC
+on by itself (`--rtc off` runs the plain sampler on the same engines). The d committed rows go in
+clean: normalized with the bundle's quantiles (`model_actions`), padded with zeros to the model
+width, fed the t = 0 style and reset after every Euler step, so they come back bit-exact. Two small
+TensorRT ops do this inside the CUDA graph (`op_rtc_rows`, `op_rtc_prefix`, built and self-checked at
+load); d is only buffer contents, so one graph serves every d.
+
+```bash
+~/venvs/openpi-lerobot/bin/python -B tools/prepare_pi05.py --bundle B --out B-fixtures   # + Mode C references
+$PY tools/build_pi05_cache.py --bundle B --out B.cache       # copy a same-model cache first: only action* rebuild
+$PY vla_live.py parity --bundle B --cache B.cache --fixtures B-fixtures --max-abs 0.02
+```
+
+Parity also runs the bundle's Mode C references (RTC off and d = 15, prefix exact) and refuses
+references from exporters before the zero-padding fix (spark-projects ef9bdd6). Measured
+2026-10-30 on smoke9 (`~/bundles/pi05-smoke9-rowtime`): all 10 fixtures pass, worst Mode C max
+0.0185. Step p50 437.1 ms plain, 439.9 / 440.2 / 440.7 ms at d = 0 / 15 / 20 (denoise
+109.1 -> 111.2 ms), plus ~11 MB of per-row modulation.
+
 ## Not yet
 
-- pi0.5: RTC, typed prompts (no tokenizer on the board: only the exported tasks run).
+- pi0.5: typed prompts (no tokenizer on the board: only the exported tasks run).
 - `kaivuri-inference` keeps its own C++ drive loop (`--live`); the operator features are only in
   `vla_live.py`.
 - `tools/policy_probe.py` is the older observation-only GR00T scaffold.

@@ -9,7 +9,12 @@ runs every prepared fixture (prepare_pi05.py) through the engines; any failure s
     actions  normalized chunk -> OpenPI unnormalize -> [slew, lift, tilt, scoop], clamped to [-1, 1]
 
 Tasks are the bundle's exported prompt heads; there is no tokenizer on the board, so typed
-prompts outside that list are refused. No RTC and no frame history yet.
+prompts outside that list are refused. No frame history yet.
+
+RTC is training-time Mode C, on bundles exported with --row-time (kaivuri.rtc.row_time): the d
+committed rows go in as the clean prefix, in model units (`model_actions`: OpenPI's quantile
+normalization with the bundle's own norm_stats.json, unclipped as in training), and come back
+unchanged. Loading also runs the bundle's Mode C references, with RTC off and on.
 """
 from __future__ import annotations
 
@@ -45,8 +50,9 @@ class Model:
         lib.kvr_pi05_close.argtypes = [_c.c_void_p]
         lib.kvr_pi05_info.argtypes = [_c.c_void_p, _c.c_char_p, _c.c_size_t, _c.c_char_p, _c.c_size_t]
         lib.kvr_pi05_infer.argtypes = [_c.c_void_p, _c.c_char_p, _c.c_void_p, _c.c_void_p, _c.c_void_p,
-                                       _c.c_int, _c.c_int, _c.c_void_p, _c.c_void_p, _c.c_void_p,
-                                       _c.c_void_p, _c.POINTER(_c.c_int), _c.c_char_p, _c.c_size_t]
+                                       _c.c_int, _c.c_int, _c.c_void_p, _c.c_int, _c.c_void_p,
+                                       _c.c_void_p, _c.c_void_p, _c.c_void_p, _c.POINTER(_c.c_int),
+                                       _c.c_char_p, _c.c_size_t]
         self.err = _c.create_string_buffer(_ERR)
         report = _c.create_string_buffer(1 << 20)
         t0 = time.time()
@@ -72,6 +78,18 @@ class Model:
         self.action_cols = [JOINTS[n] for n in names]
         self.task = self._tasks[0]
         self.task_tokens = 0
+        if self.info.get("row_time"):
+            self.rtc, self.rtc_max = k["rtc"], int(self.info["max_prefix"])
+        # The runtime unnormalizes with these (bundle_norm_stats, MANIFEST-checked); the prefix
+        # goes back through the inverse.
+        q = json.loads((Path(bundle) / "norm_stats.json").read_text())["norm_stats"]["actions"]
+        self.set_action_quantiles(q["q01"], q["q99"])
+
+    def set_action_quantiles(self, q01, q99):
+        r = self.info["robot_dim"]
+        self._q01, self._q99 = (np.asarray(v, np.float64)[:r] for v in (q01, q99))
+        if self._q01.shape != (r,) or self._q99.shape != (r,) or not (self._q99 > self._q01).all():
+            raise ValueError("norm_stats.json action quantiles do not cover the robot dims")
 
     def _check(self, rc: int):
         if rc:
@@ -106,19 +124,40 @@ class Model:
 
     def describe(self, rtc_on: bool, a) -> str:
         worst = min(self.parity, key=lambda r: r["fp16"]["cosine"])
-        return (f"[pi05] engines ready in {self.load_s} s, {len(self.parity)} fixtures PASS (worst cos "
-                f"{worst['fp16']['cosine']:.6f}, max {max(r['fp16']['max_abs'] for r in self.parity):.4f}), "
-                f"RTC off (not wired for pi0.5 yet)")
+        modes = sum(r.get("mode") == "C" for r in self.parity)
+        rtc = (f"RTC ON (Mode C, max {self.rtc_max} rows, margin {a.rtc_margin_ms:g} ms)" if rtc_on
+               else "RTC off" + (" (--rtc off)" if self.rtc else " (bundle has no row-time templates)"))
+        return (f"[pi05] engines ready in {self.load_s} s, {len(self.parity)} fixtures PASS"
+                + (f" ({modes} Mode C)" if modes else "")
+                + f" (worst cos {worst['fp16']['cosine']:.6f}, "
+                f"max {max(r['fp16']['max_abs'] for r in self.parity):.4f}), {rtc}")
 
-    def model_actions(self, valves):
-        raise NotImplementedError("pi0.5 RTC is not wired yet")
+    def model_actions(self, valves) -> np.ndarray:
+        """[N, robot_dim] commands -> normalized model units: OpenPI's quantile Normalize,
+        (x - q01) / (q99 - q01 + 1e-6) * 2 - 1, the inverse of the runtime's unnormalize.
+        Not clipped: training saw the dataset's actions unclipped too."""
+        x = np.asarray(valves, np.float64)
+        if x.ndim != 2 or x.shape[1] != len(self._q01):
+            raise ValueError(f"valves {x.shape}, expected [N, {len(self._q01)}]")
+        return ((x - self._q01) / (self._q99 - self._q01 + 1e-6) * 2.0 - 1.0).astype(np.float32)
 
     def step(self, frames_y8: list[np.ndarray], status: dict, noise: np.ndarray, timings: dict,
              rtc_delay: int = 0, rtc_prefix=None, capture_ns=None) -> tuple[np.ndarray, np.ndarray]:
         """IR frames + controller status -> ([H, robot_dim] commands in [-1, 1], the degrees used).
-        Out-of-range commands are clamped (the controller clamps too) and counted."""
-        if rtc_delay:
-            raise ValueError("pi0.5 RTC is not wired yet")
+        Out-of-range commands are clamped (the controller clamps too) and counted.
+        rtc_delay d > 0: rtc_prefix [>= d, robot_dim] model units (`model_actions`) for the d
+        committed rows (Mode C)."""
+        rows, prefix = int(rtc_delay), None
+        if rows:
+            if not self.rtc:
+                raise ValueError("RTC delay given, but this pi0.5 bundle has no row-time templates")
+            if not 0 < rows <= self.rtc_max:
+                raise ValueError(f"RTC delay {rows} outside [0, {self.rtc_max}]")
+            p = np.asarray(rtc_prefix, np.float32) if rtc_prefix is not None else None
+            if p is None or p.ndim != 2 or p.shape[0] < rows or p.shape[1] != self.info["robot_dim"] \
+                    or not np.isfinite(p[:rows]).all():
+                raise ValueError(f"bad RTC prefix {None if p is None else p.shape} for d = {rows}")
+            prefix = np.ascontiguousarray(p[:rows])
         f0, f1 = (np.ascontiguousarray(f, np.uint8) for f in frames_y8)
         if f0.shape != f1.shape or f0.ndim != 2:
             raise ValueError("two Y8 frames of one size required")
@@ -134,7 +173,8 @@ class Model:
         tokens = _c.c_int(0)
         self._check(self.lib.kvr_pi05_infer(
             self.h, self.task.encode(), angles.ctypes.data, f0.ctypes.data, f1.ctypes.data,
-            f0.shape[1], f0.shape[0], noise.ctypes.data, robot.ctypes.data, deg.ctypes.data,
+            f0.shape[1], f0.shape[0], noise.ctypes.data, rows,
+            prefix.ctypes.data if prefix is not None else None, robot.ctypes.data, deg.ctypes.data,
             t.ctypes.data, _c.byref(tokens), self.err, _ERR))
         self.task_tokens = tokens.value
         if not np.isfinite(robot).all():
@@ -161,8 +201,11 @@ def parity(a) -> int:
     m = Model(Path(a.bundle), Path(a.cache), Path(a.fixtures) if a.fixtures else None, Path(a.build),
               a.min_cosine, a.max_abs)
     for r in m.parity:
-        print(f"PASS {r['fixture']} {r.get('task', '')!r}: cos {r['fp16']['cosine']:.6f} "
-              f"max {r['fp16']['max_abs']:.4f}  prompt {r.get('prompt_tokens')} tokens", flush=True)
+        what = (f"Mode C d={r['rows']} on {r['source']} (RTC off: cos {r['off']['cosine']:.6f} "
+                f"max {r['off']['max_abs']:.4f}), prefix exact" if r.get("mode") == "C"
+                else f"{r.get('task', '')!r}, prompt {r.get('prompt_tokens')} tokens")
+        print(f"PASS {r['fixture']}: cos {r['fp16']['cosine']:.6f} max {r['fp16']['max_abs']:.4f}  {what}",
+              flush=True)
     summary = {"status": "PASS", "model": "pi05", "load_s": m.load_s, "fixtures": m.parity}
     if a.out:
         Path(a.out).write_text(json.dumps(summary, indent=1) + "\n")

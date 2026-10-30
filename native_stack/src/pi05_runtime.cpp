@@ -205,6 +205,16 @@ class Runtime::Impl {
     std::vector<int64_t> current_tokens;
     bool graph_enabled, capturing = false, primed = false, native = false;
     std::string euler, policy;
+    // Mode C (training-time RTC). Per step, op_rows writes every site's per-row modulation
+    // into `mods` ([sites][horizon][hidden]: the t = 0 style on rows < d, the step's style
+    // below), and op_prefix resets rows < d of the Euler result to `anchor`. d lives only in
+    // the `rtc_mask` contents ([1][horizon][1], 1 on prefix rows), uploaded every inference,
+    // so one captured graph serves every d, including 0.
+    bool row_time_ = false;
+    int max_rows = 0;
+    size_t mod_bytes = 0; // one site's [1][horizon][hidden] FP16 block
+    Buffer *clean{}, *rtc_mask{}, *anchor{}, *mods{}, *stepped{};
+    const std::string op_rows = "op_rtc_rows", op_prefix = "op_rtc_prefix";
     Buffer *make(std::vector<int64_t> shape, DataType type) {
         storage.push_back(std::make_unique<Buffer>(std::move(shape), type));
         return storage.back().get();
@@ -293,6 +303,15 @@ class Runtime::Impl {
             auto style = [&](int site) {
                 return offset(styles, (s * style_sites + site) * style_row_bytes);
             };
+            // Mode C: this step's per-row modulation, one [1][horizon][hidden] block per site.
+            if (row_time_)
+                run(op_rows, {{"step", style(0)},
+                              {"clean", clean->ptr},
+                              {"mask", rtc_mask->ptr},
+                              {"out", mods->ptr}});
+            auto mod = [&](int site) {
+                return row_time_ ? offset(mods, size_t(site) * mod_bytes) : style(site);
+            };
             run("action_input", {{"actions", actions[s % 2]->ptr}, {"hidden", expert[0]->ptr}});
             for (int i = 0; i < action_layers; ++i)
                 run(layer("action", i), {{"hidden", expert[i % 2]->ptr},
@@ -302,14 +321,22 @@ class Runtime::Impl {
                                          {"sin", s_sin->ptr},
                                          {"prefix_k", kv[i].first->ptr},
                                          {"prefix_v", kv[i].second->ptr},
-                                         {"mod_in", style(2 * i)},
-                                         {"mod_post", style(2 * i + 1)}});
+                                         {"mod_in", mod(2 * i)},
+                                         {"mod_post", mod(2 * i + 1)}});
             run("action_output", {{"hidden", expert[action_layers % 2]->ptr},
-                                  {"mod_final", style(style_sites - 1)},
+                                  {"mod_final", mod(style_sites - 1)},
                                   {"velocity", velocity->ptr}});
-            run(euler, {{"a", actions[s % 2]->ptr},
-                        {"b", velocity->ptr},
-                        {"out", actions[(s + 1) % 2]->ptr}});
+            if (row_time_) {
+                // Euler into `stepped`, then the prefix rows back to the committed actions.
+                run(euler, {{"a", actions[s % 2]->ptr}, {"b", velocity->ptr}, {"out", stepped->ptr}});
+                run(op_prefix, {{"x", stepped->ptr},
+                                {"anchor", anchor->ptr},
+                                {"mask", rtc_mask->ptr},
+                                {"out", actions[(s + 1) % 2]->ptr}});
+            } else
+                run(euler, {{"a", actions[s % 2]->ptr},
+                            {"b", velocity->ptr},
+                            {"out", actions[(s + 1) % 2]->ptr}});
         }
         record(3);
     }
@@ -336,6 +363,93 @@ class Runtime::Impl {
         require(plan && plan->size(), "axpy op build failed");
         auto bytes = static_cast<const char *>(plan->data());
         return std::vector<char>(bytes, bytes + plan->size());
+    }
+
+    static Dims dims3(int64_t a, int64_t b, int64_t c) {
+        Dims d{};
+        d.nbDims = 3;
+        d.d[0] = a, d.d[1] = b, d.d[2] = c;
+        return d;
+    }
+    // Mode C op: out = (mask > 0.5) ? then : otherwise, broadcast over the three inputs. A
+    // select only copies, so every output element is bit-identical to its source.
+    std::vector<char> build_select(const std::string &what, const char *then_name,
+                                   const char *else_name, DataType type, const Dims &then_shape,
+                                   const Dims &else_shape, const Dims &mask_shape) {
+        std::cerr << "[load] building the Mode C " << what << " op\n";
+        std::unique_ptr<IBuilder> builder(createInferBuilder(logger));
+        require(bool(builder), "TensorRT builder");
+        std::unique_ptr<INetworkDefinition> net(
+            builder->createNetworkV2(1U << int(NetworkDefinitionCreationFlag::kSTRONGLY_TYPED)));
+        auto then_in = net->addInput(then_name, type, then_shape);
+        auto else_in = net->addInput(else_name, type, else_shape);
+        auto mask = net->addInput("mask", DataType::kFLOAT, mask_shape);
+        static const float half = 0.5f;
+        require(then_in && else_in && mask, what + " op: inputs");
+        auto k = net->addConstant(dims3(1, 1, 1), Weights{DataType::kFLOAT, &half, 1});
+        require(k != nullptr, what + " op: constant");
+        auto cond = net->addElementWise(*mask, *k->getOutput(0), ElementWiseOperation::kGREATER);
+        require(cond != nullptr, what + " op: comparison");
+        auto select = net->addSelect(*cond->getOutput(0), *then_in, *else_in);
+        require(select != nullptr, what + " op: select");
+        select->getOutput(0)->setName("out");
+        net->markOutput(*select->getOutput(0));
+        std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());
+        std::unique_ptr<IHostMemory> plan(builder->buildSerializedNetwork(*net, *config));
+        require(plan && plan->size(), what + " op build failed");
+        auto bytes = static_cast<const char *>(plan->data());
+        return std::vector<char>(bytes, bytes + plan->size());
+    }
+    void download(Buffer *buffer) {
+        ck(cudaMemcpyAsync(buffer->staging(), buffer->ptr, buffer->bytes, cudaMemcpyDeviceToHost,
+                           stream),
+           "download");
+        ck(cudaStreamSynchronize(stream), "download synchronize");
+    }
+    // Load-time check of the Mode C ops on this device: op_rows takes the clean table on mask
+    // rows and the step's styles elsewhere, op_prefix the anchor on mask rows and x elsewhere,
+    // all bit for bit. Leaves the mask and anchor zero (d = 0).
+    void check_rtc_ops(const Npy &clean_table) {
+        const int n = noise_count();
+        float *m = staged<float>(rtc_mask, size_t(horizon));
+        std::fill(m, m + horizon, 0.f);
+        m[0] = m[2] = 1.f;
+        push(rtc_mask);
+        run(op_rows,
+            {{"step", styles->ptr}, {"clean", clean->ptr}, {"mask", rtc_mask->ptr}, {"out", mods->ptr}});
+        download(mods);
+        const size_t row = style_row_bytes;
+        auto out = static_cast<const uint8_t *>(mods->host);
+        for (int site = 0; site < style_sites; ++site)
+            for (int r = 0; r < horizon; ++r) {
+                const uint8_t *want = (r == 0 || r == 2) ? clean_table.data + site * row
+                                                         : conditioning.data + site * row;
+                require(std::memcmp(out + site * mod_bytes + r * row, want, row) == 0,
+                        "Mode C row-style op picked the wrong source at site " +
+                            std::to_string(site) + ", row " + std::to_string(r));
+            }
+        float *x = staged<float>(stepped, size_t(n)), *a = staged<float>(anchor, size_t(n));
+        for (int i = 0; i < n; ++i)
+            x[i] = float(i) + .25f, a[i] = -float(i) - .5f;
+        push(stepped);
+        push(anchor);
+        run(op_prefix, {{"x", stepped->ptr},
+                        {"anchor", anchor->ptr},
+                        {"mask", rtc_mask->ptr},
+                        {"out", actions[1]->ptr}});
+        download(actions[1]);
+        auto y = static_cast<const float *>(actions[1]->host);
+        for (int i = 0; i < n; ++i) {
+            const int r = i / width;
+            const float want = (r == 0 || r == 2) ? a[i] : x[i];
+            require(std::memcmp(&y[i], &want, 4) == 0,
+                    "Mode C prefix op picked the wrong source at row " + std::to_string(r));
+        }
+        std::fill(m, m + horizon, 0.f);
+        std::fill(a, a + n, 0.f);
+        push(rtc_mask);
+        push(anchor);
+        ck(cudaStreamSynchronize(stream), "Mode C op check");
     }
 
   public:
@@ -474,6 +588,53 @@ class Runtime::Impl {
             engines[euler].engine = std::move(engine);
         }
         require(!euler.empty(), "no cached Euler op matches the action shape");
+        // Mode C: kaivuri.rtc.row_time must agree with what the action templates take, one
+        // modulation row (broadcast) or one per action row, at every modulation input.
+        const YAML::Node &meta = info;
+        const YAML::Node rtc_meta = meta["kaivuri"] ? meta["kaivuri"]["rtc"] : YAML::Node();
+        row_time_ = rtc_meta && value_or(rtc_meta["row_time"], false);
+        require(conditioning.shape.size() == 3, "conditioning contract");
+        const int64_t hidden = conditioning.shape[2], sites = conditioning.shape[1];
+        const int64_t mod_rows = row_time_ ? horizon : 1;
+        auto check_modulation = [&](const std::string &engine, const char *tensor) {
+            auto d = engines.at(engine).engine->getTensorShape(tensor);
+            require(d.nbDims == 3 && d.d[0] == 1 && d.d[2] == hidden,
+                    "modulation input " + engine + "/" + tensor);
+            require(d.d[1] == mod_rows,
+                    row_time_ ? "the bundle declares kaivuri.rtc.row_time, but " + engine + "/" +
+                                    tensor + " takes one modulation row (re-export with --row-time)"
+                              : engine + "/" + tensor +
+                                    " takes per-row modulation, but the bundle does not declare "
+                                    "kaivuri.rtc.row_time");
+        };
+        for (int i = 0; i < action_layers; ++i) {
+            check_modulation(layer("action", i), "mod_in");
+            check_modulation(layer("action", i), "mod_post");
+        }
+        check_modulation("action_output", "mod_final");
+        if (row_time_) {
+            max_rows = rtc_meta["max_prefix"].as<int>();
+            require(max_rows > 0 && max_rows < horizon, "kaivuri.rtc.max_prefix outside (0, horizon)");
+            require(action_shape.nbDims == 3 && action_shape.d[0] == 1 &&
+                        action_shape.d[1] == horizon && action_shape.d[2] == width,
+                    "action buffer is not [1][horizon][action_dim]");
+            const auto mask_shape = dims3(1, horizon, 1);
+            auto add_op = [&](const std::string &name, std::vector<char> plan) {
+                std::unique_ptr<ICudaEngine> engine(
+                    runtime->deserializeCudaEngine(plan.data(), plan.size()));
+                require(bool(engine), "cannot deserialize " + name);
+                scratch_bytes = std::max(scratch_bytes, size_t(engine->getDeviceMemorySizeV2()));
+                engines[name].engine = std::move(engine);
+            };
+            add_op(op_rows, build_select("row-style", "clean", "step", DataType::kHALF,
+                                         dims3(sites, 1, hidden), dims3(sites, 1, hidden),
+                                         mask_shape));
+            add_op(op_prefix, build_select("prefix", "anchor", "x", DataType::kFLOAT, action_shape,
+                                           action_shape, mask_shape));
+            const auto out = engines.at(op_rows).engine->getTensorShape("out");
+            require(out.nbDims == 3 && out.d[0] == sites && out.d[1] == horizon && out.d[2] == hidden,
+                    "Mode C row-style op output shape");
+        }
         scratch = std::make_unique<Buffer>(
             std::vector<int64_t>{int64_t(std::max(size_t(1), scratch_bytes))}, DataType::kUINT8);
         for (auto &entry : engines) {
@@ -535,6 +696,23 @@ class Runtime::Impl {
         auto check = static_cast<const float *>(actions[1]->host);
         for (int i = 0; i < noise_count(); ++i)
             require(check[i] == euler_dt, "Euler op constant is not -1/num_steps");
+        if (row_time_) {
+            // The t = 0 style table, [sites][hidden] FP16, as the exporter computed it.
+            const Npy clean_table(bundle / rtc_meta["style_clean"].as<std::string>());
+            require(clean_table.dtype == "<f2" &&
+                        clean_table.shape == std::vector<int64_t>({sites, hidden}),
+                    "kaivuri.rtc.style_clean is not [sites][hidden] float16");
+            clean = make({sites, 1, hidden}, DataType::kHALF);
+            upload(clean, clean_table.data, clean_table.bytes);
+            rtc_mask = make({1, horizon, 1}, DataType::kFLOAT);
+            anchor = for_tensor("action_input", "actions");
+            stepped = for_tensor("action_input", "actions");
+            mods = make({sites, horizon, hidden}, DataType::kHALF);
+            mod_bytes = mods->bytes / size_t(sites);
+            check_rtc_ops(clean_table);
+            std::cerr << "[load] Mode C (training-time RTC): up to " << max_rows
+                      << " prefix rows, per-row modulation " << mods->bytes / 1048576.0 << " MiB\n";
+        }
         std::cerr << "[load] shared scratch MiB=" << scratch_bytes / 1048576.0 << '\n';
     }
     ~Impl() {
@@ -665,13 +843,47 @@ class Runtime::Impl {
     int action_horizon() const { return horizon; }
     int action_dim() const { return width; }
     int denoising_steps() const { return steps; }
+    bool row_time() const { return row_time_; }
+    int max_prefix() const { return max_rows; }
     std::vector<float> infer(const void *image0, const void *image1, const float *noise,
-                             Timing &timing) {
+                             Timing &timing, int prefix_rows, const float *prefix,
+                             int prefix_dims) {
         require(!current_tokens.empty(), "set prompt before inference");
+        require(prefix_rows >= 0, "negative RTC prefix");
+        if (prefix_rows) {
+            require(row_time_, "RTC prefix given, but this bundle has no Mode C (row-time) "
+                               "action templates");
+            require(prefix_rows <= max_rows, "RTC prefix of " + std::to_string(prefix_rows) +
+                                                 " rows exceeds the trained maximum " +
+                                                 std::to_string(max_rows));
+            require(prefix != nullptr && prefix_dims > 0 && prefix_dims <= width,
+                    "RTC prefix shape");
+            for (int i = 0; i < prefix_rows * prefix_dims; ++i)
+                require(std::isfinite(prefix[i]), "non-finite RTC prefix");
+        }
         uint64_t start = monotonic_ns();
         upload(images[0], image0, images[0]->bytes);
         upload(images[1], image1, images[1]->bytes);
-        upload(actions[0], noise, actions[0]->bytes);
+        const int n = noise_count();
+        float *initial = staged<float>(actions[0], size_t(n));
+        std::memcpy(initial, noise, actions[0]->bytes);
+        if (row_time_) {
+            // Every call: rows < d are [prefix, zeros] (a clean training row), the mask marks
+            // them; with d = 0 both are all zero and the graph runs the plain sampler.
+            float *mask = staged<float>(rtc_mask, size_t(horizon));
+            float *clean_rows = staged<float>(anchor, size_t(n));
+            std::fill(mask, mask + horizon, 0.f);
+            std::fill(clean_rows, clean_rows + n, 0.f);
+            for (int r = 0; r < prefix_rows; ++r) {
+                mask[r] = 1.f;
+                for (int c = 0; c < width; ++c)
+                    initial[r * width + c] = clean_rows[r * width + c] =
+                        c < prefix_dims ? prefix[r * prefix_dims + c] : 0.f;
+            }
+            push(rtc_mask);
+            push(anchor);
+        }
+        push(actions[0]);
         if (graph)
             ck(cudaGraphLaunch(graph, stream), "launch graph");
         else
@@ -712,8 +924,15 @@ std::vector<int64_t> Runtime::task_tokens(const std::string &task) const {
 void Runtime::set_prompt(const std::vector<int64_t> &tokens) { impl_->set_prompt(tokens); }
 std::vector<float> Runtime::infer(const void *image0, const void *image1, const float *noise,
                                   Timing &timing) {
-    return impl_->infer(image0, image1, noise, timing);
+    return impl_->infer(image0, image1, noise, timing, 0, nullptr, 0);
 }
+std::vector<float> Runtime::infer(const void *image0, const void *image1, const float *noise,
+                                  Timing &timing, int prefix_rows, const float *prefix,
+                                  int prefix_dims) {
+    return impl_->infer(image0, image1, noise, timing, prefix_rows, prefix, prefix_dims);
+}
+bool Runtime::row_time() const { return impl_->row_time(); }
+int Runtime::max_prefix() const { return impl_->max_prefix(); }
 } // namespace kaivuri::pi05
 
 namespace {
@@ -1012,6 +1231,79 @@ std::string validate(Runtime &model, const fs::path &bundle, const fs::path &pre
                << ",\"preprocess_different_elements\":" << different << extra.str() << '}';
         separator = ",";
         std::cerr << "[parity] " << name << " PASS " << comparison_json(fp16) << '\n';
+    }
+    // Mode C: the exporter's clean-prefix references (rtc/rtc_fixture_<i>.npz, unpacked by
+    // prepare_pi05.py), each on its source fixture's images and prompt. The same noise runs
+    // with RTC off (the per-row engines with every row on the step's style) and with the
+    // prefix; the prefix rows must come back bit-exact as [anchor, zeros].
+    if (model.row_time()) {
+        const YAML::Node &prepared_manifest = manifest;
+        auto rtc = prepared_manifest["rtc"];
+        require(rtc && rtc.size() >= 1, "Mode C bundle without prepared RTC fixtures: re-run "
+                                         "prepare_pi05.py with this checkout");
+        auto load = [&](const std::string &directory, const YAML::Node &files) {
+            std::map<std::string, std::unique_ptr<Npy>> arrays;
+            for (auto file : files)
+                arrays[file.first.as<std::string>()] = std::make_unique<Npy>(
+                    prepared / directory / file.first.as<std::string>(),
+                    file.second.as<std::string>());
+            return arrays;
+        };
+        for (auto entry : rtc) {
+            const auto name = entry["directory"].as<std::string>(),
+                       source = entry["source"].as<std::string>();
+            require(kaivuri::sha256_file(bundle / entry["file"].as<std::string>()) ==
+                        entry["source_sha256"].as<std::string>(),
+                    "original RTC fixture changed: " + name);
+            YAML::Node source_entry;
+            for (auto f : prepared_manifest["fixtures"])
+                if (f["directory"].as<std::string>() == source)
+                    source_entry.reset(static_cast<const YAML::Node &>(f));
+            require(bool(source_entry), "RTC fixture " + name + " names a missing source " + source);
+            auto src = load(source, source_entry["files"]);
+            auto arrays = load(name, entry["files"]);
+            const int rows = entry["rows"].as<int>(), dims = entry["dims"].as<int>();
+            const int h = model.action_horizon(), w = model.action_dim();
+            auto &noise = *arrays.at("noise.npy"), &prefix = *arrays.at("anchor.npy");
+            require(noise.dtype == "<f4" && noise.count == size_t(h) * w,
+                    "RTC fixture noise contract: " + name);
+            require(prefix.dtype == "<f4" && prefix.shape == std::vector<int64_t>({rows, dims}),
+                    "RTC fixture anchor contract: " + name);
+            auto &tokens = *src.at("tokens.npy"), &mask = *src.at("mask.npy");
+            std::vector<int64_t> valid;
+            for (size_t i = 0; i < tokens.count; ++i)
+                if (mask.data[i])
+                    valid.push_back(reinterpret_cast<const int64_t *>(tokens.data)[i]);
+            model.set_prompt(valid);
+            auto &image0 = *src.at("image0.npy"), &image1 = *src.at("image1.npy");
+            auto z = reinterpret_cast<const float *>(noise.data);
+            Timing timing;
+            auto off = model.infer(image0.data, image1.data, z, timing, 0, nullptr, 0);
+            auto clean = model.infer(image0.data, image1.data, z, timing, rows,
+                                     reinterpret_cast<const float *>(prefix.data), dims);
+            auto c_off = compare(off, *arrays.at("off.npy"));
+            auto c_clean = compare(clean, *arrays.at("clean.npy"));
+            require(c_off.finite && c_off.cosine >= gate.cosine && c_off.max_abs <= gate.max_abs,
+                    "C++ Mode C parity (RTC off) failed: " + name + " " + comparison_json(c_off));
+            require(c_clean.finite && c_clean.cosine >= gate.cosine &&
+                        c_clean.max_abs <= gate.max_abs,
+                    "C++ Mode C parity (prefix) failed: " + name + " " + comparison_json(c_clean));
+            auto anchor_values = reinterpret_cast<const float *>(prefix.data);
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < w; ++c) {
+                    const float want = c < dims ? anchor_values[r * dims + c] : 0.f;
+                    require(std::memcmp(&clean[size_t(r) * w + c], &want, 4) == 0,
+                            "Mode C prefix row " + std::to_string(r) + " is not the committed "
+                            "action [anchor, zeros]: " + name);
+                }
+            report << separator << "{\"fixture\":" << kaivuri::json_quote(name)
+                   << ",\"mode\":\"C\",\"source\":" << kaivuri::json_quote(source)
+                   << ",\"rows\":" << rows << ",\"fp16\":" << comparison_json(c_clean)
+                   << ",\"off\":" << comparison_json(c_off) << ",\"prefix_exact\":true}";
+            separator = ",";
+            std::cerr << "[parity] " << name << " Mode C d=" << rows << " PASS "
+                      << comparison_json(c_clean) << " off " << comparison_json(c_off) << '\n';
+        }
     }
     report << ']';
     return report.str();

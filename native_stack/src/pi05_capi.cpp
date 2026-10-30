@@ -70,7 +70,8 @@ void *kvr_pi05_open(const char *bundle, const char *cache, const char *fixtures,
 
 void kvr_pi05_close(void *handle) { delete static_cast<Handle *>(handle); }
 
-// JSON: horizon, action_dim, robot_dim, state_dim, fps, state_joints, tasks, cameras.
+// JSON: horizon, action_dim, robot_dim, state_dim, fps, state_joints, tasks, cameras,
+// row_time and max_prefix (Mode C, training-time RTC).
 int kvr_pi05_info(void *handle, char *json, size_t json_len, char *err, size_t err_len) {
     return guarded(err, err_len, [&] {
         auto &h = *static_cast<Handle *>(handle);
@@ -89,7 +90,9 @@ int kvr_pi05_info(void *handle, char *json, size_t json_len, char *err, size_t e
             out << (i ? "," : "") << c.state_joints[i];
         out << "],\"state_names\":" << quoted_list(c.state_names)
             << ",\"tasks\":" << quoted_list(tasks) << ",\"cameras\":" << quoted_list(cameras)
-            << ",\"native_cache\":" << (h.model->native_cache() ? "true" : "false") << '}';
+            << ",\"native_cache\":" << (h.model->native_cache() ? "true" : "false")
+            << ",\"row_time\":" << (h.model->row_time() ? "true" : "false")
+            << ",\"max_prefix\":" << h.model->max_prefix() << '}';
         const auto text = out.str();
         require(text.size() < json_len, "info buffer too small");
         put(json, json_len, text);
@@ -100,10 +103,12 @@ int kvr_pi05_info(void *handle, char *json, size_t json_len, char *err, size_t e
 // two Y8 frames (Pillow BILINEAR preprocessing) and noise [horizon][action_dim] -> the robot
 // chunk [horizon][robot_dim] (OpenPI unnormalized, controller order). degrees_out gets the
 // state the prompt used; timings_ms: prompt, preprocess, vision, language, denoise, total.
+// Mode C: rtc_rows committed rows, rtc_prefix [rtc_rows][robot_dim] normalized model units
+// (NULL with rtc_rows = 0); the runtime pads them with zeros and returns them unchanged.
 int kvr_pi05_infer(void *handle, const char *task, const double *angles_rad, const uint8_t *y8_0,
-                   const uint8_t *y8_1, int width, int height, const float *noise,
-                   double *robot_out, float *degrees_out, double *timings_ms, int *prompt_tokens,
-                   char *err, size_t err_len) {
+                   const uint8_t *y8_1, int width, int height, const float *noise, int rtc_rows,
+                   const float *rtc_prefix, double *robot_out, float *degrees_out,
+                   double *timings_ms, int *prompt_tokens, char *err, size_t err_len) {
     return guarded(err, err_len, [&] {
         auto &h = *static_cast<Handle *>(handle);
         const auto &c = h.contract;
@@ -117,7 +122,8 @@ int kvr_pi05_infer(void *handle, const char *task, const double *angles_rad, con
         auto image1 = kp::preprocess_openpi(y8_1, width, height, width, 1);
         const uint64_t prepared = kaivuri::monotonic_ns();
         kp::Timing t;
-        auto normalized = h.model->infer(image0.data(), image1.data(), noise, t);
+        auto normalized = h.model->infer(image0.data(), image1.data(), noise, t, rtc_rows,
+                                         rtc_prefix, c.robot_dim);
         for (float v : normalized)
             require(std::isfinite(v), "non-finite model output");
         auto robot = kp::robot_chunk(normalized, h.model->action_horizon(),

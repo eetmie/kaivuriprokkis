@@ -15,7 +15,7 @@ picks the model; the observation, operator, supervisor, logging and CLI are shar
 ## Run
 
 ```bash
-cd ~/kaivuriprokkis/native_stack/tools
+cd native_stack/tools      # of the checkout you built (the defaults follow it)
 PY=~/vla-clean-install-20261012/source/.venv-trt/bin/python
 
 # GR00T: cache defaults to ~/.cache/kaivuri-groot/<bundle name>

@@ -9,13 +9,15 @@ This file owns the excavator boundary that Gr00tPolicy applies on the Spark:
 
 `parity` runs a physical fixture (spark-projects groot/excavator/physical_fixture.py) from raw
 frames and degrees to valve commands. `run` reads live cameras and the controller, infers
-continuously and, with --drive, sends each chunk as a timed plan (t0 = observation time, so
+continuously and, with --live, sends each chunk as a timed plan (t0 = observation time, so
 the rows that went stale during inference are skipped by the controller). A supervisor thread
 renews the plan every 100 ms and disarms on chunk exhaustion, on observation age, on any
 controller state but armed and on any inference error. It never re-arms. With an Xbox pad
 (--gamepad auto): A toggles manual (sticks drive, inference paused) and model; a stale or
 exhausted chunk then falls back to manual instead of disarming. X toggles pump permission.
-Ctrl+C disarms, stops the services and still writes the summary.
+Ctrl+C disarms, stops the services and still writes the summary (with --out; without it nothing
+is written and the outcome is printed only). --live drives with pump permission on and, with
+--start-services, starts the controller with live PWM.
 
 Prompts: bundles from spark-projects groot/excavator/export_bundle.py tokenize at runtime. The
 run starts on --task or the first trained task; D-pad right/left cycles the list, and a line
@@ -40,7 +42,7 @@ Exit status: 0 run finished, 130 Ctrl+C, 3 gamepad lost, 4 controller fault, 5 p
 (observation age, chunk exhausted, no first plan), 1 any other error.
 
     python groot_live.py parity --bundle B                 # every prompt (and RTC) fixture
-    python groot_live.py run --bundle B --start-services --live-pwm --enable-slew --drive --out DIR
+    python groot_live.py run --bundle B --start-services --live --enable-slew [--out DIR]
 """
 from __future__ import annotations
 
@@ -458,7 +460,11 @@ class Pad:
         self.path = path
         self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         self.axes, self.keys = {}, set()
-        if stat.S_ISFIFO(os.fstat(self.fd).st_mode):   # tools/virtual_gamepad.py: xpad ranges
+        self.fifo = stat.S_ISFIFO(os.fstat(self.fd).st_mode)
+        self._read_axes()
+
+    def _read_axes(self):
+        if self.fifo:                         # tools/virtual_gamepad.py: xpad ranges
             self.axes = {code: [0, -32768, 32767] for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY)}
             return
         for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY):
@@ -468,6 +474,20 @@ class Pad:
             if hi <= lo:
                 raise RuntimeError("gamepad must expose Xbox X/Y/RX/RY axes")
             self.axes[code] = [v, lo, hi]
+
+    def drain(self):
+        """Drop everything queued so far (engine load can overflow the kernel queue) and
+        re-read the sticks. Called just before arming; an overrun after that still stops."""
+        while True:
+            try:
+                if not os.read(self.fd, _EVENT.size * 64):
+                    raise RuntimeError("gamepad disconnected")
+            except BlockingIOError:
+                break
+            except OSError as e:
+                raise RuntimeError(f"gamepad disconnected ({e})") from e
+        self.keys.clear()
+        self._read_axes()
 
     def poll(self) -> list[int]:
         """Read all pending events; return buttons newly pressed since the last poll."""
@@ -763,7 +783,7 @@ def start_services(a, runtime: Path, procs: list):
     control = [build / "kaivuri-control", "--profile", a.profile, "--safety", a.safety,
                "--socket", runtime / "control.sock", "--control-hz", str(a.control_hz),
                "--serial", a.serial]
-    if a.live_pwm:
+    if a.live:
         control.append("--live-pwm")
     if a.enable_slew:
         control.append("--enable-slew")
@@ -934,7 +954,7 @@ def stats(xs) -> dict | None:
 
 def write_summary(out: Path, a, chunks, sup, outcome: dict, tasks=None, extra=None) -> dict:
     np.save(out / "chunks.npy", np.stack(chunks) if chunks else np.zeros((0,)))
-    summary = {"outcome": outcome, "chunks": len(chunks), "drive": a.drive,
+    summary = {"outcome": outcome, "chunks": len(chunks), "drive": a.live,
                "plans_sent": sup.sent if sup else 0, "pad_events": list(sup.events) if sup else [],
                "tasks": tasks.items if tasks else None, **(extra or {})}
     if sup and sup.applied:
@@ -979,24 +999,26 @@ def run_live(a) -> int:
     from frame_reader import FrameReader
 
     contract = json.loads(Path(a.contract).read_text()) if a.contract else None
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=False)
+    out = Path(a.out) if a.out else None       # None: nothing is written
+    if out:
+        out.mkdir(parents=True, exist_ok=False)
     identity = {"argv": sys.argv, "groot_live_sha256": sha256(__file__), "bundle": a.bundle,
                 "bundle_json_sha256": sha256(Path(a.bundle) / "bundle.json"), "cache": a.cache,
                 "vla_root": a.vla_root, "profile": a.profile, "safety": a.safety,
                 "safety_sha256": sha256(a.safety), "control_hz": a.control_hz, "fps": a.fps,
                 "start_monotonic_ns": time.monotonic_ns(), "start_unix": time.time()}
-    (out / "run.json").write_text(json.dumps(identity, indent=1) + "\n")
+    if out:
+        (out / "run.json").write_text(json.dumps(identity, indent=1) + "\n")
     procs, tmp, sup, pad, tasks, status_conn, readers, pol = [], None, None, None, None, None, [], None
     chunks = collections.deque(maxlen=20_000)
     outcome = {"kind": "finished", "reason": "run finished"}
     rtc_on = False
     try:
-        pad_path = find_pad(a.gamepad) if a.drive else None
+        pad_path = find_pad(a.gamepad) if a.live else None
         if pad_path:
             pad = Pad(pad_path)
             print(f"[pad] {pad_path}: A = model/manual, X = pump on/off, Ctrl+C = stop", flush=True)
-        elif a.drive:
+        elif a.live:
             print("[pad] no gamepad: model drives until the run ends; Ctrl+C = stop", flush=True)
         if a.start_services:
             tmp = tempfile.TemporaryDirectory(prefix="kvr-groot-")
@@ -1031,7 +1053,7 @@ def run_live(a) -> int:
         rng = np.random.default_rng(a.seed)
         fps = float(a.fps)
         delay = RtcDelay(pol.rtc_max if rtc_on else 0, fps, a.rtc_margin_ms)
-        log = open(out / "chunks.jsonl", "w")
+        log = open(out / "chunks.jsonl" if out else os.devnull, "w")
 
         def observe_retry(deadline_s=2.0):
             end = time.monotonic() + deadline_s
@@ -1043,10 +1065,10 @@ def run_live(a) -> int:
                         raise
                     time.sleep(0.005)
 
-        # Warm-up: a few inferences before arming, so the first plan's latency is known (and a
-        # frame-history bundle starts with its history filled).
-        done, fill_end = 0, time.monotonic() + pol.lag_s + 10
-        while done < a.warmup:
+        # Warm-up: one inference before arming, so the first plan's latency (RTC delay) is known; a
+        # frame-history bundle first fills its history (no plan is made until then).
+        fill_end = time.monotonic() + pol.lag_s + 10
+        while True:
             frames, st, obs_ns, _, src = observe_retry()
             try:
                 pol.infer([gray_to_rgb(f) for f in frames], pol.boundary.degrees(st),
@@ -1056,14 +1078,16 @@ def run_live(a) -> int:
                     raise RuntimeError("the frame history did not fill during the warm-up")
                 continue
             delay.add((time.monotonic_ns() - obs_ns) / 1e6)
-            done += 1
-        if a.drive:
+            break
+        if a.live:
             sup = Supervisor(client_mod, sock, fps, a.max_observation_age_ms / 1e3, slew=a.enable_slew,
-                             pump=a.pump, pad=pad, start_model=a.start_model, tasks=tasks,
+                             pump=True, pad=pad, start_model=a.start_model, tasks=tasks,
                              first_plan_s=a.first_plan_timeout_s)
+            if pad:
+                pad.drain()
             sup.arm()
             sup.start()
-            print(f"[groot] armed, {sup.mode.upper()} mode, pump {'ON' if a.pump else 'OFF'}", flush=True)
+            print(f"[groot] armed, {sup.mode.upper()} mode, pump ON", flush=True)
 
         def read_prompts():
             """Terminal lines become prompts: appended to the task list and selected."""
@@ -1115,7 +1139,7 @@ def run_live(a) -> int:
                 log.write(json.dumps({"rejected": e.kind, "detail": str(e), "ns": time.monotonic_ns()}) + "\n")
                 time.sleep(0.005)
                 continue
-            if not first_written:        # what the model saw first, for an orientation check
+            if out and not first_written:        # what the model saw first, for an orientation check
                 for c, f in enumerate(frames, 1):
                     (out / f"cam{c}_first.pgm").write_bytes(
                         f"P5\n{f.shape[1]} {f.shape[0]}\n255\n".encode() + f.tobytes())
@@ -1217,13 +1241,18 @@ def run_live(a) -> int:
         outcome["final_controller"] = final or None
         outcome["cleanup_errors"] = cleanup
         outcome["exit"] = EXIT.get(outcome["kind"], 1)
-        try:
-            summary = write_summary(out, a, chunks, sup, outcome, tasks,
-                                    {"rtc": {"on": rtc_on, "max_delay": pol.rtc_max if rtc_on else 0,
-                                             "margin_ms": a.rtc_margin_ms} if pol else None})
-            print(json.dumps({k: v for k, v in summary.items() if k not in ("pad_events", "tasks")}), flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[groot] summary not written: {e!r}", flush=True)
+        if not out:
+            print(json.dumps({"outcome": outcome, "chunks": len(chunks),
+                              "plans_sent": sup.sent if sup else 0}), flush=True)
+        else:
+            try:
+                summary = write_summary(out, a, chunks, sup, outcome, tasks,
+                                        {"rtc": {"on": rtc_on, "max_delay": pol.rtc_max if rtc_on else 0,
+                                                 "margin_ms": a.rtc_margin_ms} if pol else None})
+                print(json.dumps({k: v for k, v in summary.items() if k not in ("pad_events", "tasks")}),
+                      flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[groot] summary not written: {e!r}", flush=True)
         signal.signal(signal.SIGINT, signal.default_int_handler)
     return outcome["exit"]
 
@@ -1237,7 +1266,7 @@ def main():
         s.add_argument("--contract", help="normalization contract JSON (default: the bundle's kaivuri.contract)")
         s.add_argument("--cache", default="~/.cache/kaivuri-groot/default")
         s.add_argument("--vla-root", default=str(Path.home() / "jetson-orin-nano-vla"))
-        s.add_argument("--out")
+        s.add_argument("--out", help="report directory (default: nothing is written)")
     s = sub.choices["parity"]
     s.add_argument("--fixture", help="one physical fixture (default: every prompt fixture in the bundle)")
     s.add_argument("--envelope", help="the same fixture from bfloat16 Gr00tPolicy: per-sample error limits")
@@ -1252,19 +1281,18 @@ def main():
     s.add_argument("--serial", default="/dev/ttyACM0")
     s.add_argument("--control-hz", type=int, default=200)
     s.add_argument("--start-services", action="store_true")
-    s.add_argument("--live-pwm", action="store_true")
     s.add_argument("--enable-slew", action="store_true")
     s.add_argument("--control-socket")
     s.add_argument("--camera-frame", action="append", help="cam1 then cam2 frame files")
-    s.add_argument("--drive", action="store_true")
-    s.add_argument("--pump", action="store_true", help="start with pump permission (X toggles it on the pad)")
+    s.add_argument("--live", action="store_true",
+                   help="drive the machine: plans, pump permission on (X toggles it on the pad), "
+                        "live PWM with --start-services")
     s.add_argument("--gamepad", default="auto", help="evdev path, 'auto' (first by-id joystick) or 'none'")
     s.add_argument("--start-model", action="store_true", help="with a gamepad, start in model mode, not manual")
     s.add_argument("--task", help="starting prompt (default: the first trained task); added to the list")
     s.add_argument("--seconds", type=float, default=30, help="0 = until Ctrl+C")
     s.add_argument("--rate-hz", type=float, default=0, help="0 = back to back")
     s.add_argument("--fps", type=float, default=30)
-    s.add_argument("--warmup", type=int, default=3)
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--action-offset-ms", type=float, default=0)
     s.add_argument("--max-frame-age-ms", type=float, default=200)
@@ -1283,10 +1311,8 @@ def main():
                    help="frame-history bundles: how far the past frame may sit from the trained lag "
                         "(back-to-back inference stores one every ~250 ms)")
     a = p.parse_args()
-    if a.cmd == "run" and not a.out:
-        p.error("run needs --out")
-    if a.cmd == "run" and a.pump and not a.drive:
-        p.error("--pump needs --drive")
+    if getattr(a, "task", None) is not None and not a.task.strip():
+        p.error("--task is empty (unset shell variable?); omit it to start on the first trained task")
     # Policy() changes into --vla-root (its engine builders import from there).
     for k in ("bundle", "contract", "cache", "vla_root", "out", "fixture", "envelope", "tools", "build",
               "profile", "safety", "control_socket"):

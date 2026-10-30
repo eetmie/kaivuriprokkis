@@ -1,5 +1,5 @@
 """groot_live.py without hardware or GPU: raw-output gate, RTC prefix/feeds, frame history, supervisor stops and
-cleanup, observation coherence, partial service start. In-memory fakes only.
+cleanup, observation coherence, partial service start, pad drain before arming. In-memory fakes only.
 
     python tests/groot_live_test.py native_stack
 """
@@ -292,12 +292,28 @@ with tempfile.TemporaryDirectory() as tmp:
     exe.write_text("#!/bin/sh\nexit 1\n")
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     a = SimpleNamespace(build=str(build), profile="p", safety="s", control_hz=200, serial="/dev/null",
-                        live_pwm=False, enable_slew=False)
+                        live=False, enable_slew=False)
     procs = []
     raises(lambda: gl.start_services(a, runtime, procs), "did not start")
     assert len(procs) == 1
     gl.stop_services(procs)
     assert procs[0].poll() is not None
+
+# ── pad: an overrun queued before arming is drained, one after it still stops ──
+
+with tempfile.TemporaryDirectory() as tmp:
+    fifo = Path(tmp) / "pad"
+    os.mkfifo(fifo)
+    pad = gl.Pad(str(fifo))
+    writer = os.open(fifo, os.O_WRONLY)
+    dropped = gl._EVENT.pack(0, 0, gl.EV_SYN, gl.SYN_DROPPED, 0)
+    os.write(writer, dropped * 3)
+    pad.drain()
+    assert pad.poll() == []
+    os.write(writer, dropped)
+    raises(pad.poll, "overrun")
+    os.close(writer)
+    pad.close()
 
 assert len(set(gl.EXIT.values())) == len(gl.EXIT) and gl.EXIT["finished"] == 0
 print("groot_live tests passed", flush=True)

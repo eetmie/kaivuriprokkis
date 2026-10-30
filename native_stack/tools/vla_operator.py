@@ -16,7 +16,7 @@ import numpy as np
 JOINTS = {"slew": 0, "lift": 1, "tilt": 2, "scoop": 3}  # controller angles_rad / plan columns
 EV_SYN, EV_KEY, EV_ABS, SYN_DROPPED = 0, 1, 3, 3
 ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_HAT0X = 0, 1, 3, 4, 0x10
-BTN_A, BTN_B, BTN_X = 0x130, 0x131, 0x133   # BTN_SOUTH, BTN_EAST, BTN_NORTH (the recorder's X)
+BTN_A, BTN_X = 0x130, 0x133   # BTN_SOUTH, BTN_NORTH (the recorder's X)
 BTN_DPAD_LEFT, BTN_DPAD_RIGHT = 0x222, 0x223
 _EVENT = struct.Struct("llHHi")              # struct input_event, 64-bit
 
@@ -307,8 +307,6 @@ class Supervisor(threading.Thread):
                         elif b == BTN_X:
                             self.pump = not self.pump
                             self.note(f"pump {'ON' if self.pump else 'OFF'}")
-                        elif b == BTN_B:   # operator marker only: one successful operation
-                            self.note("success")
                         elif b in (BTN_DPAD_LEFT, BTN_DPAD_RIGHT) and self.tasks:
                             self.drop_plan()
                             self.tasks.step(1 if b == BTN_DPAD_RIGHT else -1)

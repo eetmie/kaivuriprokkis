@@ -32,7 +32,7 @@ $PY vla_live.py parity --bundle BUNDLE [--fixtures PREPARED]
 ```
 
 Without `--live` nothing is sent to the controller (dry PWM with `--start-services`). With the pad
-the run starts in manual mode: A = model/manual, X = pump, B = success marker, D-pad = task.
+the run starts in manual mode: A = model/manual, X = pump, D-pad = task.
 Defaults (`--build`, `--profile`, `--safety`) are this checkout's, so a worktree never runs
 another checkout's binaries.
 

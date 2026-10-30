@@ -236,14 +236,25 @@ RobotState robot_state(const std::string &json, const std::vector<int> &joints, 
     require(now <= r.imu_ns || now - r.imu_ns <= max_age_ns, "stale IMU state");
     auto angles = s["angles_rad"];
     require(angles.size() == 4, "angles_rad must have four joints");
+    std::vector<double> radians;
+    for (auto a : angles)
+        radians.push_back(a.as<double>());
+    r.degrees = state_degrees(radians, joints);
+    return r;
+}
+std::vector<float> state_degrees(const std::vector<double> &angles_rad,
+                                 const std::vector<int> &joints) {
+    require(angles_rad.size() == 4, "angles_rad must have four joints");
     // np.rad2deg on float32 multiplies by float32(180) / float32(pi).
     const float to_degrees = 180.f / float(pi);
+    std::vector<float> degrees;
     for (int j : joints) {
-        float radians = float(angles[j].as<double>());
+        require(j >= 0 && j < 4, "joint index");
+        float radians = float(angles_rad[j]);
         require(std::isfinite(radians), "nonfinite joint angle");
-        r.degrees.push_back(radians * to_degrees);
+        degrees.push_back(radians * to_degrees);
     }
-    return r;
+    return degrees;
 }
 uint64_t Plan::end_ns() const {
     if (rows.size() < 2)

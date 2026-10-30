@@ -9,6 +9,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory; optional `--depth SERIAL` Z16 from the camera ASIC (`SERIAL-depth.frame` + calibration JSON) and `--depth-log DIR` zstd snapshots |
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--live` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
+| `tools/vla_live.py` | One live runner for the VLA fine-tunes, picked by the bundle: GR00T N1.7 (`vla_groot.py`, jetson-orin-nano-vla engines) and pi0.5 (`vla_pi05.py` over `libkaivuri_pi05_runtime.so`, the same C++ runtime as `kaivuri-inference`). Fixture gate at every load, coherent dual-IR + IMU observations, timed plans, gamepad A/X/B/D-pad, typed prompts, GR00T RTC and frame history ([runbook](notes/VLA_LIVE.md)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
 | `kaivuri-pid-collect` | Independent 100 Hz randomized IK/PID collector, guarded arm commands, manual takeover and committed PID sidecars; initial powered acceptance pending |
@@ -18,6 +19,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `tools/imu_audit.py` | IMU chain audit from recorded sessions: hinge axes, relative roll, angle gain/lag, cabin rocking, with bootstrap intervals |
 | `tools/sidecam_tags.py`, `tools/sidecam_audit.py` | Calibration-only side camera with AprilTags: joint angles, pin-to-pin lengths, slew and ground-touch FK checks ([method and results](notes/IMU_FK_NOTES.md#side-camera-2026-10-21-imu-align-001-gentle-imu-align-002-aggressive)) |
 | `tools/fusion_replay.py` | Offline replay of the Pico's Fusion AHRS over recorded gyro/accel to compare settings before reflashing |
+| `tools/policy_probe.py` | Observation-only GR00T scaffold: inspect bundles, capture timestamped temporal IR/state inputs with arbitrary task text, and verify prebuilt AOT engines against their fixture; Python adapter, no actuator output ([runbook](notes/GROOT_INFERENCE_SCAFFOLD.md)) |
 
 The default `kaivuri-control` mode reads real IMUs but **does not open I2C**. `--simulate-imu` gives a completely hardware-free control run. `--live-pwm` enables physical output and refuses simulated IMUs. Slew and tracks also require their own daemon flags. The pump requires an explicit command flag and an armed state.
 

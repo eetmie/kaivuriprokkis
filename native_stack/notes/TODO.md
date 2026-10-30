@@ -71,8 +71,8 @@ remain outside this logging milestone.
 - [ ] Add a clock mapper for camera exposure timestamps, host monotonic time, and Pico device time; characterize latency/drift before fusion.
 - [x] Port the validated OpenPI pi0.5 GPU chain to a separate C++ TensorRT runtime, with full fixture parity and live IR consumption through the frame C ABI.
 - [x] Integrate the fine-tuned runtime with the command interface (`--drive`, PI05_FINETUNE.md); Spark dry end-to-end only.
-- [ ] Jetson: native template cache for the fine-tune, `--validate-only`, then a dry `--drive` run against real IMUs/cameras; measure the FP32-residual 50-row latency against the 500 ms budget.
-- [ ] Port the Python pipeline's operator control to the producer: A toggles manual/model, D-pad switches task; disarm on source/task changes. No separate hold-to-run deadman (user, 2026-10-17: the Python SmolVLA/X-VLA scheme is sufficient). Today `--drive` sets the deadman flag itself.
+- [ ] Jetson: native template cache for the fine-tune, `--validate-only`, then a dry `--live` run (controller without `--live-pwm`) against real IMUs/cameras; measure the FP32-residual 50-row latency against the 500 ms budget.
+- [ ] Port the Python pipeline's operator control to the producer: A toggles manual/model, D-pad switches task; disarm on source/task changes. No separate hold-to-run deadman (user, 2026-10-17: the Python SmolVLA/X-VLA scheme is sufficient). Today `--live` sets the deadman flag itself.
 - [ ] Set lease/observation limits from measured worst inference latency and required stop time. Do not silently refresh old observation timestamps. (Producer side done: renewals keep the observation time; limits still need Jetson numbers.)
 - [ ] Evaluate beta GPU-frame APIs only when profiling shows selected-frame host copies matter; current capture does not enable CUDA zero-copy.
 - [ ] Compare native total system memory with the legacy stack under the same model/device load before stating an actual Jetson memory saving.

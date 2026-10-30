@@ -1,7 +1,7 @@
 """Bench C++ pi0.5 with two real IR cameras and disarmed native control.
 
 Only owns the processes it launches. No DRIVE/ARM packets (kaivuri-inference runs
-without --drive). Optional live PWM writes neutral only; otherwise the controller
+without --live). Optional live PWM writes neutral only; otherwise the controller
 uses dry PWM. A pi05_openpi_state bundle reads its joint-angle state from control.
 Memory samples include load and warm-up; steady samples are marked separately.
 """
@@ -168,7 +168,7 @@ def run(args):
                "--control-socket", socket_path,
                "--cache", args.cache.resolve(), "--fixtures", args.fixtures.resolve(),
                "--task", args.task, "--duration-s", str(args.duration_s),
-               "--warmup", str(args.warmup), "--out", output / "inference.json"]
+               "--out", output / "inference.json"]
     if args.rate_hz:
         command += ["--rate-hz", str(args.rate_hz)]
     if args.parity_cosine is not None:
@@ -304,14 +304,13 @@ if __name__ == "__main__":
     parser.add_argument("--rate-hz", type=float, default=0, help="optional inference limit; waits before reading fresh camera frames")
     parser.add_argument("--task", default="pick up the red block")
     parser.add_argument("--duration-s", type=float, default=300)
-    parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--parity-cosine", type=float, help="fixture gate override (pi05_openpi_state); needs --parity-max-abs")
     parser.add_argument("--parity-max-abs", type=float)
     args = parser.parse_args()
     if len(args.camera) != 2 or any(len(c.split(":")) != 2 for c in args.camera):
         parser.error("select two cameras using SERIAL:IR_INDEX")
-    if not 0 < args.duration_s <= 3600 or args.warmup < 0 or not 0 <= args.rt_priority <= 80:
-        parser.error("bounded duration, nonnegative warmup and priority 0..80 required")
+    if not 0 < args.duration_s <= 3600 or not 0 <= args.rt_priority <= 80:
+        parser.error("bounded duration and priority 0..80 required")
     if args.live_pwm and args.simulate_imu:
         parser.error("live PWM cannot use simulated IMUs")
     if not 50 <= args.control_hz <= 500 or not 0 <= args.status_hz <= 500:

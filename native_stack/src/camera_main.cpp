@@ -42,7 +42,7 @@ struct Stream {
     std::string path;
     uint32_t bytes_per_pixel = 1;
     std::unique_ptr<FrameWriter> writer;
-    std::atomic<uint64_t> received{0}, dropped{0}, last_ns{0};
+    std::atomic<uint64_t> received{0}, dropped{0}, retried{0}, last_ns{0};
     std::atomic<uint64_t> last_counter{0}, counter_gaps{0}, counter_resets{0};
     std::vector<uint16_t> rotated; // width*height pixels when rotating 180 degrees, else empty
 };
@@ -84,8 +84,20 @@ bool publish(Stream &s, const FrameMetadata &m, const void *pixels) {
         }
         pixels = s.rotated.data();
     }
-    if (!s.writer->publish(m, pixels))
-        ++s.dropped;
+    if (!s.writer->publish(m, pixels)) {
+        // A reader copying a 720p frame briefly holds the shared-store mutex. Retry
+        // on this camera thread instead of losing the exposure on the first clash.
+        // Keep the original arrival timestamp and bound waiting to 2 ms.
+        ++s.retried;
+        const auto deadline = monotonic_ns() + 2000000;
+        bool published = false;
+        while (!published && monotonic_ns() < deadline) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            published = s.writer->publish(m, pixels);
+        }
+        if (!published)
+            ++s.dropped;
+    }
     return true;
 }
 
@@ -571,16 +583,18 @@ int main(int argc, char **argv) {
         for (auto &c : cameras)
             std::fprintf(
                 stderr,
-                "serial=%s received=%llu busy_drops=%llu counter_gaps=%llu counter_resets=%llu\n",
-                c->serial.c_str(), ull(c->ir.received), ull(c->ir.dropped), ull(c->ir.counter_gaps),
-                ull(c->ir.counter_resets));
+                "serial=%s received=%llu busy_drops=%llu busy_retries=%llu "
+                "counter_gaps=%llu counter_resets=%llu\n",
+                c->serial.c_str(), ull(c->ir.received), ull(c->ir.dropped), ull(c->ir.retried),
+                ull(c->ir.counter_gaps), ull(c->ir.counter_resets));
         for (auto &c : cameras)
             if (c->with_depth)
                 std::fprintf(stderr,
                              "depth_serial=%s depth_received=%llu depth_busy_drops=%llu "
+                             "depth_busy_retries=%llu "
                              "depth_counter_gaps=%llu\n",
                              c->serial.c_str(), ull(c->depth.received), ull(c->depth.dropped),
-                             ull(c->depth.counter_gaps));
+                             ull(c->depth.retried), ull(c->depth.counter_gaps));
         return failed ? 1 : 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Camera failed: %s\n", e.what());

@@ -113,11 +113,17 @@ with tempfile.TemporaryDirectory(prefix='rec-test-') as temp:
         try: validate_episode(episode, dict(session, fps=15))
         except ValueError as e: assert 'declared' in str(e)
         else: raise AssertionError('wrong timebase accepted')
-        recorder = launch('discard')
-        command('arm'); time.sleep(.4); command('start'); time.sleep(.4); command('discard'); command('quit')
+        recorder = launch('discard', '--episode-offset', '21')
+        command('arm'); time.sleep(.4); command('start'); time.sleep(.4); command('discard')
+        time.sleep(.1)
+        assert not list((root/'discard').glob('episode-*')), 'discarded take leaked'
+        command('start'); time.sleep(.4); command('save'); command('quit')
         out, err = recorder.communicate(timeout=5)
         assert recorder.returncode == 0, (out, err)
-        assert not list((root/'discard').glob('episode-*')), 'discarded take leaked'
+        assert 'Discarded ep 22:' in out and 'Saved ep 22:' in out, out
+        assert 'Saved episodes in session: 22' in out, out
+        episode = next((root/'discard').glob('*.ready'))
+        assert json.loads((episode/'episode.json').read_text())['episode_number'] == 22
         recorder = launch('interrupt')
         command('arm'); time.sleep(.4); command('start'); time.sleep(.4)
         command('arm'); time.sleep(.05)  # Repeated Y must not end a recording or change its pump/control state.

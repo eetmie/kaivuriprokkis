@@ -1,7 +1,7 @@
 """Convert committed native Y8 episodes to a LeRobot v3 dataset, outside capture/control.
 
 Written with LeRobot 0.6.1 (0.5.1 also works). One or more sessions go into one dataset;
-each session keeps its own task. Keeps original high-rate samples, camera metadata and
+each recording run keeps its own task. Keeps original high-rate samples, camera metadata and
 calibration snapshots beside LeRobot's nominal FPS timeline. Refuses interrupted takes
 and inaccurate rates.
 
@@ -26,6 +26,8 @@ import math
 import mmap
 from pathlib import Path
 import shutil
+
+from native_sessions import committed_episodes, export_recording_paths
 
 # Shapes are flattened so numeric features remain simple vectors in LeRobot/Parquet.
 POSE_FIELDS = {
@@ -100,11 +102,6 @@ def samples(episode):
 
 def frame_rows(episode):
     return (row for row in samples(episode) if 'frame_index' in row)
-
-
-def committed_episodes(session):
-    """A session's saved takes in order; .partial (interrupted) takes are left out."""
-    return sorted(Path(session).glob('episode-*.ready'))
 
 
 def validate_episode(episode, session, rate_tolerance=.03):
@@ -225,7 +222,8 @@ def load_session(session_path):
     session = json.loads((session_path / 'session.json').read_text())
     if session['format'] != 'kaivuri-native-episode-v1':
         raise ValueError(f'{session_path}: unsupported native episode format')
-    episodes = committed_episodes(session_path)
+    # One physical recording run. Containers are expanded before calling this.
+    episodes = sorted(session_path.glob('episode-*.ready'))
     if not episodes:
         raise ValueError(f'{session_path}: no committed episodes; .partial takes are intentionally excluded')
     return session, episodes
@@ -245,7 +243,7 @@ def create_dataset(repo_id, root, fps, features):
 def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop')):
     if isinstance(session_paths, (str, Path)):
         session_paths = [session_paths]
-    session_paths = [Path(p) for p in session_paths]
+    session_paths = export_recording_paths(session_paths)
     if root.exists():
         raise ValueError(f'dataset root already exists: {root}; choose a new destination')
     sessions = [load_session(p) for p in session_paths]
@@ -307,7 +305,7 @@ def main():
     if not joints or len(set(joints)) != len(joints) or any(j not in JOINTS for j in joints):
         p.error('--state-joints must be a unique subset of slew,lift,tilt,scoop')
     if args.validate_only:
-        for path in args.session:
+        for path in export_recording_paths(args.session):
             session, episodes = load_session(path)
             for ep in episodes:
                 shape, count, hz = validate_episode(ep, session)

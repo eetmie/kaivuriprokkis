@@ -8,6 +8,7 @@ Depth (Z16 from the cameras' stereo ASIC, same resolution as IR) is recorded for
 cameras by default as lossless zstd; --depth none restores IR-only capture.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -15,8 +16,10 @@ import signal
 import subprocess
 import tempfile
 import time
+import uuid
 
 from client import stop
+from native_sessions import check_resume
 
 SOURCE = Path(__file__).resolve().parents[1]
 PROJECT = SOURCE.parent
@@ -39,7 +42,8 @@ def main():
     # SIGINT; restore it so a scripted stop still saves the active take and shuts down.
     signal.signal(signal.SIGINT, signal.default_int_handler)
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--session', type=Path, required=True, help='new raw session directory')
+    p.add_argument('--session', type=Path, required=True, help='raw session directory; new unless --resume')
+    p.add_argument('--resume', action='store_true', help='append a new recording run to an existing session')
     p.add_argument('--task', required=True)
     p.add_argument('--build', type=Path, default=SOURCE / 'build')
     p.add_argument('--profile', type=Path, default=PROJECT / 'configuration_files/profiles/jetson')
@@ -75,8 +79,12 @@ def main():
     p.add_argument('--bench-sine', type=float, default=0,
                    help='dry bench only: per-joint sine command amplitude in (0, 1] instead of zero commands')
     args = p.parse_args()
-    if args.session.exists():
-        p.error('--session must be a new directory')
+    if args.resume and not args.session.is_dir():
+        p.error('--resume requires an existing native session directory')
+    if args.session.exists() and not args.resume:
+        p.error('--session already exists; use --resume to append or choose a new directory')
+    if not args.task.strip():
+        p.error('--task must not be empty')
     live_pwm = not (args.dry or args.synthetic)
     if not args.bench_seconds and not args.gamepad:
         p.error('--gamepad required outside --bench-seconds mode')
@@ -96,6 +104,7 @@ def main():
             or parsed[0][0] == parsed[1][0]):
         p.error('select two different physical cameras as SERIAL:IR_INDEX')
     args.session = args.session.resolve()
+    args.build, args.profile, args.safety = (path.resolve() for path in (args.build, args.profile, args.safety))
     args.session.parent.mkdir(parents=True, exist_ok=True)
     # Capture the exact calibration and source bytes before launching the services.
     snapshots = {str(path.relative_to(PROJECT)): path.read_bytes() for path in args.profile.rglob('*') if path.is_file() and path.is_relative_to(PROJECT)}
@@ -103,7 +112,9 @@ def main():
         snapshots.update({f'profile/{path.relative_to(args.profile)}': path.read_bytes() for path in args.profile.rglob('*') if path.is_file()})
     snapshots['safety.yaml'] = args.safety.read_bytes()
     for name in ('src/core.cpp', 'src/control_main.cpp', 'src/camera_main.cpp', 'src/record_main.cpp',
-                 'src/frame_store.cpp', 'include/kaivuri/core.hpp', 'include/kaivuri/frame_store.hpp', 'CMakeLists.txt'):
+                 'src/frame_store.cpp', 'include/kaivuri/core.hpp', 'include/kaivuri/frame_store.hpp', 'CMakeLists.txt',
+                 'src/util.cpp', 'include/kaivuri/util.hpp', 'src/gamepad.cpp', 'include/kaivuri/gamepad.hpp',
+                 'src/pwm.cpp', 'include/kaivuri/pwm.hpp', 'tools/record_native.py', 'tools/native_sessions.py'):
         snapshots['native_stack/' + name] = (SOURCE / name).read_bytes()
     executable_hashes = {name: hashlib.sha256((args.build / name).read_bytes()).hexdigest()
                          for name in ('kaivuri-control', 'kaivuri-camera', 'kaivuri-record')}
@@ -113,6 +124,38 @@ def main():
         p.error('Rerun environment missing; install rerun-sdk==0.26.2 in .venv-rerun or use --view-python')
     if not 0 < args.view_fps <= 90:
         p.error('--view-fps must be in (0, 90]')
+    session_root = args.session
+    # A sibling lock keeps the original session immutable during validation, and
+    # also serializes two launchers attempting to append to the same session.
+    session_lock = (session_root.parent / f'.{session_root.name}.recording.lock').open('a+b')
+    try:
+        fcntl.flock(session_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        p.error('session is already recording or being backed up')
+    depth_keys = {'both': ['cam1', 'cam2'], 'cam1': ['cam1'], 'cam2': ['cam2'], 'none': []}[args.depth]
+    saved_episodes = 0
+    if args.resume:
+        expected = {'fps': args.fps, 'enable_slew': args.enable_slew, 'enable_tracks': args.enable_tracks,
+            'depth': depth_keys, 'live_pwm': live_pwm, 'simulated_imu': args.synthetic,
+            'control_hz': args.control_hz, 'camera_order': specs,
+            'camera_rotations_deg': [180 if args.rotate_camera1 else 0, 0], 'resolution': args.resolution,
+            'calibration': {name: hashlib.sha256(data).hexdigest() for name, data in snapshots.items()
+                if name == 'safety.yaml' or name.startswith(('configuration_files/profiles/', 'profile/'))}}
+        try:
+            saved_episodes = check_resume(session_root, expected)
+        except (ValueError, KeyError, OSError) as error:
+            p.error(f'cannot resume: {error}')
+        # Each invocation keeps its own task, calibration and source provenance.
+        # Earlier session.json/provenance and all original episodes are untouched.
+        runs = session_root / 'recordings'
+        last_run = max([1, *[int(path.name.split('-')[1]) for path in runs.glob('run-*')
+                           if path.is_dir() and path.name.split('-')[1].isdigit()]])
+        args.session = runs / f'run-{last_run + 1:06d}-{uuid.uuid4().hex[:8]}'
+        args.session.parent.mkdir(exist_ok=True)
+    elif session_root.exists():
+        p.error('--session already exists; use --resume to append or choose a new directory')
+    print(f'Session: {session_root}\nSaved episodes: {saved_episodes}; next ep {saved_episodes + 1}\n'
+          f'Task for new takes: {args.task}', flush=True)
     processes = []
     viewer = None
     rc = 1
@@ -157,8 +200,14 @@ def main():
             depth_files = {k: runtime / 'cameras' / f'{parsed[k][0]}-depth.frame' for k in depth_cams}
             for path in [*files, *depth_files.values()]:
                 wait_for(path, cameras)
+            # USB streams start sequentially; allow exposure/callback timing to settle
+            # before the recorder can arm or begin its first take.
+            time.sleep(1)
+            if cameras.poll() is not None:
+                raise RuntimeError('camera service exited during warmup')
             recorder_args = [str(args.build / 'kaivuri-record'), '--socket', str(runtime / 'control.sock'),
                              '--root', str(args.session), '--task', args.task, '--revision', revision,
+                             '--episode-offset', str(saved_episodes),
                              '--fps', str(args.fps), '--max-episode-s', str(args.max_episode_s),
                              '--max-pair-skew-ms', str(args.max_pair_skew_ms), *flags]
             for file in files:
@@ -216,7 +265,8 @@ def main():
                 'live_pwm': live_pwm, 'depth': args.depth, 'live_view': args.live_view, 'view_fps': args.view_fps if args.live_view else None,
                 'view_camera1_rotation_deg': 180 if args.view_rotate_camera1 else 0}, indent=2) + '\n')
     if rc == 0:
-        print(f'Native recording complete: {args.session}\nExport with export_episodes.py after recording.')
+        print(f'Native recording complete: {session_root}\nRun: {args.session}\n'
+              'Export with export_episodes.py using the session directory after recording.')
     raise SystemExit(rc)
 
 

@@ -2,21 +2,21 @@
 
 python tests/recorder_export.py /path/to/native-session
 """
-import json
 from pathlib import Path
 import sys
 import tempfile
 import warnings
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from export_episodes import export, frame_rows
+from export_episodes import export, frame_rows, load_session
+from native_sessions import export_recording_paths
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 
 session_path = Path(sys.argv[1])
-session = json.loads((session_path / 'session.json').read_text())
-episodes = sorted(session_path.glob('*.ready'))
-rows = [row for ep in episodes for row in frame_rows(ep)]
+runs = [(path, *load_session(path)) for path in export_recording_paths([session_path])]
+episodes = [episode for _, _, group in runs for episode in group]
+rows = [(row, session) for _, session, group in runs for episode in group for row in frame_rows(episode)]
 with tempfile.TemporaryDirectory(prefix='kvr-export-roundtrip-') as temp:
     root = Path(temp) / 'dataset'
     export(session_path, root, 'masi/native_recorder_roundtrip')
@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='kvr-export-roundtrip-') as temp:
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', UserWarning)
         for index in (0, len(rows)//2, len(rows)-1):
-            frame, row = d[index], rows[index]
+            frame, (row, session) = d[index], rows[index]
             for key in ('cam1', 'cam2'):
                 m = row[key]
                 assert tuple(frame[f'observation.images.{key}'].shape) == (3, m['height'], m['width'])
@@ -37,5 +37,6 @@ with tempfile.TemporaryDirectory(prefix='kvr-export-roundtrip-') as temp:
             for name, prefix in (('fk_joint_xyz_m', 'fk'), ('fk_upper_quat_wxyz', 'fk'), ('imu_corrected_quat_wxyz', 'imu')):
                 np.testing.assert_allclose(frame[f'feedback.{prefix}.{name}'].numpy(),
                                            np.asarray(row['status'][name]).reshape(-1), atol=1e-7)
+            assert frame['task'] == session['task'], (frame['task'], session['task'])
     assert (root / 'native/episode-000000/samples.jsonl').read_bytes() == (episodes[0] / 'samples.jsonl').read_bytes()
 print(f'LeRobot round trip passed: {len(rows)} frames; both videos, timestamps, applied actions and FK/IMU')

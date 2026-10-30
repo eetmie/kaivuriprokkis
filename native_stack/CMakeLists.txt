@@ -118,8 +118,9 @@ add_test(NAME service-integration COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRE
 
 if(BUILD_CAMERA)
     add_test(NAME recorder-integration COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/recorder_integration.py $<TARGET_FILE_DIR:kaivuri-record> ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME recorder-resume COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/recorder_resume.py $<TARGET_FILE_DIR:kaivuri-record> ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 set_tests_properties(mlp-integration mlp-lifecycle pid-collector service-integration pi05-policy PROPERTIES RESOURCE_LOCK native_control TIMEOUT 120)
 if(BUILD_CAMERA)
-    set_tests_properties(recorder-integration PROPERTIES RESOURCE_LOCK native_control TIMEOUT 120)
+    set_tests_properties(recorder-integration recorder-resume PROPERTIES RESOURCE_LOCK native_control TIMEOUT 120)
 endif()

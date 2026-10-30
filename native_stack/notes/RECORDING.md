@@ -29,6 +29,15 @@ bits, hardware sensor/readout timestamps, host arrivals, exposure/gain, counters
 and signed pair skew are logged. Host arrival pairing is **not** synchronized
 exposure. Default maximum arrival skew is 40 ms and maximum frame age is 200 ms.
 
+Collection/inference convention (2026-10-27): capture both IR cameras at
+**640x480@30**, the recorder default and the current native pi0.5 runtime's required
+camera size. Exposure may adapt to the environment; use the same camera geometry,
+orientation and model resize/crop/padding contract in training and inference.
+The original `digging_native` session is 1280x720 and remains intact: start a fresh
+`digging_native_640` session for the new capture resolution, then resume that one.
+Ordinary H.264 dataset export is lossy, so raw capture fidelity and training-video
+compression are separate considerations when validating pixel preprocessing.
+
 ### Depth
 
 `--depth both` (default; or `cam1`, `cam2`, `none`) adds Z16 depth from each
@@ -117,6 +126,12 @@ fault is stopped and kept as `.partial`, which export skips; the session carries
 | Y | Re-arm now (normally not needed) |
 | Ctrl+C | Save a valid active take, disarm, shut down all services |
 
+The terminal uses consecutive human episode numbers (`ep 1`, `ep 2`, ...), reports
+frame count and elapsed seconds every two seconds, and prints stopping/saving,
+saved and discarded messages. Saved is printed only after files are synced and
+the episode is committed. Discarding a take does not increment the saved count.
+Internal directory names retain their unique timestamp IDs.
+
 Saving or discarding a take leaves the controller armed and the pump as it was.
 Configuration reload is not implemented by the native controller: stop and restart
 after edits. Default maximum take length is 180 s, with automatic save.
@@ -145,7 +160,48 @@ python3 tools/virtual_gamepad.py $F --episodes 5 --seconds 20 --discard-every 4 
 
 Every new session contains `session.json` and calibration/source snapshots with
 SHA-256 checksums under `provenance/`. There can be multiple saved/discarded takes
-within one session. A new invocation requires a new session directory.
+within one session. A new invocation requires a new directory unless `--resume`
+is explicitly supplied. Resume is never enabled by default.
+
+### Resume and add tasks
+
+After recording the first run, reuse the same command and session path with
+`--resume`, and give the instruction for the new takes with `--task`:
+
+```bash
+python3 tools/record_native.py \
+  --session ~/data_collection/native_sessions/digging_native_640 --resume \
+  --resolution 640x480 --depth none --enable-slew \
+  --gamepad /dev/input/by-id/usb-Microsoft_Controller_3039373030313334303932333135-event-joystick \
+  --serial /dev/serial/by-id/usb-RPi_IMU_Reader_4250305031363910-if00 \
+  --task "level the sand"
+```
+
+With 21 saved takes, the next is displayed as `ep 22`. Old episodes, task labels
+and source/calibration snapshots stay unchanged. Each resumed invocation writes
+into `SESSION/recordings/run-NNNNNN-ID/`, with its own `session.json`, task,
+episodes and provenance. Interrupted `.partial` takes stay excluded and do not
+count as saved. Empty runs do not contribute episodes to export.
+
+The launcher checks camera identities/order/orientation, resolution, FPS,
+slew/track/depth flags, live/synthetic mode, control rate and calibration before
+opening hardware. Mismatches require matching arguments or a new session.
+Task text, exposure and gain may differ; each run preserves its actual settings.
+A session lock prevents concurrent launchers from appending to the same session.
+
+Pass the original session directory to `export_episodes.py` and `view_native.py`;
+they include all its recording runs and preserve the task/calibration for each
+run. Legacy single-run sessions work without conversion. Resuming raw capture
+does not append to an already exported LeRobot dataset: export to a new target
+directory when incorporating the new takes.
+
+Resume validation on 2026-10-27: all 16 CTest checks pass. Synthetic tests cover
+explicit opt-in, legacy episodes without display numbers, immutable prior files,
+changed tasks, mismatched capture settings, locking, preserved partial takes,
+sequential saved counts, and discarding without incrementing the count. A real
+LeRobot 0.6.1 export/load round trip passed across four synthetic episodes and
+three task labels (120 frames); Rerun playback selected a resumed episode through
+the original session path. Evidence: `results/recorder-resume-20261027/`.
 
 Each take starts as `episode-<monotonic_ns>.partial`. Its bounded writer streams:
 
@@ -198,7 +254,8 @@ first, keeping their layout intact.
 ```
 
 Several sessions go into one dataset in the order given, each episode keeping its
-session's task. Sessions must share FPS, track layout and camera resolution.
+recording run's task. Resumed runs are expanded automatically in recording order.
+Sessions must share FPS, track layout and camera resolution.
 
 Exporter validates every committed take **before creating** a dataset: counts,
 packed pixel sizes, consistent resolution, healthy armed FK, applied action
@@ -208,15 +265,35 @@ instead of silently compressing motion into `frame_index/fps`. The real timing
 columns are retained alongside LeRobot's nominal timestamps. Failed export leaves
 raw data intact; choose a new destination when retrying an incomplete export.
 
-**Open issue (2026-10-20): startup frames can fail export timing validation.**
+**Timing follow-up (2026-10-27).** The launcher lets camera startup settle for
+one second before starting the recorder. New takes wait for exposures newer than
+the frames present at start and reject an old first master frame. The camera
+publisher retries shared-store contention for at most 2 ms, keeping its original
+capture timestamp; `busy_retries` and `busy_drops` are reported separately.
+Validate every session before export.
+
+On `pikkumasi2tb`, the 15 native regression tests passed. After the startup fixes,
+a real-IMU, live-PWM test at dual IR 1280x720@30 with depth disabled exercised four
+valve commands (absolute normalized values <= 0.1), pump toggles, A/save,
+B/discard and Ctrl+C/save. Servo/pump mains power was off. Both saved episodes
+passed export timing validation (215 and 226 pairs, 29.998 Hz); one episode was
+discarded. Cameras reported zero capture-counter gaps/resets and publication
+drops. PCA9685 readback showed changed outputs during commands and calibrated
+neutral/pump-minimum counts after shutdown, with prescale 60. Evidence:
+`results/recorder-preflight-20261027-live-v2/`. The LeRobot 0.6.1 export/load round
+trip also passed for all 441 frames: both videos, timestamps, applied actions and
+FK/IMU. This is a short preflight, not a guarantee against later capture/USB/disk
+faults; validate each collection session.
+
+**Historical issue (2026-10-20): startup frames can fail export timing validation.**
 In `sand-depth-001`, `episode-332085182766231.ready` skipped one cam1 frame
 between its first two saved frame pairs, creating a 66.7 ms interval at 30 FPS
 (the export limit is 50 ms). Its saved IR/depth files are intact, but the current
 validator rejects the take. `episode-332144087887833.ready` passes validation.
-Check frame pairing at the start of each take and whether a short pairing warmup
-is needed, using more recordings. This remains unresolved; no warmup fix has
-been validated. Run `tools/export_episodes.py SESSION --validate-only` from
-`native_stack` before export, and preserve the raw recordings while investigating.
+The original files remain intact. The startup changes above have passed a short
+live preflight; they do not repair these older takes. Run
+`tools/export_episodes.py SESSION --validate-only` from `native_stack` before export,
+and preserve raw recordings when investigating any later timing failure.
 
 State defaults to `[lift,tilt,scoop]` in degrees, preserving the legacy convention
 and avoiding unanchored slew yaw. Use `--state-joints slew,lift,tilt,scoop` to include

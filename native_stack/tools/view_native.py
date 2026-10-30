@@ -13,10 +13,14 @@ import math
 from pathlib import Path
 import time
 
+from native_sessions import recording_paths
+
 
 def wait_episode(session, index, live):
     while True:
-        episodes = sorted([*session.glob('episode-*.ready'), *session.glob('episode-*.partial')])
+        runs = recording_paths(session) if (session / 'session.json').is_file() else [session]
+        episodes = [ep for run in runs
+                    for ep in sorted([*run.glob('episode-*.ready'), *run.glob('episode-*.partial')])]
         if not live:
             episodes = [ep for ep in episodes if ep.suffix == '.ready']
         if len(episodes) > index:
@@ -174,10 +178,11 @@ def main():
     import numpy as np
     import rerun as rr
     import rerun.blueprint as rrb
-    depth_keys, calibration = [], {}
+    depth_keys, calibration, episode = [], {}, None
     if args.session is not None and not args.live and not args.no_depth:
-        depth_keys = json.loads((args.session / 'session.json').read_text()).get('depth', [])
-        calibration = {key: json.loads((args.session / f'{key}.depth.json').read_text()) for key in depth_keys}
+        episode = wait_episode(args.session, args.episode_index, False)
+        depth_keys = json.loads((episode.parent / 'session.json').read_text()).get('depth', [])
+        calibration = {key: json.loads((episode.parent / f'{key}.depth.json').read_text()) for key in depth_keys}
     rr.init('kaivuri-native-episode', spawn=False)
     series = rrb.Horizontal(rrb.TimeSeriesView(origin='actions', name='Actions'),
                             rrb.TimeSeriesView(origin='joints', name='Joint angles (rad)'),
@@ -210,7 +215,7 @@ def main():
         source = camera_rows(args.camera_file, args.socket, args.library, args.max_fps)
     else:
         print(f'Waiting for episode {args.episode_index}: {args.session}', flush=True)
-        episode = wait_episode(args.session, args.episode_index, args.live)
+        episode = episode or wait_episode(args.session, args.episode_index, args.live)
         source = rows(episode, args.live, args.max_fps, depth_keys)
     # Depth intrinsics/extrinsics are SDK values for unrotated sensor pixels. Unrotate stored
     # pixels for geometry; a 180 degree image turn equals flipping camera x and y.

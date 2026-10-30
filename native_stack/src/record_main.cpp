@@ -154,6 +154,7 @@ struct Record {
 
 class Writer {
     fs::path path_;
+    uint64_t episode_number_;
     std::ofstream rows_;
     std::array<std::ofstream, 2> cams_;
     // camN.depth.zst: one independent zstd frame per recorded frame (self-delimiting).
@@ -230,9 +231,9 @@ class Writer {
     }
 
   public:
-    Writer(const fs::path &root, size_t limit, std::array<bool, 2> depth)
+    Writer(const fs::path &root, size_t limit, std::array<bool, 2> depth, uint64_t episode_number)
         : path_(root / ("episode-" + std::to_string(monotonic_ns()) + ".partial")),
-          depth_enabled_(depth), limit_(limit) {
+          episode_number_(episode_number), depth_enabled_(depth), limit_(limit) {
         require(fs::create_directory(path_), "episode directory exists");
         rows_.open(path_ / "samples.jsonl");
         cams_[0].open(path_ / "cam1.y8", std::ios::binary);
@@ -247,6 +248,7 @@ class Writer {
         }
         thread_ = std::thread([this] { run(); });
     }
+    std::string name() const { return std::to_string(episode_number_); }
     ~Writer() {
         join();
         ZSTD_freeCCtx(zstd_);
@@ -255,7 +257,8 @@ class Writer {
     void abandon(const std::string &reason) {
         join();
         close_files();
-        std::cerr << "Take stopped (" << reason << "); kept incomplete at " << path_ << std::endl;
+        std::cerr << "Stopped ep " << name() << " (" << reason
+                  << "); kept incomplete at " << path_ << std::endl;
     }
     bool push(Record r) {
         std::lock_guard<std::mutex> l(mutex_);
@@ -274,8 +277,10 @@ class Writer {
         if (thread_.joinable())
             thread_.join();
     }
-    void finish(bool save, uint64_t frames, uint64_t start, uint64_t end,
+    bool finish(bool save, uint64_t frames, uint64_t start, uint64_t end,
                 const std::string &reason) {
+        std::cout << "Stopping ep " << name() << " (" << reason << "): " << frames
+                  << " frames; " << (save && frames ? "saving..." : "discarding...") << std::endl;
         join();
         close_files();
         for (int k = 0; k < 2; ++k)
@@ -284,11 +289,12 @@ class Writer {
         require(!failed_ && written_ == frames, "incomplete episode retained at " + path_.string());
         if (!save || !frames) {
             fs::remove_all(path_);
-            std::cout << "Episode discarded\n";
-            return;
+            std::cout << "Discarded ep " << name() << ": " << frames << " frames" << std::endl;
+            return false;
         }
         std::ofstream summary(path_ / "episode.json");
-        summary << "{\"frames\":" << frames << ",\"start_ns\":" << start << ",\"end_ns\":" << end
+        summary << "{\"episode_number\":" << episode_number_ << ",\"frames\":" << frames
+                << ",\"start_ns\":" << start << ",\"end_ns\":" << end
                 << ",\"reason\":" << json_quote(reason) << ",\"depth\":";
         put_depth_list(summary, depth_enabled_);
         summary << "}\n";
@@ -305,7 +311,8 @@ class Writer {
         ready.replace_extension(".ready");
         fs::rename(path_, ready);
         fsync_path(ready.parent_path(), O_DIRECTORY, "session");
-        std::cout << "Saved " << frames << " frames: " << ready << std::endl;
+        std::cout << "Saved ep " << name() << ": " << frames << " frames -> " << ready << std::endl;
+        return true;
     }
 };
 
@@ -320,6 +327,7 @@ const char *usage =
     "  [--cam1-depth-file .../SERIAL1-depth.frame] [--cam2-depth-file ...]\n"
     "  (depth is paired to its IR frame by sensor timestamp; camN.depth.zst)\n"
     "  [--socket PATH --fps 30 --enable-slew --enable-tracks]\n"
+    "  [--episode-offset N] (number of previously saved episodes; display numbering only)\n"
     "  [--max-episode-s 180 --queue-frames 64 --max-pair-skew-ms 40 --max-age-ms 200]\n"
     "Arms automatically and re-arms after controller faults; sticks drive at all times.\n"
     "A=start/save B=discard X=pump Y=re-arm now; Ctrl+C=save and exit.\n"
@@ -337,6 +345,7 @@ int main(int argc, char **argv) {
         std::vector<std::string> camera_paths;
         std::array<std::string, 2> depth_paths;
         int fps = 30, queue = 64, auto_episodes = 1;
+        uint64_t saved_episodes = 0;
         double max_episode = 180, auto_seconds = 0, max_skew_ms = 40, max_age_ms = 200;
         double auto_sine = 0;
         bool scripted = false, tracks = false, slew = false;
@@ -359,6 +368,8 @@ int main(int argc, char **argv) {
                 fps = args.integer();
             else if (args.is("--queue-frames"))
                 queue = args.integer();
+            else if (args.is("--episode-offset"))
+                saved_episodes = args.natural();
             else if (args.is("--max-episode-s"))
                 max_episode = args.number();
             else if (args.is("--auto-record-s"))
@@ -438,7 +449,7 @@ int main(int argc, char **argv) {
         control.send(Operation::Disarm);
         install_stop_handlers();
         std::unique_ptr<Writer> writer;
-        uint64_t begin = 0, frames = 0, last_frame = 0, last_master_ns = 0;
+        uint64_t begin = 0, frames = 0, last_frame = 0, last_master_ns = 0, next_progress = 0;
         std::array<uint64_t, 2> last_ir{}, last_depth{};
         // No operator arming: the controller's centered arming hold is sent automatically
         // (zero commands with the arm flag) whenever it is not armed, then sticks take over.
@@ -460,8 +471,10 @@ int main(int argc, char **argv) {
         auto finish = [&](bool save, const std::string &reason) {
             pending_start = false;
             if (writer) {
-                writer->finish(save, frames, begin, monotonic_ns(), reason);
+                if (writer->finish(save, frames, begin, monotonic_ns(), reason))
+                    ++saved_episodes;
                 writer.reset();
+                std::cout << "Saved episodes in session: " << saved_episodes << std::endl;
             }
         };
         auto abandon = [&](const std::string &reason) {
@@ -572,14 +585,18 @@ int main(int argc, char **argv) {
                     std::cout << "Armed\n" << std::flush;
                 was_armed = armed;
                 if (pending_start && armed && healthy) {
-                    writer = std::make_unique<Writer>(root, queue, depth_enabled);
+                    writer = std::make_unique<Writer>(root, queue, depth_enabled, saved_episodes + 1);
                     frames = 0;
                     begin = monotonic_ns();
                     last_frame = begin;
-                    last_ir = {};
-                    last_depth = {};
+                    next_progress = begin + 2000000000;
+                    // Start with new exposures, rather than a cached frame from before A.
+                    for (int k = 0; k < 2; ++k) {
+                        last_ir[k] = cam[k].read() ? cam[k].m.sequence : 0;
+                        last_depth[k] = depth[k] && depth[k]->read() ? depth[k]->m.sequence : 0;
+                    }
                     pending_start = false;
-                    std::cout << "Recording\n" << std::flush;
+                    std::cout << "Recording ep " << writer->name() << ": 0 frames" << std::endl;
                 }
                 if (writer && (!healthy || !armed))
                     abandon("recording lost healthy armed controller");
@@ -605,6 +622,10 @@ int main(int argc, char **argv) {
                                     (cam[k].m.valid_metadata & 1) &&
                                     (depth[k]->m.valid_metadata & 1) &&
                                     depth[k]->m.sensor_timestamp_us == cam[k].m.sensor_timestamp_us;
+                    // Do not anchor a new take to an old master exposure while waiting
+                    // for camera 2; that can create a skipped frame at the next pair.
+                    if (frames == 0)
+                        fresh = fresh && capture - cam[0].m.host_monotonic_ns <= uint64_t(.7e9 / fps);
                     // FPS is an upper bound; sample each new master frame without a second
                     // capture clock.
                     if (fresh && (frames == 0 || cam[0].m.host_monotonic_ns - last_master_ns >=
@@ -659,6 +680,11 @@ int main(int argc, char **argv) {
                     require(writer->push(std::move(record)),
                             "recording disk queue full/write failed; episode retained incomplete");
                     const double duration = double(capture - begin) / 1e9;
+                    if (capture >= next_progress) {
+                        std::cout << "Recording ep " << writer->name() << ": " << frames
+                                  << " frames, " << uint64_t(duration) << " s" << std::endl;
+                        next_progress = capture + 2000000000;
+                    }
                     if (duration >= max_episode || (auto_seconds > 0 && duration >= auto_seconds)) {
                         finish(true, "duration");
                         if (auto_seconds > 0 && ++auto_done < auto_episodes) {
@@ -679,6 +705,7 @@ int main(int argc, char **argv) {
                        !stop_requested) {
                 }
             }
+            std::cout << "Stopping recorder..." << std::endl;
             finish(true, "session_end");
         } catch (...) {
             try {

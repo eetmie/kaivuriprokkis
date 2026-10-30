@@ -122,15 +122,16 @@ The camera/profile checks are new compared to the Python stack: the native recor
 - **Cameras**: frame files must be the bundle's `kaivuri.cameras` in slot order; rotation
   comes from `kaivuri-camera --rotate-180` (`bench_pi05.py --rotate-180`), not checkable here.
 
-### Driving (`--drive`)
+### Driving (`--live`)
 
-`pi05::Producer` owns its own control connection on its own thread. Without `--drive` nothing
+`pi05::Producer` owns its own control connection on its own thread. Without `--live` nothing
 is sent (`bench_pi05.py` never passes it).
 
-- Refuses to start unless control is disarmed; live PWM needs `--allow-live`; `--enable-slew`
-  / `--enable-tracks` need the same daemon flag, otherwise those columns are sent as 0.
-  `--pump` is the only pump permission.
-- Arms after warm-up (centered hold, renewed) once the worst warm-up observation-to-plan
+- Refuses to start unless control is disarmed. `--live` sends plans, accepts a live-PWM
+  controller and grants pump permission (it replaced `--drive --allow-live --pump`);
+  `--enable-slew` / `--enable-tracks` need the same daemon flag, otherwise those columns
+  are sent as 0.
+- Arms after one warm-up inference (centered hold, renewed) once its observation-to-plan
   time plus the start period fits inside both the chunk length and the observation limit.
 - Each chunk: `t0` = observation time (+ `--action-offset-ms`), so the controller starts at
   the row matching its clock and the inference delay is skipped; replaces the previous plan;

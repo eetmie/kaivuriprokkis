@@ -388,7 +388,7 @@ Producer::Producer(ProducerOptions options)
     require(state == "disarmed", "controller must start disarmed (is " + state + ": " +
                                      s["reason"].as<std::string>() + "); disarm it explicitly");
     require(!s["live_pwm"].as<bool>() || options_.allow_live,
-            "controller writes live PWM; driving it requires --allow-live");
+            "controller writes live PWM; driving it requires --live");
     require(!options_.gate.slew || s["enable_slew"].as<bool>(),
             "--enable-slew also requires kaivuri-control --enable-slew");
     require(!options_.gate.tracks || s["enable_tracks"].as<bool>(),

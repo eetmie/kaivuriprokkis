@@ -8,7 +8,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | --- | --- |
 | `kaivuri-control` | Configurable loop (100 Hz default); disarmed boot; one command owner; deadman/lease/IMU/deadline checks; direct Linux I2C PWM; complete per-tick FK/IMU snapshot |
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory; optional `--depth SERIAL` Z16 from the camera ASIC (`SERIAL-depth.frame` + calibration JSON) and `--depth-log DIR` zstd snapshots |
-| `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--drive` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
+| `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--live` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
 | `kaivuri-pid-collect` | Independent 100 Hz randomized IK/PID collector, guarded arm commands, manual takeover and committed PID sidecars; initial powered acceptance pending |
@@ -106,7 +106,7 @@ After the register-level hardware checks, `bench_pi05.py --live-pwm` also comple
 
 ### Live sand height beside pi0.5
 
-`tools/sand_height_live.py live` reads the cabin camera's shared depth frame and control status (read-only) and keeps `sand_height.py`'s level height map, litres moved and slew correction while inference runs. `replay SESSION` times the same work on a recording. `tools/bench_fullstack.py` runs dry/disarmed control, both IR cameras with depth, pi0.5 without `--drive`, and the sand process:
+`tools/sand_height_live.py live` reads the cabin camera's shared depth frame and control status (read-only) and keeps `sand_height.py`'s level height map, litres moved and slew correction while inference runs. `replay SESSION` times the same work on a recording. `tools/bench_fullstack.py` runs dry/disarmed control, both IR cameras with depth, pi0.5 without `--live`, and the sand process:
 
 ```bash
 python3 -B tools/bench_fullstack.py --out results/fullstack-new \

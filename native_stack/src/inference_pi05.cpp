@@ -1,7 +1,7 @@
 // OpenPI pi0.5 TensorRT runtime: the pi05_libero bench bundle and the fine-tuned
 // pi05_openpi_state excavator bundle (joint angles in a per-step prompt). The device chain
 // follows the validated jetson-orin-nano-vla/bench/vendor/pi05_trt.py implementation.
-// Without --drive, model actions are recorded only. With --drive (pi05_openpi_state only),
+// Without --live, model actions are recorded only. With --live (pi05_openpi_state only),
 // chunks go to kaivuri-control as drive plans through pi05::Producer; no I2C path here.
 #include "kaivuri/frame_store.hpp"
 #include "kaivuri/pi05_policy.hpp"
@@ -1067,17 +1067,18 @@ double percentile(std::vector<double> values, double p) {
 }
 constexpr const char *usage =
     "kaivuri-inference --bundle OPENPI_BUNDLE --cache VALIDATED_ENGINE_CACHE\n"
-    "  --fixtures PREPARED_FIXTURES --out NEW_REPORT.json [--validate-only]\n"
+    "  --fixtures PREPARED_FIXTURES [--out NEW_REPORT.json] [--validate-only]\n"
     "  [--camera-frame FIRST.frame --camera-frame SECOND.frame]\n"
-    "  [--task EXPORTED_TASK --duration-s 60 --warmup 5 --no-graph]\n"
-    "  [--rate-hz 2] (0 = unrestricted; wait before reading fresh frames)\n"
+    "  [--task EXPORTED_TASK --duration-s 60 --no-graph]\n"
+    "  [--rate-hz 0] (0 = unrestricted; wait before reading fresh frames)\n"
     "  pi05_openpi_state: [--control-socket PATH --max-state-age-ms 50]\n"
     "    [--parity-cosine 0.9998 --parity-max-abs 0.01]\n"
-    "  Driving (pi05_openpi_state only; nothing is enabled implicitly):\n"
-    "    --drive [--allow-live] [--pump] [--enable-slew] [--enable-tracks]\n"
+    "  Driving (pi05_openpi_state only):\n"
+    "    --live [--enable-slew] [--enable-tracks]\n"
     "    [--action-tolerance inf --renew-ms 100 --max-observation-age-ms 1400 "
     "--action-offset-ms 0]\n"
-    "Without --drive, actions are recorded only and never drive hardware.\n";
+    "--live sends plans with live PWM and pump permission; without it actions never drive\n"
+    "hardware. Without --out nothing is written (report NEW.json + timing NEW.csv).\n";
 constexpr const char *csv_header =
     "sample,start_ns,finish_ns,frame0_sequence,frame1_sequence,frame0_arrival_ns,"
     "frame1_arrival_ns,frame0_sensor_us,frame1_sensor_us,frame0_exposure_us,frame1_exposure_us,"
@@ -1094,7 +1095,9 @@ int main(int argc, char **argv) {
         std::string task = "pick up the red block";
         std::string control_socket = (kaivuri::runtime_dir() / "control.sock").string();
         double duration = 60, rate_hz = 0, max_state_age_ms = 50, action_offset_ms = 0;
-        int warmup = 5;
+        // One inference on live inputs before timing starts; --live arms only after it, from
+        // its observation-to-plan time. Validation has already warmed the engines.
+        constexpr int warmup = 1;
         bool only = false, graph = true, drive = false;
         kp::ProducerOptions producer_options;
         auto &supervisor = producer_options.supervisor;
@@ -1117,8 +1120,6 @@ int main(int argc, char **argv) {
                 duration = args.number();
             else if (args.is("--rate-hz"))
                 rate_hz = args.number();
-            else if (args.is("--warmup"))
-                warmup = args.integer();
             else if (args.is("--validate-only"))
                 only = true;
             else if (args.is("--no-graph"))
@@ -1131,12 +1132,8 @@ int main(int argc, char **argv) {
                 gate.cosine = args.number(), gate.overridden = true;
             else if (args.is("--parity-max-abs"))
                 gate.max_abs = args.number(), gate.overridden = true;
-            else if (args.is("--drive"))
-                drive = true;
-            else if (args.is("--allow-live"))
-                producer_options.allow_live = true;
-            else if (args.is("--pump"))
-                producer_options.pump = true;
+            else if (args.is("--live"))
+                drive = producer_options.allow_live = producer_options.pump = true;
             else if (args.is("--enable-slew"))
                 producer_options.gate.slew = true;
             else if (args.is("--enable-tracks"))
@@ -1155,10 +1152,10 @@ int main(int argc, char **argv) {
             } else
                 args.unknown();
         }
-        require(!bundle.empty() && !cache.empty() && !fixtures.empty() && !out.empty(),
-                "bundle, cache, fixtures and out required");
-        require(duration > 0 && std::isfinite(duration) && warmup >= 0 &&
-                    (only || frames.size() == 2),
+        require(!bundle.empty() && !cache.empty() && !fixtures.empty(),
+                "bundle, cache and fixtures required");
+        const bool logging = !out.empty();
+        require(duration > 0 && std::isfinite(duration) && (only || frames.size() == 2),
                 "positive duration and two camera frames required");
         require(std::isfinite(rate_hz) && rate_hz >= 0 && rate_hz <= 500 &&
                     (rate_hz == 0 || rate_hz >= .001),
@@ -1169,7 +1166,7 @@ int main(int argc, char **argv) {
                     supervisor.max_observation_age_ns >= 200000000ULL &&
                     supervisor.max_observation_age_ns <= 1450000000ULL,
                 "renewal 10..250 ms (lease 500 ms); observation age 200..1450 ms (daemon 1500)");
-        require(!fs::exists(out), "report already exists; choose a new path");
+        require(!logging || !fs::exists(out), "report already exists; choose a new path");
         kaivuri::install_stop_handlers();
         uint64_t load_start = monotonic_ns();
         Pi05 model(bundle, cache, graph);
@@ -1185,14 +1182,17 @@ int main(int argc, char **argv) {
         require(contract || !gate.overridden, "parity overrides apply to pi05_openpi_state only");
         if (contract && !gate.overridden)
             gate = {.9998, .01, false};
-        require(!drive || contract, "--drive requires a pi05_openpi_state bundle");
-        require(!drive || contract->fps > 0, "--drive requires kaivuri.fps in bundle.json");
-        require(!drive || warmup >= 1, "--drive needs warm-up runs to check plan coverage");
+        require(!drive || contract, "--live requires a pi05_openpi_state bundle");
+        require(!drive || contract->fps > 0, "--live requires kaivuri.fps in bundle.json");
         std::string parity = validate(model, bundle, fixtures, contract.get(), gate);
-        if (!out.parent_path().empty())
-            fs::create_directories(out.parent_path());
-        std::ofstream summary(out);
-        require(bool(summary), "cannot create report");
+        // Without --out the streams stay closed and every write to them is a no-op.
+        std::ofstream summary, csv;
+        if (logging) {
+            if (!out.parent_path().empty())
+                fs::create_directories(out.parent_path());
+            summary.open(out);
+            require(bool(summary), "cannot create report");
+        }
         summary << std::setprecision(12)
                 << "{\"model\":" << kaivuri::json_quote(model.policy_name())
                 << ",\"runtime\":\"C++ TensorRT " << (model.native_cache() ? "native" : "+ AOT")
@@ -1205,6 +1205,7 @@ int main(int argc, char **argv) {
                 << '}';
         if (only) {
             summary << ",\"status\":\"PASS\"}\n";
+            std::cout << "PASS validate-only\n";
             return 0;
         }
         std::vector<uint32_t> ir_indices;
@@ -1226,11 +1227,13 @@ int main(int argc, char **argv) {
         std::mt19937 random(42);
         std::normal_distribution<float> gaussian(0, 1);
         std::vector<float> noise(model.noise_count());
-        fs::path csv_path = out;
-        csv_path.replace_extension(".csv");
-        std::ofstream csv(csv_path);
-        require(bool(csv), "cannot create timing CSV");
-        csv << csv_header;
+        if (logging) {
+            fs::path csv_path = out;
+            csv_path.replace_extension(".csv");
+            csv.open(csv_path);
+            require(bool(csv), "cannot create timing CSV");
+            csv << csv_header;
+        }
         std::vector<double> latencies, delays, prompt_times, warmup_delays, waits;
         int count = 0;
         uint64_t begin = 0;
@@ -1375,7 +1378,7 @@ int main(int argc, char **argv) {
                 << join(robot.degrees, ' ', 9) << ',' << join(bins, ' ') << ',' << prompt_tokens
                 << ',' << prompt_ms << ',' << plan.t0_ns << ',' << plan.observation_ns << ','
                 << sent << ',' << clamped << '\n';
-            require(bool(csv), "timing write failed");
+            require(!logging || bool(csv), "timing write failed");
         }
         std::string producer_json;
         if (producer) {
@@ -1409,9 +1412,12 @@ int main(int argc, char **argv) {
         if (contract)
             summary << ",\"last_robot_chunk\":[" << join(last_robot, ',', 12) << ']';
         summary << ",\"status\":\"PASS\"}\n";
-        require(bool(summary), "summary write failed");
+        require(!logging || bool(summary), "summary write failed");
         std::cout << "PASS samples=" << latencies.size() << " p50_ms=" << percentile(latencies, .5)
-                  << " p99_ms=" << percentile(latencies, .99) << " report=" << out << '\n';
+                  << " p99_ms=" << percentile(latencies, .99);
+        if (logging)
+            std::cout << " report=" << out;
+        std::cout << '\n';
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "kaivuri-inference: " << e.what() << '\n';

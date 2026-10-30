@@ -2,7 +2,7 @@
 """Full-stack test: dry/disarmed control + dual IR (+ depth) camera + pi0.5 at 2 Hz + live sand height.
 
 Nothing drives hardware: kaivuri-control runs dry (no I2C), stays disarmed (checked every 0.5 s),
-and kaivuri-inference runs without --drive. Live sand height starts once inference is READY so
+and kaivuri-inference runs without --live. Live sand height starts once inference is READY so
 both share the same measured window. Reuses bench_pi05.py's summary; adds the sand process's CPU/RSS.
 """
 import argparse
@@ -62,7 +62,7 @@ def main():
         camera += ['--depth', CAM1, '--depth', CAM2]
     ir = [frames / f'{CAM1}-ir2.frame', frames / f'{CAM2}-ir1.frame']
     infer = [build / 'kaivuri-inference', '--bundle', a.bundle, '--cache', a.cache, '--fixtures', a.fixtures,
-             '--control-socket', sock, '--task', a.task, '--duration-s', a.duration_s, '--warmup', 5,
+             '--control-socket', sock, '--task', a.task, '--duration-s', a.duration_s,
              '--out', out / 'inference.json', '--rate-hz', a.rate_hz,
              '--parity-cosine', 0.9998, '--parity-max-abs', 0.02, '--camera-frame', ir[0], '--camera-frame', ir[1]]
     samples, client, ok = [], None, False

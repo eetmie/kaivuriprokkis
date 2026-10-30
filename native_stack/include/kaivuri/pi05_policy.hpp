@@ -68,6 +68,9 @@ struct RobotState {
 // and the IMU sample is at most max_age_ns old at now.
 RobotState robot_state(const std::string &status_json, const std::vector<int> &joints, uint64_t now,
                        uint64_t max_age_ns);
+// Controller angles_rad [slew, boom, arm, bucket] -> float32 degrees of `joints`, as robot_state.
+std::vector<float> state_degrees(const std::vector<double> &angles_rad,
+                                 const std::vector<int> &joints);
 
 struct Plan {
     std::vector<Commands> rows; // controller order: slew, boom, arm, bucket, trackL, trackR

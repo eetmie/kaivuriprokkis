@@ -467,7 +467,7 @@ def main():
     s.add_argument("--gamepad", default="auto", help="evdev path, 'auto' (first by-id joystick) or 'none'")
     s.add_argument("--start-model", action="store_true", help="with a gamepad, start in model mode, not manual")
     s.add_argument("--task", help="starting prompt (default: the first trained task); added to the list")
-    s.add_argument("--seconds", type=float, default=30, help="0 = until Ctrl+C")
+    s.add_argument("--seconds", type=float, default=0, help="stop after this many seconds (default 0: until Ctrl+C)")
     s.add_argument("--rate-hz", type=float, default=0, help="0 = back to back")
     s.add_argument("--fps", type=float, help="plan row rate (default: the bundle's dataset fps)")
     s.add_argument("--seed", type=int, default=0)

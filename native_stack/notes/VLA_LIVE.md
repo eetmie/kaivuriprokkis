@@ -20,13 +20,13 @@ PY=~/vla-clean-install-20261012/source/.venv-trt/bin/python
 
 # GR00T: cache defaults to ~/.cache/kaivuri-groot/<bundle name>
 $PY vla_live.py run --bundle ~/bundles/groot17-digging640_rtc12_fullft \
-  --start-services --live --enable-slew --seconds 0 \
+  --start-services --live --enable-slew \
   --task "scoop the sand and dump it into the container" --out ~/groot-live/F0_$(date +%H%M%S)
 
 # pi0.5: cache defaults to <bundle>.cache; --fixtures is required (checked at every load)
 $PY vla_live.py run --bundle ~/bundles/pi05-excavator-smoke9 \
   --fixtures ~/bundles/smoke9-export-test-fixtures --max-abs 0.02 \
-  --start-services --live --enable-slew --seconds 0 --out ~/groot-live/P0_$(date +%H%M%S)
+  --start-services --live --enable-slew --out ~/groot-live/P0_$(date +%H%M%S)
 
 $PY vla_live.py parity --bundle BUNDLE [--fixtures PREPARED]
 ```

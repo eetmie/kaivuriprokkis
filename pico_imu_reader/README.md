@@ -97,6 +97,25 @@ stationary windows**, stopping at the first one it accepts:
 Leave the machine **completely stationary** from power-on until the LED turns
 green.
 
+### Lost sensor while streaming
+
+If an IMU stops answering mid-stream (for example a loose connector), the board
+**stops streaming for good**. Before this, it kept sending that sensor's last
+quaternion, which every host took for a healthy joint that was not moving. A
+sensor counts as lost after 10 reads in a row (about 24 ms) that fail or read
+under 0.1 g, or 42 reads in a row (about 100 ms) of bit-identical gyro and
+accel. Single I2C errors still pass. The board then sends `ERR_IMU`, plus
+`0x10 + sensor index` (descriptor order) for each lost sensor, every 200 ms,
+and blinks red slowly (250 ms). If core 1 stops producing frames for 100 ms,
+the board reports `ERR_IMU` too.
+
+Hosts need no change. Native control treats `ERR_IMU` as firmware-blocked and
+faults. The Python reader marks the IMU not ready after 0.5 s without data,
+and its next read neutralises the valves. To recover, fix the connector, then
+reset the Pico (replug its USB or power-cycle). It recalibrates on boot.
+Bench-tested on 2026-11-02: one IMU unplugged under dry-armed control faulted
+immediately, and the board reported `0x06` and `0x11`.
+
 > Earlier firmware applied the measured bias even when its own gates failed and
 > streamed regardless, so a boot with the machine moving produced a silently
 > wrong bias on every sensor. Set `STARTUP_CALIBRATION_REQUIRE_ACCEPTED` to 0 in
@@ -111,7 +130,7 @@ All frames start with the sync bytes `0xAA 0x55` followed by a frame-type byte.
 
 | Frame              | type   | Description                                                            |
 |--------------------|--------|------------------------------------------------------------------------|
-| Control/error      | `0x02` | `CAL_WAIT`, `ERR_CAL`, `ERR_IMU`, `ERR_I2C` status codes                |
+| Control/error      | `0x02` | `CAL_WAIT`, `ERR_CAL`, `ERR_IMU`, `ERR_I2C`; `0x10`+n sensor n lost   |
 | Data               | `0x04` | count, timestamp, 10 floats per sensor                                  |
 | Calibration report | `0x05` | Per-IMU stats, one per calibration attempt                              |
 | Descriptor         | `0x06` | Sent at stream start — sensor count, rate, bus/addr and full scales     |

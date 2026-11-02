@@ -13,9 +13,12 @@
 
 // Message types for control frames (version=2)
 #define MSG_TYPE_ERR_I2C   0x05  // I2C bus init failed
-#define MSG_TYPE_ERR_IMU   0x06  // No IMU detected
+#define MSG_TYPE_ERR_IMU   0x06  // No IMU detected at boot, or one lost while streaming
 #define MSG_TYPE_CAL_WAIT  0x07  // Startup gyro-bias calibration in progress
 #define MSG_TYPE_ERR_CAL   0x08  // Startup calibration failed (robot moved during cal)
+// Sent alongside ERR_IMU when a sensor is lost while streaming: 0x10 + sensor index
+// (descriptor order). Hosts that predate it ignore unknown control types.
+#define MSG_TYPE_IMU_LOST_0 0x10
 
 #define CAL_REPORT_ACCEPTED 0x01
 

@@ -53,6 +53,23 @@
 // in the existing dataset.
 #define STARTUP_CALIBRATION_REQUIRE_ACCEPTED 1
 
+// Lost-sensor guard. When an IMU stops answering (a loose connector) its reads fail and
+// the AHRS can only repeat the last quaternion; streaming that looks to every host like a
+// healthy joint that is not moving. That is how whole recording sessions came out with
+// slew and boom frozen. So the sensor loop declares a sensor lost when, for IMU_LOST_READS
+// reads in a row, the read fails or returns under IMU_LOST_MIN_ACCEL_G (an unpowered
+// ISM330 answers with zeros), or when it returns bit-identical gyro+accel for
+// IMU_STUCK_READS reads in a row (answers but no longer updates). Core 0 does the same if
+// core 1 stops producing frames. Either way data streaming stops for good: the host sees
+// MSG_TYPE_ERR_IMU (plus MSG_TYPE_IMU_LOST_0 + index) every 200 ms, its own no-data
+// timeout fires, and the LED blinks red slowly. Recovery is a Pico reset (USB replug or
+// power cycle), which also redoes the startup calibration.
+#define IMU_LOST_READS       10u      // ~24 ms at 416 Hz; single I2C errors still pass
+#define IMU_STUCK_READS      42u      // ~100 ms
+#define IMU_LOST_MIN_ACCEL_G 0.1f
+#define STREAM_STALL_US      100000u  // core 0: no new frame from core 1 for this long
+#define IMU_LOST_BLINK_MS    250u     // slower than the 60 ms calibration-error blink
+
 typedef struct imu_stream_slot_t {
     uint32_t sequence;
     uint32_t timestamp_us;
@@ -96,6 +113,8 @@ typedef struct calibration_stats_t {
 } calibration_stats_t;
 
 static sensor_runtime_t g_sensor_runtime = {0};
+// Bit i: sensor i lost while streaming. Written by core 1, read by core 0.
+static volatile uint8_t g_imu_lost_mask = 0;
 
 static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR], Sensor* sensors, uint8_t sensor_count);
 
@@ -477,6 +496,37 @@ static void calibration_error_forever(void) {
     }
 }
 
+static void imu_lost_forever(void) {
+    bool led_on = true;
+    uint64_t next_msg_us = 0;
+    uint64_t next_blink_us = 0;
+
+    while (true) {
+        tud_task();
+        const uint64_t now_us = time_us_64();
+        if (now_us >= next_msg_us) {
+            send_control_msg(MSG_TYPE_ERR_IMU);
+            const uint8_t lost = __atomic_load_n(&g_imu_lost_mask, __ATOMIC_ACQUIRE);
+            for (uint8_t i = 0; i < MAX_SENSORS; i++) {
+                if (lost & (1u << i)) {
+                    send_control_msg((uint8_t)(MSG_TYPE_IMU_LOST_0 + i));
+                }
+            }
+            next_msg_us = now_us + 200000u;
+        }
+        if (now_us >= next_blink_us) {
+            if (led_on) {
+                status_led_set_rgb(255, 0, 0);
+            } else {
+                status_led_off();
+            }
+            led_on = !led_on;
+            next_blink_us = now_us + (uint64_t)IMU_LOST_BLINK_MS * 1000u;
+        }
+        sleep_ms(5);
+    }
+}
+
 static void stream_publish_descriptor(uint16_t sample_rate_hz, uint8_t sensor_count,
                                       const uint8_t *sensor_bus_ids, const uint8_t *sensor_addrs) {
     if (sensor_count > MAX_SENSORS) {
@@ -546,6 +596,7 @@ static void sleep_until_deadline(uint64_t deadline_us) {
 
 static void usb_transport_loop(void) {
     uint32_t last_sequence = 0;
+    uint64_t last_frame_us = 0;
     uint8_t descriptor_retries_remaining = 5;
     uint64_t next_descriptor_us = time_us_64();
 
@@ -565,10 +616,19 @@ static void usb_transport_loop(void) {
             next_descriptor_us = now_us + 200000u;
         }
 
+        if (__atomic_load_n(&g_imu_lost_mask, __ATOMIC_ACQUIRE) != 0u) {
+            imu_lost_forever();
+        }
+
         imu_stream_slot_t latest;
         if (stream_copy_latest(&latest, &last_sequence)) {
             print_output_data(latest.timestamp_us, latest.sensors_data, latest.sensor_count);
+            last_frame_us = now_us;
             continue;
+        }
+        // Core 1 stopped producing frames without flagging a sensor (wedged bus or loop).
+        if ((last_frame_us != 0u) && ((now_us - last_frame_us) > STREAM_STALL_US)) {
+            imu_lost_forever();
         }
 
         if (!__atomic_load_n(&g_usb_stream.stream_started, __ATOMIC_ACQUIRE)) {
@@ -595,9 +655,45 @@ static void update_loop(float period_ms, float sensors_data[][FLOATS_PER_SENSOR]
     bool sensor_valid[MAX_SENSORS] = {false};
     uint64_t next_loop_us = time_us_64();
     uint64_t next_output_us = time_us_64();
+    uint16_t bad_reads[MAX_SENSORS] = {0};
+    uint16_t same_reads[MAX_SENSORS] = {0};
+    FusionVector last_accel[MAX_SENSORS];
+    FusionVector last_gyro[MAX_SENSORS];
+    bool have_last[MAX_SENSORS] = {false};
 
     while (true) {
         read_all_sensors(sensors, sensor_valid);
+
+        uint8_t lost = 0;
+        for (uint8_t i = 0; i < sensor_count; i++) {
+            const FusionVector a = sensors[i].accelerometer;
+            const FusionVector g = sensors[i].gyroscope;
+            const float accel2 = a.axis.x * a.axis.x + a.axis.y * a.axis.y + a.axis.z * a.axis.z;
+            // !(x >= min) also catches NaN.
+            const bool bad = !sensor_valid[i] ||
+                             !(accel2 >= IMU_LOST_MIN_ACCEL_G * IMU_LOST_MIN_ACCEL_G);
+            bad_reads[i] = bad ? (uint16_t)(bad_reads[i] + 1u) : 0u;
+            if (!bad) {
+                const bool same = have_last[i] &&
+                    a.axis.x == last_accel[i].axis.x && a.axis.y == last_accel[i].axis.y &&
+                    a.axis.z == last_accel[i].axis.z && g.axis.x == last_gyro[i].axis.x &&
+                    g.axis.y == last_gyro[i].axis.y && g.axis.z == last_gyro[i].axis.z;
+                same_reads[i] = same ? (uint16_t)(same_reads[i] + 1u) : 0u;
+                last_accel[i] = a;
+                last_gyro[i] = g;
+                have_last[i] = true;
+            }
+            if ((bad_reads[i] >= IMU_LOST_READS) || (same_reads[i] >= IMU_STUCK_READS)) {
+                lost |= (uint8_t)(1u << i);
+            }
+        }
+        if (lost != 0u) {
+            // Never publish another frame: core 0 sees the mask and reports the loss.
+            __atomic_or_fetch(&g_imu_lost_mask, lost, __ATOMIC_RELEASE);
+            while (true) {
+                sleep_ms(1000);
+            }
+        }
 
         for (uint8_t i = 0; i < sensor_count; i++) {
             if (!sensor_valid[i] ||

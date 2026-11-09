@@ -1,0 +1,10 @@
+# Jetson Orin Nano (JetPack 6): tensorrt comes with JetPack; opencv-python or the system cv2.
+numpy
+opencv-python
+tokenizers
+safetensors
+huggingface_hub
+python-can
+gs-usb        # only for --can gs_usb:0 (candleLight)
+pyserial      # only for --can slcan:/dev/ttyACM0
+inputs        # Xbox gamepad (optional)

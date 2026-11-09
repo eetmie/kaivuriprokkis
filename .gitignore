@@ -1,0 +1,4 @@
+bundle/
+.venv/
+__pycache__/
+camera.jpg

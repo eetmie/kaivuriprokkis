@@ -1,5 +1,24 @@
 # Valtra T171 pallet demo (X-VLA, Jetson)
 
+Nopee vibe-koodattu pohja Valtraan. Tästä pitää vielä kattoo:
+
+-CAN prio, menin kolmosella enkä testannut toimiiko suoraan laskemalla arvoa. En usko että koneen MCU kattoo tota yhtään (eli ei varmaan toimi)
+
+-pätkiminen (MCU tappelee joikkarin/jetsonin komentojen välillä) korjattiin ampumalla komentoja sisään 100hz. Huomio että väännetty pythonilla, eli viestit ei mene tasaisin väliajoin sisään (korkea jitter)
+
+
+Ekaa kertaa kun ajat tän jetsonilla, niin odota rauhassa 10min. Malli rakennetaan splitatuista ONNX-palikoista yhdeksi TensorRuntime(TRT) kokonaisuudeksi, tässä menee hetki. Moottorit tallennetaan niin jatkossa lähtee nopeeta käyntiin.
+
+
+Jetson on semi tarkka siitä että se saa laadukasta virtaa sisään. Huono piuha tai muuttuva jännite saattaa jumittaa koko kortin, GPU hävii näkyvistä kokonaan ("brown-out"). Heittää jotain satunnaisia TRT virheitä.
+
+Omat mallit voit kouluttaa ihan normaalisti LeRobotilla, sun pitää vaan exporttaa `jetson-orin-nano-vla` -repon työkalulla. Claude jeesaa ja sillai.
+
+noni palaillaa mo
+
+---
+
+
 X-VLA runtime for a Valtra T171 front loader on a Jetson Orin Nano: one USB camera -> TensorRT policy -> ISOBUS
 valve commands. Self-contained (`lerobot_vla/` is the minimal TensorRT runtime, `modules/gamepad.py` the pad
 reader). The model `bundle/` (10k-step full fine-tune on `AleksiL/valtra_t171_pallet`: one camera, zero state,

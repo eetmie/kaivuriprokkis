@@ -13,6 +13,8 @@ them into one top-down height map.
       features (finished holes); it fixes the cabin camera's offset from the slew axis, which
       flat sand cannot show. --overlap is a static stretch both cameras see; it fixes the
       cabin camera's rotation about the slew axis and the wrist camera's sideways offset.
+      Before the mounts, each camera's depth is corrected so the flat take is planar
+      (fit_depth_correction; --no-depth-correction skips it).
   view SESSION [--calibration FILE] [--episode EP] [--save FILE.rrd]
       Per-camera level height images, a fused top-down height map, the change since the take
       started, litres dug/piled and the dug hole's bottom below the flat sand.
@@ -23,6 +25,8 @@ Slew angle comes from a gyro-only IMU and can drift: the viewer re-registers the
 against the calibration's reference map every frame and applies that turn to both cameras.
 Chassis tilt (digging forces tip the machine) comes from the base IMU and levels all FK poses;
 recordings from a controller with robot.level_frame.cabin_tilt already carry it in their FK.
+Boom, arm and bucket points are dropped by distance to their mesh surfaces placed on the FK
+(config/arm_model.npz from arm_model.py; --arm-model none: capsules around the FK segments).
 """
 import argparse
 import json
@@ -126,11 +130,22 @@ class Rays:
         v, u = np.mgrid[0:self.h, 0:self.w].astype(float)
         if c.get('rotation_deg', 0) == 180:
             u, v = self.w - 1 - u, self.h - 1 - v
+        self.u, self.v = u, v  # sensor pixel of each stored pixel
         self.x, self.y = (u - i['ppx']) / i['fx'], (v - i['ppy']) / i['fy']
+        self.k = None
+
+    def set_correction(self, correction):
+        """Depth correction from fit_depth_correction (None: raw SDK depth)."""
+        self.k = None if correction is None else depth_basis(self.u, self.v, self.w, self.h, correction['degree']) @ correction['coeffs']
+
+    def depth(self, data, stride):
+        """Depth image (m) on the strided grid, 0 = no depth."""
+        z = np.frombuffer(data, '<u2').reshape(self.h, self.w)[::stride, ::stride] * self.scale
+        return z if self.k is None else z / (1 - z * self.k[::stride, ::stride])
 
     def points(self, data, stride, max_range):
         """Camera-frame points of valid pixels, and their flat pixel indices on the strided grid."""
-        z = np.frombuffer(data, '<u2').reshape(self.h, self.w)[::stride, ::stride] * self.scale
+        z = self.depth(data, stride)
         P = np.stack([self.x[::stride, ::stride] * z, self.y[::stride, ::stride] * z, z], -1).reshape(-1, 3)
         keep = np.flatnonzero((z.reshape(-1) > 0) & (np.einsum('ij,ij->i', P, P) < max_range ** 2))
         return P[keep], keep
@@ -241,6 +256,51 @@ def flat_samples(episode, rays, every=3, per_frame=150, seed=0):
         inl = P[np.abs(P @ n + d) < .015]
         out.append((i, rows[i]['status'], inl[rng.choice(len(inl), min(per_frame, len(inl)), replace=False)], n, d))
     return out
+
+
+def depth_basis(u, v, w, h, degree):
+    """Polynomial terms x^i y^j (i + j <= degree) of sensor pixels, centred and scaled by half the width."""
+    x, y = (u - w / 2) / (w / 2), (v - h / 2) / (w / 2)
+    return np.stack([x ** i * y ** j for i in range(degree + 1) for j in range(degree + 1 - i)], -1)
+
+
+def fit_depth_correction(frames_in, rays, degree=3, every=5, stride=4, seed=0):
+    """Stereo depth bends flat sand into a dome (a few mm at the image edges: a disparity error that
+    varies smoothly over the sensor). Fit k(u, v) so that z' = z / (1 - z k) makes every depth frame
+    (raw bytes) of the flat take planar; k is a disparity offset over focal length x baseline (1/m),
+    so its error grows as z^2. Fitted on even frames, scored on odd ones. Planarity cannot see an overall depth
+    scale; the FK mount fit after this checks absolute heights."""
+    rng = np.random.default_rng(seed); frames = []
+    for i, data in enumerate(frames_in):
+        if i % every:
+            continue
+        z = np.frombuffer(data, '<u2').reshape(rays.h, rays.w)[::stride, ::stride] * rays.scale
+        k = (z > 0) & (z < 1.)
+        if k.sum() > 1500:
+            s = np.s_[::stride, ::stride]
+            frames.append((np.stack([rays.x[s][k], rays.y[s][k], np.ones(k.sum())], -1), z[k],
+                           depth_basis(rays.u[s][k], rays.v[s][k], rays.w, rays.h, degree)))
+
+    def fit_planes(subset, c):
+        """Per frame (residuals, Jacobian rows) of sand inliers to that frame's own plane."""
+        out = []
+        for ray, zm, B in subset:
+            z = zm / (1 - zm * (B @ c)); P = ray * z[:, None]
+            n, d, _ = plane_ransac(P, rng, iters=60, tol=.01); keep = np.abs(P @ n + d) < .01
+            for _ in range(2):  # least-squares refit on the inliers
+                q = P[keep]; m = q.mean(0); n = np.linalg.svd(q - m, full_matrices=False)[2][2]; d = -n @ m
+                r = P @ n + d; keep = np.abs(r) < 2.5 * max(r[keep].std(), .002)
+            out.append((r[keep], ((ray[keep] @ n) * z[keep] ** 2)[:, None] * B[keep]))
+        return out
+
+    c = np.zeros(frames[0][2].shape[1]); train, test = frames[0::2], frames[1::2]
+    before = np.abs(np.concatenate([r for r, _ in fit_planes(test, c)]))
+    for _ in range(6):  # Gauss-Newton: planes for fixed c, then c for fixed planes
+        rs = fit_planes(train, c)
+        c = c - np.linalg.lstsq(np.concatenate([J for _, J in rs]), np.concatenate([r for r, _ in rs]), rcond=None)[0]
+    after = np.abs(np.concatenate([r for r, _ in fit_planes(test, c)]))
+    return {'model': "z' = z / (1 - z k(u, v)), k = coeffs . depth_basis(sensor u, v), 1/m",
+            'degree': degree, 'coeffs': c.tolist()}, p50_p90_mm(before), p50_p90_mm(after), len(frames)
 
 
 def fit_mount(samples, link, start=None):
@@ -491,6 +551,7 @@ def p50_p90_mm(r):
 def calibrate(args):
     session = args.session
     path = args.output or session / 'sand-calibration.json'
+    load_arm(args)
     rays = {k: Rays(session, k) for k in ('cam1', 'cam2')}
     flat = episode_path(session, args.flat)
     global GRAVITY_REFERENCE
@@ -498,8 +559,13 @@ def calibrate(args):
     g = np.median([base_gravity(st) for st in flat_rows], 0)
     levelled = all(st.get('fk_cabin_tilt') for st in flat_rows)  # the controller's FK is already level
     GRAVITY_REFERENCE = None if args.no_tilt or levelled else g / np.linalg.norm(g)
-    report, mounts = {}, {}
+    report, mounts, corrections = {}, {}, {}
     for key, links in (('cam2', (0,)), ('cam1', (1, 2, 3))):
+        if not args.no_depth_correction:
+            corrections[key], before, after, n = fit_depth_correction(depth_frames(flat / f'{key}.depth.zst'), rays[key])
+            rays[key].set_correction(corrections[key])
+            report[f'{key}_depth'] = {'frames': n, 'flat_planarity_mm_p50_p90_before_after': [before, after]}
+            print(f'{key}: depth correction, flat-sand planarity p50/p90 {before} -> {after} mm (held-out frames)', flush=True)
         samples = flat_samples(flat, rays[key])
         fits = [(np.median(np.abs(r)), link, m, r) for link in links for m, r in [fit_mount(samples, link)]]
         med, link, mount, r = min(fits, key=lambda f: f[0])
@@ -568,7 +634,7 @@ def calibrate(args):
            'base_gravity_reference': None if GRAVITY_REFERENCE is None else GRAVITY_REFERENCE.tolist(),
            'tilt_imu_yaw_deg': math.degrees(TILT_YAW), 'tilt_pivot_base_m': TILT_PIVOT.tolist(),
            'tilt_deadband_deg': math.degrees(TILT_DEADBAND),
-           'cameras': {k: m.to_json() for k, m in mounts.items()}, 'sand_polygon_level_xy_m': poly, **extra, 'report': report}
+           'cameras': {k: m.to_json() for k, m in mounts.items()}, 'depth_correction': corrections, 'sand_polygon_level_xy_m': poly, **extra, 'report': report}
     path.write_text(json.dumps(out, indent=2) + '\n')
     print(f'wrote {path}')
 
@@ -590,8 +656,54 @@ def inside(poly, xy):
     return (cross >= 0).all(1)
 
 
+class ArmModel:
+    """Boom, arm and bucket surfaces from arm_model.py: each link's distance grid, placed on the FK
+    pivots and stretched to the FK link length. margins: per link (boom, arm, bucket), m; the
+    bucket's is wide because FK puts it 2-6 cm off where the cameras see it, varying with pose."""
+    def __init__(self, path, margins=(.025, .025, .08)):
+        z = np.load(path); self.voxel, self.margins = float(z['voxel']), margins
+        self.links = [(k, z[f'link{k}_mm'], z[f'link{k}_lo'], float(z[f'link{k}_length'])) for k in (1, 2, 3)]
+
+    def near(self, Pb, status):
+        """Base-frame points within their link's margin of the boom, arm or bucket surface."""
+        chain = fk_chain(status); lateral = link_pose(status, 0)[0][:, 1]
+        hit = np.zeros(len(Pb), bool)
+        for (k, grid, lo, length), margin in zip(self.links, self.margins):
+            E = link_frame(chain[k], chain[k + 1], lateral)
+            Q = (Pb - chain[k]) @ E.T; Q[:, 0] *= length / ((chain[k + 1] - chain[k]) @ E[0])
+            ijk = np.floor((Q - lo) / self.voxel).astype(int)
+            ok = ((ijk >= 0) & (ijk < grid.shape)).all(1)
+            hit[ok] |= grid[tuple(ijk[ok].T)] < margin * 1000  # grids hold mm, capped at 255
+        return hit
+
+
+def link_frame(pivot, nxt, lateral):
+    """Rows: along the link, lateral, and their cross product (arm_model.py builds the same)."""
+    e1 = nxt - pivot; e1 = e1 - (e1 @ lateral) * lateral; e1 /= np.linalg.norm(e1)
+    return np.stack([e1, lateral, np.cross(e1, lateral)])
+
+
+ARM = None  # ArmModel; None: capsules around the FK segments
+ARM_MODEL_DEFAULT = Path(__file__).resolve().parents[1] / 'config/arm_model.npz'
+
+
+def arm_arguments(p):
+    p.add_argument('--arm-model', default=str(ARM_MODEL_DEFAULT),
+                   help="boom/arm/bucket surfaces from arm_model.py ('none': capsules of --arm-radius-m around the FK)")
+    p.add_argument('--arm-margins-m', type=float, nargs=3, default=(.025, .025, .08), metavar=('BOOM', 'ARM', 'BUCKET'),
+                   help='drop points this close to each link surface')
+
+
+def load_arm(args):
+    global ARM
+    ARM = None if args.arm_model == 'none' else ArmModel(args.arm_model, tuple(args.arm_margins_m))
+
+
 def near_arm(Pb, status, radius):
-    """Points within radius of the boom/arm/bucket segments (FK base frame, tilt corrected)."""
+    """Points on the boom/arm/bucket: near the mesh model when one is loaded, else within radius of
+    the FK segments (base frame, tilt corrected)."""
+    if ARM is not None:
+        return ARM.near(Pb, status)
     chain = fk_chain(status, 1)
     hit = np.zeros(len(Pb), bool)
     for a, b in zip(chain[:-1], chain[1:]):
@@ -685,8 +797,11 @@ def view(args):
     cal = json.loads(cal_path.read_text())
     if not args.no_tilt:
         load_tilt(cal)
+    load_arm(args)
     mounts = {k: Mount.from_json(c) for k, c in cal['cameras'].items()}
     rays = {k: Rays(session, k) for k in mounts}
+    for k in rays:
+        rays[k].set_correction(cal.get('depth_correction', {}).get(k))
     tracker = None
     if 'reference_map' in cal and 'cam2' in mounts and not args.no_slew_correction:
         ref = np.load(cal_path.parent / cal['reference_map'])
@@ -767,6 +882,8 @@ def main():
     c.add_argument('--overlap', type=span, help='EP:START:END static frames both cameras see')
     c.add_argument('-o', '--output', type=Path)
     c.add_argument('--no-tilt', action='store_true', help='ignore base IMU chassis tilt')
+    c.add_argument('--no-depth-correction', action='store_true', help='use raw SDK depth (no flat-sand planarity fit)')
+    arm_arguments(c)
     v = sub.add_parser('view'); v.add_argument('session', type=Path)
     v.add_argument('--calibration', type=Path); v.add_argument('--episode', type=int, default=0)
     v.add_argument('--every', type=int, default=3, help='show every Nth frame')
@@ -774,7 +891,8 @@ def main():
     v.add_argument('--max-range-m', type=float, default=.8, help='drop depth farther than this from the camera')
     v.add_argument('--above-m', type=float, default=.12, help='drop points this far above the flat sand')
     v.add_argument('--below-m', type=float, default=.15, help='drop points this far below the flat sand')
-    v.add_argument('--arm-radius-m', type=float, default=.11, help='drop points this close to the FK arm')
+    v.add_argument('--arm-radius-m', type=float, default=.11, help='with --arm-model none: drop points this close to the FK arm')
+    arm_arguments(v)
     v.add_argument('--color-mm', type=float, default=50)
     v.add_argument('--deadband-mm', type=float, default=8, help='changes smaller than this count as unchanged')
     v.add_argument('--fusion', choices=('fill', 'average', 'cabin'), default='cabin',

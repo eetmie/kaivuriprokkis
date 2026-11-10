@@ -65,10 +65,13 @@ class Engine:
         cal = json.loads(Path(cal_path).read_text())
         if not args.no_tilt:
             sh.load_tilt(cal)
+        sh.load_arm(args)
         self.args = args
         self.keys = ['cam2'] + (['cam1'] if args.fusion != 'cabin' else [])
         self.mounts = {k: sh.Mount.from_json(cal['cameras'][k]) for k in self.keys}
         self.rays = rays
+        for k in rays:
+            rays[k].set_correction(cal.get('depth_correction', {}).get(k))
         self.tracker = None
         if args.reference == 'live':
             self.tracker = LiveTracker(self.mounts['cam2'], rays['cam2'], args.seed_frames, args.grow_score)
@@ -171,7 +174,8 @@ def common(p):
     p.add_argument('--max-range-m', type=float, default=.8)
     p.add_argument('--above-m', type=float, default=.12)
     p.add_argument('--below-m', type=float, default=.15)
-    p.add_argument('--arm-radius-m', type=float, default=.11)
+    p.add_argument('--arm-radius-m', type=float, default=.11, help='with --arm-model none: capsule radius')
+    sh.arm_arguments(p)
     p.add_argument('--deadband-mm', type=float, default=8)
     p.add_argument('--color-mm', type=float, default=50)
     p.add_argument('--no-tilt', action='store_true')

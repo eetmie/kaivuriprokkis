@@ -247,3 +247,4 @@ data_collection/coverage_plots/
 .venv-lerobot061/
 .venv-rerun/
 .venv-tags/
+!native_stack/config/arm_model.npz

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "machine_id": "kaivuri-rc-pikkumasi2tb",
+  "calibration_version": "native-profile-20261110-uncommissioned",
+  "simulation": false,
+  "use_tracks": false,
+  "use_tool": false,
+  "use_lidar": false,
+  "cameras": ["cabin", "arm"],
+  "normalization": {
+    "joint_angles": {
+      "unit": "rad",
+      "min": [-3.141592653589793, -0.5235987755982988, -2.5132741228718345, -2.0943951023931953],
+      "max": [3.141592653589793, 0.8726646259971648, -0.4886921905584123, 0.3490658503988659]
+    },
+    "command": {
+      "physical_quantity": "kaivuri_native_normalized_valve_demand",
+      "unit": "1",
+      "negative_limit": [1.0, 1.0, 1.0, 1.0],
+      "positive_limit": [1.0, 1.0, 1.0, 1.0]
+    }
+  },
+  "native_angle_sign": [1, -1, -1, 1],
+  "native_command_sign": [1, -1, -1, 1],
+  "sign_commissioning": "Uncommissioned (from kaivuri-ros-fit 2026-11-04). Validate every axis with powered motion at small magnitude before use.",
+  "joint_bounds_source": "Native profile: slew wrapped [-pi,pi], boom [-50,30], arm [28,144], bucket [-120,20] degrees, before sign conversion",
+  "cameras_native": {
+    "cabin": {"serial": "141722076647", "ir_index": 1, "modality": "infrared_y8"},
+    "arm": {"serial": "233522073919", "ir_index": 2, "modality": "infrared_y8", "rotation_deg": 180}
+  }
+}

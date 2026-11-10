@@ -105,6 +105,10 @@ This is an **unfinetuned LIBERO performance demo**. IR gray is replicated into t
 
 After the register-level hardware checks, `bench_pi05.py --live-pwm` also completed a 60-second inference run with real 100 Hz neutral I2C writes. It stays disarmed and refuses simulated IMUs. Inference p50/p99 was 425.50/426.98 ms; control wake-up lateness p99/max was 0.070/0.242 ms, and per-tick control work p99 was 1.108 ms. Both camera callback counters had zero gaps/resets. One camera skipped two shared-frame publications (latest-frame writer busy) across capture including model load; the other skipped none. Evidence is in `results/pi05-dual-ir-live-pwm-60s-20261012/`.
 
+### ROS 2
+
+[ros2/README.md](ros2/README.md): read-only bridge onto the Isaac sim's topics (excavator-vla contract), for RViz on another machine.
+
 ### Live sand height beside pi0.5
 
 `tools/sand_height_live.py live` reads the cabin camera's shared depth frame and control status (read-only) and keeps `sand_height.py`'s level height map, litres moved and slew correction while inference runs. `replay SESSION` times the same work on a recording. `tools/bench_fullstack.py` runs dry/disarmed control, both IR cameras with depth, pi0.5 without `--live`, and the sand process:

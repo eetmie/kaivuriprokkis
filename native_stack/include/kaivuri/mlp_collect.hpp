@@ -7,7 +7,7 @@ struct Options {
     std::string gamepad, suffix;
     bool dry = false, scripted = false, slew = false, tracks = false, record_on_start = false;
     bool fixed_seed = false;
-    double duration = 0, record_seconds = 600;
+    double duration = 0, record_seconds = 600, range = 1;
     size_t queue = 4096, read_chunk = 512;
     ExcitationOptions excitation{};
 };

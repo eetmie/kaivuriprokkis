@@ -117,6 +117,8 @@ int main(int argc, char **argv) {
                     try {
                         pad->poll_events();
                         manual = pad->action(o.slew, o.tracks);
+                        for (auto &value : manual) // fit the stick travel into +-range, not clip it
+                            value *= o.range;
                         const auto keys = buttons(*pad);
                         auto pressed = [&](unsigned i) { return keys[i] && !previous[i]; };
                         start_record = pressed(0);

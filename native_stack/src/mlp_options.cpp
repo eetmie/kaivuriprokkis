@@ -24,6 +24,7 @@ constexpr const char *usage =
     "  [--excitation-seed N --excitation-amplitude A --chirp-start-hz F "
     "--chirp-end-hz F --chirp-seconds S]\n"
     "  [--stroke-seconds 8 --stroke-margin-deg 10 --record-seconds 600]\n"
+    "  [--range R: scale the gamepad sticks to +-R (0<R<=1), default 1]\n"
     "  [--scripted --record-on-start --duration-s S --queue-records 4096 "
     "--read-chunk-bytes 512]\n"
     "Defaults: sine carriers 0.2-10 Hz (log-uniform), 12 Hz instantaneous limit;\n"
@@ -73,6 +74,8 @@ Options parse_options(int argc, char **argv) {
             o.tracks = true;
         else if (args.is("--record-on-start"))
             o.record_on_start = true;
+        else if (args.is("--range"))
+            o.range = args.finite();
         else if (args.is("--duration-s"))
             o.duration = args.finite();
         else if (args.is("--record-seconds"))
@@ -109,8 +112,8 @@ Options parse_options(int argc, char **argv) {
             args.unknown();
     }
     require(!o.out.empty() && o.scripted == o.gamepad.empty() && o.duration >= 0 &&
-                o.record_seconds > 0 && o.read_chunk > 0 && o.read_chunk <= 8192 && o.queue >= 16 &&
-                o.queue <= 65536 && !(o.queue & (o.queue - 1)),
+                o.record_seconds > 0 && o.range > 0 && o.range <= 1 && o.read_chunk > 0 &&
+                o.read_chunk <= 8192 && o.queue >= 16 && o.queue <= 65536 && !(o.queue & (o.queue - 1)),
             "invalid output, input, duration or queue options");
     require(e.target != 1 || o.slew, "slew excitation requires --enable-slew");
     for (char &c : o.suffix)
@@ -148,7 +151,8 @@ Runtime load_runtime(const Options &o) {
               << "{\"profile\":" << json_quote(fs::absolute(o.profile).string())
               << ",\"serial\":" << json_quote(o.serial.string())
               << ",\"gamepad\":" << json_quote(o.gamepad) << ",\"scripted\":" << o.scripted
-              << ",\"duration_s\":" << o.duration << ",\"record_seconds\":" << o.record_seconds
+              << ",\"range\":" << o.range << ",\"duration_s\":" << o.duration
+              << ",\"record_seconds\":" << o.record_seconds
               << ",\"read_chunk_bytes\":" << o.read_chunk << ",\"fixed_seed\":" << o.fixed_seed
               << ",\"pwm_frequency_hz\":" << r.config.frequency << '}';
     m.options_json = effective.str();

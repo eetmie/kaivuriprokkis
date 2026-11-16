@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ROS 2 bridge for the Kaivuri native stack: the topics the Isaac sim publishes, so one viewer
-(and later one client) works on either. Read-only for now: STATUS polls only, no DRIVE.
+"""ROS 2 bridge for the Kaivuri native stack: the topics the Isaac sim publishes and accepts, so one
+viewer, recorder and policy node works on either. Read-only (STATUS polls only) unless --commands.
 
   live   [--socket S] [--frames DIR] [--calibration CAL]     the running controller and cameras
   replay SESSION [--episode N] [--calibration CAL]           a recorded take, looped at real time
@@ -11,7 +11,14 @@ Published (wall-clock stamps; frames from the shared URDF, sim-scratchpad ros2/u
   /excavator/feedback_healthy        controller not faulted, IMUs healthy, FK valid, angles in bounds
   /excavator/adapter_info            {interface_id, calibration_id} from the profile, 1 Hz
   /excavator/cameras/<name>/image_raw  IR mono8 (the contract asks rgb8; tripling is left to clients)
+  /excavator/cameras/<name>/depth/{image_raw,camera_info}  16UC1 mm, live cameras started with --depth
   /tf_static                         camera depth frames, with --calibration (sand_height.py calibrate)
+  /excavator/episode                 with a gamepad: A starts an episode of --task / ends it as a success,
+                                     B ends it as a failure (latched JSON, the recorder's and policy's cue)
+
+live --commands also drives: /excavator/command [slew, lift, tilt, scoop] in [-1, 1] -> native DRIVE on this
+one connection (it owns the drive lease). The controller is armed only from an all-zero command, a command
+older than 150 ms or invalid disarms, and pump permission is never taken from ROS: X on the gamepad toggles it.
 
 Run with the system ROS (source /opt/ros/jazzy/setup.bash); needs no ROS package build.
 """
@@ -28,7 +35,8 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import Bool, Float32MultiArray, MultiArrayDimension, String
 from tf2_ros import StaticTransformBroadcaster
 
@@ -45,6 +53,7 @@ CABIN_SHIFT = np.array([0, 0, .014])  # slew-link origin sits 14 mm above upper_
 ARM_TURN = .02813  # tilt_boom is turned this far about +y from the native arm link
 CAMERA_KEYS = {'cabin': 'cam2', 'arm': 'cam1'}  # recorder keys
 CAMERA_PARENTS = {'cabin': ('upper_carriage', 0), 'arm': ('tilt_boom', 2)}  # URDF link, native link
+COMMAND_TIMEOUT_S = .15  # the contract's: an older command stream means stop
 
 
 def digest(value):
@@ -92,11 +101,19 @@ class Live:
         from client import Client
         from frame_reader import FrameReader
         self.client = Client(a.socket)
-        self.readers = {}
+        self.readers, self.depths, self.sequence = {}, {}, {}
         for name, cam in profile['cameras_native'].items():
             path = Path(a.frames) / f'{cam["serial"]}-ir{cam["ir_index"]}.frame'
             if path.exists():
                 self.readers[name] = FrameReader(path, a.library, max_age_s=.5)
+            path = Path(a.frames) / f'{cam["serial"]}-depth.frame'
+            if path.exists():  # kaivuri-camera --depth
+                c = json.loads(path.with_suffix('.json').read_text())
+                i, turned = c['depth_intrinsics'], cam.get('rotation_deg') == 180
+                # The camera frame is turned with the published pixels (camera_transforms), so is the principal point.
+                ppx, ppy = (i['width'] - 1 - i['ppx'], i['height'] - 1 - i['ppy']) if turned else (i['ppx'], i['ppy'])
+                self.depths[name] = (FrameReader(path, a.library, i['width'] * i['height'] * 2, .5), turned,
+                                     c['depth_scale_m'] * 1e3, (i['fx'], i['fy'], ppx, ppy))
 
     def status(self):
         return self.client.status()
@@ -107,10 +124,27 @@ class Live:
         if got is None:
             return None
         m, pixels = got
+        if self.sequence.get(name) == m.sequence:  # polled faster than the camera: each frame goes out once
+            return None
+        self.sequence[name] = m.sequence
         return (time.monotonic_ns() - m.host_monotonic_ns) * 1e-9, m.width, m.height, bytes(pixels)
+
+    def depth(self, name):
+        """(age s, depth mm uint16 [h, w]) of the newest depth frame, or None."""
+        reader, turned, mm, _ = self.depths[name]
+        got = reader.read()
+        if got is None:
+            return None
+        m, pixels = got
+        z = np.frombuffer(pixels, '<u2').reshape(m.height, m.width)
+        z = z if mm == 1 else np.minimum(np.rint(z * mm), 65535).astype('<u2')  # finer camera units: ROS depth is mm
+        return (time.monotonic_ns() - m.host_monotonic_ns) * 1e-9, np.rot90(z, 2) if turned else z
 
 
 class Replay:
+    depths = {}  # shortcut: recorded depth is not replayed; add when a replayed height map is needed
+
+
     def __init__(self, a, profile):
         from export_episodes import committed_episodes, samples
         episode = committed_episodes(a.session)[a.episode]
@@ -158,8 +192,23 @@ class Bridge(Node):
         self.pub_info = self.create_publisher(String, 'excavator/adapter_info', 10)
         self.pub_images = {n: self.create_publisher(Image, f'excavator/cameras/{n}/image_raw', 2) for n in profile['cameras']}
         self.problem = None
+        live = a.mode == 'live'
+        self.commands, self.state, self.last_command, self.pump = live and a.commands, None, None, False
+        if self.commands:
+            self.command_sign = np.array(profile['native_command_sign'], float)
+            self.create_subscription(Float32MultiArray, 'excavator/command', self.on_command, 1)
+        from vla_operator import Pad, find_pad
+        path = find_pad(a.gamepad) if live else None
+        self.pad, self.task, self.episode, self.running = Pad(path) if path else None, a.task, 0, False
+        self.pub_episode = self.create_publisher(String, 'excavator/episode',
+                                                 QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_timer(1 / a.state_hz, self.poll_state)
         self.create_timer(1 / a.camera_hz, self.poll_images)
+        self.pub_depth = {n: (self.create_publisher(Image, f'excavator/cameras/{n}/depth/image_raw', 2),
+                              self.create_publisher(CameraInfo, f'excavator/cameras/{n}/depth/camera_info', 2))
+                          for n in source.depths}
+        if self.pub_depth:
+            self.create_timer(1 / a.depth_hz, self.poll_depth)
         self.create_timer(1., lambda: self.pub_info.publish(String(data=self.info)))
         if a.calibration:
             self.static = StaticTransformBroadcaster(self)
@@ -173,8 +222,59 @@ class Bridge(Node):
                 msgs.append(m)
             self.static.sendTransform(msgs)
 
+    def disarm(self, reason):
+        import client
+        self.source.client.send(client.DISARM)
+        if self.state in ('arming', 'armed'):
+            self.get_logger().warning(f'disarmed: {reason}')
+            self.state = 'disarmed'
+
+    def on_command(self, msg):
+        import client
+        v = np.asarray(msg.data, float)
+        if v.shape != (4,) or not np.isfinite(v).all() or np.abs(v).max() > 1:
+            return self.disarm('invalid command')
+        self.last_command = time.monotonic()
+        send, flags = self.source.client.send, client.DEADMAN | (client.PUMP if self.pump else 0)
+        if self.state == 'armed':
+            send(client.DRIVE, [(*(v * self.command_sign), 0., 0.)], flags=flags)
+        elif self.state is not None and not v.any():  # arming, and leaving a fault, only from neutral demand
+            if self.state in ('fault', 'decaying'):
+                send(client.DISARM)
+            send(client.DRIVE, [(0.,) * 6], flags=flags | client.ARM)
+
+    def poll_pad(self):
+        from vla_operator import BTN_A, BTN_B, BTN_X
+        try:
+            pressed = self.pad.poll()
+        except RuntimeError as e:  # lost pad: no way to take the pump back, so take it now
+            self.pad, self.pump = None, False
+            self.get_logger().error(f'{e}; pump permission off')
+            if self.commands:
+                self.disarm('gamepad lost')
+            return
+        for b in pressed:
+            if b == BTN_X:
+                self.pump = not self.pump
+                self.get_logger().info(f'pump permission {"ON" if self.pump else "OFF"}')
+            elif b == BTN_A or (b == BTN_B and self.running):
+                self.running = not self.running
+                self.episode += self.running
+                event = ({'event': 'start', 'task': self.task} if self.running else
+                         {'event': 'end', 'success': b == BTN_A})
+                event.update(episode=self.episode, time_s=self.get_clock().now().nanoseconds * 1e-9)
+                self.pub_episode.publish(String(data=json.dumps(event)))
+                self.get_logger().info(json.dumps(event))
+
     def poll_state(self):
+        if self.pad:
+            self.poll_pad()
         s = self.source.status()
+        if self.commands:
+            self.state = s['state'] if s.get('imu_healthy') else None
+            stale = self.last_command is None or time.monotonic() - self.last_command > COMMAND_TIMEOUT_S
+            if s['state'] in ('arming', 'armed') and (stale or self.state is None):
+                self.disarm('command timeout' if stale else 'IMU unhealthy')
         stamp = self.get_clock().now().to_msg()
         q = np.array(s['angles_rad'], float)
         q[0] = math.remainder(q[0], 2 * math.pi)
@@ -205,6 +305,23 @@ class Bridge(Node):
             pub.publish(m)
 
 
+    def poll_depth(self):
+        now = self.get_clock().now()
+        for name, (pub, pub_info) in self.pub_depth.items():
+            got = self.source.depth(name)
+            if got is None:
+                continue
+            age, z = got
+            fx, fy, ppx, ppy = self.source.depths[name][3]
+            m = Image(); m.header.stamp = (now - rclpy.duration.Duration(seconds=age)).to_msg()
+            m.header.frame_id = f'{name}_camera'; m.height, m.width = z.shape
+            m.encoding, m.step, m.data = '16UC1', 2 * z.shape[1], z.tobytes()
+            info = CameraInfo(header=m.header, height=m.height, width=m.width, distortion_model='plumb_bob', d=[0.] * 5)
+            info.k = [fx, 0., ppx, 0., fy, ppy, 0., 0., 1.]; info.r = [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+            info.p = [fx, 0., ppx, 0., 0., fy, ppy, 0., 0., 0., 1., 0.]
+            pub_info.publish(info); pub.publish(m)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='mode', required=True)
@@ -213,12 +330,17 @@ def main():
     live.add_argument('--socket', default=DEFAULT_SOCKET)
     live.add_argument('--frames', default=f'{RUNTIME_DIR}/cameras', help='kaivuri-camera frame store directory')
     live.add_argument('--library', default=None, help='libkaivuri_frames.so (default: native_stack/build)')
+    live.add_argument('--commands', action='store_true', help='accept /excavator/command and drive the controller')
+    live.add_argument('--gamepad', default='auto', help="evdev path, 'auto' (first by-id joystick) or 'none'")
+    live.add_argument('--task', default='dig the sand', help='instruction of the episodes started on the gamepad')
     replay.add_argument('session', type=Path); replay.add_argument('--episode', type=int, default=0)
     for q in (live, replay):
         q.add_argument('--profile', type=Path, default=Path(__file__).with_name('kaivuri.profile.json'))
         q.add_argument('--calibration', type=Path, help='sand_height.py calibration: publishes the camera frames')
         q.add_argument('--state-hz', type=float, default=50)
-        q.add_argument('--camera-hz', type=float, default=5, help='IR image rate (WiFi viewers: keep it low)')
+        q.add_argument('--camera-hz', type=float, default=5,
+                       help='IR image poll rate (WiFi viewers: keep it low; 60 publishes every 30 fps frame, for a policy)')
+        q.add_argument('--depth-hz', type=float, default=5, help='depth image rate, and so the height map\'s')
     a = p.parse_args()
     profile = json.loads(a.profile.read_text())
     source = (Live if a.mode == 'live' else Replay)(a, profile)

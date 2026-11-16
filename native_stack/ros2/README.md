@@ -2,7 +2,7 @@
 
 `kaivuri_bridge.py` puts the native stack on the topics the Isaac sim publishes (sim-scratchpad `ros2/`), so one
 viewer, and later one client, works on either. It follows the excavator-vla topic contract v1 for the machine-facing
-topics. **Read-only for now:** it only polls STATUS and never sends DRIVE.
+topics. Read-only by default (STATUS polls only); `live --commands` also accepts `/excavator/command`.
 
 ROS 2 Jazzy runs bare metal on the board (`ros-jazzy-ros-base`, from the official ROS apt source, 2026-11-10).
 The bridge is one Python file; no colcon build.
@@ -27,7 +27,44 @@ ros2 launch scripts/sim-scratchpad/ros2/view_excavator.launch.py sim:=false   # 
 | `/excavator/feedback_healthy` | `std_msgs/Bool` | 50 Hz | no controller fault, IMUs healthy, FK valid, angles inside the profile bounds |
 | `/excavator/adapter_info` | `std_msgs/String` | 1 Hz | `interface_id`, `calibration_id` derived from `kaivuri.profile.json` as the shared stack does |
 | `/excavator/cameras/{cabin,arm}/image_raw` | `sensor_msgs/Image` mono8 | 5 Hz (`--camera-hz`) | IR; frames `cabin_camera`, `arm_camera` |
+| `/excavator/cameras/{cabin,arm}/depth/{image_raw,camera_info}` | `Image` 16UC1 mm, `CameraInfo` | 5 Hz (`--depth-hz`) | cameras started with `--depth`; finer camera depth units are converted to mm |
+| `/excavator/episode` | `std_msgs/String` JSON, latched | on the pad | A starts an episode of `--task` or ends it as a success, B ends it as a failure |
 | `/tf_static` | | | with `--calibration`: the depth frames of both cameras on `upper_carriage` / `tilt_boom` |
+
+## Commands, height map and a policy (2026-11-16)
+
+`live --commands` sends `/excavator/command` `[slew, lift, tilt, scoop]` in [-1, 1] as native DRIVE rows (times
+`native_command_sign`) on the bridge's one connection, which then owns the drive lease. The controller is armed
+only from an all-zero command; a command older than 150 ms, an invalid one, an unhealthy IMU or a lost gamepad
+disarms. Pump permission never comes from ROS: X on the gamepad toggles it. Checked on the board with live PWM
+and the hydraulics unpowered: signs as in the profile, stop 140 ms after the last command.
+
+The whole observation side of the sim runs on the board: with ROS sourced, build sim-scratchpad `ros2/setup_ws.sh`
+(colcon from a venv is enough; 2 minutes), then
+
+```bash
+kaivuri-control ... & kaivuri-camera --camera 233522073919:2 --camera 141722076647:1 --rotate-180 233522073919 \
+    --depth 141722076647 &
+python3 -B native_stack/ros2/kaivuri_bridge.py live --commands --camera-hz 60 --calibration CAL --task "..." &
+ros2 launch ~/sim-scratchpad/ros2/view_excavator.launch.py sim:=false rviz:=false teleop:=false calibration:=CAL
+```
+
+gives depth, the self-filtered cloud, FastDEM's scan and `/excavator/heightmap/image` at 5.0 Hz each (FastDEM
+9 % and the bridge 9 % of one core). The sand reads about -0.23 m in `upper_carriage` here, against -0.15 m in
+the sim (mid-gray): the height image is darker than the sim's until one of the two is moved.
+
+A policy runs through ros-excavator `policy_node.py`. With an X-VLA TensorRT bundle it uses the python
+branch's engine runtime, no LeRobot or Torch:
+
+```bash
+source /opt/ros/jazzy/setup.bash && cd ~/ros-excavator
+~/kaivuriprokkis-python/.venv/bin/python policy_node.py profiles/kaivuri_xvla_ir.json \
+    ~/bundles/xvla-masi_dual_camera-c30x10-full-17000-fp16 --execute 15
+```
+
+Measured with that bundle, both IR cameras at 30 Hz and live PWM (hydraulics unpowered): chunks of 30 in
+342 ms (11 steps), commands at 29.9 Hz, the controller armed throughout an episode and neutral after it,
+3.1 GB of RAM in use. `--execute` must leave more rows than the latency: 15 for a 30-row chunk.
 
 URDF positions are the native angles plus fixed offsets (0, 0, −0.02813, +0.00355 rad), same signs: the URDF stick
 line is 1.6° below its link axis and its bucket lip 0.2° off the native tip. Checked against the native FK
@@ -41,16 +78,11 @@ Tailscale link could not carry (state fell to 2.6 Hz); with `--camera-hz 0.5` st
 
 ## Not done yet
 
-- **Commands:** `/excavator/command` → native DRIVE, ported from `~/kaivuri-ros-fit` (11-04 dry fit: 150 ms command
-  expiry, arming only from neutral, one socket owns the drive lease). Command signs in the profile are not
-  commissioned: check each axis with powered motion at a small magnitude first.
-- **Pump permission** stays with the robot's gamepad, as a toggle (X, like `vla_live.py`); ROS never grants it.
-  Future: a client-side toggle (e.g. the contract's `OperatorState`) as a second way to switch it, with the pad
-  still able to turn it off.
-- Depth point cloud and `/excavator/heightmap` from `sand_height_live.py`; `camera_info`; compressed images for
-  WiFi viewers.
+- Command signs in the profile are not commissioned: check each axis with powered motion at a small magnitude
+  first. Slew also needs `kaivuri-control --enable-slew`.
+- Recorded depth in `replay`; compressed images for WiFi viewers; the arm camera in the map (its mount is a
+  placeholder in sim-scratchpad `sensors.py`).
 - The recorded angles pass the profile bounds by ~1-2° at the end stops (sand-depth-001: boom -51°, arm 145.5°,
   bucket -121.3° / +21.7°), so `feedback_healthy` is false 18-28 % of a dig take. Widen the bounds (it changes the
   normalization) or keep them.
-- Inference: the sim runs stock LeRobot; the robot runs the TRT bundles from jetson-orin-nano-vla, hooked back to
-  LeRobot later. One LeRobot robot class over these topics could then serve both.
+- A TensorRT bundle of the sim-trained (cabin + height map) model: the tested bundle is the dual-IR X-VLA.

@@ -253,8 +253,9 @@ def main():
                 z = np.frombuffer(depth[key], dtype='<u2').reshape(m['height'], m['width'])
                 if rotate:
                     z = np.rot90(z, 2).copy()
-                rr.log(f'scene/{key}/camera/depth', rr.DepthImage(z, meter=1000.0, colormap='turbo',
-                       depth_range=args.depth_range_mm))
+                units = 1e-3 / calibration[key].get('depth_scale_m', 1e-3)   # depth units per mm
+                rr.log(f'scene/{key}/camera/depth', rr.DepthImage(z, meter=1000.0 * units, colormap='turbo',
+                       depth_range=[r * units for r in args.depth_range_mm]))
                 if geometry.get(key):
                     pts, gray = point_cloud(geometry[key], z, image, args.depth_range_mm)
                     rr.log(f'scene/{key}/points', rr.Points3D(pts, colors=np.repeat(gray[:, None], 3, 1),

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <librealsense2/rs.hpp>
+#include <librealsense2/rs_advanced_mode.hpp>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -177,24 +178,29 @@ const char *usage = "kaivuri-camera --list\nkaivuri-camera --camera SERIAL:IR_IN
                     "[--camera SECOND:1]\n  [--width 640 --height 480 --fps 30] [--duration-s SEC] "
                     "[--exposure-us US --gain N]\n  [--hardware-clock] [--allow-missing-metadata] "
                     "[--output-dir DIR] [--metadata-csv FILE]\n  [--rotate-180 SERIAL] [--depth "
-                    "SERIAL] [--depth-log DIR --depth-log-hz 2]\n  [--synthetic] (hardware-free "
+                    "SERIAL] [--disparity-shift SERIAL:N] [--depth-units-um 1000]\n  [--depth-log DIR --depth-log-hz 2] [--synthetic] (hardware-free "
                     "test source; never a physical camera)\nIR index 1 or 2. Sync mode 0 "
                     "standalone, 1 master, 2 slave; requires a sync cable.\n--depth adds same-size "
                     "Z16 from the camera's stereo ASIC to SERIAL-depth.frame (+ SERIAL-depth.json\n"
-                    "calibration); --depth-log appends zstd snapshots at the given rate. Emitter "
+                    "calibration); --depth-log appends zstd snapshots at the given rate.\n"
+                    "--disparity-shift moves the depth window closer (0 = SDK default, applied on every\n"
+                    "start; 640x480: min ~ 19290/(126+N) mm, max ~ 19290/N mm).\n"
+                    "--depth-units-um 100 removes the 1 mm depth steps at close range (max 6.5 m). Emitter "
                     "disabled;\nno RGB, host conversion, encoding, or CUDA context.";
 } // namespace
 
 int main(int argc, char **argv) {
     try {
         int width = 640, height = 480, fps = 30;
-        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2;
+        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2, depth_units_um = 1000;
         bool list = false, synthetic = false, global_time = true, require_metadata = true;
         std::string output = (runtime_dir() / "cameras").string(), csv_path, depth_log;
-        std::vector<std::string> specs, rotate_serials, depth_serials;
+        std::vector<std::string> specs, rotate_serials, depth_serials, shift_specs;
         for (Args args(argc, argv); args.next();) {
             if (args.is("--camera"))
                 specs.push_back(args.value());
+            else if (args.is("--disparity-shift"))
+                shift_specs.push_back(args.value());
             else if (args.is("--rotate-180"))
                 rotate_serials.push_back(args.value());
             else if (args.is("--depth"))
@@ -203,6 +209,8 @@ int main(int argc, char **argv) {
                 depth_log = args.value();
             else if (args.is("--depth-log-hz"))
                 depth_log_hz = args.number();
+            else if (args.is("--depth-units-um"))
+                depth_units_um = args.number();
             else if (args.is("--width"))
                 width = args.integer();
             else if (args.is("--height"))
@@ -236,8 +244,12 @@ int main(int argc, char **argv) {
         require(width >= 1 && height >= 1 && uint64_t(width) * height <= 16 * 1024 * 1024 &&
                     fps >= 1 && fps <= 90 && duration >= 0 && std::isfinite(duration) &&
                     std::isfinite(exposure) && std::isfinite(gain) && std::isfinite(depth_log_hz) &&
-                    depth_log_hz > 0 && (depth_log.empty() || !depth_serials.empty()),
+                    depth_log_hz > 0 && (depth_log.empty() || !depth_serials.empty()) &&
+                    depth_units_um >= 100 && depth_units_um <= 1000,
                 "invalid camera options");
+        for (const auto &s : shift_specs) // a typo'd serial must not silently record at shift 0
+            require(contains(depth_serials, s.substr(0, s.rfind(':'))),
+                    "--disparity-shift serial has no --depth: " + s);
         // Synthetic mode constructs no context: no USB enumeration or SDK worker threads.
         // Otherwise keep one enumeration alive for both cameras: re-enumerating after starting
         // the first RSUSB stream can reopen its claimed USB interfaces.
@@ -329,6 +341,31 @@ int main(int argc, char **argv) {
                     }
                 require(bool(profile), "requested Y8 IR profile unavailable: " + spec);
                 auto &sensor = camera->sensor;
+                int shift = 0;
+                for (const auto &s : shift_specs) {
+                    const auto colon = s.rfind(':');
+                    require(colon != std::string::npos && colon > 0 && colon + 1 < s.size() &&
+                                s.find_first_not_of("0123456789", colon + 1) == std::string::npos,
+                            "invalid --disparity-shift (SERIAL:N): " + s);
+                    if (s.substr(0, colon) == camera->serial)
+                        shift = std::stoi(s.substr(colon + 1));
+                }
+                if (camera->with_depth) {
+                    // Always written, so a shift left by another tool never leaks into a take.
+                    rs400::advanced_mode advanced(*selected);
+                    require(advanced.is_enabled(), "advanced mode off; cannot set disparity shift: " +
+                                                       camera->serial);
+                    auto table = advanced.get_depth_table();
+                    table.disparityShift = shift;
+                    advanced.set_depth_table(table);
+                    require(int(advanced.get_depth_table().disparityShift) == shift,
+                            "disparity shift not applied: " + camera->serial);
+                    // Also always written. Z16 then reaches 65535 units: 6.5 m at 100 um.
+                    sensor.set_option(RS2_OPTION_DEPTH_UNITS, float(depth_units_um * 1e-6));
+                    std::printf("depth serial=%s disparity_shift=%d depth_units_um=%g\n",
+                                camera->serial.c_str(), shift, depth_units_um);
+                } else
+                    require(shift == 0, "--disparity-shift needs --depth for " + camera->serial);
                 if (camera->with_depth) {
                     // IR and depth on one stereo sensor must share resolution and rate.
                     depth_profile = find_profile(sensor, RS2_STREAM_DEPTH, -1, RS2_FORMAT_Z16);
@@ -338,6 +375,7 @@ int main(int argc, char **argv) {
                         "{\"synthetic\":false,\"serial\":\"" + camera->serial +
                         "\",\"depth_scale_m\":" +
                         format("%.9g", sensor.as<rs2::depth_sensor>().get_depth_scale()) +
+                        ",\"disparity_shift\":" + std::to_string(shift) +
                         ",\"ir_index\":" + std::to_string(camera->index) +
                         ",\"rotation_deg\":" + (camera->rotate_180 ? "180" : "0") +
                         ",\"note\":\"intrinsics/extrinsics are SDK values for unrotated pixels\""

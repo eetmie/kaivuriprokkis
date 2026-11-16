@@ -124,6 +124,22 @@ The slew gyro is zeroed at power-on, so park the machine in its zero pose before
 
 Depth and arm masking (2026-11-10, `sand-depth-001`, emitter off): the D435 depth bends flat sand into a dome (centre +3–5 mm, corners −4 to −8 mm, the same at every pose). `calibrate` now fits a smooth per-pixel disparity correction on the flat take: planarity p50/p90 on held-out frames 2.2/6.3 → 1.4/3.5 mm, cabin flat residual through FK 2.1/6.8 → 1.4/4.0 mm. The wrist camera's FK residual stays 3.5/10 mm (FK, not depth). The arm is masked with the sim excavator's link meshes (`tools/arm_model.py URDF`, same machine) placed on the FK pivots, margins 2.5/2.5/8 cm (`--arm-margins-m`). On the flat take this removes as many arm points as the old 11 cm capsules but 4× less sand in the wrist camera (0.8 % vs 3.5 %; 0.1 % at 2.5 cm with the post-10-21 FK geometry). Same speed on the board (cabin update 26 ms). The bucket margin is wide because FK places the bucket 2–6 cm off where the cameras see it, varying with pose; recordings made with the 10-21 geometry (arm 0.240, new tip) should allow a tighter one. Fitting the cabin camera against the arm meshes consistently suggests a +4° turn about the slew axis that flat sand cannot see; not applied, to check on the next calibration take.
 
+Close range (2026-11-16, both cameras on fairly flat sand, emitter off, 640x480): the wrist camera sat 24–28 cm
+from the sand and the cabin camera 28–68 cm. Passive stereo already fills the sand completely there; the holes are
+the left image band (as wide as the disparity, ~80 px at 25 cm) and anything nearer than 153 mm. Two camera options
+help, both written on every start so nothing leaks between tools:
+
+| Setting | Effect measured |
+|---|---|
+| `--depth-units-um 100` (recorder: same flag) | Depth steps 1 mm → 0.1 mm: the terraces on near sand go away, per-pixel temporal noise 0.36 → 0.22 mm (wrist), 0.76 → 0.71 mm (cabin). Z16 then ends at 6.5 m. `depth_scale_m` in the depth JSON carries it; `sand_height.py` and `view_native.py` read it |
+| `--disparity-shift SERIAL:N` (recorder: `--camN-disparity-shift`) | Window 19290/(126+N) to 19290/N mm. Wrist camera: N=25 (128–772 mm) raises fill 0.77 → 0.81, N=50 (110–386 mm) 0.85 and halves the left band; N=75 already cuts sand beyond 257 mm. The fitted plane's distance is the same at every shift (within 1 mm). Leave the cabin camera at 0: it needs the far range |
+
+The plane residual of this sand (1.4 mm rms wrist, 2.3 mm cabin) is its real relief (tracks, ripples), so it cannot
+refit the dome correction above; that still needs a flattened take. The read-only on-chip calibration health check
+gave −0.02 (wrist) and +0.14 (cabin), both inside the ±0.25 "good" band, so the factory calibration was left as is.
+At this pose the two cameras' sand heights through FK and the 11-10 mounts differ by 7–10 mm (spread p50/p90 3/6 mm),
+the known FK-limited wrist residual, not a depth error.
+
 Measured on `pikkumasi2tb` on 2026-10-22, smoke9 at 2 Hz, 120 s runs:
 
 | Sand process | pi0.5 p50/p99 ms | Overruns | Sand CPU (one core) | Sand RSS |

@@ -71,6 +71,11 @@ def main():
     p.add_argument('--enable-tracks', action='store_true')
     p.add_argument('--depth', choices=('both', 'cam1', 'cam2', 'none'), default='both',
                    help='record same-sensor depth for these cameras (camN.depth.zst, ~11%% of one core)')
+    for k in (1, 2):
+        p.add_argument(f'--cam{k}-disparity-shift', type=int, default=0, choices=range(0, 256), metavar='N',
+                       help=f'camera {k} depth window closer (640x480: ~19290/(126+N) to 19290/N mm); 0 = default')
+    p.add_argument('--depth-units-um', type=int, default=1000, choices=(100, 1000),
+                   help='depth step; 100 removes the 1 mm steps at close range (saved as depth_scale_m)')
     p.add_argument('--exposure-us', type=float)
     p.add_argument('--gain', type=float)
     p.add_argument('--synthetic', action='store_true', help='simulated cameras and IMUs, dry only')
@@ -186,8 +191,11 @@ def main():
             if args.rotate_camera1:
                 camera_args += ['--rotate-180', parsed[0][0]]
             depth_cams = {'both': (0, 1), 'cam1': (0,), 'cam2': (1,), 'none': ()}[args.depth]
+            shifts = (args.cam1_disparity_shift, args.cam2_disparity_shift)
             for k in depth_cams:
-                camera_args += ['--depth', parsed[k][0]]
+                camera_args += ['--depth', parsed[k][0], '--disparity-shift', f'{parsed[k][0]}:{shifts[k]}']
+            if depth_cams:
+                camera_args += ['--depth-units-um', str(args.depth_units_um)]
             if args.synthetic:
                 camera_args.append('--synthetic')
             if args.exposure_us is not None:

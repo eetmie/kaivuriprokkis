@@ -15,7 +15,7 @@ import numpy as np
 
 JOINTS = {"slew": 0, "lift": 1, "tilt": 2, "scoop": 3}  # controller angles_rad / plan columns
 EV_SYN, EV_KEY, EV_ABS, SYN_DROPPED = 0, 1, 3, 3
-ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_HAT0X = 0, 1, 3, 4, 0x10
+ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X = 0, 1, 2, 3, 4, 5, 0x10   # Z/RZ: left/right trigger
 BTN_A, BTN_B, BTN_X = 0x130, 0x131, 0x133   # BTN_SOUTH, BTN_EAST, BTN_NORTH (the recorder's X)
 BTN_DPAD_LEFT, BTN_DPAD_RIGHT = 0x222, 0x223
 _EVENT = struct.Struct("llHHi")              # struct input_event, 64-bit
@@ -25,8 +25,8 @@ class Pad:
     """Xbox evdev pad without python-evdev: same axes, signs and 25% deadzone as
     native_stack/src/gamepad.cpp, so manual driving feels like recording."""
 
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, path: str, sticks=(ABS_X, ABS_Y, ABS_RX, ABS_RY)):
+        self.path, self.sticks = path, sticks
         self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         self.axes, self.keys = {}, set()
         self.fifo = stat.S_ISFIFO(os.fstat(self.fd).st_mode)
@@ -34,14 +34,14 @@ class Pad:
 
     def _read_axes(self):
         if self.fifo:                         # tools/virtual_gamepad.py: xpad ranges
-            self.axes = {code: [0, -32768, 32767] for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY)}
+            self.axes = {code: [0, -32768, 32767] for code in self.sticks}
             return
-        for code in (ABS_X, ABS_Y, ABS_RX, ABS_RY):
+        for code in self.sticks:
             buf = bytearray(24)               # struct input_absinfo, six int32
             fcntl.ioctl(self.fd, (2 << 30) | (24 << 16) | (ord("E") << 8) | (0x40 + code), buf)
             v, lo, hi = struct.unpack_from("iii", buf)
             if hi <= lo:
-                raise RuntimeError("gamepad must expose Xbox X/Y/RX/RY axes")
+                raise RuntimeError(f"gamepad lacks Xbox axis {code}")
             self.axes[code] = [v, lo, hi]
 
     def drain(self):

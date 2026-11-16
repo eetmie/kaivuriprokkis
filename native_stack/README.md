@@ -10,6 +10,7 @@ This is a working C++17 bench implementation: independent safety/valve service, 
 | `kaivuri-camera` | One or two explicitly selected cameras; one IR1 or IR2 Y8 stream per camera; native timestamp metadata; latest frame in mapped memory; optional `--depth SERIAL` Z16 from the camera ASIC (`SERIAL-depth.frame` + calibration JSON) and `--depth-log DIR` zstd snapshots |
 | `kaivuri-inference` | Optional OpenPI pi0.5 TensorRT + CUDA graph: LIBERO (AOT) bench, or the fine-tuned `pi05_openpi_state` bundle (native engines, joint-angle prompt per step); fixture parity gate; two fresh IR inputs; actions recorded, or sent as drive plans only with `--live` ([notes](notes/PI05_FINETUNE.md#runtime-branch-featpi05-finetune-runtime)) |
 | `tools/vla_live.py` | One live runner for the VLA fine-tunes, picked by the bundle: GR00T N1.7 (`vla_groot.py`, jetson-orin-nano-vla engines) and pi0.5 (`vla_pi05.py` over `libkaivuri_pi05_runtime.so`, the same C++ runtime as `kaivuri-inference`). Fixture gate at every load, coherent dual-IR + IMU observations, timed plans, gamepad A/X/B/D-pad, typed prompts, GR00T RTC and frame history ([runbook](notes/VLA_LIVE.md)) |
+| `tools/ppo_live.py` | The trained PPO arm controller (Isaac-hydraulic-actuator) through `kaivuri-control`: bucket-edge circle and gamepad edge control, NumPy only, bundle verified against its training reference at every load ([below](#ppo-arm-controller)) |
 | `kaivuri-record` | C++ gamepad teleoperation, bounded dual-IR Y8 episode spool and full FK/IMU/action snapshots; offline LeRobot v3 export |
 | `kaivuri-mlp-collect` | Separate 100 Hz actuator collector: manual/excitation control, direct PWM, every accepted raw IMU packet and bounded asynchronous CSV writer |
 | `kaivuri-pid-collect` | Independent 100 Hz randomized IK/PID collector, guarded arm commands, manual takeover and committed PID sidecars; initial powered acceptance pending |
@@ -104,6 +105,35 @@ The bench reports per-stage inference time, start interval variation, oldest cam
 This is an **unfinetuned LIBERO performance demo**. IR gray is replicated into three channels with OpenPI's antialiased resize and centered padding. Prompts use the exported token table; normalized seven-dimensional LIBERO outputs are not excavator valve commands. Fine-tuning must establish the IR view order/orientation, proprioception, action meaning, normalization and training FPS; then export that checkpoint and implement its runtime boundary. The current LIBERO exporter pins a specific public checkpoint, so a custom checkpoint needs an export path adapted to its trained contract. Camera arrival time is measured; exposure-to-host clock mapping and synchronized exposure are not established by this bench.
 
 After the register-level hardware checks, `bench_pi05.py --live-pwm` also completed a 60-second inference run with real 100 Hz neutral I2C writes. It stays disarmed and refuses simulated IMUs. Inference p50/p99 was 425.50/426.98 ms; control wake-up lateness p99/max was 0.070/0.242 ms, and per-tick control work p99 was 1.108 ms. Both camera callback counters had zero gaps/resets. One camera skipped two shared-frame publications (latest-frame writer busy) across capture including model load; the other skipped none. Evidence is in `results/pi05-dual-ir-live-pwm-60s-20261012/`.
+
+### PPO arm controller
+
+`tools/ppo_live.py` runs the valve policy trained in Isaac-hydraulic-actuator (boom, arm and bucket
+valves from a bucket-edge twist request; pivot tracking with absolute bucket angle and reference
+lookahead). It follows `kaivuri-control`'s status at 100 Hz for the policy's gyro and command
+histories, runs the policy at 20 Hz and sends one valve row per tick, so arming, lease, IMU and
+deadline faults stay with the controller. Slew and tracks stay neutral.
+
+```bash
+python3 -B tools/ppo_live.py check                                         # bundle parity and step time, no devices
+python3 -B tools/ppo_live.py run --start-control --live --out results/ppo-circle-new
+python3 -B tools/ppo_live.py run --start-control --live --mode gamepad --speed-mm-s 40
+```
+
+Circle: 100 mm diameter at 20 mm/s from the current pose, bucket angle held (`--radius-mm`,
+`--speed-mm-s`, `--direction`, `--cycles`). Gamepad: the left stick moves the edge target in X/Z and
+the triggers turn the bucket (right curls in); released sticks hold the pose. A arms and starts with
+pump permission; A or B stops. It stops by itself on tracking error, joint or self-collision margin,
+joint rate, missed ticks and any controller fault. Pass `--serial` if the Pico is not `/dev/ttyACM0`.
+
+The bundle in `ppo_bundles/controller_pivot` is the packaged seed-42 pivot controller, exported with
+`export_robot_bundle.py native`. Angles and rates come from the raw IMU quaternions and gyros in the
+training sensor contract, and the training USD is retargeted to this profile, so the bundle's
+geometry is the machine's (pivots and edge agree to 1e-7 m; the bundle's joint limits are the USD's,
+up to 4 degrees wider than `ik.joint_limits_relative` before the governor's 3.4 degree margin).
+A policy step takes 3 ms on the Orin Nano, other ticks 1 ms. Measured on `pikkumasi2tb` 2026-11-16
+with the hydraulics unpowered: both modes arm, command the valves through live PWM and disarm, with
+no missed ticks. Powered motion is not yet tested; start with a small slow circle in free space.
 
 ### ROS 2
 

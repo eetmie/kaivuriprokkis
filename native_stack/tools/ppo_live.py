@@ -91,8 +91,12 @@ class Circle:
 
 def stick_reference(pad, target, pose, a, dt):
     """Advance the edge target by the sticks; returns their twist as feedforward."""
-    twist = np.array([a.speed_mm_s / 1e3 * pad.axis(ABS_X), -a.speed_mm_s / 1e3 * pad.axis(ABS_Y),
-                      a.pitch_rate * (pad.axis(ABS_RZ) - pad.axis(ABS_Z))])
+    xz = np.array([pad.axis(ABS_X), -pad.axis(ABS_Y)])
+    xz /= max(np.linalg.norm(xz), 1.0)   # a full diagonal is still full speed, not 1.41x
+    twist = np.array([*(a.speed_mm_s / 1e3 * xz), a.pitch_rate * (pad.axis(ABS_RZ) - pad.axis(ABS_Z))])
+    if not twist.any():   # sticks released: hold where the machine is, so the target cannot drift or wind up
+        target[:] = pose
+        return twist
     target += twist * dt
     # A target the machine cannot follow (limits, slow valves) must not run away from it.
     offset = target[:2] - pose[:2]
@@ -119,6 +123,9 @@ def summarize(rows, outcome, missed):
 def run(a, control=None, pad=None):
     """One operator-started run; returns its summary. `control`/`pad` are injected by the test."""
     bundle = Bundle(a.bundle)
+    if a.no_limits:   # shortcut: manual stage; drops joint-limit and self-collision margins everywhere (governor too)
+        bundle.kin.valid = lambda q, margin: np.isfinite(q).all(1)
+        bundle.settings["joint_margin"] = -10.0
     cfg, dec, margin = bundle.settings, bundle.settings["decimation"], bundle.settings["joint_margin"] / 2
     dt = cfg["dt"] * dec
     procs, rows, missed, outcome = [], [], 0, "error"
@@ -272,6 +279,7 @@ def main():
     s.add_argument("--direction", choices=("ccw", "cw"), default="ccw")
     s.add_argument("--cycles", type=int, default=1)
     s.add_argument("--pitch-rate", type=float, default=0.2, help="gamepad: full-trigger bucket rate [rad/s]")
+    s.add_argument("--no-limits", action="store_true", help="ignore the joint-limit and self-collision margins (manual operation)")
     s.add_argument("--max-error-mm", type=float, default=20)
     s.add_argument("--gamepad", default="auto", help="evdev path, 'auto' (first by-id joystick) or 'none'")
     s.add_argument("--out", help="new directory for ticks.csv and summary.json (default: nothing is written)")

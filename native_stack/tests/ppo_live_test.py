@@ -70,7 +70,7 @@ class Sticks:
 
 def args(**changes):
     values = dict(bundle=str(BUNDLE), mode="circle", radius_mm=50, speed_mm_s=20, direction="ccw", cycles=1,
-                  pitch_rate=0.2, max_error_mm=20, gamepad="none", out=None, socket=None, start_control=False)
+                  pitch_rate=0.2, max_error_mm=20, gamepad="none", out=None, socket=None, start_control=False, no_limits=False)
     return SimpleNamespace(**{**values, **changes})
 
 
@@ -96,3 +96,17 @@ plant = Plant(bundle, response=0.0)   # valves that do nothing: the tracking-err
 result = ppo_live.run(args(speed_mm_s=40, max_error_mm=10), control=plant)
 assert result["outcome"].startswith("tracking error") and plant.sent[-1] == client.DISARM, result
 print("ppo_live ok")
+
+# Released sticks pull the target onto the measured pose; held sticks still move it.
+class Sticks:
+    def __init__(self, x): self.x = x
+    def axis(self, code): return self.x if code == ppo_live.ABS_X else 0.0
+pose, target = np.array([0.5, -0.2, 0.1]), np.array([0.51, -0.19, 0.15])
+ppo_live.stick_reference(Sticks(0.0), target, pose, args(), 0.05)
+assert np.array_equal(target, pose)
+ppo_live.stick_reference(Sticks(1.0), target, pose, args(), 0.05)
+assert target[0] > pose[0]
+class Diag:
+    def axis(self, code): return 1.0 if code in (ppo_live.ABS_X, ppo_live.ABS_Y) else 0.0
+tw = ppo_live.stick_reference(Diag(), np.zeros(3), np.zeros(3), args(), 0.05)
+assert abs(np.linalg.norm(tw[:2]) - 0.02) < 1e-9

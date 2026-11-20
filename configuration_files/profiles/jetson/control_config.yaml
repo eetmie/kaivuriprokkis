@@ -82,6 +82,7 @@ robot:
   level_frame:
     cabin_tilt: true
     link_roll: false
+    tilt_pivot_dist: 0.16   # m, slew axis -> track end the tilt turns about, front/back (null: ground origin); fitted on flat-calib-001, 2026-11-20
   # URDF-style chain. Each joint has a fixed translation from its parent's
   # rotated frame (parent_to_joint_xyz) and a unit rotation axis. The tool
   # has a single rigid offset from the last joint's rotated frame to the

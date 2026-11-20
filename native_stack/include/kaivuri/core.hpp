@@ -41,8 +41,11 @@ struct Joint {
 // Level frame options (control_config robot.level_frame). The cabin carries the 'base' IMU,
 // so its roll/pitch is the whole upper body's tilt; link_roll adds each link's measured roll
 // about its own X relative to its parent IMU (hinge play/flex; mounting error looks the same).
+// tilt_pivot_dist: the tilt turns about the track end that stays down (+-x m from the slew
+// axis) instead of the ground origin; null (stored as 0) keeps the origin.
 struct LevelOptions {
     bool cabin_tilt = true, link_roll = false;
+    double tilt_pivot_dist = 0;
 };
 struct Config {
     LevelOptions level;

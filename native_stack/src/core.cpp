@@ -195,6 +195,12 @@ Config load_hardware_config(const std::string &profile_dir) {
     if (const auto level = control["robot"]["level_frame"]) {
         c.level.cabin_tilt = level["cabin_tilt"].as<bool>(c.level.cabin_tilt);
         c.level.link_roll = level["link_roll"].as<bool>(c.level.link_roll);
+        if (const auto d = level["tilt_pivot_dist"]; d && !d.IsNull()) {
+            c.level.tilt_pivot_dist = d.as<double>();
+            require(std::isfinite(c.level.tilt_pivot_dist) && c.level.tilt_pivot_dist > 0 &&
+                        c.level.tilt_pivot_dist < 1,
+                    "invalid level_frame tilt_pivot_dist");
+        }
     }
     const auto joints = control["robot"]["joints"], chain = control["imu"]["chain"];
     require(joints.size() == 4 && chain.size() == 4,
@@ -335,9 +341,13 @@ KinematicState forward_kinematic_state(const Config &c, const std::array<double,
         state.link_orientations_upper[i] = state.upper.orientation;
     }
     add_to(state.upper.position, rotate(state.upper.orientation, c.tip));
-    // Carriage to level base: slew, then the measured tilt about the ground reference origin.
+    // Carriage to level base: slew, then the measured tilt about the track end that stays on the
+    // ground (fore/aft only: side tipping is not modelled), or the ground origin when it is null.
     const Quat carriage = normalized(multiply(tilt, slew));
-    const Vec3 pivot = rotate(tilt, c.joints[0].offset);
+    Vec3 pivot = rotate(tilt, c.joints[0].offset);
+    const Vec3 x = rotate(tilt, {1, 0, 0});
+    const double end = x[2] > 0 ? -c.level.tilt_pivot_dist : c.level.tilt_pivot_dist;
+    add_to(pivot, {end * (1 - x[0]), -end * x[1], -end * x[2]});
     const auto to_base = [&](const Vec3 &upper) {
         Vec3 p = rotate(carriage, upper);
         add_to(p, pivot);

@@ -152,15 +152,32 @@ int main(int argc, char **argv) {
                        "parallel hinges have no relative roll at any tilt");
             const auto flat = forward_kinematic_state(c, q);
             const auto level = forward_kinematic_state(c, q, a.tilt);
+            expect(close(c.level.tilt_pivot_dist, .16), "profile tilt pivot");
+            // The track end that goes down stays put: tilt about it, not the ground origin.
+            const auto end_x = rotate(a.tilt, {1, 0, 0});
+            const Vec3 end{end_x[2] > 0 ? -.16 : .16, 0, 0};
+            const auto end_moved = rotate(a.tilt, end);
+            const Vec3 lift{end[0] - end_moved[0], end[1] - end_moved[1], end[2] - end_moved[2]};
+            expect(lift[2] > 0 && lift[2] < .16 * .035 + 1e-9, "tipping about a track end lifts the body");
             for (int i = 0; i < 4; ++i) {
-                const auto p = rotate(a.tilt, flat.joint_positions_base[i]);
+                auto p = rotate(a.tilt, flat.joint_positions_base[i]);
+                for (int j = 0; j < 3; ++j)
+                    p[j] += lift[j];
                 for (int j = 0; j < 3; ++j)
                     expect(close(level.joint_positions_base[i][j], p[j]) &&
                                close(level.joint_positions_upper[i][j],
                                      flat.joint_positions_upper[i][j]),
-                           "tilt turns base pivots about the ground origin; upper frame unchanged");
+                           "tilt turns base pivots about the track end; upper frame unchanged");
             }
-            const auto tip = rotate(a.tilt, flat.base.position);
+            auto tip = rotate(a.tilt, flat.base.position);
+            for (int j = 0; j < 3; ++j)
+                tip[j] += lift[j];
+            Config origin = c;
+            origin.level.tilt_pivot_dist = 0;
+            const auto about_origin = forward_kinematic_state(origin, q, a.tilt).base.position,
+                       plain = rotate(a.tilt, flat.base.position);
+            for (int j = 0; j < 3; ++j)
+                expect(close(about_origin[j], plain[j]), "no tilt pivot tilts about the ground origin");
             const auto qt = multiply(a.tilt, flat.base.orientation);
             for (int j = 0; j < 4; ++j)
                 expect((j == 3 || close(level.base.position[j], tip[j])) &&

@@ -116,6 +116,7 @@ add_test(NAME imu-audit COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_
 add_test(NAME sidecam-audit COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/sidecam_audit_test.py ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME fusion-replay COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/fusion_replay_test.py ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME sand-height COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/sand_height_test.py ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fit-mounts COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/fit_mounts_test.py ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ik-collection COMMAND ik-collection-tests ${CMAKE_CURRENT_SOURCE_DIR}/../configuration_files/profiles/jetson)
 add_test(NAME ik-reference-parity COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/ik_reference_parity.py $<TARGET_FILE:ik-reference-probe> ${CMAKE_CURRENT_SOURCE_DIR}/../configuration_files/profiles/jetson)
 add_test(NAME ik-preview-integration COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/ik_preview_integration.py $<TARGET_FILE:kaivuri-ik-preview> ${CMAKE_CURRENT_SOURCE_DIR}/../configuration_files/profiles/jetson)

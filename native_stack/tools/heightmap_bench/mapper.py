@@ -80,6 +80,11 @@ def projection_arguments(parser):
     parser.add_argument("--arm-min-view-deg", type=float, default=None,
                         help="drop the arm camera when its optical axis tips back past this "
                              "(0 = straight down, + forward, - toward the cabin); unset = never")
+    parser.add_argument("--arm-silhouette-cells", type=int, default=-1,
+                        help="drop depth pixels inside the arm model's projected silhouette grown by this many "
+                             "strided cells; catches returns with wrong depth on the arm; -1 = off")
+    parser.add_argument("--camera-mask-radius-m", type=float, default=0,
+                        help="drop points within this of another camera (its body and cable); 0 = off")
     parser.add_argument("--arm-min-forward-m", type=float, default=None,
                         help="drop arm-camera points closer than this in front of the slew axis "
                              "(the cabin camera's near edge); unset = keep all")
@@ -95,6 +100,11 @@ class DepthProjector:
     def __init__(self, calibration, camera_files, args):
         self.stride = args.stride
         self.radius = args.arm_radius_m
+        self.camera_radius = getattr(args, "camera_mask_radius_m", 0)
+        self.silhouette = getattr(args, "arm_silhouette_cells", -1)
+        self.solids = None  # arm model voxels per link, built on first use (needs sh.load_arm)
+        # Every calibrated camera, even one not streaming here, so the other camera's body is masked.
+        self.all_mounts = {k: sh.Mount.from_json(c) for k, c in calibration["cameras"].items()}
         self.rays, self.mounts, self.metadata = {}, {}, {}
         for key, path in camera_files.items():
             info = json.loads(path.read_text())
@@ -107,16 +117,64 @@ class DepthProjector:
             self.mounts[key] = sh.Mount.from_json(calibration["cameras"][key])
 
     def scan(self, key, data, pose):
-        return scan(data, self.rays[key], self.mounts[key], pose, self.stride, self.radius)
+        others = []
+        if self.camera_radius > 0:
+            for other, mount in self.all_mounts.items():
+                if other != key:
+                    link_r, link_t = sh.link_pose(pose, mount.link)
+                    others.append(link_t + link_r @ mount.t)
+        sil = self.arm_silhouette(key, pose) if self.silhouette >= 0 and sh.ARM is not None else None
+        return scan(data, self.rays[key], self.mounts[key], pose, self.stride, self.radius,
+                    others, self.camera_radius, sil)
+
+    def arm_silhouette(self, key, pose):
+        """Strided-grid cells the boom/arm/bucket model covers in this camera, grown by self.silhouette."""
+        arm = sh.ARM
+        if self.solids is None:
+            self.solids = [(k, lo + (np.argwhere(grid == 0) + .5) * arm.voxel, length)
+                           for k, grid, lo, length in arm.links]
+            self.pinholes = {}
+        ray, mount = self.rays[key], self.mounts[key]
+        if key not in self.pinholes:  # the stored (possibly rotated) image's pinhole, from its ray tables
+            self.pinholes[key] = (np.polyfit(ray.x[ray.h // 2], np.arange(ray.w), 1),
+                                  np.polyfit(ray.y[:, ray.w // 2], np.arange(ray.h), 1))
+        chain = sh.fk_chain(pose)
+        lateral = sh.link_pose(pose, 0)[0][:, 1]
+        model = []
+        for k, Q, length in self.solids:  # same link frame and stretch as ArmModel.near, inverted
+            E = sh.link_frame(chain[k], chain[k + 1], lateral)
+            R = Q.copy()
+            R[:, 0] *= ((chain[k + 1] - chain[k]) @ E[0]) / length
+            model.append(chain[k] + R @ E)
+        link_r, link_t = sh.link_pose(pose, mount.link)
+        M = (np.vstack(model) - (link_t + link_r @ mount.t)) @ (link_r @ mount.R)
+        M = M[M[:, 2] > .05]
+        (ax, bx), (ay, by) = self.pinholes[key]
+        s = self.stride
+        cu = np.round((ax * M[:, 0] / M[:, 2] + bx) / s).astype(int)
+        cv = np.round((ay * M[:, 1] / M[:, 2] + by) / s).astype(int)
+        gh, gw = (ray.h + s - 1) // s, (ray.w + s - 1) // s
+        ok = (cu >= 0) & (cu < gw) & (cv >= 0) & (cv < gh)
+        sil = np.zeros((gh, gw), bool)
+        sil[cv[ok], cu[ok]] = True
+        for _ in range(self.silhouette):
+            grown = sil.copy()
+            grown[1:] |= sil[:-1]; grown[:-1] |= sil[1:]; grown[:, 1:] |= sil[:, :-1]; grown[:, :-1] |= sil[:, 1:]
+            sil = grown
+        return sil
 
 
-def scan(data, ray, mount, st, stride, arm_radius):
+def scan(data, ray, mount, st, stride, arm_radius, cameras=(), camera_radius=0, silhouette=None):
     p, pixels = ray.points(data, stride, .90)
     link_r, link_t = sh.link_pose(st, mount.link)
     r = link_r @ mount.R
     t = link_t + link_r @ mount.t
     base = p @ r.T + t
     self_hit = sh.near_arm(base, st, arm_radius)
+    for centre in cameras:  # base-frame origins of the other cameras
+        self_hit |= np.einsum("ij,ij->i", base - centre, base - centre) < camera_radius ** 2
+    if silhouette is not None:  # the arm hides everything behind it, whatever depth a pixel reports
+        self_hit |= silhouette.reshape(-1)[pixels]
     t[2] += mount.d
     world = base.copy()
     world[:, 2] += mount.d

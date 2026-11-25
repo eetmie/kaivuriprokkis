@@ -13,8 +13,10 @@
   },
   "projection": {
     "stride": 4,
-    "arm_margins_m": [0.045, 0.045, 0.100],
+    "arm_margins_m": [0.090, 0.045, 0.100],
     "arm_radius_m": 0.11,
+    "camera_mask_radius_m": 0.09,
+    "arm_silhouette_cells": 2,
     "arm_min_view_deg": -5,
     "arm_min_forward_m": 0.24
   }

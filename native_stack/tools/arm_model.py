@@ -89,7 +89,7 @@ def link_frame(pivot, nxt, lateral):
     return np.stack([e1, lateral, np.cross(e1, lateral)])
 
 
-def build(urdf):
+def build(urdf, pads=(PAD,) * 3):
     from scipy.ndimage import distance_transform_edt
     points, joints = upper_frame_meshes(urdf)
     lateral, out = np.array([0, 1., 0]), {}
@@ -101,7 +101,8 @@ def build(urdf):
         else:
             nxt = joints[next_joint]
         E = link_frame(pivot, nxt, lateral); Q = (P - pivot) @ E.T; length = float((nxt - pivot) @ E[0])
-        lo = Q.min(0) - PAD; shape = tuple(np.ceil((Q.max(0) + PAD - lo) / VOXEL).astype(int) + 1)
+        pad = pads[link - 1]
+        lo = Q.min(0) - pad; shape = tuple(np.ceil((Q.max(0) + pad - lo) / VOXEL).astype(int) + 1)
         occupied = np.zeros(shape, bool); occupied[tuple(np.floor((Q - lo) / VOXEL).astype(int).T)] = True
         if next_joint is None:  # bucket: fill its convex hull, so carried sand counts as bucket
             from scipy.spatial import Delaunay
@@ -119,8 +120,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('urdf', type=Path)
     p.add_argument('-o', '--output', type=Path, default=Path(__file__).resolve().parents[1] / 'config/arm_model.npz')
+    p.add_argument('--pad', type=float, nargs=3, default=(PAD,) * 3, metavar=('BOOM', 'ARM', 'BUCKET'),
+                   help='grid extent beyond each mesh (m); a margin cannot reach past it')
     a = p.parse_args()
-    np.savez_compressed(a.output, **build(a.urdf))
+    np.savez_compressed(a.output, **build(a.urdf, a.pad))
     print(f'wrote {a.output} ({a.output.stat().st_size // 1024} KiB)')
 
 

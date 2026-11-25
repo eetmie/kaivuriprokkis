@@ -145,7 +145,7 @@ def run(args):
     (args.out / "settings.json").write_text(json.dumps(vars(args), default=str, indent=2) + "\n")
     cal = json.loads(args.calibration.read_text())
     sh.load_arm(args)
-    sources = committed_episodes(args.session)
+    sources = [ep for session in args.session for ep in committed_episodes(session)]
     if args.episode is not None:
         sources = [sources[args.episode]]
     first = json.loads((sources[0].parent / "session.json").read_text())
@@ -266,7 +266,7 @@ def save_chunk(root, ep, start, buffer):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("session", type=Path)
+    parser.add_argument("session", type=Path, nargs="+", help="one or more native sessions, in episode order")
     parser.add_argument("--calibration", type=Path, required=True)
     projection_arguments(parser)
     parser.add_argument("--fastdem", type=Path, required=True)

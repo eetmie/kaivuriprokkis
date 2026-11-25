@@ -105,7 +105,7 @@ def run(args, stack, children):
     launch('camera', build / 'kaivuri-camera', '--output-dir', frames, '--fps', args.ir_fps,
            '--metadata-csv', out / 'camera-timestamps.csv', '--camera', f'{CAM1}:2',
            '--camera', f'{CAM2}:1', '--rotate-180', CAM1, *depth_flags,
-           '--depth-units-um', args.depth_units_um,
+           '--depth-units-um', args.depth_units_um, '--depth-clamp-mm', args.depth_clamp_mm,
            '--disparity-shift', f'{CAM1}:{args.arm_disparity_shift}',
            '--disparity-shift', f'{CAM2}:{args.cabin_disparity_shift}')
     wait_for(lambda: sock.exists() and all(p.exists() for p in ir), children, 25)
@@ -186,7 +186,7 @@ def run(args, stack, children):
             previous = [meta.sequence for meta, _, _ in obs]
             scans = [projector.scan(key, data, pose) for key, (_, data, pose) in zip(keys, obs)]
             projected = time.monotonic_ns()
-            front, surround, age = update(engine, scans, obs[0][2]['slew_yaw_rad'])
+            front, surround, age = update(engine, scans, obs[0][2]['slew_yaw_rad'], args.arm_min_view_deg, args.arm_min_forward_m)
             latest = front, surround, age
             finish = time.monotonic_ns()
             stamps = [meta.host_monotonic_ns for meta, _, _ in obs]
@@ -249,6 +249,7 @@ def main():
     p.add_argument('--depth-units-um', type=int, choices=(100, 1000), default=100)
     p.add_argument('--arm-disparity-shift', type=int, default=25)
     p.add_argument('--cabin-disparity-shift', type=int, default=0)
+    p.add_argument('--depth-clamp-mm', type=int, default=0)
     p.add_argument('--seconds', type=float, default=60)
     p.add_argument('--map-hz', type=float, default=5)
     p.add_argument('--policy-hz', type=float, default=2)

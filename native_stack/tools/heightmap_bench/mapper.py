@@ -77,6 +77,12 @@ def projection_arguments(parser):
     parser.add_argument("--stride", type=int, choices=range(1, 9), default=STRIDE)
     parser.add_argument("--arm-radius-m", type=float, default=.11,
                         help="capsule radius when --arm-model none")
+    parser.add_argument("--arm-min-view-deg", type=float, default=None,
+                        help="drop the arm camera when its optical axis tips back past this "
+                             "(0 = straight down, + forward, - toward the cabin); unset = never")
+    parser.add_argument("--arm-min-forward-m", type=float, default=None,
+                        help="drop arm-camera points closer than this in front of the slew axis "
+                             "(the cabin camera's near edge); unset = keep all")
 
 
 def track_pivot(calibration, profile):
@@ -193,13 +199,24 @@ def render(height):
     return np.repeat(gray[..., None], 3, axis=-1)
 
 
-def update(engine, scans, yaw):
+def view_deg(transform, yaw):
+    """Optical-axis angle in the cabin plane: 0 = straight down, + forward, - back toward the cabin."""
+    axis = np.asarray(transform)[:, 2]
+    forward = axis[:2] @ sh.rz(yaw)[:2, :2]
+    return float(np.degrees(np.arctan2(forward[0], -axis[2])))
+
+
+def update(engine, scans, yaw, arm_min_view_deg=None, arm_min_forward_m=None):
     """Integrate one latest-frame observation and return front, surround and age."""
     pc, wc, tc, _, _ = scans[0]
     front = raster(wc, yaw)
     inputs = [(pc, tc)]
-    if len(scans) == 2:
+    # Looking back past the limit the arm camera sees the machine and far clutter, not the dig area.
+    if len(scans) == 2 and (arm_min_view_deg is None or view_deg(scans[1][2], yaw) >= arm_min_view_deg):
         pa, wa, ta, _, _ = scans[1]
+        if arm_min_forward_m is not None:  # nothing nearer than where the cabin camera starts seeing
+            keep = (wa[:, :2] @ sh.rz(yaw)[:2, :2])[:, 0] >= arm_min_forward_m
+            pa, wa = pa[keep], wa[keep]
         front = np.where(np.isfinite(front), front, raster(wa, yaw))
         inputs.append((pa[arm_fill(wc, wa)], ta))
     surround, age = engine.update(*inputs)

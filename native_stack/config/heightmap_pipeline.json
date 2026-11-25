@@ -3,7 +3,8 @@
     "ir_fps": 30,
     "depth_units_um": 100,
     "arm_disparity_shift": 25,
-    "cabin_disparity_shift": 0
+    "cabin_disparity_shift": 0,
+    "depth_clamp_mm": 900
   },
   "runtime": {
     "map_hz": 5,
@@ -13,6 +14,8 @@
   "projection": {
     "stride": 4,
     "arm_margins_m": [0.045, 0.045, 0.100],
-    "arm_radius_m": 0.11
+    "arm_radius_m": 0.11,
+    "arm_min_view_deg": -5,
+    "arm_min_forward_m": 0.24
   }
 }

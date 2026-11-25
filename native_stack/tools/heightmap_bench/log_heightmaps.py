@@ -102,7 +102,7 @@ def run(args):
                     obs = observe(readers, previous, poses, args.max_fk_age_ms, pivot)
                     if not isinstance(obs, str):
                         scans = [projector.scan(k, data, pose) for k, (_, data, pose) in zip(KEYS, obs)]
-                        front, surround, _ = update(engine, scans, obs[0][2]["slew_yaw_rad"])
+                        front, surround, _ = update(engine, scans, obs[0][2]["slew_yaw_rad"], args.arm_min_view_deg, args.arm_min_forward_m)
                         previous = [meta.sequence for meta, _, _ in obs]
                         rows.append((time.monotonic_ns(), [meta.host_monotonic_ns for meta, _, _ in obs],
                                      previous, millimetres(front), millimetres(surround)))

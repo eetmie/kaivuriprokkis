@@ -109,9 +109,10 @@ from each run.
 Both tools accept `--stride` (default 4), `--arm-model`, and
 `--arm-margins-m BOOM ARM BUCKET` (defaults 0.045, 0.045, 0.100 m).
 `--arm-model none --arm-radius-m 0.11` uses FK capsules for comparison.
-Pass the same calibration and FastDEM YAML to both. Offline replay processes
-every recorded frame, while live mapping samples fresh frames at the requested
-rate. FastDEM age counts accepted updates in each case. The review video shows
+Pass the same calibration and FastDEM YAML to both. Offline replay follows the
+live cadence by default: it maps the newest frame every 1/map_hz (5 Hz from the
+pipeline config), skips an update when FK is older than max_fk_age_ms, and holds
+the last maps in between. `--map-hz 0` maps every recorded frame. FastDEM age counts accepted updates in each case. The review video shows
 the arm mask over recorded depth. Live `latest.npz` contains the same strided
 depth and arm masks (0 missing, 1 depth return, 2 rejected by FK) alongside the
 final maps, and `updates.jsonl` reports each camera’s rejection rate.

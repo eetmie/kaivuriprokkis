@@ -78,6 +78,8 @@ def main():
                        help=f'camera {k} depth window closer (640x480: ~19290/(126+N) to 19290/N mm); 0 = default')
     p.add_argument('--depth-units-um', type=int, default=1000, choices=(100, 1000),
                    help='depth step; 100 removes the 1 mm steps at close range (saved as depth_scale_m)')
+    p.add_argument('--depth-clamp-mm', type=int, default=0,
+                   help='camera drops depth beyond this; 0 = no clamp (heightmaps: pipeline config)')
     p.add_argument('--exposure-us', type=float)
     p.add_argument('--gain', type=float)
     p.add_argument('--synthetic', action='store_true', help='simulated cameras and IMUs, dry only')
@@ -98,6 +100,7 @@ def main():
         args.cam1_disparity_shift = capture['arm_disparity_shift']
         args.cam2_disparity_shift = capture['cabin_disparity_shift']
         args.depth_units_um = capture['depth_units_um']
+        args.depth_clamp_mm = capture['depth_clamp_mm']
     if args.resume and not args.session.is_dir():
         p.error('--resume requires an existing native session directory')
     if args.session.exists() and not args.resume:
@@ -219,7 +222,8 @@ def main():
             for k in depth_cams:
                 camera_args += ['--depth', parsed[k][0], '--disparity-shift', f'{parsed[k][0]}:{shifts[k]}']
             if depth_cams:
-                camera_args += ['--depth-units-um', str(args.depth_units_um)]
+                camera_args += ['--depth-units-um', str(args.depth_units_um),
+                                '--depth-clamp-mm', str(args.depth_clamp_mm)]
             if args.synthetic:
                 camera_args.append('--synthetic')
             if args.exposure_us is not None:

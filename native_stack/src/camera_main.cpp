@@ -178,21 +178,22 @@ const char *usage = "kaivuri-camera --list\nkaivuri-camera --camera SERIAL:IR_IN
                     "[--camera SECOND:1]\n  [--width 640 --height 480 --fps 30] [--duration-s SEC] "
                     "[--exposure-us US --gain N]\n  [--hardware-clock] [--allow-missing-metadata] "
                     "[--output-dir DIR] [--metadata-csv FILE]\n  [--rotate-180 SERIAL] [--depth "
-                    "SERIAL] [--disparity-shift SERIAL:N] [--depth-units-um 1000]\n  [--depth-log DIR --depth-log-hz 2] [--synthetic] (hardware-free "
+                    "SERIAL] [--disparity-shift SERIAL:N] [--depth-units-um 1000]\n  [--depth-clamp-mm MM] [--depth-log DIR --depth-log-hz 2] [--synthetic] (hardware-free "
                     "test source; never a physical camera)\nIR index 1 or 2. Sync mode 0 "
                     "standalone, 1 master, 2 slave; requires a sync cable.\n--depth adds same-size "
                     "Z16 from the camera's stereo ASIC to SERIAL-depth.frame (+ SERIAL-depth.json\n"
                     "calibration); --depth-log appends zstd snapshots at the given rate.\n"
                     "--disparity-shift moves the depth window closer (0 = SDK default, applied on every\n"
                     "start; 640x480: min ~ 19290/(126+N) mm, max ~ 19290/N mm).\n"
-                    "--depth-units-um 100 removes the 1 mm depth steps at close range (max 6.5 m). Emitter "
+                    "--depth-units-um 100 removes the 1 mm depth steps at close range (max 6.5 m).\n"
+                    "--depth-clamp-mm drops depth beyond MM in the camera (0 = no clamp, applied on every start). Emitter "
                     "disabled;\nno RGB, host conversion, encoding, or CUDA context.";
 } // namespace
 
 int main(int argc, char **argv) {
     try {
         int width = 640, height = 480, fps = 30;
-        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2, depth_units_um = 1000;
+        double duration = 0, exposure = -1, gain = -1, depth_log_hz = 2, depth_units_um = 1000, depth_clamp_mm = 0;
         bool list = false, synthetic = false, global_time = true, require_metadata = true;
         std::string output = (runtime_dir() / "cameras").string(), csv_path, depth_log;
         std::vector<std::string> specs, rotate_serials, depth_serials, shift_specs;
@@ -211,6 +212,8 @@ int main(int argc, char **argv) {
                 depth_log_hz = args.number();
             else if (args.is("--depth-units-um"))
                 depth_units_um = args.number();
+            else if (args.is("--depth-clamp-mm"))
+                depth_clamp_mm = args.number();
             else if (args.is("--width"))
                 width = args.integer();
             else if (args.is("--height"))
@@ -245,7 +248,8 @@ int main(int argc, char **argv) {
                     fps >= 1 && fps <= 90 && duration >= 0 && std::isfinite(duration) &&
                     std::isfinite(exposure) && std::isfinite(gain) && std::isfinite(depth_log_hz) &&
                     depth_log_hz > 0 && (depth_log.empty() || !depth_serials.empty()) &&
-                    depth_units_um >= 100 && depth_units_um <= 1000,
+                    depth_units_um >= 100 && depth_units_um <= 1000 && std::isfinite(depth_clamp_mm) &&
+                    depth_clamp_mm >= 0 && depth_clamp_mm * 1000 / depth_units_um <= 65535,
                 "invalid camera options");
         for (const auto &s : shift_specs) // a typo'd serial must not silently record at shift 0
             require(contains(depth_serials, s.substr(0, s.rfind(':'))),
@@ -355,15 +359,21 @@ int main(int argc, char **argv) {
                     rs400::advanced_mode advanced(*selected);
                     require(advanced.is_enabled(), "advanced mode off; cannot set disparity shift: " +
                                                        camera->serial);
+                    // Also always written. Z16 then reaches 65535 units: 6.5 m at 100 um.
+                    // Set before the table: the clamp below is counted in these units.
+                    sensor.set_option(RS2_OPTION_DEPTH_UNITS, float(depth_units_um * 1e-6));
+                    const int clamp = depth_clamp_mm > 0
+                                          ? int(std::lround(depth_clamp_mm * 1000 / depth_units_um))
+                                          : 65536; // SDK default: no clamp
                     auto table = advanced.get_depth_table();
                     table.disparityShift = shift;
+                    table.depthClampMax = clamp;
                     advanced.set_depth_table(table);
-                    require(int(advanced.get_depth_table().disparityShift) == shift,
-                            "disparity shift not applied: " + camera->serial);
-                    // Also always written. Z16 then reaches 65535 units: 6.5 m at 100 um.
-                    sensor.set_option(RS2_OPTION_DEPTH_UNITS, float(depth_units_um * 1e-6));
-                    std::printf("depth serial=%s disparity_shift=%d depth_units_um=%g\n",
-                                camera->serial.c_str(), shift, depth_units_um);
+                    const auto applied = advanced.get_depth_table();
+                    require(int(applied.disparityShift) == shift && int(applied.depthClampMax) == clamp,
+                            "depth table not applied: " + camera->serial);
+                    std::printf("depth serial=%s disparity_shift=%d depth_units_um=%g depth_clamp_mm=%g\n",
+                                camera->serial.c_str(), shift, depth_units_um, depth_clamp_mm);
                 } else
                     require(shift == 0, "--disparity-shift needs --depth for " + camera->serial);
                 if (camera->with_depth) {
@@ -376,6 +386,7 @@ int main(int argc, char **argv) {
                         "\",\"depth_scale_m\":" +
                         format("%.9g", sensor.as<rs2::depth_sensor>().get_depth_scale()) +
                         ",\"disparity_shift\":" + std::to_string(shift) +
+                        ",\"depth_clamp_mm\":" + format("%g", depth_clamp_mm) +
                         ",\"ir_index\":" + std::to_string(camera->index) +
                         ",\"rotation_deg\":" + (camera->rotate_180 ? "180" : "0") +
                         ",\"note\":\"intrinsics/extrinsics are SDK values for unrotated pixels\""

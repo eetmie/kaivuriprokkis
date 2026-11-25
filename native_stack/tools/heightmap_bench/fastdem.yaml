@@ -1,0 +1,96 @@
+# FastDEM for the lab-scale excavator (sim and real). Started by mapping.launch.py.
+# Copied from FastDEM ros2/config/local_mapping.yaml; changed values are marked "excavator".
+topics:
+  input_scans: ["/excavator/cameras/cabin/points"]  # excavator: self-filtered by depth_to_cloud
+  publish_rate: 5.0         # [Hz] excavator: input is throttled to 5 Hz by depth_to_cloud
+  post_process_rate: 0.0    # [Hz] excavator: service-only until post-processing is validated
+
+tf:
+  # excavator: FastDEM caches sensor->base_frame once as a static extrinsic, so base_frame must be the camera's
+  # parent link. The swing then comes in through the per-scan pose (world->upper_carriage at the scan stamp).
+  # The map itself stays world-aligned and is centred on the swing axis. shortcut: the arm camera (on tilt_boom)
+  # needs a per-stamp extrinsic in FastDEM's tf_bridge.hpp before it can feed the map.
+  base_frame: "upper_carriage"
+  map_frame: "world"  # excavator: fixed base, no odometry
+  max_wait_time: 0.1   # [sec]
+  max_stale_time: 0.1  # [sec]
+
+map:
+  width: 1.6        # [m] excavator: reach is ~0.8 m
+  height: 1.6       # [m]
+  resolution: 0.01  # [m/cell] excavator: 160 x 160 cells
+
+point_filter:
+  z_min: -0.35      # [m] excavator: ground is ~-0.08 in upper_carriage, plus digging
+  z_max: 0.3        # [m]
+  range_min: 0.1    # [m]
+  range_max: 0.9    # [m]
+
+logger:
+  level: "info"  # info, warn, error, debug
+
+# ─── Mapping Pipeline ───────────────────────────────
+mapping:
+  mode: "local"                # local | global
+  type: "kalman_filter"        # kalman_filter | p2_quantile
+  kalman:
+    min_variance: 0.0001     # [m²]
+    max_variance: 0.01       # [m²]
+    process_noise: 0.0       # [m²]
+  p2:
+    dn0: 0.0
+    dn1: 0.16
+    dn2: 0.50
+    dn3: 0.84
+    dn4: 1.0
+    elevation_marker: 3
+    max_sample_count: 0
+
+sensor_model:
+  type: "rgbd"               # excavator: D435i
+  lidar:
+    range_noise: 0.02        # [m] σ_r
+    angular_noise: 0.001     # [rad] σ_θ
+  rgbd:
+    normal_a: 0.001          # [m] base depth noise
+    normal_b: 0.002          # [m⁻¹] quadratic coefficient
+    normal_c: 0.4            # [m] optimal depth
+    lateral_factor: 0.001    # lateral noise factor
+  constant:
+    uncertainty: 0.03        # [m] σ
+
+# ─── Post-processing ───────────────────────────────
+raycasting:
+  enabled: true
+  height_conflict_threshold: 0.02  # [m] excavator: lab scale
+  log_odds_observed: 0.4
+  log_odds_ghost: 0.2
+  log_odds_max: 2.0
+  clear_threshold: -1.0
+
+inpainting:
+  enabled: false  # excavator: show raw coverage for now
+  max_iterations: 3
+  min_valid_neighbors: 2
+
+uncertainty_fusion:
+  enabled: false
+  search_radius: 0.15       # [m]
+  spatial_sigma: 0.05        # [m]
+  quantile_lower: 0.01
+  quantile_upper: 0.99
+  min_valid_neighbors: 3
+
+feature_extraction:
+  enabled: false
+  analysis_radius: 0.3       # [m]
+  min_valid_neighbors: 4
+  step_lower_percentile: 0.05
+  step_upper_percentile: 0.95
+
+# ─── Visualization ────────────────────────────────
+visualization:
+  feature_extraction:
+    normals:
+      arrow_length: 0.15    # [m] normal vector line length
+      stride: 1             # cell stride (1=all, 2=every 2nd, ...)

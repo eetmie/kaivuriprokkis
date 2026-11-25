@@ -251,6 +251,11 @@ def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop'))
     for path, (session, _) in zip(session_paths, sessions):
         if session['fps'] != first['fps'] or session['enable_tracks'] != first['enable_tracks']:
             raise ValueError(f'{path}: fps/track layout differs from {session_paths[0]}')
+    for path, (_, episodes) in zip(session_paths, sessions):
+        if (path / 'provenance/native_stack/config/heightmap_pipeline.json').is_file():
+            for episode in episodes:
+                if not (episode / 'heightmaps.npz').is_file():
+                    raise ValueError(f'{episode}: missing heightmap observations')
     checked = [[validate_episode(ep, session) for ep in episodes] for session, episodes in sessions]
     shapes = {tuple(item[0]) for group in checked for item in group}
     if len(shapes) != 1:
@@ -282,6 +287,9 @@ def export(session_paths, root, repo_id, state_joints=('lift', 'tilt', 'scoop'))
                 target.mkdir()
                 for name in ('samples.jsonl', 'episode.json', *(f'{k}.depth.zst' for k in session.get('depth', []))):
                     shutil.copy2(episode / name, target / name)
+                maps = episode / 'heightmaps.npz'
+                if maps.is_file():
+                    shutil.copy2(maps, target / maps.name)
                 (target / 'source.json').write_text(json.dumps({'source': str(episode.resolve()), 'session': number,
                     'task': session['task'], 'frames': count, 'achieved_hz': hz,
                     'samples_sha256': hashlib.sha256((episode/'samples.jsonl').read_bytes()).hexdigest()}) + '\n')

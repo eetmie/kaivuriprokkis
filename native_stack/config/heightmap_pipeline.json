@@ -1,0 +1,18 @@
+{
+  "capture": {
+    "ir_fps": 30,
+    "depth_units_um": 100,
+    "arm_disparity_shift": 25,
+    "cabin_disparity_shift": 0
+  },
+  "runtime": {
+    "map_hz": 5,
+    "policy_hz": 2,
+    "max_fk_age_ms": 40
+  },
+  "projection": {
+    "stride": 4,
+    "arm_margins_m": [0.045, 0.045, 0.100],
+    "arm_radius_m": 0.11
+  }
+}

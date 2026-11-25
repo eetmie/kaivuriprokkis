@@ -11,6 +11,8 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
+import sys
 from pathlib import Path
 import signal
 import subprocess
@@ -69,8 +71,8 @@ def main():
     p.add_argument('--live-pwm', action='store_true', help=argparse.SUPPRESS)  # old flag; live is the default
     p.add_argument('--enable-slew', action='store_true')
     p.add_argument('--enable-tracks', action='store_true')
-    p.add_argument('--depth', choices=('both', 'cam1', 'cam2', 'none'), default='both',
-                   help='record same-sensor depth for these cameras (camN.depth.zst, ~11%% of one core)')
+    p.add_argument('--depth', choices=('both', 'cam1', 'cam2', 'none', 'heightmaps'), default='both',
+                   help='record Z16 or fused 5 Hz heightmaps without saving Z16')
     for k in (1, 2):
         p.add_argument(f'--cam{k}-disparity-shift', type=int, default=0, choices=range(0, 256), metavar='N',
                        help=f'camera {k} depth window closer (640x480: ~19290/(126+N) to 19290/N mm); 0 = default')
@@ -84,6 +86,18 @@ def main():
     p.add_argument('--bench-sine', type=float, default=0,
                    help='dry bench only: per-joint sine command amplitude in (0, 1] instead of zero commands')
     args = p.parse_args()
+    heightmaps = args.depth == 'heightmaps'
+    hm_tools = SOURCE / 'tools/heightmap_bench'
+    if heightmaps:
+        if args.synthetic or args.resolution != '640x480' or args.fps != 30:
+            p.error('heightmaps require real calibrated cameras at 640x480 and 30 FPS')
+        if (args.camera1, args.camera2, args.rotate_camera1) != (f'{CAM1}:2', f'{CAM2}:1', True):
+            p.error('heightmaps require the calibrated IR camera setup')
+        pipeline = json.loads((SOURCE / 'config/heightmap_pipeline.json').read_text())
+        capture = pipeline['capture']
+        args.cam1_disparity_shift = capture['arm_disparity_shift']
+        args.cam2_disparity_shift = capture['cabin_disparity_shift']
+        args.depth_units_um = capture['depth_units_um']
     if args.resume and not args.session.is_dir():
         p.error('--resume requires an existing native session directory')
     if args.session.exists() and not args.resume:
@@ -121,6 +135,12 @@ def main():
                  'src/util.cpp', 'include/kaivuri/util.hpp', 'src/gamepad.cpp', 'include/kaivuri/gamepad.hpp',
                  'src/pwm.cpp', 'include/kaivuri/pwm.hpp', 'tools/record_native.py', 'tools/native_sessions.py'):
         snapshots['native_stack/' + name] = (SOURCE / name).read_bytes()
+    if heightmaps:
+        for name in ('config/heightmap_pipeline.json', 'config/arm_model.npz',
+                     'tools/heightmap_bench/calibration.json', 'tools/heightmap_bench/fastdem.yaml',
+                     'tools/heightmap_bench/fastdem_replay', 'tools/heightmap_bench/log_heightmaps.py',
+                     'tools/heightmap_bench/mapper.py'):
+            snapshots['native_stack/' + name] = (SOURCE / name).read_bytes()
     executable_hashes = {name: hashlib.sha256((args.build / name).read_bytes()).hexdigest()
                          for name in ('kaivuri-control', 'kaivuri-camera', 'kaivuri-record')}
     revision = subprocess.run(['git', '-C', str(PROJECT), 'rev-parse', 'HEAD'], capture_output=True, text=True)
@@ -137,9 +157,13 @@ def main():
         fcntl.flock(session_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         p.error('session is already recording or being backed up')
-    depth_keys = {'both': ['cam1', 'cam2'], 'cam1': ['cam1'], 'cam2': ['cam2'], 'none': []}[args.depth]
+    depth_keys = {'both': ['cam1', 'cam2'], 'cam1': ['cam1'], 'cam2': ['cam2'], 'none': [], 'heightmaps': []}[args.depth]
     saved_episodes = 0
     if args.resume:
+        if heightmaps or (session_root / 'provenance/native_stack/config/heightmap_pipeline.json').exists():
+            first_run_maps = session_root / 'provenance/native_stack/config/heightmap_pipeline.json'
+            if not heightmaps or not first_run_maps.is_file():
+                p.error('resume requires the original heightmap capture mode')
         expected = {'fps': args.fps, 'enable_slew': args.enable_slew, 'enable_tracks': args.enable_tracks,
             'depth': depth_keys, 'live_pwm': live_pwm, 'simulated_imu': args.synthetic,
             'control_hz': args.control_hz, 'camera_order': specs,
@@ -190,7 +214,7 @@ def main():
                            '--width', args.resolution.split('x')[0], '--height', args.resolution.split('x')[1]]
             if args.rotate_camera1:
                 camera_args += ['--rotate-180', parsed[0][0]]
-            depth_cams = {'both': (0, 1), 'cam1': (0,), 'cam2': (1,), 'none': ()}[args.depth]
+            depth_cams = {'both': (0, 1), 'cam1': (0,), 'cam2': (1,), 'none': (), 'heightmaps': (0, 1)}[args.depth]
             shifts = (args.cam1_disparity_shift, args.cam2_disparity_shift)
             for k in depth_cams:
                 camera_args += ['--depth', parsed[k][0], '--disparity-shift', f'{parsed[k][0]}:{shifts[k]}']
@@ -220,8 +244,23 @@ def main():
                              '--max-pair-skew-ms', str(args.max_pair_skew_ms), *flags]
             for file in files:
                 recorder_args += ['--camera-file', str(file)]
-            for k, file in depth_files.items():
-                recorder_args += [f'--cam{k + 1}-depth-file', str(file)]
+            logger = None
+            if heightmaps:
+                hm_ready = runtime / 'heightmap.ready'
+                env = dict(os.environ, PYTHONPATH=str(SOURCE / 'tools'),
+                           OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')
+                logger = subprocess.Popen([sys.executable, str(hm_tools / 'log_heightmaps.py'),
+                    '--root', str(args.session), '--frames', str(runtime / 'cameras'),
+                    '--socket', str(runtime / 'control.sock'), '--library', str(args.build / 'libkaivuri_frames.so'),
+                    '--profile', str(args.profile), '--calibration', str(hm_tools / 'calibration.json'),
+                    '--fastdem', str(hm_tools / 'fastdem_replay'), '--config', str(hm_tools / 'fastdem.yaml'),
+                    '--serials', parsed[1][0], parsed[0][0], '--ready', str(hm_ready)],
+                    env=env, start_new_session=True)
+                processes.append(logger)
+                wait_for(hm_ready, logger)
+            else:
+                for k, file in depth_files.items():
+                    recorder_args += [f'--cam{k + 1}-depth-file', str(file)]
             if args.bench_seconds is not None:
                 recorder_args += ['--scripted', '--auto-record-s', str(args.bench_seconds),
                                   '--auto-episodes', str(args.bench_episodes)]
@@ -235,11 +274,23 @@ def main():
                 viewer = view('--camera-file', str(files[0]), '--camera-file', str(files[1]),
                               '--socket', str(runtime / 'control.sock'), '--library', str(args.build / 'libkaivuri_frames.so'))
             try:
+                while logger is not None and recorder.poll() is None:
+                    if logger.poll() is not None:
+                        recorder.send_signal(signal.SIGINT)
+                        recorder.wait(timeout=20)
+                        raise RuntimeError(f'heightmap logger exited ({logger.returncode})')
+                    time.sleep(.05)
                 rc = recorder.wait()
             except KeyboardInterrupt:
                 recorder.send_signal(signal.SIGINT)
                 rc = recorder.wait(timeout=20)
             finally:
+                if logger is not None:
+                    stop([logger])
+                    if rc == 0 and (logger.returncode or any(
+                            not (ep / 'heightmaps.npz').is_file() for ep in args.session.glob('episode-*.ready'))):
+                        print('Incomplete heightmaps; native IR and telemetry retained.', file=sys.stderr)
+                        rc = 1
                 # Stop recorder before controller and cameras, including startup failures.
                 for proc in reversed(processes):
                     stop([proc])

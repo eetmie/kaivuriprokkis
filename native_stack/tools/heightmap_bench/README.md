@@ -26,7 +26,7 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python offline_heightmaps/replay.py "$S
 python offline_heightmaps/verify.py "$OUTPUT" --counts 341 1194 3061
 ```
 
-Both variants use a fixed 64×64 forward observation and a fixed 160×160 surround observation. The forward grid follows the cabin yaw and uses 12.5 mm cells. The surround grid stays aligned to the undercarriage and uses 10 mm cells. Rows run from positive to negative X, columns from positive to negative Y. Heights are measured relative to flat ground. The images map ±120 mm to grayscale and reserve black for unknown. The surround map covers the annulus from 0.14 m through 0.80 m with no inpainting, and restarts at each episode boundary.
+Both variants use a fixed 64×64 forward observation and a fixed 160×160 surround observation. The forward grid follows the cabin yaw and uses 12.5 mm cells. The surround grid stays aligned to the undercarriage and uses 10 mm cells. Rows run from positive to negative X, columns from positive to negative Y. Heights are measured relative to flat ground. The images map ±120 mm to grayscale and reserve black for unknown. The surround map covers the annulus from 0.14 m through 0.80 m with no inpainting, and persists across the takes of one recorder start, as live. Offline replay only sees the saved takes, so driving between takes is missing from replayed maps.
 
 The forward map uses current observations. The surround map uses FastDEM's Kalman estimator and raycasting with camera origins from timestamp-matched FK. The fused variant gives the cabin first priority and fills unobserved cells with the arm camera. Both variants store identical state and actions. The separate side-by-side episode videos include both diagnostic depth views. Red indicates FK-predicted boom, arm or bucket returns excluded from mapping.
 
@@ -156,10 +156,11 @@ flat ground to see residual arm hits, over-filtering and map alignment.
 On pikkumasi2tb, use the native recorder and add `--depth heightmaps` to your
 usual gamepad, session, task and motion options. The mapper reads both Z16
 streams from shared memory, saves a fresh fused front and surround at up to
-5 Hz, and resets FastDEM at each take. Both 30 Hz IR streams, FK, IMU, timing
-and action records remain in the take. The mode uses the calibrated capture
-settings in `config/heightmap_pipeline.json`, including the 45 / 45 / 100 mm
-boom, arm and bucket margins. Use the usual raw-depth mode when collecting
+5 Hz. FastDEM starts with the recorder and keeps mapping between takes, so
+drive around once (e.g. a few slews) before the first take and every take
+starts on that map; a new recorder start begins an empty map. Both 30 Hz IR
+streams, FK, IMU, timing and action records remain in the take. The mode uses
+the calibrated capture and mask settings in `config/heightmap_pipeline.json`. Use the usual raw-depth mode when collecting
 data expressly for recalibration.
 
 Each saved episode has `heightmaps.npz` with signed int16 millimetres and

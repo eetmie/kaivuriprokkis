@@ -69,10 +69,14 @@ def run(args):
             ring.client.close()
 
         resources.callback(close_status)
-        engine, active, rows = None, None, []
+        # One map per recorder start: it keeps building between takes (driving around before
+        # logging), so every take starts on the map made so far.
+        engine = resources.enter_context(FastDEM(args.fastdem, args.config))
+        active, rows = None, []
         recorded = set()
+        previous = [-1] * len(KEYS)
         args.ready.touch()
-        next_map = 0
+        next_map = time.monotonic_ns()
         try:
             while alive:
                 if ring.error:
@@ -86,15 +90,11 @@ def run(args):
                         count = save_episode(ready, rows, args)
                         print(f"{ready.name}: saved {count} fused map observations", flush=True)
                     recorded.add(active)
-                    engine.__exit__(None, None, None)
-                    engine, active, rows = None, None, []
+                    active, rows = None, []
                 if partial is not None and active is None and partial not in recorded:
                     active = partial
-                    previous = [-1] * len(KEYS)
-                    engine = FastDEM(args.fastdem, args.config).__enter__()
-                    next_map = time.monotonic_ns()
                 now = time.monotonic_ns()
-                if active is not None and now >= next_map:
+                if now >= next_map:
                     next_map = now + period
                     with ring.lock:
                         poses = [p for p in ring.ring if p["fk_valid"] and p["imu_healthy"]
@@ -104,16 +104,16 @@ def run(args):
                         scans = [projector.scan(k, data, pose) for k, (_, data, pose) in zip(KEYS, obs)]
                         front, surround, _ = update(engine, scans, obs[0][2]["slew_yaw_rad"], args.arm_min_view_deg, args.arm_min_forward_m)
                         previous = [meta.sequence for meta, _, _ in obs]
-                        rows.append((time.monotonic_ns(), [meta.host_monotonic_ns for meta, _, _ in obs],
-                                     previous, millimetres(front), millimetres(surround)))
-                time.sleep(.01 if active is None else min(.01, max(0, (next_map-time.monotonic_ns()) / 1e9)))
+                        if active is not None:
+                            rows.append((time.monotonic_ns(), [meta.host_monotonic_ns for meta, _, _ in obs],
+                                         previous, millimetres(front), millimetres(surround)))
+                time.sleep(min(.01, max(0, (next_map - time.monotonic_ns()) / 1e9)))
         finally:
             if active is not None:
                 ready = active.with_suffix(".ready")
                 if ready.is_dir():
                     count = save_episode(ready, rows, args)
                     print(f"{ready.name}: saved {count} fused map observations", flush=True)
-                engine.__exit__(None, None, None)
 
 
 def main():

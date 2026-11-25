@@ -153,6 +153,7 @@ def run(args):
     action_size = 6 if first["enable_tracks"] else 4
     ds = [create_dataset(args.out / mode, fps, mode, action_size) for mode in MODES]
     report = []
+    runs, run_dir = ExitStack(), None
     try:
         for ep_idx, episode in enumerate(sources):
             print(f"Replay {episode.name}", flush=True)
@@ -171,8 +172,11 @@ def run(args):
             unknown = lambda n: np.full((n, n), np.nan, np.float32)
             held = (unknown(FRONT_SIZE), unknown(SURROUND_SIZE), np.full((SURROUND_SIZE,) * 2, 65535, np.uint16)) * 2
             map_stamps = np.zeros(len(KEYS), np.int64)  # depth host ns the held maps came from; 0 = none yet
+            if episode.parent != run_dir:  # one map per recorder start, as live; driving between takes is not saved
+                runs.close()
+                engines = [runs.enter_context(FastDEM(args.fastdem, args.config)) for _ in MODES]
+                run_dir = episode.parent
             with ExitStack() as stack:
-                engines = [stack.enter_context(FastDEM(args.fastdem, args.config)) for _ in MODES]
                 review = stack.enter_context(ReviewVideo(args.out / f"episode-{ep_idx:03d}-review.mp4", fps))
                 streams = [depth_frames(episode / f"{k}.depth.zst") for k in KEYS]
                 for i, (row, cab, arm) in enumerate(zip(frame_rows(episode), *streams, strict=True)):
@@ -242,6 +246,7 @@ def run(args):
             report.append(record)
             print(json.dumps(record), flush=True)
     finally:
+        runs.close()
         for dataset in ds:
             dataset.finalize()
     info = {"fps": fps, "map_hz": args.map_hz, "max_fk_age_ms": args.max_fk_age_ms, "fastdem_config": args.config.read_text(), "calibration": cal,

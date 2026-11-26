@@ -248,3 +248,6 @@ data_collection/coverage_plots/
 .venv-rerun/
 .venv-tags/
 !native_stack/config/arm_model.npz
+.venv-heightmaps/
+native_stack/tools/heightmap_bench/.fastdem/
+native_stack/tools/heightmap_bench/fastdem_replay

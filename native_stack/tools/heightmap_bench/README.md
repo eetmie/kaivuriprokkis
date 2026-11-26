@@ -2,29 +2,36 @@
 
 This exporter reads committed native episodes, including resumed recording runs, and writes two LeRobot 0.6.1 datasets. It uses the robot checkout's `sand_height.py`, `native_sessions.py`, `export_episodes.py` and arm mesh distance grid. Run it with those tools on `PYTHONPATH`. Calibration needs NumPy and SciPy. Replay needs LeRobot with its dataset dependencies, Pillow and PyAV. The attached C++ adapter uses the same FastDEM core as the ROS workspace.
 
-Build the adapter after running the repo's ROS workspace setup:
+Build the adapter on any machine (x86 or Jetson; needs cmake, g++, Eigen3, yaml-cpp, spdlog, fmt).
+`build_fastdem.sh` clones FastDEM at the commit the robot runs (`5cd3e25`), applies
+`fastdem-core.patch` (pinned nanoGrid, scan-time map stamps, no stray `(0,0,0)` raster points;
+the core part of sim-scratchpad's `ros2/fastdem.patch`) and writes `fastdem_replay` next to it:
 
 ```bash
-f=ros2/ws/src/FastDEM/fastdem
-b=ros2/ws/build/fastdem
-g++ -O3 -std=c++17 -I/usr/include/eigen3 -I"$f/include" \
-  -I"$f/lib/nanoPCL/include" -I"$b/_deps/nanogrid-src/include" \
-  offline_heightmaps/fastdem_replay.cpp "$b/libfastdem.a" \
-  "$b/_deps/nanogrid-build/libnanoGrid.a" -lyaml-cpp -lspdlog -lfmt \
-  -o /tmp/fastdem_replay
+native_stack/tools/heightmap_bench/build_fastdem.sh
 ```
 
-Fit the mounts using a flat arm-motion take and a separate holdout. The prior supplies the camera parameters the flat take cannot identify. The depth-fit file is the output of the native `sand_height.py calibrate` command for the same cameras and depth settings.
+### Offline from a complete export (no robot sessions needed)
+
+A full export (`export_episodes.py` + `add_to_native.py`, e.g. `heightmap_tests_complete`) keeps the raw
+depth, FK samples and camera metadata under `native/`. `sessions_from_export.py` rebuilds the native session
+folders from it as symlinks, so the arm filter and mapper can be re-run with any settings:
 
 ```bash
-export PYTHONPATH="$NATIVE_STACK/tools"
-OPENBLAS_NUM_THREADS=1 python offline_heightmaps/calibrate.py "$SESSION" \
-  --prior "$MOUNT_PRIOR" --depth-fit "$DEPTH_FIT" --out /tmp/heightmap-calibration.json
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python offline_heightmaps/replay.py "$SESSION" \
-  --calibration /tmp/heightmap-calibration.json --arm-model "$NATIVE_STACK/config/arm_model.npz" \
-  --fastdem /tmp/fastdem_replay --config ros2/fastdem.yaml --out "$OUTPUT"
-python offline_heightmaps/verify.py "$OUTPUT" --counts 341 1194 3061
+cd native_stack
+uv venv -p 3.12 ../.venv-heightmaps && uv pip install -p ../.venv-heightmaps/bin/python "lerobot[dataset]==0.6.1" scipy av pillow pyyaml
+export PYTHONPATH=tools:tools/heightmap_bench OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+h=tools/heightmap_bench
+sessions=$(python3 $h/sessions_from_export.py ~/Desktop/heightmap_tests_complete /tmp/hm-sessions)
+../.venv-heightmaps/bin/python $h/replay.py $sessions --episode 0 \
+  --calibration $h/calibration.json --fastdem $h/fastdem_replay --config $h/fastdem.yaml \
+  --arm-model config/arm_model.npz --out /tmp/hm-replay-$(date +%s)
 ```
+
+With the defaults from `config/heightmap_pipeline.json` this reproduces the robot-made maps in the export
+(checked on x86 for episode 0: front identical, surround within 1 mm). Override filters with
+`--arm-margins-m`, `--arm-min-view-deg`, `--arm-min-forward-m`, `--arm-silhouette-cells`, `--map-hz` and so on;
+`--limit N` replays only the first N frames. Robot-side mount calibration is `calibrate_tags.py`.
 
 Both variants use a fixed 64×64 forward observation and a fixed 160×160 surround observation. The forward grid follows the cabin yaw and uses 12.5 mm cells. The surround grid stays aligned to the undercarriage and uses 10 mm cells. Rows run from positive to negative X, columns from positive to negative Y. Heights are measured relative to flat ground. The images map ±120 mm to grayscale and reserve black for unknown. The surround map covers the annulus from 0.14 m through 0.80 m with no inpainting, and persists across the takes of one recorder start, as live. Offline replay only sees the saved takes, so driving between takes is missing from replayed maps.
 
@@ -42,8 +49,8 @@ records under `native/`. The recorded camera streams are monochrome IR in the
 three-channel LeRobot image fields.
 
 ```bash
-python offline_heightmaps/add_to_native.py "$NATIVE_EXPORT" "$OUTPUT/cabin-only" "$FULL_OUTPUT/cabin-only"
-python offline_heightmaps/add_to_native.py "$NATIVE_EXPORT" "$OUTPUT/cabin-arm-fused" "$FULL_OUTPUT/cabin-arm-fused"
+python native_stack/tools/heightmap_bench/add_to_native.py "$NATIVE_EXPORT" "$OUTPUT/cabin-only" "$FULL_OUTPUT/cabin-only"
+python native_stack/tools/heightmap_bench/add_to_native.py "$NATIVE_EXPORT" "$OUTPUT/cabin-arm-fused" "$FULL_OUTPUT/cabin-arm-fused"
 ```
 
 The script checks frame, episode and source alignment before adding the two map
